@@ -16,3 +16,10 @@ Modules/llama-cpp/*
 resource/Vosk_Model/*
 
 test/*
+
+
+
+
+
+
+!.gitkeep
