@@ -1,0 +1,56 @@
+services:
+
+  llama-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: llama-server
+    restart: unless-stopped
+
+    ports:
+      - "2001:2001"
+
+    volumes:
+      - ./models:/app/models
+
+    command: >
+      ./llama-cpp/llama-server
+      -m /app/models/gguf/Gemma-E4B-Code-Q4-K_M.gguf
+      --host 0.0.0.0
+      --port 2001
+      --ctx-size 4096
+      --threads 8
+      --batch-size 256
+      --ubatch-size 128
+      --cache-type-k q4_0
+      --cache-type-v q8_0
+      --flash-attn on
+      --gpu-layers 20
+      --parallel 2
+
+  codegen-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: codegen-api
+    restart: unless-stopped
+
+    ports:
+      - "4001:4001"
+
+    environment:
+      - LLAMA_CPP_BASE_URL=http://llama-server:2001
+
+    volumes:
+      - ./data:/app/data
+
+    depends_on:
+      - llama-server
+
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 4001
+      --workers 1
