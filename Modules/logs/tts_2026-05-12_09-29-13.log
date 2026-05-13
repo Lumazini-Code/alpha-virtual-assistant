@@ -1,0 +1,48 @@
+[32mINFO[0m:     127.0.0.1:45684 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+ for application startup.
+2026-05-12 09:29:13,251 [INFO] Iniciando AVA TTS API...
+2026-05-12 09:29:13,252 [INFO] [W0] Carregando Supertonic...
+2026-05-12 09:29:13,253 [INFO] [W1] Carregando Supertonic...
+2026-05-12 09:29:13,254 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:13,254 [INFO] [W2] Carregando Supertonic...
+2026-05-12 09:29:13,254 [INFO] TTSPool iniciado com 3 workers
+2026-05-12 09:29:13,254 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:13,254 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:13,254 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:29:13,254 [INFO] TTS API pronta
+[32mINFO[0m:     Application startup complete.
+2026-05-12 09:29:13,255 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:3004[0m (Press CTRL+C to quit)
+2026-05-12 09:29:13,255 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:29:13,255 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:29:13,255 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:29:13,255 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:13,256 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:29:13,256 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:13,321 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:14,818 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:15,128 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:15,178 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:15,181 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:15,184 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:15,187 [INFO] Model loaded successfully
+2026-05-12 09:29:15,190 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:15,193 [INFO] Model loaded successfully
+2026-05-12 09:29:15,193 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:15,195 [INFO] Model loaded successfully
+2026-05-12 09:29:15,195 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:15,196 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:16,075 [INFO] [W0] Pronto (pré-aquecido)
+2026-05-12 09:29:16,105 [INFO] [W1] Pronto (pré-aquecido)
+2026-05-12 09:29:16,226 [INFO] [W2] Pronto (pré-aquecido)
+2026-05-12 09:29:19,763 [INFO] [W0] seq=0 ok (1.29s) 'Olá,'
+2026-05-12 09:29:19,803 [INFO] [PLAY] seq=0 (58368 samples)
+2026-05-12 09:29:20,407 [INFO] [W1] seq=1 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:29:20,407 [INFO] [STREAM] 2 sentenças enfileiradas em 1146.73ms
+2026-05-12 09:29:20,443 [INFO] [PLAY] seq=1 (199680 samples)
+2026-05-12 09:29:20,443 [INFO] [PLAY] Fala completa
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+2026-05-12 09:29:33,048 [INFO] AVA TTS API encerrada
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m14557[0m]

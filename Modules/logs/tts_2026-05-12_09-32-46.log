@@ -1,0 +1,127 @@
+[32mINFO[0m:     127.0.0.1:35586 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:34794 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:39220 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:38540 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:60496 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:42266 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:55506 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51672 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:47462 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51820 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:39084 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+ running on [1mhttp://0.0.0.0:3004[0m (Press CTRL+C to quit)
+2026-05-12 09:32:46,242 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:32:46,242 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:32:46,242 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:32:46,242 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:32:46,242 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:32:46,243 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:32:46,243 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:32:47,733 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:32:48,044 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:32:48,094 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:32:48,097 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:32:48,101 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:32:48,103 [INFO] Model loaded successfully
+2026-05-12 09:32:48,106 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:32:48,109 [INFO] Model loaded successfully
+2026-05-12 09:32:48,109 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:32:48,112 [INFO] Model loaded successfully
+2026-05-12 09:32:48,112 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:32:48,112 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:32:48,907 [INFO] [W2] Pronto (pré-aquecido)
+2026-05-12 09:32:48,911 [INFO] [W1] Pronto (pré-aquecido)
+2026-05-12 09:32:49,027 [INFO] [W0] Pronto (pré-aquecido)
+2026-05-12 09:32:51,879 [INFO] [W2] seq=0 ok (1.29s) 'Olá,'
+2026-05-12 09:32:51,915 [INFO] [PLAY] seq=0 (58368 samples)
+2026-05-12 09:32:52,216 [INFO] [W1] seq=1 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:32:52,216 [INFO] [STREAM] 2 sentenças enfileiradas em 900.8ms
+2026-05-12 09:32:53,120 [INFO] [PLAY] seq=1 (199680 samples)
+2026-05-12 09:32:57,279 [INFO] [PLAY] Fala completa
+2026-05-12 09:33:11,227 [INFO] [W0] seq=2 ok (1.29s) 'Olá,'
+2026-05-12 09:33:11,232 [WARNING] [PLAY] seq=0 atrasado 13953ms — pula para seq=2
+2026-05-12 09:33:11,274 [INFO] [PLAY] seq=2 (58368 samples)
+2026-05-12 09:33:12,009 [INFO] [W2] seq=4 ok (4.14s) 'Espero que funcione bem e que a voz seja clara e n'
+2026-05-12 09:33:12,149 [INFO] [W0] seq=5 ok (2.70s) 'Obrigado por usar este serviço!'
+2026-05-12 09:33:12,258 [INFO] [W1] seq=3 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:33:12,258 [INFO] [STREAM] 4 sentenças enfileiradas em 1808.32ms
+2026-05-12 09:33:12,480 [INFO] [PLAY] seq=3 (199680 samples)
+2026-05-12 09:33:16,640 [INFO] [PLAY] seq=4 (184320 samples)
+2026-05-12 09:33:20,480 [INFO] [PLAY] seq=5 (119808 samples)
+2026-05-12 09:33:22,954 [INFO] [PLAY] Fala completa
+2026-05-12 09:33:30,390 [INFO] [W2] seq=6 ok (1.29s) 'Olá,'
+2026-05-12 09:33:30,400 [WARNING] [PLAY] seq=0 atrasado 7446ms — pula para seq=6
+2026-05-12 09:33:30,432 [INFO] [PLAY] seq=6 (58368 samples)
+2026-05-12 09:33:31,179 [INFO] [W1] seq=8 ok (4.32s) 'Espero que funcione bem e que a voz seja clara e n'
+2026-05-12 09:33:31,238 [INFO] [W2] seq=9 ok (2.70s) 'Obrigado por usar este serviço!'
+2026-05-12 09:33:31,388 [INFO] [W0] seq=7 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:33:31,388 [INFO] [STREAM] 4 sentenças enfileiradas em 1907.77ms
+2026-05-12 09:33:31,637 [INFO] [PLAY] seq=7 (199680 samples)
+2026-05-12 09:33:35,797 [INFO] [PLAY] seq=8 (190464 samples)
+2026-05-12 09:33:39,754 [INFO] [PLAY] seq=9 (119808 samples)
+2026-05-12 09:33:42,271 [INFO] [PLAY] Fala completa
+2026-05-12 09:33:58,597 [INFO] [W1] seq=10 ok (1.27s) 'Olá,'
+2026-05-12 09:33:58,634 [WARNING] [PLAY] seq=0 atrasado 16363ms — pula para seq=10
+2026-05-12 09:33:58,677 [INFO] [PLAY] seq=10 (58368 samples)
+2026-05-12 09:33:59,209 [INFO] [W2] seq=11 ok (4.43s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:33:59,475 [INFO] [W0] seq=12 ok (4.22s) 'Espero que funcione bem e que a voz seja clara e n'
+2026-05-12 09:33:59,553 [INFO] [W1] seq=13 ok (2.64s) 'Obrigado por usar este serviço!'
+2026-05-12 09:33:59,554 [INFO] [STREAM] 4 sentenças enfileiradas em 1885.34ms
+2026-05-12 09:33:59,872 [INFO] [PLAY] seq=11 (196608 samples)
+2026-05-12 09:34:03,957 [INFO] [PLAY] seq=12 (187392 samples)
+2026-05-12 09:34:07,871 [INFO] [PLAY] seq=13 (116736 samples)
+2026-05-12 09:34:10,314 [INFO] [PLAY] Fala completa
+2026-05-12 09:34:13,545 [INFO] [W2] seq=14 ok (1.27s) 'Olá,'
+2026-05-12 09:34:13,557 [WARNING] [PLAY] seq=0 atrasado 3243ms — pula para seq=14
+2026-05-12 09:34:13,600 [INFO] [PLAY] seq=14 (58368 samples)
+2026-05-12 09:34:13,812 [INFO] [W0] seq=15 ok (4.43s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:34:13,812 [INFO] [STREAM] 2 sentenças enfileiradas em 758.21ms
+2026-05-12 09:34:14,794 [INFO] [PLAY] seq=15 (196608 samples)
+2026-05-12 09:34:18,879 [INFO] [PLAY] Fala completa
+2026-05-12 09:34:22,059 [INFO] [W1] seq=16 ok (1.17s) 'Olá,'
+2026-05-12 09:34:22,080 [WARNING] [PLAY] seq=0 atrasado 3200ms — pula para seq=16
+2026-05-12 09:34:22,112 [INFO] [PLAY] seq=16 (52224 samples)
+2026-05-12 09:34:22,311 [INFO] [W2] seq=17 ok (3.92s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:34:22,312 [INFO] [STREAM] 2 sentenças enfileiradas em 751.58ms
+2026-05-12 09:34:23,200 [INFO] [PLAY] seq=17 (175104 samples)
+2026-05-12 09:34:26,837 [INFO] [PLAY] Fala completa
+2026-05-12 09:34:30,963 [INFO] [W0] seq=18 ok (1.22s) 'Olá,'
+2026-05-12 09:34:30,997 [WARNING] [PLAY] seq=0 atrasado 4160ms — pula para seq=18
+2026-05-12 09:34:31,040 [INFO] [PLAY] seq=18 (55296 samples)
+2026-05-12 09:34:31,229 [INFO] [W1] seq=19 ok (4.27s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:34:31,230 [INFO] [STREAM] 2 sentenças enfileiradas em 778.7ms
+2026-05-12 09:34:32,160 [INFO] [PLAY] seq=19 (190464 samples)
+2026-05-12 09:34:36,159 [INFO] [PLAY] Fala completa
+2026-05-12 09:34:41,129 [INFO] [W2] seq=20 ok (1.29s) 'Olá,'
+2026-05-12 09:34:41,151 [WARNING] [PLAY] seq=0 atrasado 4992ms — pula para seq=20
+2026-05-12 09:34:41,194 [INFO] [PLAY] seq=20 (58368 samples)
+2026-05-12 09:34:41,504 [INFO] [W0] seq=21 ok (4.51s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:34:41,504 [INFO] [STREAM] 2 sentenças enfileiradas em 837.22ms
+2026-05-12 09:34:42,400 [INFO] [PLAY] seq=21 (199680 samples)
+2026-05-12 09:34:46,559 [INFO] [PLAY] Fala completa
+2026-05-12 09:34:52,771 [INFO] [W1] seq=22 ok (1.30s) 'Olá,'
+2026-05-12 09:34:52,801 [WARNING] [PLAY] seq=0 atrasado 6241ms — pula para seq=22
+2026-05-12 09:34:52,832 [INFO] [PLAY] seq=22 (58368 samples)
+2026-05-12 09:34:53,093 [INFO] [W2] seq=23 ok (4.52s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:34:53,093 [INFO] [STREAM] 2 sentenças enfileiradas em 919.47ms
+2026-05-12 09:34:54,037 [INFO] [PLAY] seq=23 (199680 samples)
+2026-05-12 09:34:58,197 [INFO] [PLAY] Fala completa
+2026-05-12 09:35:03,410 [INFO] [W0] seq=24 ok (1.23s) 'Olá,'
+2026-05-12 09:35:03,434 [WARNING] [PLAY] seq=0 atrasado 5237ms — pula para seq=24
+2026-05-12 09:35:03,477 [INFO] [PLAY] seq=24 (55296 samples)
+2026-05-12 09:35:03,725 [INFO] [W1] seq=25 ok (4.28s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:35:03,725 [INFO] [STREAM] 2 sentenças enfileiradas em 762.59ms
+2026-05-12 09:35:04,597 [INFO] [PLAY] seq=25 (190464 samples)
+2026-05-12 09:35:08,597 [INFO] [PLAY] Fala completa
+2026-05-12 09:35:14,342 [INFO] [W2] seq=26 ok (1.34s) 'Olá,'
+2026-05-12 09:35:14,357 [WARNING] [PLAY] seq=0 atrasado 5760ms — pula para seq=26
+2026-05-12 09:35:14,400 [INFO] [PLAY] seq=26 (61440 samples)
+2026-05-12 09:35:14,687 [INFO] [W0] seq=27 ok (4.66s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:35:14,687 [INFO] [STREAM] 2 sentenças enfileiradas em 920.54ms
+2026-05-12 09:35:15,680 [INFO] [PLAY] seq=27 (205824 samples)
+2026-05-12 09:35:19,957 [INFO] [PLAY] Fala completa
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+2026-05-12 10:11:57,400 [INFO] AVA TTS API encerrada
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m15397[0m]

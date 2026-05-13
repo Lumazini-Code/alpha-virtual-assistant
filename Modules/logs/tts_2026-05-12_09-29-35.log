@@ -1,0 +1,54 @@
+[32mINFO[0m:     127.0.0.1:51608 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:39318 - "[1mPOST /stream HTTP/1.1[0m" [32m200 OK[0m
+6-05-12 09:29:35,636 [INFO] [W0] Carregando Supertonic...
+2026-05-12 09:29:35,637 [INFO] [W1] Carregando Supertonic...
+2026-05-12 09:29:35,637 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:35,638 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:35,638 [INFO] [W2] Carregando Supertonic...
+2026-05-12 09:29:35,638 [INFO] TTSPool iniciado com 3 workers
+2026-05-12 09:29:35,638 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:29:35,638 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:29:35,639 [INFO] Loading model from /home/felipe/.cache/supertonic3
+2026-05-12 09:29:35,639 [INFO] TTS API pronta
+[32mINFO[0m:     Application startup complete.
+2026-05-12 09:29:35,639 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:29:35,639 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:3004[0m (Press CTRL+C to quit)
+2026-05-12 09:29:35,639 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-05-12 09:29:35,639 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:35,640 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:35,640 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-05-12 09:29:35,803 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-05-12 09:29:36,958 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:37,379 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:37,429 [INFO] Successfully loaded all ONNX models
+2026-05-12 09:29:37,433 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:37,435 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:37,438 [INFO] Model loaded successfully
+2026-05-12 09:29:37,440 [INFO] Model loaded successfully
+2026-05-12 09:29:37,443 [INFO] Loaded unicode indexer from /home/felipe/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-05-12 09:29:37,443 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:37,443 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:37,446 [INFO] Model loaded successfully
+2026-05-12 09:29:37,448 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-05-12 09:29:38,145 [INFO] [W0] Pronto (pré-aquecido)
+2026-05-12 09:29:38,148 [INFO] [W2] Pronto (pré-aquecido)
+2026-05-12 09:29:38,274 [INFO] [W1] Pronto (pré-aquecido)
+2026-05-12 09:29:44,643 [INFO] [W0] seq=0 ok (1.29s) 'Olá,'
+2026-05-12 09:29:44,656 [INFO] [PLAY] seq=0 (58368 samples)
+2026-05-12 09:29:45,045 [INFO] [W2] seq=1 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:29:45,046 [INFO] [STREAM] 2 sentenças enfileiradas em 859.92ms
+2026-05-12 09:29:45,051 [INFO] [PLAY] seq=1 (199680 samples)
+2026-05-12 09:29:45,051 [INFO] [PLAY] Fala completa
+2026-05-12 09:30:27,824 [INFO] [W0] seq=2 ok (1.29s) 'Olá,'
+2026-05-12 09:30:27,855 [WARNING] [PLAY] seq=0 atrasado 42804ms — pula para seq=2
+2026-05-12 09:30:27,888 [INFO] [PLAY] seq=2 (58368 samples)
+2026-05-12 09:30:28,114 [INFO] [W1] seq=3 ok (4.53s) 'este é um teste de síntese de voz usando a API loc'
+2026-05-12 09:30:28,115 [INFO] [STREAM] 2 sentenças enfileiradas em 830.09ms
+2026-05-12 09:30:28,133 [INFO] [PLAY] seq=3 (199680 samples)
+2026-05-12 09:30:28,133 [INFO] [PLAY] Fala completa
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+2026-05-12 09:32:44,166 [INFO] AVA TTS API encerrada
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m14831[0m]

@@ -1,59 +1,73 @@
+"""
+AVA — LLM Inference API
+========================
+REST API para inferência conversacional com:
+  - Gerenciamento do llama-server (subida/desligamento)
+  - Integração com API de memória (localhost:3001)
+  - Integração com API de TTS (localhost:3004)
+  - Streaming de texto + disparo paralelo de áudio
+  - Histórico de chat persistido em JSON
+  - Detecção de idioma para resposta automática
+
+Porta: 0.0.0.0:4003
+"""
+
 import sys
 import os
-from os import environ
-environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 import json
-import psutil
-import socket
 import datetime
-from threading import Event
-import threading
-import tkinter as tk
-from tkinter import messagebox
+import asyncio
+import subprocess
+import time
 from pathlib import Path
+from threading import Event
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from langdetect import detect
-import re
 
+# ─────────────────────────────────────────────────────────────
+#                          CONFIG
+# ─────────────────────────────────────────────────────────────
 
-stop_event = Event()
-
-# pasta do script atual
 BASEFOLDER = Path(__file__).parent.parent
 
+# URLs das APIs satélite
+MEMORY_URL = "http://localhost:3001"
+TTS_URL    = "http://0.0.0.0:3004"
 
-def errorpop(msg):
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror("Erro", msg)
-    root.destroy()
+# llama-server
+LLAMA_SERVER_PATH = r".\llama-cpp\llama-server"
+LLAMA_HOST        = "0.0.0.0"
+LLAMA_PORT        = 2001
+LLAMA_URL         = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
 
-try:
+# Histórico
+CHAT_HISTORY_PATH = BASEFOLDER / "chat_history.json"
 
-    # Limpeza de Cache
-    caminho_pasta = BASEFOLDER / "resource/voices"
-    arquivos = os.listdir(caminho_pasta)
-    for arquivo in arquivos:
-        caminho_arquivo = os.path.join(caminho_pasta, arquivo)
-        if os.path.isfile(caminho_arquivo):
-            os.remove(caminho_arquivo)
+# ─────────────────────────────────────────────────────────────
+#                       LOGGING DUPLO
+# ─────────────────────────────────────────────────────────────
 
+def _setup_logging():
     log_dir = BASEFOLDER / "logs"
-    log_filename = f"LLM_log_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-    log_path = os.path.join(log_dir, log_filename)
-
-    voiceCom = False
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"LLM_api_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     class LogDuplicado:
-        def __init__(self, terminal, caminho_log):
+        def __init__(self, terminal, path):
             self.terminal = terminal
-            self.log = open(caminho_log, "w", encoding="utf-8")
+            self.log = open(path, "w", encoding="utf-8")
 
-        def write(self, mensagem):
+        def write(self, msg):
             try:
-                self.terminal.write(mensagem)
+                self.terminal.write(msg)
             except Exception:
                 pass
-            self.log.write(mensagem)
+            self.log.write(msg)
 
         def flush(self):
             try:
@@ -65,323 +79,480 @@ try:
         def isatty(self):
             return False
 
-
-    # Por isso:
     sys.stdout = LogDuplicado(sys.__stdout__, log_path)
     sys.stderr = LogDuplicado(sys.__stderr__, log_path)
 
+_setup_logging()
+
+# ─────────────────────────────────────────────────────────────
+#                     LEITURA DE CONFIGS
+# ─────────────────────────────────────────────────────────────
+
+def _read(path: Path) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+username   = _read(BASEFOLDER / r"resource\username.dll")
+voiceModel = _read(BASEFOLDER / r"resource\VoiceModel.dll") or "F1"
+ctxUsed    = _read(BASEFOLDER / r"resource\ctxConfig.dll")
+context    = _read(BASEFOLDER / f"Ctxbin/{ctxUsed}.bin")
+searchCfg  = _read(BASEFOLDER / r"resource\SearchCfg.dll")
+
+model_raw = _read(BASEFOLDER / "resource/AiConfig.dll").replace("on-", "")
+
+with open(BASEFOLDER / f"CfgModels/{model_raw}.json", "r", encoding="utf-8") as f:
+    MODELCFG = json.load(f)
+
+MODEL_NAME      = model_raw
+THREADS         = (max(4, os.cpu_count() - 2)
+                   if MODELCFG["threads"] == "max"
+                   else int(MODELCFG["threads"]))
+KV_CACHE_QUANT  = MODELCFG.get("kv_cache", "q8_0")
+MODEL_PATH      = MODELCFG.get("model_path", "")
+CTX_SIZE        = int(MODELCFG.get("ctx_size", 8192))
+GPU_LAYERS      = MODELCFG.get("gpu_layers", "all")
+
+LLAMA_ARGS = [
+    "--model",         MODEL_PATH,
+    "--host",          LLAMA_HOST,
+    "--port",          str(LLAMA_PORT),
+    "--n-gpu-layers",  str(GPU_LAYERS),
+    "--threads",       str(THREADS),
+    "--threads-batch", str(min(THREADS + 2, os.cpu_count())),
+    "--batch-size",    "2048",
+    "--ubatch-size",   "512",
+    "--flash-attn",    "on",
+    "--cache-type-k",  KV_CACHE_QUANT if KV_CACHE_QUANT in ("q4_0", "q8_0") else "f16",
+    "--cache-type-v",  "q8_0",
+    "--ctx-size",      str(CTX_SIZE),
+    "--parallel",      "1",
+    "--cont-batching",
+    "--mmap",
+    "--cache-reuse",   "256",
+    "--slot-prompt-similarity", "0.5",
+]
+
+# ─────────────────────────────────────────────────────────────
+#                    GERENCIAMENTO DO SERVIDOR
+# ─────────────────────────────────────────────────────────────
+
+llama_proc: subprocess.Popen | None = None
 
 
-    # ─────────────────────────────────────────────────────────────
-    #                        FUNÇÕES UTILITÁRIAS
-    # ─────────────────────────────────────────────────────────────
-
-    def is_app_running(process_name: str) -> bool:
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and process_name.lower() in proc.info['name'].lower():
-                return True
-        return False
-
-
-    def startConnection_close():
-        HOST = '127.0.0.1'
-        PORT = 5500
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((HOST, PORT))
-        server_socket.listen(1)
-        print("\n[INFO] Waiting for connection (close)...")
-        conn, addr = server_socket.accept()
-        print(f"\n[INFO] Client connected: {addr}")
-        return conn
+def _start_llama():
+    global llama_proc
+    print(f"[SERVER] Iniciando llama-server com modelo: {MODEL_NAME}")
+    llama_proc = subprocess.Popen(
+        [LLAMA_SERVER_PATH] + LLAMA_ARGS,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
 
 
-    def startConnection():
-        HOST = '127.0.0.1'
-        PORT = 5050
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((HOST, PORT))
-        server_socket.listen(1)
-        print("\n[INFO] Waiting for connection...")
-        conn, addr = server_socket.accept()
-        print(f"\n[INFO] Client connected: {addr}")
-        return conn
-
-
-    def tem_conexao():
+def _wait_llama(timeout: int = 90):
+    print("[SERVER] Aguardando llama-server...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            socket.create_connection(("8.8.8.8", 53), timeout=3)
-            return True
-        except OSError:
-            return False
+            r = httpx.get(f"{LLAMA_URL}/health", timeout=2)
+            if r.status_code == 200:
+                print("[SERVER] llama-server pronto!\n")
+                return
+        except httpx.ConnectError:
+            pass
+        time.sleep(1)
+    raise TimeoutError("[SERVER] llama-server não respondeu a tempo.")
 
 
-    def break_listener(conn_close, conn, stop_event):
-        """Listen for break signal on the close connection and set stop_event."""
-        while True:
-            try:
-                data = conn_close.recv(4096)
-                if not data:
-                    break
-                message = data.decode("utf-8").strip()
-                if message == "<break>":
-                    # Send interruption message to the main connection
-                    try:
-                        conn.sendall("\n\n   Geração interrompida.".encode("utf-8"))
-                    except:
-                        pass
-                    stop_event.set()
-            except Exception as e:
-                print(f"[ERROR] Break listener: {e}")
-                break
-
-
-    def buscar_arquivo(nome_arquivo, pasta_raiz):
-        for raiz, _, arquivos in os.walk(pasta_raiz):
-            if nome_arquivo in arquivos:
-                pathModel = os.path.join(raiz, nome_arquivo)
-                print(f"Caminho do arquivo encontrado: {pathModel}")
-                return True, pathModel
-        return False
-
-
-    def salvar_chat_history(chat_history, caminho=BASEFOLDER / "chat_history.json"):
-        with open(caminho, "w", encoding="utf-8") as f:
-            json.dump(chat_history, f, ensure_ascii=False, indent=2)
-
-
-    def carregar_chat_history(caminho=BASEFOLDER / "chat_history.json"):
+def _stop_llama():
+    if llama_proc:
+        print("[SERVER] Encerrando llama-server...")
+        llama_proc.terminate()
         try:
-            with open(caminho, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-                else:
-                    return [data]
-        except FileNotFoundError:
-            return []
+            llama_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            llama_proc.kill()
 
 
-    def listen_for_break(conn_close, conn, stop_event):
-        """Listen for break signal on the close connection and set stop_event."""
-        while not stop_event.is_set():
-            try:
-                data = conn_close.recv(4096)
-                if not data:
-                    break
-                message = data.decode("utf-8").strip()
-                if message == "<break>":
-                    # Send interruption message to the main connection
-                    conn.sendall("\n\n   Geração interrompida.".encode("utf-8"))
-                    stop_event.set()
-                    break
-            except Exception as e:
-                print(f"[ERROR] Break listener: {e}")
-                break
-
-
-    # ─────────────────────────────────────────────────────────────
-    #                     BUSCA WEB (DuckDuckGo)
-    # ─────────────────────────────────────────────────────────────
-
-    # Compila padrões uma vez — reuse em todas as chamadas sem recompilar
-    _PATTERNS_SEARCH = [
-        r'\bhoje\b|\bagora\b|\batual(mente)?\b',
-        r'\beste\s*(semana|mês|ano)\b|\boutem\b|\bamanhã\b',
-        r'\bnotícias?\b|\bnovidade[ds]?\b|\beventos?\b|\burgent',
-        r'\bpreço[s]?\b|\bcotação\b|\bdólar\b|\beuro\b|\bbitcoin\b',
-        r'\bbolsa\b|\binflação\b|\bjuros\b|\bações\b',
-        r'\bplacar\b|\bresultado[s]?\b|\bjogo[s]?\b|\bpartida[s]?\b',
-        r'\bgol[s]?\b|\bcampeonato\b|\btorneio\b|\bcopa\b',
-        r'\btempo\b|\bclima\b|\bprevisão\b|\btemperatura\b|\bchuva\b',
-        r'\blançamento[s]?\b|\bnovo\b|\bnovos?\b|\bestreiou?\b|\bdisponível\b|\batualizado\b',
-        r'\bquem\s+(é|foi|ganhou|perdeu|venceu)\b',
-        r'\bpresidente\b|\bgoverno\b|\bfaleceu\b|\bmorreu\b|\bnasceu\b',
-        r'\bquando\b|\bque\s+horas\b|\bquanto\s+tempo\b',
-        r'\binteligência\s+artificial\b|\bia\b|\bllm\b|\bgpt\b|\bgemini\b',
-        r'\bfilme[s]?\b|\bsérie[s]?\b|\bstreaming\b|\bnetflix\b',
-        r'\blei\b|\bdecreto\b|\bimposto\b|\bprazo\b',
-    ]
-    _COMPILED_PATTERNS = [re.compile(p) for p in _PATTERNS_SEARCH]
-
-
-    def precisa_buscar(user_input: str) -> bool:
-        """Heurística com padrões regex — verifica rede inline a cada chamada."""
-
-        # Rede verificada em tempo real (não rely em netCon estático)
-        try:
-            socket.create_connection(("8.8.8.8", 53), timeout=2)
-        except OSError:
-            return False
-
-        entrada = user_input.lower()
-
-        for pattern in _COMPILED_PATTERNS:
-            if pattern.search(entrada):
-                print(f"[SEARCH] Pattern matched: {pattern.pattern}")
-                return True
-        return False
-
-    def buscar_web(query: str) -> str:  
-        pass
-
-        
-
-
-
-    # ─────────────────────────────────────────────────────────────
-    #                        PROMPT
-    # ─────────────────────────────────────────────────────────────
-
-    chat_history = carregar_chat_history()
-
-    def build_messages(system_content: str, user_input: str, max_turns: int = 10) -> list:
-        messages = [{"role": "system", "content": system_content}]
-
-        history_slice = chat_history[-(max_turns * 2):]
-        for turn in history_slice:
-            if isinstance(turn, dict) and "role" in turn and "content" in turn:
-                content = turn["content"].strip()[:500]
-                messages.append({"role": turn["role"], "content": content})
-
-        # Injeta /no_think na mensagem do usuário, não no system
-        final_input = user_input
-
-        messages.append({"role": "user", "content": final_input})
-        return messages
-
-
-    def build_prompt(user_message: str, max_turns: int = 3) -> str:
-        """Usado apenas para contexto de busca web e RAG, não para o LLM principal."""
-        prompt = ""
-        history_slice = chat_history[-(max_turns * 2):]
-
-        if len(chat_history) > max_turns * 2:
-            prompt += "[Previous conversation omitted]\n"
-
-        for turn in history_slice:
-            if isinstance(turn, dict) and "role" in turn and "content" in turn:
-                role    = "User" if turn["role"] == "user" else "AI"
-                content = turn["content"].strip()[:150]
-                prompt += f"{role}: {content}\n"
-
-        prompt += f"User: {user_message.strip()}\n"
-        return prompt
-
-    # ─────────────────────────────────────────────────────────────
-    #                     LEITURA DE CONFIGS
-    # ─────────────────────────────────────────────────────────────
-
-    with open(BASEFOLDER / R"resource\VoiceModel.dll", "r", encoding="utf-8") as VoiceModelfile:
-        voiceModel = VoiceModelfile.read()
-        if voiceModel == "Voz padrão":
-            voiceModel = "sage"
-
-    with open(BASEFOLDER / R"resource\username.dll", "r", encoding="utf-8") as file:
-        username = file.read()
-
-    with open(BASEFOLDER / "resource/AiConfig.dll", "r", encoding="utf-8") as file2:
-        model = file2.read().strip()
-        model = model.replace("on-", "")
-        model = model.strip()
-
-    with open(BASEFOLDER / fR"resource/ctxConfig.dll", "r", encoding="utf-8") as ctxFile:
-        ctxUsed = ctxFile.read()
-
-    with open(BASEFOLDER / fR"Ctxbin\{ctxUsed}.bin", "r", encoding="utf-8") as contFile:
-        context = contFile.read()
-
-    with open(BASEFOLDER / f"resource/keyConfig.dll", "r", encoding="utf-8") as file3:
-        keyConfig = file3.read()
-
-    with open(BASEFOLDER / f"CfgModels/{model}.json", "r", encoding="utf-8") as f:
-        MODELCFG = json.load(f)
-        THREADS = int(MODELCFG["threads"])
-        if MODELCFG["threads"] == "max":
-            THREADS = max(4, os.cpu_count() - 2)
-
-        KV_CACHE_QUANT = MODELCFG["kv_cache"]
-            
-        if KV_CACHE_QUANT != "q8_0" and KV_CACHE_QUANT != "q4_0":
-            KV_CACHE_QUANT_CFG = "f16"
-
-    with open(BASEFOLDER / f"resource\SearchCfg.dll", "r", encoding="utf-8") as searchFile:
-        searchCfg = searchFile.read().strip()
-
-    with open(BASEFOLDER / Rf"resource\agentCfg.json", "r", encoding="utf-8") as agentFile:
-        agentCfg = json.load(agentFile)
-    # ─────────────────────────────────────────────────────────────
-    #                     CARREGAMENTO DO MODELO
-    # ─────────────────────────────────────────────────────────────
-
-
+def _warmup():
+    """Requisição mínima para pré-aquecer KV cache e GPU."""
+    print("[MAIN] Warmup do modelo...")
     try:
-        dirname = fR"C:\Users\{os.getlogin()}\.cache\huggingface\hub"
-        filename = model
-        tryDir, modelPath = buscar_arquivo(filename, dirname)
-
-        try:
-            print(f"\n[INFO] Carregando modelo: {model}")
-
-
-
-        except Exception as e:
-            print(f"\n[ERROR] Erro ao carregar o modelo: {str(e)}\n")
-
-
-
-        # ─────────────────────────────────────────────────────
-        #              LOOP PRINCIPAL — MODELO LOCAL
-        # ─────────────────────────────────────────────────────
-
-        try:
-            while True:
-
-                if "<voice>" in user_input:
-                    voiceCom = True
-                    user_input = user_input.replace("<voice>", "")
-
-
-                # ── Busca web ──────────────────────────────────
-                contexto_web = ""
-                if precisa_buscar(user_input):
-                    if searchCfg == "on":
-                        print("\n[INFO] Gerando query de busca...")
-                        contexto_web = buscar_web(user_input)
-                        print(contexto_web)
-                        if contexto_web:
-                            print("[INFO] Contexto web injetado no prompt.")
-                # ───────────────────────────────────────────────
-                askLang = detect(user_input)
-                system_final = f"{context}, my name's {username}, today's date is {datetime.datetime.now().strftime('%d/%m/%Y')} and respond in {askLang}"
-                if contexto_web:
-                    trechos = "\n\n---\n".join(contexto_web)
-                    system_final += (
-                        f"\n\n[RESULTADO DA SUA BUSCA WEB]\n"
-                        f"Você realizou uma busca na internet e encontrou as seguintes informações:\n\n"
-                        f"{trechos}\n\n"
-                        f"Use essas informações para embasar sua resposta quando relevante. "
-                        f"Não mencione que o usuário pesquisou — foi você que buscou autonomamente."
-                    )
-
-                print(f"\n[INPUT]: {user_input}\n")
-                response_text = ""
-                print(f"{system_final}\n\n {user_input}")
-
-
-
-                print("{end}")
-
-                chat_history.append({"role": "user",      "content": user_input})
-                chat_history.append({"role": "assistant", "content": response_text})
-                salvar_chat_history(chat_history)
-
-        except Exception as e:
-            print(f"\n[ERROR] {e}")
-            sys.exit(1)
-
+        httpx.post(
+            f"{LLAMA_URL}/v1/chat/completions",
+            json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "ok"}],
+                "max_tokens": 1,
+            },
+            timeout=30,
+        )
+        print("[MAIN] Warmup concluído.\n")
     except Exception as e:
-        print(f"\n[ERROR] {e}")
-        sys.exit(1)
+        print(f"[MAIN] Warmup falhou (não crítico): {e}")
 
-except Exception as e:
-    errorpop(f"Um erro crítico ocorreu: {e}")
+# ─────────────────────────────────────────────────────────────
+#                      HISTÓRICO DE CHAT
+# ─────────────────────────────────────────────────────────────
+
+def _load_history() -> list:
+    try:
+        with open(CHAT_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else [data]
+    except FileNotFoundError:
+        return []
+
+
+def _save_history(history: list):
+    with open(CHAT_HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+chat_history: list = _load_history()
+
+# ─────────────────────────────────────────────────────────────
+#                     INTEGRAÇÃO: MEMÓRIA
+# ─────────────────────────────────────────────────────────────
+
+async def memory_read(query: str, top_k: int = 5) -> list[dict]:
+    """Busca memórias relevantes para o contexto da conversa."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.post(
+                f"{MEMORY_URL}/read",
+                json={"query": query, "top_k": top_k, "min_score": 0.3},
+            )
+            return r.json().get("results", [])
+    except Exception as e:
+        print(f"[MEMORY] Falha na leitura: {e}")
+        return []
+
+
+async def memory_write(text: str, source: str = "chat", confidence: float = 0.8):
+    """Grava informação relevante na memória em background."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"{MEMORY_URL}/write",
+                json={"text": text, "source": source, "confidence": confidence},
+            )
+    except Exception as e:
+        print(f"[MEMORY] Falha na escrita: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+#                      INTEGRAÇÃO: TTS
+# ─────────────────────────────────────────────────────────────
+
+async def tts_stream_chunk(text: str, voice: str, lang: str):
+    """Envia um delta de texto diretamente ao endpoint de streaming do TTS."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{TTS_URL}/stream",
+                json={"text": text, "voice": voice, "lang": lang},
+            )
+    except Exception as e:
+        print(f"[TTS] Falha no chunk: {e}")
+
+
+async def tts_speak(text: str, voice: str, lang: str):
+    """
+    Fallback para texto completo (usado pelo /chat síncrono).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(
+                f"{TTS_URL}/speak",
+                json={"text": text, "voice": voice, "lang": lang},
+            )
+    except Exception as e:
+        print(f"[TTS] Falha ao disparar áudio: {e}")
+
+
+
+
+# ─────────────────────────────────────────────────────────────
+#                       CONSTRUÇÃO DO PROMPT
+# ─────────────────────────────────────────────────────────────
+
+def _build_messages(
+    user_input: str,
+    lang: str,
+    memories: list[dict],
+    max_turns: int = 10,
+) -> list[dict]:
+    """
+    Monta a lista de mensagens para o llama-server.
+    Injeta memórias relevantes no system prompt sem poluir o histórico.
+    """
+    memory_block = ""
+    if memories:
+        mem_lines = "\n".join(
+            f"- {m['text']}" for m in memories if m.get("text")
+        )
+        memory_block = f"\n\n[Memórias relevantes sobre o usuário]\n{mem_lines}"
+
+    system_content = (
+        f"{context}{memory_block}\n\n"
+        f"O nome do usuário é {username}. "
+        f"Data de hoje: {datetime.datetime.now().strftime('%d/%m/%Y')}. "
+        f"Responda sempre em {lang}."
+    )
+
+    messages = [{"role": "system", "content": system_content}]
+
+    # Histórico recente (últimas max_turns rodadas)
+    for turn in chat_history[-(max_turns * 2):]:
+        if isinstance(turn, dict) and "role" in turn and "content" in turn:
+            messages.append({
+                "role":    turn["role"],
+                "content": turn["content"].strip()[:600],  # trunca turns longos
+            })
+
+    messages.append({"role": "user", "content": user_input})
+    return messages
+
+# ─────────────────────────────────────────────────────────────
+#                           FASTAPI
+# ─────────────────────────────────────────────────────────────
+
+app = FastAPI(title="AVA — LLM API", version="1.0.0")
+
+
+# ── Schemas ───────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    voice:   str  = Field(default=None, description="Voz TTS. None = sem áudio.")
+    lang:    str  = Field(default=None, description="Idioma forçado. None = detectado.")
+    max_turns: int = Field(default=10,  ge=1, le=40)
+    tts: bool = Field(default=True, description="Dispara TTS após gerar resposta.")
+
+
+class ClearRequest(BaseModel):
+    confirm: bool = False
+
+
+# ── Ciclo de vida ─────────────────────────────────────────────
+
+@app.on_event("startup")
+def startup():
+    _start_llama()
+    _wait_llama()
+    _warmup()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    _stop_llama()
+
+
+# ── Endpoints ─────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    """Verifica se a API e o llama-server estão no ar."""
+    try:
+        r = httpx.get(f"{LLAMA_URL}/health", timeout=2)
+        llama_ok = r.status_code == 200
+    except Exception:
+        llama_ok = False
+    return {"api": "ok", "llama_server": "ok" if llama_ok else "down"}
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    Inferência síncrona — retorna a resposta completa em JSON.
+    TTS é disparado em background após a geração.
+
+    Body:
+        message   : mensagem do usuário
+        voice     : voz TTS (ex: "F1", "M1") — None desativa TTS
+        lang      : idioma forçado — None detecta automaticamente
+        max_turns : quantas rodadas do histórico incluir (padrão 10)
+        tts       : ativa/desativa disparo de áudio (padrão true)
+    """
+    user_input = req.message.strip()
+    if not user_input:
+        raise HTTPException(status_code=400, detail="Mensagem vazia.")
+
+    # 1. Detectar idioma
+    lang = req.lang or _safe_detect(user_input)
+
+    # 2. Buscar memórias relevantes
+    memories = await memory_read(user_input)
+
+    # 3. Montar prompt
+    messages = _build_messages(user_input, lang, memories, req.max_turns)
+
+    # 4. Inferência
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{LLAMA_URL}/v1/chat/completions",
+                json={
+                    "model":       MODEL_NAME,
+                    "messages":    messages,
+                    "max_tokens":  1024,
+                    "temperature": 0.7,
+                    "stream":      False,
+                },
+            )
+            r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"llama-server error: {e}")
+
+    response_text = r.json()["choices"][0]["message"]["content"]
+    elapsed = time.perf_counter() - t0
+    print(f"[CHAT] Concluído em {elapsed:.2f}s | {len(response_text)} chars")
+
+    # 5. Persistir histórico
+    chat_history.append({"role": "user",      "content": user_input})
+    chat_history.append({"role": "assistant", "content": response_text})
+    _save_history(chat_history)
+
+    # 6. Gravar memória relevante em background
+    background_tasks.add_task(
+        memory_write,
+        f"Usuário disse: {user_input[:200]}",
+        "chat",
+        0.7,
+    )
+
+    # 7. Disparar TTS em background
+    voice = req.voice or voiceModel
+    if req.tts and voice:
+        background_tasks.add_task(tts_speak, response_text, voice, lang)
+
+    return {
+        "response": response_text,
+        "lang":     lang,
+        "elapsed":  round(elapsed, 3),
+    }
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Inferência com streaming — retorna Server-Sent Events (SSE).
+    Cada evento tem o formato: data: {"delta": "..."}\n\n
+    Após [DONE], o TTS é disparado com o texto completo acumulado.
+
+    Ideal para interface com typewriter effect.
+    """
+    user_input = req.message.strip()
+    if not user_input:
+        raise HTTPException(status_code=400, detail="Mensagem vazia.")
+
+    lang      = req.lang or _safe_detect(user_input)
+    memories  = await memory_read(user_input)
+    messages  = _build_messages(user_input, lang, memories, req.max_turns)
+    voice     = req.voice or voiceModel
+
+    async def generator():
+        full_response = ""
+        t0 = time.perf_counter()
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream(
+                    "POST",
+                    f"{LLAMA_URL}/v1/chat/completions",
+                    json={
+                        "model":       MODEL_NAME,
+                        "messages":    messages,
+                        "max_tokens":  1024,
+                        "temperature": 0.7,
+                        "stream":      True,
+                    },
+                ) as r:
+                    r.raise_for_status()
+                    async for line in r.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if not delta:
+                                continue
+
+                            full_response += delta
+
+                            # Repassa delta para o cliente (UI)
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+
+                            # Dispara delta pro TTS imediatamente, sem buffer
+                            if req.tts and voice:
+                                asyncio.create_task(tts_stream_chunk(delta, voice, lang))
+
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            return
+
+        elapsed = time.perf_counter() - t0
+        print(f"[STREAM] Concluído em {elapsed:.2f}s | {len(full_response)} chars")
+
+        # Sinaliza fim ao cliente
+        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3)})}\n\n"
+
+        # Persistir histórico
+        chat_history.append({"role": "user",      "content": user_input})
+        chat_history.append({"role": "assistant", "content": full_response})
+        _save_history(chat_history)
+
+        # Gravar memória
+        asyncio.create_task(
+            memory_write(f"Usuário disse: {user_input[:200]}", "chat", 0.7)
+        )
+
+        # Disparar TTS com texto completo
+        if req.tts and voice and full_response:
+            asyncio.create_task(tts_speak(full_response, voice, lang))
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.delete("/history")
+def clear_history(req: ClearRequest):
+    """Limpa o histórico de chat. Requer confirm=true."""
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Envie confirm=true para confirmar.")
+    chat_history.clear()
+    _save_history(chat_history)
+    return {"cleared": True}
+
+
+@app.get("/history")
+def get_history(last_n: int = 20):
+    """Retorna as últimas N mensagens do histórico."""
+    return {"history": chat_history[-(last_n * 2):], "total": len(chat_history)}
+
+
+# ─────────────────────────────────────────────────────────────
+#                         UTILITÁRIOS
+# ─────────────────────────────────────────────────────────────
+
+def _safe_detect(text: str) -> str:
+    try:
+        return detect(text)
+    except Exception:
+        return "pt"
+
+
+# ─────────────────────────────────────────────────────────────
+#                         ENTRY POINT
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=4003, log_level="info")
