@@ -98,12 +98,13 @@ def print_results(response: dict):
         print(f"       Trecho : {r['text'][:1000]}...")
 
 
-def test_search(query: str, use_cache: bool = True):
+def test_search(query: str, use_cache: bool = True, pdfs: bool = True):
     r = httpx.post(f"{BASE_URL}/search", json={
         "query":      query,
         "max_results": 3,
         "use_cache":  use_cache,
-    }, timeout=30.0)
+        search_pdfs:   pdfs }
+        , timeout=30.0)
     if r.status_code == 200:
         print_results(r.json())
     else:

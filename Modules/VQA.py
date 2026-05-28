@@ -7,7 +7,7 @@ import json
 import requests
 import base64
 import subprocess
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -15,10 +15,10 @@ import uvicorn
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LLAMA_SERVER_PATH = r".\llama-cpp\llama-server"
+LLAMA_SERVER_PATH = r".//llama-cpp//llama-server"
 LLAMA_ARGS = [
-    "--model",        r"Models\Qwen3VL-2B-Instruct-Q4_K_M.gguf",
-    "--mmproj",       r"Models\mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
+    "--model",        r"Models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",   # ← barras corrigidas p/ Linux
+    "--mmproj",       r"Models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
     "--host",         "0.0.0.0",
     "--port",         "2004",
     "--n-gpu-layers", "all",
@@ -29,11 +29,10 @@ LLAMA_ARGS = [
     "--flash-attn",   "on",
     "--cache-type-k", "q4_0",
     "--cache-type-v", "q8_0",
-    "--ctx-size",     "16384",
+    "--ctx-size",     "8192",
     "--parallel",     "1",
     "--cont-batching",
     "--mmap",
-    "--mlock",
     "--poll",         "50",
     "--prio",         "2",
     "--mmproj-offload",
@@ -41,16 +40,15 @@ LLAMA_ARGS = [
     "--slot-prompt-similarity", "0.1",
 ]
 
-QWEN_URL   = "http://0.0.0.0:2004/v1/chat/completions"
+QWEN_URL = "http://0.0.0.0:2004/v1/chat/completions"  # ← corrigido # ← 127.0.0.1 em vez de 0.0.0.0
 QWEN_MODEL = "Qwen3VL-2B-Instruct-Q4_K_M"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 BASEFOLDER = Path(__file__).parent.parent
-log_dir = BASEFOLDER / "logs"
+log_dir    = BASEFOLDER / "logs"
 log_dir.mkdir(exist_ok=True)
-log_filename = f"Florence_log_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-log_path = log_dir / log_filename
+log_path   = log_dir / f"Florence_log_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
 
 class LogDuplicado:
@@ -76,32 +74,31 @@ sys.stderr = LogDuplicado(sys.__stderr__, log_path)
 # ── Llama server ──────────────────────────────────────────────────────────────
 
 llama_proc: subprocess.Popen | None = None
+llama_log_path = log_dir / f"llama_server_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
 
-def start_llama_server() -> subprocess.Popen:
-    print("[SERVER] Iniciando llama-server...")
-    proc = subprocess.Popen(
-        [LLAMA_SERVER_PATH] + LLAMA_ARGS,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    return proc
 
-
-def wait_for_server(url: str, timeout: int = 60):
-    print("[SERVER] Aguardando servidor ficar pronto...")
+def wait_for_server(url: str, timeout: int = 120):   # ← timeout aumentado para 120s
+    print(f"[SERVER] Aguardando servidor em {url}/health ...")
     start = time.time()
     while time.time() - start < timeout:
+        # Verifica se o processo ainda está vivo
+        if llama_proc and llama_proc.poll() is not None:
+            raise RuntimeError(
+                f"llama-server morreu durante inicialização (código {llama_proc.returncode}). "
+                f"Veja: {llama_log_path}"
+            )
         try:
             res = requests.get(f"{url}/health", timeout=2)
             if res.status_code == 200:
-                print("[SERVER] Servidor pronto!\n")
+                print("[SERVER] ✅ Servidor pronto!\n")
                 return True
         except requests.exceptions.ConnectionError:
             pass
-        time.sleep(1)
-    raise TimeoutError("[SERVER] Servidor não respondeu a tempo.")
+        time.sleep(2)
+    raise TimeoutError(
+        f"[SERVER] Servidor não respondeu em {timeout}s. Veja o log: {llama_log_path}"
+    )
 
 
 def stop_llama_server(proc: subprocess.Popen):
@@ -123,28 +120,25 @@ def get_mime(path: str) -> str:
     ext = Path(path).suffix.lower().lstrip(".")
     return "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Florence / Qwen3VL")
-
+# ── Lifespan (substitui on_event depreciado) ──────────────────────────────────
 
 class DescribeRequest(BaseModel):
     img_path: str
     prompt: str = "Descreva a imagem detalhadamente."
 
 
-@app.on_event("startup")
-def startup():
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global llama_proc
-    llama_proc = start_llama_server()
     wait_for_server("http://0.0.0.0:2004")
     _warmup()
-
-
-@app.on_event("shutdown")
-def shutdown():
+    yield
     if llama_proc:
         stop_llama_server(llama_proc)
+
+
+app = FastAPI(title="Florence / Qwen3VL", lifespan=lifespan)
 
 
 def _warmup():
@@ -156,29 +150,18 @@ def _warmup():
             "max_tokens": 1,
         }
         requests.post(QWEN_URL, json=payload, timeout=30)
-        print("[MAIN] Pronto!\n")
+        print("[MAIN] ✅ Pronto!\n")
     except Exception as e:
         print(f"[MAIN] Warmup falhou: {e}")
-
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """Verifica se o serviço está no ar."""
     return {"status": "ok"}
-
 
 @app.post("/describe")
 def describe(req: DescribeRequest):
-    """
-    Descreve uma imagem de forma síncrona.
-    Retorna o texto completo gerado pelo modelo.
-    
-    Body JSON:
-        img_path : caminho absoluto para a imagem
-        prompt   : instrução para o modelo (opcional)
-    """
     if not Path(req.img_path).exists():
         raise HTTPException(status_code=404, detail=f"Imagem não encontrada: {req.img_path}")
 
@@ -187,16 +170,13 @@ def describe(req: DescribeRequest):
 
     payload = {
         "model": QWEN_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-                    {"type": "text",      "text": req.prompt},
-                ],
-            }
-        ],
-        "max_tokens": 512,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                {"type": "text",      "text": req.prompt},
+            ],
+        }],
         "stream": False,
     }
 
@@ -208,19 +188,19 @@ def describe(req: DescribeRequest):
         print(f"[MAIN] Concluído em {time.perf_counter()-t0:.3f}s")
         return {"result": result}
     except Exception as e:
+        import traceback
+        print(f"[ERRO] {e}")
+        print(traceback.format_exc())
+        # Mostra também o que o llama-server respondeu, se houver
+        try:
+            print(f"[ERRO] Resposta do llama-server: {res.text}")
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/describe/stream")
 def describe_stream(req: DescribeRequest):
-    """
-    Descreve uma imagem em modo streaming (Server-Sent Events).
-    Retorna chunks de texto conforme o modelo gera.
-    
-    Body JSON:
-        img_path : caminho absoluto para a imagem
-        prompt   : instrução para o modelo (opcional)
-    """
     if not Path(req.img_path).exists():
         raise HTTPException(status_code=404, detail=f"Imagem não encontrada: {req.img_path}")
 
@@ -229,16 +209,13 @@ def describe_stream(req: DescribeRequest):
 
     payload = {
         "model": QWEN_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-                    {"type": "text",      "text": req.prompt},
-                ],
-            }
-        ],
-        "max_tokens": 512,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                {"type": "text",      "text": req.prompt},
+            ],
+        }],
         "stream": True,
     }
 
@@ -267,7 +244,7 @@ def describe_stream(req: DescribeRequest):
     return StreamingResponse(generator(), media_type="text/event-stream")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=4002)

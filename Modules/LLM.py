@@ -46,7 +46,7 @@ LLAMA_PORT        = 2001
 LLAMA_URL         = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
 
 # Histórico
-CHAT_HISTORY_PATH = BASEFOLDER / "chat_history.json"
+
 
 # ─────────────────────────────────────────────────────────────
 #                       LOGGING DUPLO
@@ -98,39 +98,66 @@ ctxUsed    = _read(BASEFOLDER / r"resource\ctxConfig.dll")
 context    = _read(BASEFOLDER / f"Ctxbin/{ctxUsed}.bin")
 searchCfg  = _read(BASEFOLDER / r"resource\SearchCfg.dll")
 
-model_raw = _read(BASEFOLDER / "resource/AiConfig.dll").replace("on-", "")
+model_raw = _read(BASEFOLDER / r"resource\Aimodel.dll")
+
+model_path = model_raw.split("/") or model_raw.split("\\")
+MODEL_PATH = model_path[-1]
 
 with open(BASEFOLDER / f"CfgModels/{model_raw}.json", "r", encoding="utf-8") as f:
     MODELCFG = json.load(f)
+try:
+    
+    MODEL_NAME      = model_raw
+    THREADS         = (max(4, os.cpu_count() - 2)
+                    if MODELCFG["threads"] == "max"
+                    else int(MODELCFG["threads"]))
+    KV_CACHE_QUANT  = MODELCFG.get("kv_cache", "q8_0")
+    CTX_SIZE        = int(MODELCFG.get("ctx_size", 8192))
+    GPU_LAYERS      = MODELCFG.get("gpu_layers", "all")
 
-MODEL_NAME      = model_raw
-THREADS         = (max(4, os.cpu_count() - 2)
-                   if MODELCFG["threads"] == "max"
-                   else int(MODELCFG["threads"]))
-KV_CACHE_QUANT  = MODELCFG.get("kv_cache", "q8_0")
-MODEL_PATH      = MODELCFG.get("model_path", "")
-CTX_SIZE        = int(MODELCFG.get("ctx_size", 8192))
-GPU_LAYERS      = MODELCFG.get("gpu_layers", "all")
+    LLAMA_ARGS = [
+        "--model",         MODEL_PATH,
+        "--host",          LLAMA_HOST,
+        "--port",          str(LLAMA_PORT),
+        "--n-gpu-layers",  str(GPU_LAYERS),
+        "--threads",       str(THREADS),
+        "--threads-batch", str(min(THREADS + 2, os.cpu_count())),
+        "--batch-size",    "2048",
+        "--ubatch-size",   "512",
+        "--flash-attn",    "on",
+        "--cache-type-k",  KV_CACHE_QUANT if KV_CACHE_QUANT in ("q4_0", "q8_0") else "f16",
+        "--cache-type-v",  "q8_0",
+        "--ctx-size",      str(CTX_SIZE),
+        "--parallel",      "1",
+        "--cont-batching",
+        "--mmap",
+        "--cache-reuse",   "256",
+        "--slot-prompt-similarity", "0.5",
+    ]
 
-LLAMA_ARGS = [
+
+except Exception as e:
+    print(f"[CONFIG] Erro ao ler configurações: {e}. Utilizando configurações de inicialização padrão.")
+    LLAMA_ARGS = [
     "--model",         MODEL_PATH,
     "--host",          LLAMA_HOST,
     "--port",          str(LLAMA_PORT),
-    "--n-gpu-layers",  str(GPU_LAYERS),
-    "--threads",       str(THREADS),
-    "--threads-batch", str(min(THREADS + 2, os.cpu_count())),
+    "--n-gpu-layers",  20,
+    "--threads",       8,
+    "--threads-batch", str(min(8 + 2, os.cpu_count())),
     "--batch-size",    "2048",
     "--ubatch-size",   "512",
     "--flash-attn",    "on",
-    "--cache-type-k",  KV_CACHE_QUANT if KV_CACHE_QUANT in ("q4_0", "q8_0") else "f16",
+    "--cache-type-k",  "q4_0",
     "--cache-type-v",  "q8_0",
-    "--ctx-size",      str(CTX_SIZE),
+    "--ctx-size",      4096,
     "--parallel",      "1",
     "--cont-batching",
     "--mmap",
     "--cache-reuse",   "256",
-    "--slot-prompt-similarity", "0.5",
-]
+    "--slot-prompt-similarity", "0.5",]
+
+
 
 # ─────────────────────────────────────────────────────────────
 #                    GERENCIAMENTO DO SERVIDOR
@@ -196,21 +223,18 @@ def _warmup():
 #                      HISTÓRICO DE CHAT
 # ─────────────────────────────────────────────────────────────
 
-def _load_history() -> list:
-    try:
-        with open(CHAT_HISTORY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else [data]
-    except FileNotFoundError:
-        return []
 
 
-def _save_history(history: list):
-    with open(CHAT_HISTORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+chat_history: list = []
 
-
-chat_history: list = _load_history()
+async def _save_history(history: list, role: list = ["user"]):
+    global chat_history
+    chat_history.extend(history) # default para curto prazo
+    async with httpx.AsyncClient(timeout=5) as client:
+        await client.post(
+            f"{MEMORY_URL}/write_st",
+            json={"session_id": 0, "turns": role},
+            )
 
 # ─────────────────────────────────────────────────────────────
 #                     INTEGRAÇÃO: MEMÓRIA
@@ -238,6 +262,8 @@ async def memory_write(text: str, source: str = "chat", confidence: float = 0.8)
                 f"{MEMORY_URL}/write",
                 json={"text": text, "source": source, "confidence": confidence},
             )
+                
+
     except Exception as e:
         print(f"[MEMORY] Falha na escrita: {e}")
 
@@ -398,7 +424,6 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 json={
                     "model":       MODEL_NAME,
                     "messages":    messages,
-                    "max_tokens":  1024,
                     "temperature": 0.7,
                     "stream":      False,
                 },
@@ -466,7 +491,6 @@ async def chat_stream(req: ChatRequest):
                     json={
                         "model":       MODEL_NAME,
                         "messages":    messages,
-                        "max_tokens":  1024,
                         "temperature": 0.7,
                         "stream":      True,
                     },

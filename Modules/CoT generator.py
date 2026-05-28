@@ -1,38 +1,39 @@
 from __future__ import annotations
 
 import time
-import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-from collections import OrderedDict
-from pathlib import Path
 
-import json
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ── Configuração ───────────────────────────────────────────────────────────────
 
-LLAMA_SERVER_URL = "http://localhost:8081"
-LLAMA_TIMEOUT_S  = 60.0
+LLAMA_SERVER_URL  = "http://localhost:8081"
+LLAMA_TIMEOUT_S   = 60.0
+MEMORY_API_URL    = "http://localhost:3001"
+MEMORY_TIMEOUT_S  = 5.0
 
-MAX_TOKENS      = 256
-TEMPERATURE     = 0.1
-TOP_P           = 0.9
-REPEAT_PENALTY  = 1.1
+MAX_TOKENS     = 160   # margem para 7 steps verbosos sem whitespace (~100-140 tokens reais)
+TEMPERATURE    = 0.1
+TOP_P          = 0.9
+REPEAT_PENALTY = 1.1
 
-PLAN_CACHE_SIZE = 64
-CACHE_HIT_SCORE = 0.92
+# Threshold de similaridade para aceitar um plano do cache semântico.
+# Valor mais alto (ex: 0.95) = só aceita hits muito próximos = menos falsos positivos.
+CACHE_HIT_THRESHOLD = 0.92
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ava.cot")
 
+
 # ── Módulos disponíveis no AVA ─────────────────────────────────────────────────
 
-AVA_MODULES = {
+AVA_MODULES: dict[str, str] = {
     "llm":        "responder perguntas, explicar conceitos, gerar texto, análise geral",
     "memory":     "buscar ou gravar informações de longo prazo sobre o usuário",
     "search":     "buscar informações atuais na internet",
@@ -47,6 +48,10 @@ AVA_MODULES = {
 MODULES_BLOCK = "\n".join(f"  - {k}: {v}" for k, v in AVA_MODULES.items())
 
 # ── System prompt ──────────────────────────────────────────────────────────────
+#
+# Separado em bloco estático puro — nunca concatenado com dados dinâmicos —
+# para maximizar o reuso do KV cache do llama-server (cache_prompt: true).
+# O _build_prompt injeta os dados variáveis apenas no turno <|user|>.
 
 SYSTEM_PROMPT = f"""You are a planning module for an AI assistant called AVA.
 Your ONLY job is to break down a user request into a sequence of concrete, actionable steps.
@@ -62,99 +67,81 @@ Rules:
 5. Steps must be in the SAME LANGUAGE as the user input
 6. Never include explanations outside the JSON structure
 7. If a step needs output from a previous step, reference it as "result of step N"
+8. Mark independent steps with depends_on:null; dependent steps list their dependencies
 
-BAD example (vague):
-  {{"action": "analyze the problem", "executor": "llm"}}
+Output format — output ONLY the inner content, starting from the first step object:
+{{"step":1,"action":"...","executor":"llm","depends_on":null}},{{"step":2,...}}]}}
 
-GOOD example (actionable):
-  {{"action": "search recent RTX 4070 vs RX 7800 XT benchmarks", "executor": "search"}}
-  {{"action": "retrieve user GPU budget from memory", "executor": "memory"}}
-  {{"action": "recommend best GPU based on result of step 1 and result of step 2", "executor": "llm"}}
+Examples:
+Input: "what GPU should I buy for gaming under R$2000"
+Output: {{"step":1,"action":"search RTX 4060 RX 7600 benchmark price Brazil 2024","executor":"search","depends_on":null}},{{"step":2,"action":"retrieve user GPU preferences from memory","executor":"memory","depends_on":null}},{{"step":3,"action":"recommend GPU based on result of step 1 and result of step 2","executor":"llm","depends_on":[1,2]}}]}}
+
+Input: "play some jazz music"
+Output: {{"step":1,"action":"search jazz playlist Spotify","executor":"search","depends_on":null}},{{"step":2,"action":"open music player with result of step 1","executor":"commander","depends_on":[1]}}]}}
 """
 
-# ── Grammar GBNF ───────────────────────────────────────────────────────────────
+# ── Grammar GBNF otimizada ─────────────────────────────────────────────────────
+#
+# Melhorias em relação à versão anterior:
+#
+# 1. PREFIXO INJETADO NO PROMPT: o modelo começa a gerar a partir do primeiro
+#    step object — pula os ~12 tokens fixos do envelope {"steps":[ que foram
+#    pré-injetados no prompt. O grammar começa correspondentemente no meio do array.
+#
+# 2. SEM WHITESPACE ENTRE LITERAIS: ws removido entre campos fixos. Literais
+#    contíguos são processados como uma única restrição no FSM do llama.cpp.
+#
+# 3. number RESTRITO A [1-7]: elimina o estado de "pode continuar com dígito?"
+#    após o primeiro caractere. Um único token resolve o campo step.
+#
+# 4. depends_on TIPADO: null | array de dígitos. O orquestrador usa isso para
+#    paralelizar steps independentes sem heurísticas extras.
 
-GRAMMAR_GBNF = r"""root ::= "{" ws "\"steps\"" ws ":" ws steps-array ws "}"
-steps-array ::= "[" ws step ("," ws step)* ws "]"
-step ::= "{" ws "\"step\"" ws ":" ws number ws "," ws "\"action\"" ws ":" ws string ws "," ws "\"executor\"" ws ":" ws executor ws "}"
-executor ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\""
-number ::= [0-9]+
-string ::= "\"" ([^"\\] | "\\" .)* "\""
-ws ::= [ \t\n]*
+GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
+steps-cont  ::= step ("," step)*
+step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
+step-num    ::= [1-7]
+executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\""
+depends     ::= "null" | "[" step-num ("," step-num)* "]"
+string      ::= "\"" ([^"\\] | "\\" .)* "\""
 """
-# ── Cache LRU Jaccard ──────────────────────────────────────────────────────────
 
-class PlanCache:
-    def __init__(self, max_size: int = PLAN_CACHE_SIZE):
-        self._cache: OrderedDict[str, dict] = OrderedDict()
-        self._max_size = max_size
-
-    def _tokens(self, text: str) -> set[str]:
-        return set(text.lower().split())
-
-    def _jaccard(self, a: set, b: set) -> float:
-        if not a or not b:
-            return 0.0
-        return len(a & b) / len(a | b)
-
-    def _key(self, text: str) -> str:
-        return hashlib.md5(text.lower().strip().encode()).hexdigest()
-
-    def get(self, query: str) -> Optional[dict]:
-        query_tokens = self._tokens(query)
-        best_score, best_plan = 0.0, None
-        for entry in self._cache.values():
-            score = self._jaccard(query_tokens, entry["tokens"])
-            if score > best_score:
-                best_score, best_plan = score, entry["plan"]
-        if best_score >= CACHE_HIT_SCORE:
-            log.info(f"Cache hit (jaccard={best_score:.3f}): {query[:50]}")
-            return best_plan
-        return None
-
-    def put(self, query: str, plan: dict):
-        key = self._key(query)
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        else:
-            if len(self._cache) >= self._max_size:
-                self._cache.popitem(last=False)
-            self._cache[key] = {"tokens": self._tokens(query), "plan": plan}
-
-    def clear(self):
-        self._cache.clear()
-
-    @property
-    def size(self) -> int:
-        return len(self._cache)
+# Prefixo que é injetado no prompt — o modelo continua daqui.
+# Recomposto junto com o output do modelo para formar o JSON final.
+JSON_PREFIX = '{"steps":['
 
 
 # ── Modelos de request/response ────────────────────────────────────────────────
 
 class PlanRequest(BaseModel):
-    input:     str
-    context:   Optional[str] = None
-    max_steps: Optional[int] = None
-    use_cache: bool = True
+    input:      str
+    context:    Optional[str] = None
+    max_steps:  Optional[int] = None
+    use_cache:  bool = True
+    # threshold sobrescrevível por request (ex: domínios críticos usam 0.95)
+    cache_threshold: float = CACHE_HIT_THRESHOLD
 
 class PlanStep(BaseModel):
-    step:     int
-    action:   str
-    executor: str
+    step:       int
+    action:     str
+    executor:   str
+    depends_on: Optional[list[int]] = None
 
 class PlanResponse(BaseModel):
-    steps:      list[PlanStep]
-    input:      str
-    from_cache: bool
-    latency_ms: float
+    steps:         list[PlanStep]
+    input:         str
+    from_cache:    bool
+    cache_score:   Optional[float] = None   # score de similaridade se from_cache=True
+    tokens_used:   Optional[int]   = None   # tokens_predicted do llama-server
+    latency_ms:    float
 
 
 # ── Estado global ──────────────────────────────────────────────────────────────
 
 @dataclass
 class AppState:
-    http_client: httpx.AsyncClient = field(default=None)
-    cache:       PlanCache         = field(default=None)
+    llama_client:  httpx.AsyncClient = field(default=None)
+    memory_client: httpx.AsyncClient = field(default=None)
 
 state = AppState()
 
@@ -178,18 +165,35 @@ async def lifespan(app: FastAPI):
                 f"Inicie com: llama-server -m Phi-3.5-mini-instruct-Q4_K_M.gguf --port 8081"
             )
 
-    # Cliente HTTP persistente com keep-alive
-    state.http_client = httpx.AsyncClient(
+    # Verifica Memory API
+    async with httpx.AsyncClient(timeout=5.0) as probe:
+        try:
+            r = await probe.get(f"{MEMORY_API_URL}/status")
+            if r.status_code != 200:
+                raise RuntimeError(f"Memory API retornou {r.status_code}")
+            log.info(f"Memory API OK em {MEMORY_API_URL}")
+        except httpx.ConnectError:
+            raise RuntimeError(
+                f"Memory API não encontrada em {MEMORY_API_URL}\n"
+                f"Inicie com: uvicorn memory:app --port 3001"
+            )
+
+    state.llama_client = httpx.AsyncClient(
         base_url = LLAMA_SERVER_URL,
         timeout  = httpx.Timeout(LLAMA_TIMEOUT_S),
         limits   = httpx.Limits(max_keepalive_connections=4, max_connections=8),
     )
-    state.cache = PlanCache(max_size=PLAN_CACHE_SIZE)
+    state.memory_client = httpx.AsyncClient(
+        base_url = MEMORY_API_URL,
+        timeout  = httpx.Timeout(MEMORY_TIMEOUT_S),
+        limits   = httpx.Limits(max_keepalive_connections=4, max_connections=8),
+    )
 
     log.info("CoT API pronta")
     yield
 
-    await state.http_client.aclose()
+    await state.llama_client.aclose()
+    await state.memory_client.aclose()
     log.info("AVA CoT API encerrada")
 
 
@@ -201,18 +205,33 @@ app = FastAPI(title="AVA CoT API", lifespan=lifespan)
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _build_prompt(user_input: str, context: Optional[str], max_steps: Optional[int]) -> str:
+    """
+    Monta o prompt com o system prompt completamente estático no bloco <|system|>
+    e os dados dinâmicos isolados no bloco <|user|>.
+
+    Isso garante que o llama-server possa reutilizar o KV cache do system prompt
+    entre todas as chamadas, independente do user input.
+
+    O prompt termina com o JSON_PREFIX pré-injetado no bloco <|assistant|> —
+    o modelo começa a gerar a partir do primeiro step object.
+    """
     steps_hint   = f" Use no máximo {max_steps} passos." if max_steps else ""
     user_content = f"Plan the following request:{steps_hint}\n\n{user_input}"
     if context:
         user_content += f"\n\nRelevant context:\n{context}"
+
     return (
         f"<|system|>\n{SYSTEM_PROMPT}<|end|>\n"
         f"<|user|>\n{user_content}<|end|>\n"
-        f"<|assistant|>\n"
+        f"<|assistant|>\n{JSON_PREFIX}"   # modelo continua daqui
     )
 
 
-async def _call_llama_server(prompt: str) -> str:
+async def _call_llama(prompt: str) -> tuple[str, int]:
+    """
+    Chama o llama-server e retorna (raw_content, tokens_predicted).
+    raw_content é o que o modelo gerou APÓS o JSON_PREFIX injetado.
+    """
     payload = {
         "prompt":         prompt,
         "grammar":        GRAMMAR_GBNF,
@@ -221,11 +240,10 @@ async def _call_llama_server(prompt: str) -> str:
         "top_p":          TOP_P,
         "repeat_penalty": REPEAT_PENALTY,
         "stream":         False,
-        "cache_prompt":   True,   # reutiliza KV cache do system prompt entre chamadas
+        "cache_prompt":   True,
     }
-
     try:
-        response = await state.http_client.post("/completion", json=payload)
+        response = await state.llama_client.post("/completion", json=payload)
         response.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"llama-server erro {e.response.status_code}")
@@ -234,70 +252,189 @@ async def _call_llama_server(prompt: str) -> str:
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="llama-server não acessível")
 
-    return response.json().get("content", "").strip()
+    data            = response.json()
+    raw             = data.get("content", "").strip()
+    tokens_used     = data.get("tokens_predicted", 0)
+    return raw, tokens_used
 
 
-def _parse_and_validate(raw: str) -> list[PlanStep]:
+def _parse_steps(raw: str) -> list[PlanStep]:
+    """
+    Reconstrói o JSON completo prefixando JSON_PREFIX ao output do modelo,
+    parseia e valida os steps.
+
+    Estratégia de fallback: se o JSON completo falhar (quantizações INT4 podem
+    cortar o output), tenta parsear steps individuais que estejam completos.
+    """
+    valid_executors = set(AVA_MODULES.keys())
+    full_json       = JSON_PREFIX + raw
+
+    # Tentativa 1: parse normal do JSON completo
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"JSON inválido: {e}")
+        result    = json.loads(full_json)
+        raw_steps = result.get("steps", [])
+    except json.JSONDecodeError:
+        # Tentativa 2: o modelo cortou antes do fechamento — tenta recuperar
+        # steps que já estão completos no output truncado
+        log.warning("JSON incompleto do llama-server — tentando recuperação parcial")
+        raw_steps = _recover_partial_steps(raw)
+        if not raw_steps:
+            raise HTTPException(status_code=500, detail="JSON inválido e sem steps recuperáveis")
 
-    raw_steps = result.get("steps", [])
     if not raw_steps:
         raise HTTPException(status_code=500, detail="Modelo retornou plano vazio")
 
-    valid_executors = set(AVA_MODULES.keys())
     steps = []
     for i, s in enumerate(raw_steps, start=1):
         executor = s.get("executor", "llm")
         if executor not in valid_executors:
+            log.warning(f"Executor inválido '{executor}' no step {i} — substituído por 'llm'")
             executor = "llm"
         action = s.get("action", "").strip()
-        if action:
-            steps.append(PlanStep(step=i, action=action, executor=executor))
+        if not action:
+            continue
+        depends_on = s.get("depends_on")
+        if isinstance(depends_on, list):
+            # Filtra referências para steps que ainda não existem
+            depends_on = [d for d in depends_on if isinstance(d, int) and d < i]
+            depends_on = depends_on or None
+        elif depends_on is not None:
+            depends_on = None
+        steps.append(PlanStep(step=i, action=action, executor=executor, depends_on=depends_on))
 
     if not steps:
-        raise HTTPException(status_code=500, detail="Nenhum passo válido gerado")
+        raise HTTPException(status_code=500, detail="Nenhum step válido após validação")
 
     return steps
+
+
+def _recover_partial_steps(raw: str) -> list[dict]:
+    """
+    Tenta extrair steps completos de um JSON truncado.
+    Procura por objetos {...} fechados no output.
+    """
+    steps = []
+    depth, start = 0, None
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(raw[start:i + 1])
+                    if "action" in obj and "executor" in obj:
+                        steps.append(obj)
+                except json.JSONDecodeError:
+                    pass
+    return steps
+
+
+# ── Cache semântico via Memory API ─────────────────────────────────────────────
+
+async def _cache_get(query: str, threshold: float) -> Optional[tuple[dict, float, int]]:
+    """
+    Busca no cache semântico da Memory API.
+    Retorna (plan_dict, score, cache_id) se hit, None se miss.
+    Falhas de rede retornam None silenciosamente — o CoT continua sem cache.
+    """
+    try:
+        r = await state.memory_client.post(
+            "/cache/get",
+            json={"query": query, "threshold": threshold},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("hit"):
+            return data["plan"], data["score"], data["cache_id"]
+    except Exception as e:
+        log.warning(f"cache_get falhou (continuando sem cache): {e}")
+    return None
+
+
+async def _cache_put(query: str, plan: dict):
+    """
+    Grava um plano no cache semântico da Memory API.
+    Falhas de rede são logadas mas não propagadas.
+    """
+    try:
+        r = await state.memory_client.post(
+            "/cache/put",
+            json={"query": query, "plan": plan},
+        )
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f"cache_put falhou (plano não cacheado): {e}")
 
 
 # ── POST /plan ─────────────────────────────────────────────────────────────────
 
 @app.post("/plan", response_model=PlanResponse)
 async def plan(req: PlanRequest):
+    """
+    Gera um plano de execução para o input do usuário.
+
+    Fluxo:
+      1. Consulta o cache semântico na Memory API (se use_cache=True).
+         Hit  → retorna imediatamente (~5ms, sem inferência).
+         Miss → continua para o passo 2.
+
+      2. Infere com o Phi-3.5-mini via llama-server.
+         O prompt usa prefixo JSON pré-injetado para reduzir tokens gerados.
+         Grammar GBNF garante output estruturado com depends_on para paralelismo.
+
+      3. Cacheia o plano gerado na Memory API para requests futuros similares.
+
+    O campo depends_on em cada step indica quais steps anteriores precisam
+    terminar antes deste começar. Steps com depends_on=null podem ser
+    executados em paralelo pelo orquestrador do AVA.
+    """
     user_input = req.input.strip()
     if not user_input:
         raise HTTPException(status_code=400, detail="input vazio")
 
     t0 = time.perf_counter()
 
+    # ── 1. Consulta cache semântico ────────────────────────────────────────────
     if req.use_cache:
-        cached = state.cache.get(user_input)
-        if cached:
+        cache_result = await _cache_get(user_input, req.cache_threshold)
+        if cache_result:
+            cached_plan, score, _ = cache_result
+            steps = [PlanStep(**s) for s in cached_plan["steps"]]
+            latency = round((time.perf_counter() - t0) * 1000, 2)
+            log.info(f"Cache HIT em {latency}ms — score={score:.3f}: {user_input[:60]}")
             return PlanResponse(
-                steps      = [PlanStep(**s) for s in cached["steps"]],
-                input      = user_input,
-                from_cache = True,
-                latency_ms = round((time.perf_counter() - t0) * 1000, 2),
+                steps       = steps,
+                input       = user_input,
+                from_cache  = True,
+                cache_score = score,
+                latency_ms  = latency,
             )
 
-    prompt = _build_prompt(user_input, req.context, req.max_steps)
-    raw    = await _call_llama_server(prompt)
-    steps  = _parse_and_validate(raw)
+    # ── 2. Inferência ──────────────────────────────────────────────────────────
+    prompt      = _build_prompt(user_input, req.context, req.max_steps)
+    raw, tokens = await _call_llama(prompt)
+    steps       = _parse_steps(raw)
 
+    # ── 3. Cacheia o plano gerado ──────────────────────────────────────────────
     if req.use_cache:
-        state.cache.put(user_input, {"steps": [s.model_dump() for s in steps]})
+        plan_dict = {"steps": [s.model_dump() for s in steps]}
+        await _cache_put(user_input, plan_dict)
 
     latency = round((time.perf_counter() - t0) * 1000, 2)
-    log.info(f"Plano em {latency}ms — {len(steps)} passos: {user_input[:60]}")
+    log.info(
+        f"Plano em {latency}ms — {len(steps)} steps | "
+        f"{tokens} tokens: {user_input[:60]}"
+    )
 
     return PlanResponse(
-        steps      = steps,
-        input      = user_input,
-        from_cache = False,
-        latency_ms = latency,
+        steps       = steps,
+        input       = user_input,
+        from_cache  = False,
+        tokens_used = tokens,
+        latency_ms  = latency,
     )
 
 
@@ -305,27 +442,45 @@ async def plan(req: PlanRequest):
 
 @app.get("/status")
 async def status():
+    llama_ok  = False
+    memory_ok = False
     try:
-        r = await state.http_client.get("/health", timeout=2.0)
+        r = await state.llama_client.get("/health", timeout=2.0)
         llama_ok = r.status_code == 200
     except Exception:
-        llama_ok = False
+        pass
+    try:
+        r = await state.memory_client.get("/status", timeout=2.0)
+        memory_ok = r.status_code == 200
+        memory_status = r.json().get("plan_cache", {}) if memory_ok else {}
+    except Exception:
+        memory_status = {}
 
     return {
-        "llama_server":  LLAMA_SERVER_URL,
-        "llama_healthy": llama_ok,
-        "cache_size":    state.cache.size,
-        "cache_max":     PLAN_CACHE_SIZE,
-        "modules":       list(AVA_MODULES.keys()),
+        "llama_server":    LLAMA_SERVER_URL,
+        "llama_healthy":   llama_ok,
+        "memory_api":      MEMORY_API_URL,
+        "memory_healthy":  memory_ok,
+        "plan_cache":      memory_status,
+        "modules":         list(AVA_MODULES.keys()),
+        "cache_threshold": CACHE_HIT_THRESHOLD,
     }
 
 
-# ── DELETE /cache ──────────────────────────────────────────────────────────────
+# ── DELETE /cache — invalida todo o cache de planos ───────────────────────────
 
 @app.delete("/cache")
-async def clear_cache():
-    state.cache.clear()
-    return {"cleared": True}
+async def invalidate_cache():
+    """
+    Proxy para DELETE /cache da Memory API.
+    Chamar quando módulos do AVA mudarem ou o system prompt for atualizado.
+    """
+    try:
+        r = await state.memory_client.delete("/cache", timeout=10.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao invalidar cache: {e}")
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
