@@ -16,7 +16,7 @@ Dependências:
   pip install fastapi uvicorn supertonic numpy miniaudio pydantic
 
 Uso:
-  uvicorn tts_api:app --host 0.0.0.0 --port 3004 --log-level info
+  uvicorn tts_api:app --host localhost --port 3004 --log-level info
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ WORKER_TIMEOUT   = 30.0
 
 # Playback
 BUFFER_MS        = 40       # buffer miniaudio — 40ms = mínima latência audível
-SKIP_TIMEOUT_MS  = 100      # ms máximos esperando chunk atrasado antes de pular
+SKIP_TIMEOUT_MS  = 5000     # ms máximos esperando chunk atrasado antes de pular
 
 # Chunking para /stream
 MIN_PALAVRAS     = 4        # mínimo de palavras por chunk
@@ -266,29 +266,27 @@ def split_chunks(texto: str) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SENTINELAS
+# PLAYBACK — heap ordenado + miniaudio 40ms
 # ════════════════════════════════════════════════════════════════════════════
-
-SENTINEL_AUD = object()   # sinaliza fim de fala no heap de áudio
-
-# ════════════════════════════════════════════════════════════════════════════
-# PLAYBACK — heap ordenado + miniaudio 40ms (portado do módulo Piper)
-# ════════════════════════════════════════════════════════════════════════════
-
 
 from dataclasses import dataclass as _dc
 
 @_dc(order=False)
 class _Chunk:
-    seq:    int
-    wav:    object   # np.ndarray | None
-    is_end: bool = False
+    seq:       int
+    wav:       object   # np.ndarray | None
+    is_end:    bool = False
+    # FIX #1: sentinel carrega o seq base da próxima fala para o generator
+    # saber onde esperar — sem isso, após is_end o generator reseta para 0
+    # mas state._seq já avançou, causando espera eterna no heap.
+    next_base: int  = 0
 
     def __lt__(self, o): return self.seq < o.seq
     def __le__(self, o): return self.seq <= o.seq
     def __gt__(self, o): return self.seq > o.seq
     def __ge__(self, o): return self.seq >= o.seq
     def __eq__(self, o): return self.seq == o.seq
+
 
 class HeapPlayer:
     def __init__(self):
@@ -302,16 +300,20 @@ class HeapPlayer:
     def start(self):
         self._thread.start()
 
-
     def push(self, seq_idx: int, wav: np.ndarray):
         with self._heap_lock:
             heapq.heappush(self._heap, _Chunk(seq=seq_idx, wav=wav))
 
-    def push_sentinel(self, sentinel_seq: int):
-        """sentinel_seq deve ser base + n_chunks, calculado ANTES da síntese."""
+    def push_sentinel(self, sentinel_seq: int, next_base: int):
+        """
+        sentinel_seq : base + n_chunks  (posição do sentinel no heap)
+        next_base    : state._seq após reserva  (FIX #1: informa generator
+                       onde começa a próxima fala)
+        """
         with self._heap_lock:
-            heapq.heappush(self._heap, _Chunk(seq=sentinel_seq, wav=None, is_end=True))
-
+            heapq.heappush(self._heap, _Chunk(
+                seq=sentinel_seq, wav=None, is_end=True, next_base=next_base
+            ))
 
     def cancel(self):
         self._cancel_flag.set()
@@ -330,8 +332,11 @@ class HeapPlayer:
         cancel    = self._cancel_flag
 
         def _stream_gen():
+            # FIX #1 + #3: prox_seq começa em 0 (correto para a 1ª fala).
+            # Ao encontrar sentinel, é atualizado para chunk.next_base em vez
+            # de resetar para 0 fixo — permite falas consecutivas sem cancel.
             prox_seq    = 0
-            audio_buf   = None   # np.ndarray atual sendo reproduzido
+            audio_buf   = None
             pos         = 0
             ultimo_av   = time.monotonic()
 
@@ -342,11 +347,13 @@ class HeapPlayer:
                 if cancel.is_set():
                     audio_buf = None
                     pos       = 0
+                    # Após cancel, state._seq foi resetado para 0 —
+                    # sincroniza o generator com o novo estado global.
                     prox_seq  = 0
                     required_frames = yield np.zeros(required_frames, dtype=np.int16).tobytes()
                     continue
 
-                output = np.zeros(required_frames, dtype=np.int16)
+                output  = np.zeros(required_frames, dtype=np.int16)
                 out_pos = 0
 
                 while out_pos < required_frames:
@@ -368,21 +375,22 @@ class HeapPlayer:
                             break
                         topo = heap[0]
 
-                                        
                     if topo.seq == prox_seq:
                         with heap_lock:
                             chunk = heapq.heappop(heap)
 
-                        if chunk.is_end:                          # ← era: chunk is SENTINEL_AUD
+                        if chunk.is_end:
                             log.info("[PLAY] Fala completa")
-                            prox_seq  = 0
+                            # FIX #1/#3: usa next_base do sentinel para saber
+                            # onde começa a próxima fala — não assume 0.
+                            prox_seq  = chunk.next_base
                             ultimo_av = time.monotonic()
                             break
 
-                        # Conversão float32→int16 (estava faltando no path de playback!)
-                        pcm = (np.clip(chunk.wav, -1.0, 1.0) * 32767).astype(np.int16)
-                        audio_buf = pcm   # ← mesmo nome que o loop lê
-                        pos       = 0     # ← mesmo nome que o loop lê
+                        # Conversão float32 → int16
+                        pcm       = (np.clip(chunk.wav, -1.0, 1.0) * 32767).astype(np.int16)
+                        audio_buf = pcm
+                        pos       = 0
                         ultimo_av = time.monotonic()
                         log.info(f"[PLAY] seq={chunk.seq} ({len(pcm)} samples)")
                         prox_seq += 1
@@ -417,7 +425,6 @@ class HeapPlayer:
                 gen = _stream_gen()
                 next(gen)
                 device.start(gen)
-                # Mantém a thread (e o `with`) vivos enquanto o daemon rodar
                 threading.Event().wait()
         except Exception as e:
             log.error(f"[PLAY] Erro fatal no playback: {e}", exc_info=True)
@@ -560,7 +567,6 @@ class AppState:
     pool:   TTSPool    = field(default=None)
     player: HeapPlayer = field(default=None)
 
-    # Contador de sequência global — compartilhado entre /speak e /stream
     _seq:      int             = field(default=0, init=False)
     _seq_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
@@ -582,6 +588,8 @@ def cancelar_fala():
     """
     Cancela fala em andamento: limpa heap, reseta sequência.
     Thread-safe — pode ser chamado de qualquer contexto.
+    Após reset_seq(), state._seq=0; o generator também volta a prox_seq=0
+    via o branch cancel.is_set() no _stream_gen.
     """
     state.reset_seq()
     if state.player:
@@ -634,7 +642,6 @@ async def lifespan(app: FastAPI):
     state.pool = TTSPool(num_workers=NUM_WORKERS)
     state.pool.start()
 
-    # Workers já fazem warmup internamente — aguardamos apenas o pool estar pronto
     log.info("TTS API pronta")
 
     yield
@@ -652,9 +659,6 @@ app = FastAPI(title="AVA TTS API", lifespan=lifespan)
 
 # ════════════════════════════════════════════════════════════════════════════
 # POST /speak
-# Sintetiza o texto, normaliza, divide em chunks se necessário e
-# enfileira no heap em ordem correta. Resposta retorna imediatamente
-# (não bloqueia até o áudio terminar de tocar).
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.post("/speak", response_model=SpeakResponse)
@@ -673,8 +677,15 @@ async def speak(req: SpeakRequest):
     loop = asyncio.get_event_loop()
 
     total_dur = 0.0
-    # Atribui seq_idx antes de disparar para garantir ordem mesmo em paralelo
-    seq_base = state.next_seq() if len(chunks) == 1 else None
+
+    # FIX #2: reserva bloco contíguo de seq_idx atomicamente em lock único,
+    # eliminando race condition do path multi-chunk original.
+    # FIX #1: captura next_base (state._seq após reserva) para o sentinel.
+    with state._seq_lock:
+        base       = state._seq
+        state._seq += len(chunks)
+    sentinel_seq = base + len(chunks)
+    next_base    = state._seq   # seq que a próxima fala vai usar
 
     async def _synth_and_push(seq_idx: int, chunk: str):
         nonlocal total_dur
@@ -690,19 +701,11 @@ async def speak(req: SpeakRequest):
         except Exception as e:
             log.error(f"[SPEAK] Erro seq={seq_idx}: {e}")
 
-    if len(chunks) == 1:
-        sentinel_seq = seq_base + 1
-        await _synth_and_push(seq_base, chunks[0])
-    else:
-        with state._seq_lock:
-            base = state._seq
-            state._seq += len(chunks)
-        sentinel_seq = base + len(chunks)   # ← fixo, antes de qualquer síntese
+    tasks = [_synth_and_push(base + i, c) for i, c in enumerate(chunks)]
+    await asyncio.gather(*tasks)
 
-        tasks = [_synth_and_push(base + i, c) for i, c in enumerate(chunks)]
-        await asyncio.gather(*tasks)
-
-    state.player.push_sentinel(sentinel_seq)   # ← agora com seq correto
+    # FIX #1: passa next_base para o sentinel informar o generator
+    state.player.push_sentinel(sentinel_seq, next_base)
 
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     log.info(f"[SPEAK] {len(chunks)} chunk(s) enfileirados em {latency_ms}ms")
@@ -717,11 +720,6 @@ async def speak(req: SpeakRequest):
 
 # ════════════════════════════════════════════════════════════════════════════
 # POST /stream
-# Mesmo pipeline do /speak mas otimizado para textos longos:
-# sintetiza sentenças em paralelo e as enfileira no heap assim que
-# cada uma fica pronta — sem esperar todas terminarem.
-# Sentença 0 começa a tocar assim que sintetizada, não importa se
-# sentença 1 ainda está sendo processada.
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.post("/stream", response_model=StreamResponse)
@@ -740,14 +738,14 @@ async def stream(req: StreamRequest):
     loop = asyncio.get_event_loop()
     n    = len(sentencas)
 
-    # Reserva bloco contíguo de seq_idx — garante ordem global no heap
+    # FIX #1: captura next_base junto com a reserva do bloco
     with state._seq_lock:
         base       = state._seq
         state._seq += n
+    sentinel_seq = base + n
+    next_base    = state._seq   # seq que a próxima fala vai usar
 
-    sentinel_seq = base + n 
-
-    durations: list[float]       = [0.0] * n
+    durations: list[float]         = [0.0] * n
     events:    list[asyncio.Event] = [asyncio.Event() for _ in range(n)]
 
     async def _synth_and_signal(i: int, sentenca: str):
@@ -761,15 +759,13 @@ async def stream(req: StreamRequest):
         except Exception as e:
             log.error(f"[STREAM] Erro seq={base + i}: {e}")
         finally:
-            events[i].set()   # libera o enqueuer ordenado
+            events[i].set()
 
-    # Enqueuer: aguarda slot i estar pronto antes de avançar
-    # (o push já acontece dentro de _synth_and_signal, mas o sentinel
-    #  só é empurrado depois que todos os slots confirmaram)
     async def _aguardar_todos():
         for i in range(n):
             await events[i].wait()
-        state.player.push_sentinel(sentinel_seq) 
+        # FIX #1: passa next_base para o sentinel
+        state.player.push_sentinel(sentinel_seq, next_base)
 
     synth_tasks   = [asyncio.create_task(_synth_and_signal(i, s)) for i, s in enumerate(sentencas)]
     sentinel_task = asyncio.create_task(_aguardar_todos())
@@ -811,12 +807,12 @@ async def voices():
 @app.get("/status")
 async def status():
     return {
-        "workers":       NUM_WORKERS,
-        "default_voice": DEFAULT_VOICE,
-        "sample_rate":   SAMPLE_RATE,
-        "buffer_ms":     BUFFER_MS,
+        "workers":         NUM_WORKERS,
+        "default_voice":   DEFAULT_VOICE,
+        "sample_rate":     SAMPLE_RATE,
+        "buffer_ms":       BUFFER_MS,
         "skip_timeout_ms": SKIP_TIMEOUT_MS,
-        "voices":        AVAILABLE_VOICES,
+        "voices":          AVAILABLE_VOICES,
     }
 
 

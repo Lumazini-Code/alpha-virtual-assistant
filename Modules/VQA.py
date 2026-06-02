@@ -11,38 +11,33 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import time
 import uvicorn
+import httpx
+qwen_adress = ""
+# ── Detecta suporte a visão de forma síncrona ─────────────────────────────────
+def is_vision_supported(base_url: str = "http://localhost:2001") -> bool:
+    try:
+        r = httpx.get(f"{base_url}/props", timeout=5)
+        data = r.json()
+        return data.get("modalities", {}).get("vision", False)
+    except Exception:
+        return False
 
-# ── Config ────────────────────────────────────────────────────────────────────
+time.sleep(10)
+is_vision = is_vision_supported()
 
-LLAMA_SERVER_PATH = r".//llama-cpp//llama-server"
-LLAMA_ARGS = [
-    "--model",        r"Models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",   # ← barras corrigidas p/ Linux
-    "--mmproj",       r"Models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
-    "--host",         "0.0.0.0",
-    "--port",         "2004",
-    "--n-gpu-layers", "all",
-    "--threads",      "4",
-    "--threads-batch","6",
-    "--batch-size",   "2048",
-    "--ubatch-size",  "512",
-    "--flash-attn",   "on",
-    "--cache-type-k", "q4_0",
-    "--cache-type-v", "q8_0",
-    "--ctx-size",     "8192",
-    "--parallel",     "1",
-    "--cont-batching",
-    "--mmap",
-    "--poll",         "50",
-    "--prio",         "2",
-    "--mmproj-offload",
-    "--cache-reuse",  "256",
-    "--slot-prompt-similarity", "0.1",
-]
+if is_vision:
+    # Modelo principal (porta 2001) suporta visão
+    config_path = Path(__file__).parent.parent / "resource" / "Aiconfig.dll"
+    QWEN_MODEL  = config_path.read_text().strip()
+    qwen_adress = "localhost:2001"
+else:
+    # Fallback para modelo VL dedicado na porta 2004
+    qwen_adress = "localhost:2004"
+    QWEN_MODEL  = "Qwen3VL-2B-Instruct-Q4_K_M"
 
-QWEN_URL = "http://0.0.0.0:2004/v1/chat/completions"  # ← corrigido # ← 127.0.0.1 em vez de 0.0.0.0
-QWEN_MODEL = "Qwen3VL-2B-Instruct-Q4_K_M"
-
+qwen_url = f"http://{qwen_adress}/v1/chat/completions"
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 BASEFOLDER = Path(__file__).parent.parent
@@ -89,7 +84,7 @@ def wait_for_server(url: str, timeout: int = 120):   # ← timeout aumentado par
                 f"Veja: {llama_log_path}"
             )
         try:
-            res = requests.get(f"{url}/health", timeout=2)
+            res = requests.get(f"http://{url}/health", timeout=2)
             if res.status_code == 200:
                 print("[SERVER] ✅ Servidor pronto!\n")
                 return True
@@ -130,12 +125,12 @@ class DescribeRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global llama_proc
-    wait_for_server("http://0.0.0.0:2004")
-    _warmup()
+    try:
+        wait_for_server(qwen_adress, timeout=30)
+        _warmup()
+    except (TimeoutError, RuntimeError) as e:
+        print(f"[WARN] VQA iniciou sem servidor disponível: {e}")
     yield
-    if llama_proc:
-        stop_llama_server(llama_proc)
 
 
 app = FastAPI(title="Florence / Qwen3VL", lifespan=lifespan)
@@ -149,7 +144,7 @@ def _warmup():
             "messages": [{"role": "user", "content": [{"type": "text", "text": "ok"}]}],
             "max_tokens": 1,
         }
-        requests.post(QWEN_URL, json=payload, timeout=30)
+        requests.post(qwen_url, json=payload, timeout=30)
         print("[MAIN] ✅ Pronto!\n")
     except Exception as e:
         print(f"[MAIN] Warmup falhou: {e}")
@@ -182,7 +177,7 @@ def describe(req: DescribeRequest):
 
     try:
         t0  = time.perf_counter()
-        res = requests.post(QWEN_URL, json=payload, timeout=60)
+        res = requests.post(qwen_url, json=payload, timeout=60)
         res.raise_for_status()
         result = res.json()["choices"][0]["message"]["content"]
         print(f"[MAIN] Concluído em {time.perf_counter()-t0:.3f}s")
@@ -220,7 +215,7 @@ def describe_stream(req: DescribeRequest):
     }
 
     def generator():
-        with requests.post(QWEN_URL, json=payload, stream=True, timeout=60) as res:
+        with requests.post(qwen_url, json=payload, stream=True, timeout=60) as res:
             res.raise_for_status()
             for line in res.iter_lines():
                 if not line:

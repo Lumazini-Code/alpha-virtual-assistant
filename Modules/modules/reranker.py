@@ -1,52 +1,35 @@
 """
-AVA KG-RAG — Cross-Encoder Reranker (ONNX Runtime)
-Modelo: ms-marco-MiniLM-L-6-v2
-Entrada: (query, passagem) → score de relevância
+AVA KG-RAG — Cross-Encoder Reranker (via ONNX Serving API)
+Substitui o carregamento local do ONNX por chamadas HTTP ao servidor unificado.
+Mantém a mesma interface pública — drop-in replacement.
 """
 
 import numpy as np
-import onnxruntime as ort
-from tokenizers import Tokenizer
-from typing import List, Tuple
-from pathlib import Path
+from typing import List, Tuple, Optional
 import logging
 
-from config import RERANKER_ONNX, RERANKER_TOKENIZER, RETRIEVAL
+from onnx_client import RerankerClient, DEFAULT_ONNX_BASE_URL
 
 logger = logging.getLogger(__name__)
 
 
 class CrossEncoderReranker:
     """
-    Reranker cross-encoder via ONNX.
-    Recebe candidatos (texto) + query e retorna os top_k mais relevantes.
+    Reranker cross-encoder via API REST (onnx_serving).
+    Interface idêntica à versão ONNX local — substituição transparente.
     """
 
     def __init__(
         self,
-        onnx_path: str  = RERANKER_ONNX,
-        tokenizer_path: str = RERANKER_TOKENIZER,
+        onnx_path: str = None,         # Ignorado — mantido para compatibilidade
+        tokenizer_path: str = None,    # Ignorado — mantido para compatibilidade
+        base_url: str = DEFAULT_ONNX_BASE_URL,
     ):
-        if not Path(onnx_path).exists():
-            raise FileNotFoundError(
-                f"Reranker ONNX não encontrado: {onnx_path}\n"
-                "Baixe ms-marco-MiniLM-L-6-v2 em ONNX e coloque em models/."
-            )
+        self._client = RerankerClient(base_url=base_url)
+        self._base_url = base_url
+        logger.info("CrossEncoderReranker iniciado — via API: %s", base_url)
 
-        sess_opts = ort.SessionOptions()
-        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_opts.intra_op_num_threads = 2
-
-        self._session = ort.InferenceSession(
-            onnx_path,
-            sess_options=sess_opts,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
-        self._tokenizer = Tokenizer.from_file(tokenizer_path)
-        self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
-        self._tokenizer.enable_truncation(max_length=512)
-
-        logger.info("CrossEncoderReranker iniciado — %s", Path(onnx_path).name)
+    # ─── API pública ─────────────────────────────────────────────────────────
 
     def rerank(
         self,
@@ -59,43 +42,61 @@ class CrossEncoderReranker:
 
         Retorna lista de (índice_original, score, texto) ordenada do mais
         ao menos relevante, truncada em top_k.
+
+        ATENÇÃO: Método síncrono por compatibilidade. Prefira rerank_async()
+        quando em contexto assíncrono.
         """
-        if not candidates:
-            return []
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        self._client.rerank(query, candidates, top_k)
+                    )
+                    return future.result()
+        except RuntimeError:
+            pass
+        return asyncio.run(self._client.rerank(query, candidates, top_k))
 
-        top_k = top_k or RETRIEVAL.top_k_final
+    def score(self, query: str, passages: List[str]) -> np.ndarray:
+        """
+        Raw cross-encoder scores — retorna array de scores sigmoid-normalizados.
 
-        # Tokeniza pares (query, passagem) — cross-encoder espera sequência A+B
-        pairs = [f"{query} [SEP] {c}" for c in candidates]
-        encoded = self._tokenizer.encode_batch(pairs)
+        ATENÇÃO: Método síncrono por compatibilidade. Prefira score_async()
+        quando em contexto assíncrono.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        self._client.score(query, passages)
+                    )
+                    return future.result()
+        except RuntimeError:
+            pass
+        return asyncio.run(self._client.score(query, passages))
 
-        input_ids      = np.array([e.ids           for e in encoded], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+    async def rerank_async(
+        self,
+        query: str,
+        candidates: List[str],
+        top_k: int = None,
+    ) -> List[Tuple[int, float, str]]:
+        """Versão assíncrona nativa — preferida em contexto async."""
+        return await self._client.rerank(query, candidates, top_k)
 
-        input_names = {i.name for i in self._session.get_inputs()}
-        ort_inputs: dict = {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-        }
-        if "token_type_ids" in input_names:
-            ort_inputs["token_type_ids"] = np.zeros_like(input_ids)
+    async def score_async(self, query: str, passages: List[str]) -> np.ndarray:
+        """Versão assíncrona nativa — preferida em contexto async."""
+        return await self._client.score(query, passages)
 
-        # logits shape: (batch, 1) ou (batch, 2)
-        logits: np.ndarray = self._session.run(None, ort_inputs)[0]
-
-        # Extrai score de relevância
-        if logits.shape[-1] == 1:
-            scores = logits[:, 0]
-        else:
-            # Modelos de classificação binária — usa logit da classe positiva
-            scores = logits[:, 1]
-
-        # Sigmoid para converter em probabilidade 0-1
-        scores = 1.0 / (1.0 + np.exp(-scores))
-
-        ranked = sorted(
-            [(i, float(scores[i]), candidates[i]) for i in range(len(candidates))],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        return ranked[:top_k]
+    @property
+    def client(self) -> RerankerClient:
+        """Acesso direto ao cliente HTTP para chamadas assíncronas avançadas."""
+        return self._client

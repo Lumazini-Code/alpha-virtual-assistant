@@ -1,0 +1,48 @@
+# ==============================================================================
+# AVA — requirements-docker.txt
+# Dependências Python para o container Docker
+# ==============================================================================
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# HTTP client
+httpx>=0.25.0
+
+# Numerical & ML
+numpy>=1.26.0
+faiss-cpu>=1.7.4
+
+# ONNX Runtime (CPU por padrão; para CUDA, instalar onnxruntime-gpu)
+onnxruntime>=1.16.0
+
+# Tokenizers (HuggingFace)
+tokenizers>=0.15.0
+
+# GGUF metadata reader
+gguf>=0.6.0
+
+# Language detection
+langdetect>=1.0.9
+
+# Keyword extraction
+yake>=0.4.8
+
+# PDF processing
+pdfplumber>=0.10.0
+
+# Web search
+ddgs>=4.0.0
+
+# Audio playback
+miniaudio>=1.59
+
+# TTS Engine
+supertonic>=0.1.0
+
+# Supervisord Python companion (opcional)
+supervisor>=4.2.5
+
+bs4

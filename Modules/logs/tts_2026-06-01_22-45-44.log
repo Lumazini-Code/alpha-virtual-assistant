@@ -1,0 +1,102 @@
+INFO:     127.0.0.1:54152 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44278 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44262 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50802 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44262 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44280 - "POST /stream HTTP/1.1" 200 OK
+ool iniciado com 3 workers
+2026-06-01 22:45:44,961 [INFO] Loading model from /root/.cache/supertonic3
+2026-06-01 22:45:45,978 [INFO] TTS API pronta
+2026-06-01 22:45:45,978 [INFO] Successfully loaded all ONNX models
+INFO:     Application startup complete.
+2026-06-01 22:45:45,979 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-01 22:45:45,979 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-01 22:45:45,979 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-01 22:45:45,999 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 22:45:46,058 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-01 22:45:46,062 [INFO] Model loaded successfully
+2026-06-01 22:45:46,124 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-01 22:45:46,224 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 22:45:47,126 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-01 22:45:47,133 [INFO] Successfully loaded all ONNX models
+2026-06-01 22:45:47,684 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 22:45:47,688 [INFO] Model loaded successfully
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-01 22:45:47,967 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 22:45:48,086 [INFO] Successfully loaded all ONNX models
+2026-06-01 22:45:48,102 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 22:45:48,109 [INFO] Model loaded successfully
+2026-06-01 22:45:48,112 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 22:45:49,444 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-01 22:45:49,576 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-01 22:45:49,780 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-01 22:46:06,221 [INFO] [W1] seq=0 ok (1.30s) 'E aí,'
+2026-06-01 22:46:06,241 [INFO] [PLAY] seq=0 (58368 samples)
+2026-06-01 22:46:06,309 [INFO] [W2] seq=1 ok (1.38s) 'Usuário!'
+2026-06-01 22:46:06,312 [INFO] [STREAM] 2 sentenças enfileiradas em 894.24ms
+2026-06-01 22:46:07,374 [INFO] [W0] seq=2 ok (3.62s) 'Pronto para ter a mente explodindo um pouquinho?'
+2026-06-01 22:46:07,374 [INFO] [STREAM] 1 sentenças enfileiradas em 832.52ms
+2026-06-01 22:46:07,443 [INFO] [PLAY] seq=1 (61440 samples)
+2026-06-01 22:46:08,724 [INFO] [PLAY] seq=2 (159744 samples)
+2026-06-01 22:46:11,075 [INFO] [W2] seq=3 ok (1.58s) 'Segura essa:'
+2026-06-01 22:46:11,818 [INFO] [W0] seq=5 ok (2.99s) 'planetas ou gás como a gente imagina.'
+2026-06-01 22:46:12,041 [INFO] [PLAY] seq=3 (70656 samples)
+2026-06-01 22:46:12,371 [INFO] [W1] seq=4 ok (5.09s) 'A maior parte do universo que conhecemos não é fei'
+2026-06-01 22:46:12,372 [INFO] [STREAM] 3 sentenças enfileiradas em 3218.46ms
+2026-06-01 22:46:13,524 [INFO] [PLAY] seq=4 (227328 samples)
+2026-06-01 22:46:14,345 [INFO] [W2] seq=6 ok (1.47s) 'Na verdade,'
+2026-06-01 22:46:14,851 [INFO] [W0] seq=8 ok (2.86s) 'Matéria Escura e Energia Escura.'
+2026-06-01 22:46:15,547 [INFO] [W1] seq=7 ok (6.74s) 'mais de 85 por cento do universo é composto por du'
+2026-06-01 22:46:15,547 [INFO] [STREAM] 3 sentenças enfileiradas em 2689.73ms
+2026-06-01 22:46:17,319 [INFO] [W2] seq=9 ok (1.50s) 'Pensa comigo:'
+2026-06-01 22:46:18,238 [INFO] [PLAY] seq=5 (132096 samples)
+2026-06-01 22:46:19,181 [INFO] [W0] seq=10 ok (9.18s) 'a Matéria Escura é aquela "cola" invisível que dá '
+2026-06-01 22:46:19,183 [INFO] [STREAM] 2 sentenças enfileiradas em 2657.71ms
+2026-06-01 22:46:20,211 [INFO] [W2] seq=12 ok (3.27s) 'mas não consegue ver ela de jeito nenhum!'
+2026-06-01 22:46:20,678 [INFO] [W0] seq=13 ok (1.98s) 'Já a Energia Escura?'
+2026-06-01 22:46:20,681 [INFO] [STREAM] 1 sentenças enfileiradas em 1628.11ms
+2026-06-01 22:46:21,002 [INFO] [PLAY] seq=6 (67584 samples)
+2026-06-01 22:46:21,208 [INFO] [W2] seq=14 ok (2.13s) 'Essa é a mais maluca.'
+2026-06-01 22:46:21,209 [INFO] [STREAM] 1 sentenças enfileiradas em 1351.16ms
+2026-06-01 22:46:21,228 [INFO] [W1] seq=11 ok (3.50s) 'A gente vê a atração gravitacional dela,'
+2026-06-01 22:46:21,229 [INFO] [STREAM] 2 sentenças enfileiradas em 2813.44ms
+2026-06-01 22:46:22,399 [INFO] [PLAY] seq=7 (297984 samples)
+2026-06-01 22:46:23,829 [INFO] [W0] seq=15 ok (8.14s) 'Ela é uma espécie de força repulsiva que está faze'
+2026-06-01 22:46:23,829 [INFO] [STREAM] 1 sentenças enfileiradas em 1461.83ms
+2026-06-01 22:46:26,579 [INFO] [W0] seq=18 ok (1.97s) 'ver ou medir (você,'
+2026-06-01 22:46:26,807 [INFO] [W1] seq=17 ok (2.16s) 'tudo o que você pode tocar,'
+2026-06-01 22:46:26,872 [INFO] [W2] seq=16 ok (1.49s) 'Basicamente,'
+2026-06-01 22:46:27,814 [INFO] [W0] seq=19 ok (1.27s) 'eu,'
+2026-06-01 22:46:28,649 [INFO] [PLAY] seq=8 (129024 samples)
+2026-06-01 22:46:28,715 [INFO] [W1] seq=20 ok (3.32s) 'as estrelas) é só a pontinha do iceberg!'
+2026-06-01 22:46:28,716 [INFO] [STREAM] 5 sentenças enfileiradas em 3664.96ms
+2026-06-01 22:46:28,889 [INFO] [W2] seq=21 ok (1.32s) 'O resto?'
+2026-06-01 22:46:28,891 [INFO] [STREAM] 1 sentenças enfileiradas em 3289.84ms
+2026-06-01 22:46:28,972 [INFO] [W0] seq=22 ok (3.30s) 'É um mistério cósmico super potente!'
+2026-06-01 22:46:28,972 [INFO] [STREAM] 1 sentenças enfileiradas em 2167.68ms
+2026-06-01 22:46:31,336 [INFO] [PLAY] Fala completa
+2026-06-01 22:46:31,368 [INFO] [PLAY] seq=9 (67584 samples)
+2026-06-01 22:46:32,777 [INFO] [PLAY] seq=10 (405504 samples)
+2026-06-01 22:46:41,214 [INFO] [PLAY] Fala completa
+2026-06-01 22:46:41,257 [INFO] [PLAY] seq=11 (156672 samples)
+2026-06-01 22:46:44,489 [INFO] [PLAY] seq=12 (144384 samples)
+2026-06-01 22:46:47,497 [INFO] [PLAY] seq=13 (89088 samples)
+2026-06-01 22:46:49,374 [INFO] [PLAY] seq=14 (95232 samples)
+2026-06-01 22:46:51,337 [INFO] [PLAY] seq=15 (359424 samples)
+2026-06-01 22:46:58,857 [INFO] [PLAY] Fala completa
+2026-06-01 22:46:58,889 [INFO] [PLAY] seq=16 (67584 samples)
+2026-06-01 22:47:00,297 [INFO] [PLAY] seq=17 (95232 samples)
+2026-06-01 22:47:02,249 [INFO] [PLAY] seq=18 (89088 samples)
+2026-06-01 22:47:04,137 [INFO] [PLAY] seq=19 (58368 samples)
+2026-06-01 22:47:05,332 [INFO] [PLAY] seq=20 (147456 samples)
+2026-06-01 22:47:08,414 [INFO] [PLAY] Fala completa
+2026-06-01 22:47:08,457 [INFO] [PLAY] seq=21 (58368 samples)
+2026-06-01 22:47:09,652 [INFO] [PLAY] seq=22 (147456 samples)
+2026-06-01 22:47:12,734 [INFO] [PLAY] Fala completa

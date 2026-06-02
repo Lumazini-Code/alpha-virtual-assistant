@@ -1,0 +1,79 @@
+INFO:     127.0.0.1:38088 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34462 - "POST /speak HTTP/1.1" 200 OK
+ciando AVA TTS API...
+2026-06-01 14:23:19,062 [INFO] [W0] Carregando Supertonic...
+2026-06-01 14:23:19,063 [INFO] Loading model from /root/.cache/supertonic3
+2026-06-01 14:23:19,063 [INFO] [W1] Carregando Supertonic...
+2026-06-01 14:23:19,063 [INFO] [W2] Carregando Supertonic...
+2026-06-01 14:23:19,063 [INFO] TTSPool iniciado com 3 workers
+2026-06-01 14:23:19,063 [INFO] Loading model from /root/.cache/supertonic3
+2026-06-01 14:23:19,064 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-01 14:23:19,065 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-01 14:23:19,064 [INFO] Loading model from /root/.cache/supertonic3
+2026-06-01 14:23:19,064 [INFO] TTS API pronta
+2026-06-01 14:23:19,065 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+INFO:     Application startup complete.
+2026-06-01 14:23:19,065 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-01 14:23:19,065 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-01 14:23:19,065 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-01 14:23:19,147 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-01 14:23:19,210 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-01 14:23:20,073 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-01 14:23:20,120 [INFO] Successfully loaded all ONNX models
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-01 14:23:22,075 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 14:23:22,076 [INFO] Successfully loaded all ONNX models
+2026-06-01 14:23:22,207 [INFO] Successfully loaded all ONNX models
+2026-06-01 14:23:22,209 [INFO] Model loaded successfully
+2026-06-01 14:23:22,210 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 14:23:22,213 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 14:23:22,217 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 14:23:22,220 [INFO] Model loaded successfully
+2026-06-01 14:23:22,223 [INFO] Model loaded successfully
+2026-06-01 14:23:22,223 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 14:23:22,223 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 14:23:23,246 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-01 14:23:23,379 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-01 14:23:23,602 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-01 14:24:53,461 [INFO] [W0] seq=0 ok (1.68s) 'E aí de novo,'
+2026-06-01 14:24:53,476 [INFO] [PLAY] seq=0 (76800 samples)
+2026-06-01 14:24:53,856 [INFO] [W2] seq=1 ok (1.38s) 'Usuário!'
+2026-06-01 14:24:55,065 [INFO] [PLAY] seq=1 (61440 samples)
+2026-06-01 14:24:55,612 [INFO] [W0] seq=3 ok (3.97s) 'A curiosidade de hoje é sobre a Energia Escura.'
+2026-06-01 14:24:55,789 [INFO] [W1] seq=2 ok (6.77s) 'Já que você está com fome de conhecimento cósmico.'
+2026-06-01 14:24:56,352 [INFO] [PLAY] seq=2 (301056 samples)
+2026-06-01 14:24:56,695 [INFO] [W1] seq=6 ok (1.31s) 'Pois é.'
+2026-06-01 14:24:56,854 [INFO] [W0] seq=5 ok (1.70s) 'planetas e nós)?'
+2026-06-01 14:24:57,764 [INFO] [W1] seq=7 ok (2.18s) 'Essa energia esquisita,'
+2026-06-01 14:24:57,921 [INFO] [W2] seq=4 ok (6.44s) 'Lembra que eu falei que a maior parte do universo '
+2026-06-01 14:24:59,798 [INFO] [W0] seq=8 ok (5.74s) 'misteriosa e que está fazendo tudo se afastar cada'
+2026-06-01 14:25:00,022 [INFO] [W2] seq=10 ok (2.77s) 'O que isso significa na prática?'
+2026-06-01 14:25:00,654 [INFO] [W1] seq=9 ok (6.19s) 'Ela compõe cerca de 68 por cento de toda a massa-e'
+2026-06-01 14:25:01,099 [INFO] [W2] seq=12 ok (1.30s) 'tocar,'
+2026-06-01 14:25:01,471 [INFO] [W0] seq=11 ok (3.10s) 'Significa que tudo o que você consegue ver,'
+2026-06-01 14:25:02,587 [INFO] [PLAY] seq=3 (175104 samples)
+2026-06-01 14:25:02,854 [INFO] [W2] seq=14 ok (4.03s) 'é só uma pontinha minúscula no sorvete cósmico.'
+2026-06-01 14:25:04,303 [INFO] [W1] seq=13 ok (4.65s) 'ou até mesmo imaginar (galáxias inteiras!),'
+2026-06-01 14:25:04,654 [INFO] [W0] seq=15 ok (7.91s) 'Os outros 95 por cento são feito de "mistério" – a'
+2026-06-01 14:25:04,902 [INFO] [W2] seq=16 ok (4.33s) 'É tipo descobrir que o universo é um sorvete gigan'
+2026-06-01 14:25:05,839 [INFO] [W0] seq=18 ok (2.05s) 'Dá para imaginar isso?'
+2026-06-01 14:25:06,256 [INFO] [W2] seq=19 ok (3.54s) 'A gente é só a decoração do bolo cósmico!'
+2026-06-01 14:25:06,270 [INFO] [PLAY] seq=4 (285696 samples)
+2026-06-01 14:25:06,299 [INFO] [W1] seq=17 ok (3.25s) 'e nós somos só o granulado mais brilhante.'
+2026-06-01 14:25:06,299 [INFO] [SPEAK] 20 chunk(s) enfileirados em 13972.15ms
+2026-06-01 14:25:12,188 [INFO] [PLAY] seq=5 (76800 samples)
+2026-06-01 14:25:13,788 [INFO] [PLAY] seq=6 (58368 samples)
+2026-06-01 14:25:15,026 [INFO] [PLAY] seq=7 (98304 samples)
+2026-06-01 14:25:17,069 [INFO] [PLAY] seq=8 (254976 samples)
+2026-06-01 14:25:22,393 [INFO] [PLAY] seq=9 (273408 samples)
+2026-06-01 14:25:28,069 [INFO] [PLAY] seq=10 (122880 samples)
+2026-06-01 14:25:30,625 [INFO] [PLAY] seq=11 (138240 samples)
+2026-06-01 14:25:33,514 [INFO] [PLAY] seq=12 (58368 samples)
+2026-06-01 14:25:34,752 [INFO] [PLAY] seq=13 (205824 samples)
+2026-06-01 14:25:39,029 [INFO] [PLAY] seq=14 (178176 samples)
+2026-06-01 14:25:42,753 [INFO] [PLAY] seq=15 (350208 samples)
+2026-06-01 14:25:50,032 [INFO] [PLAY] seq=16 (193536 samples)
+2026-06-01 14:25:54,072 [INFO] [PLAY] seq=17 (144384 samples)
+2026-06-01 14:25:57,074 [INFO] [PLAY] seq=18 (92160 samples)
+2026-06-01 14:25:58,987 [INFO] [PLAY] seq=19 (156672 samples)
+2026-06-01 14:26:02,270 [INFO] [PLAY] Fala completa

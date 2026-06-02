@@ -1,0 +1,55 @@
+# ==============================================================================
+# AVA — .dockerignore
+# Arquivos/diretórios excluídos do contexto de build do Docker
+# ==============================================================================
+
+# Modelos GGUF e ONNX (montados como volume)
+Modules/Models/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist
+build
+.eggs/
+*.egg
+test
+logs/*
+compiler
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentação
+*.md
+README*
+LICENSE
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporários
+*.tmp
+*.bak
+*.log
+
+
+*.gguf
+*.onnx

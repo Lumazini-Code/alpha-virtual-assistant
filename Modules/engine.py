@@ -6,9 +6,11 @@ Orquestra as 7 etapas do blueprint, adaptadas ao stack do AVA:
   2. Web Researcher → DuckDuckGo search + httpx fetch + BeautifulSoup parse
   3. Distiller      → LLM extrai triplas (sujeito, relação, objeto) de cada página
   4. Chunker+Graph  → Semantic chunking + construção do KG (NetworkX + SQLite)
-  5. Embeddings     → ONNX Runtime (multilingual-e5-small, mean pooling correto)
+  5. Embeddings     → ONNX Serving API (multilingual-e5-small, mean pooling correto)
   6. Memória        → FAISS + KG SQLite persistidos entre sessões
   7. Retrieval      → Vetor + Grafo + Cross-Encoder → LLM Reasoning final
+
+MODIFIED: All ONNX model calls now go through the unified onnx_serving API.
 """
 
 import logging
@@ -36,12 +38,15 @@ class AVAKnowledgeEngine:
 
     O método query() executa o pipeline completo:
       Planner → WebResearch → Distill → Chunk+Graph → Embed → Store → Retrieve → Reason
+
+    MODIFIED: All ONNX inference is delegated to the unified onnx_serving API
+    via EmbeddingEngine and CrossEncoderReranker (which use onnx_client).
     """
 
     def __init__(self, lazy_models: bool = False):
         """
-        lazy_models=True: não carrega os modelos ONNX imediatamente.
-        Útil para testar sem os modelos baixados.
+        lazy_models=True: não inicializa os clientes API imediatamente.
+        Útil para testar sem o onnx_serving disponível.
         """
         logger.info("Iniciando AVAKnowledgeEngine...")
 
@@ -62,13 +67,14 @@ class AVAKnowledgeEngine:
         if self._embed is not None:
             return
         try:
+            # ── MODIFIED: These now create API clients, not local ONNX sessions ─
             self._embed    = EmbeddingEngine()
             self._reranker = CrossEncoderReranker()
             self._chunker  = SemanticChunker(embedding_engine=self._embed)
-            logger.info("Modelos ONNX carregados.")
-        except FileNotFoundError as e:
-            logger.warning("Modelos ONNX não encontrados: %s", e)
-            logger.warning("Sistema rodará sem embeddings (modo degradado).")
+            logger.info("ONNX API clients initialized (onnx_serving).")
+        except Exception as e:
+            logger.warning("Failed to initialize ONNX API clients: %s", e)
+            logger.warning("System will run without embeddings (degraded mode).")
 
     # ─── PIPELINE COMPLETO ────────────────────────────────────────────────────
 
@@ -95,7 +101,6 @@ class AVAKnowledgeEngine:
         if verbose:
             print(f"\n  [2/7] Pesquisando na internet ({len(sub_topics)} sub-tópicos)...")
 
-        # Chamada diretamente async — sem thread wrapper, sem conflito de loop
         pages = await self._researcher.research_async(sub_topics, verbose=verbose)
 
         if not pages:
@@ -111,7 +116,7 @@ class AVAKnowledgeEngine:
             print(f"\n       Total: {len(pages)} páginas coletadas")
 
         # ── Etapas 3-6: Processar cada página → KG + FAISS ───────────────────
-        total_chunks, total_triples = self._process_pages(pages, verbose)
+        total_chunks, total_triples = await self._process_pages(pages, verbose)
 
         if verbose:
             print(
@@ -127,7 +132,7 @@ class AVAKnowledgeEngine:
         if not self._embed:
             return "⚠️ Modelos ONNX não carregados. Instale os modelos e reinicie."
 
-        answer = self._retrieve_and_reason(user_goal, verbose)
+        answer = await self._retrieve_and_reason(user_goal, verbose)
 
         if verbose:
             print(f"\n{'─'*60}\n")
@@ -152,7 +157,7 @@ class AVAKnowledgeEngine:
 
     # ─── Etapas 3-6: Distill + Chunk + Embed + Store ─────────────────────────
 
-    def _process_pages(
+    async def _process_pages(
         self,
         pages: list[tuple[str, dict]],
         verbose: bool,
@@ -182,10 +187,11 @@ class AVAKnowledgeEngine:
             if not chunks:
                 continue
 
-            # Etapa 5: Embeddings
+            # Etapa 5: Embeddings — MODIFIED: now uses async embed_passages
             if self._embed:
                 chunk_texts = [c.text for c in chunks]
-                embeddings  = self._embed.embed_passages(chunk_texts)
+                # ── MODIFIED: embed_passages is now async via API ──────────────
+                embeddings = await self._embed.embed_passages(chunk_texts)
 
                 # Liga chunks → nós do KG por match de substring
                 node_ids_per_chunk = []
@@ -210,11 +216,12 @@ class AVAKnowledgeEngine:
 
     # ─── Etapa 7: Retrieval + Reranking + Reasoning ──────────────────────────
 
-    def _retrieve_and_reason(self, goal: str, verbose: bool) -> str:
+    async def _retrieve_and_reason(self, goal: str, verbose: bool) -> str:
         if verbose:
             print("\n  [7a] Recuperação vetorial densa...")
 
-        query_emb      = self._embed.embed_query(goal)
+        # ── MODIFIED: embed_query is now async via API ────────────────────────
+        query_emb      = await self._embed.embed_query(goal)
         vector_results = self._store.search(query_emb, top_k=RETRIEVAL.top_k_dense)
 
         if not vector_results:
@@ -228,7 +235,6 @@ class AVAKnowledgeEngine:
         for entry, _ in vector_results:
             all_node_ids.extend(entry.node_ids)
 
-        # Busca entidades da query no KG
         kg_matches = self._kg.search_nodes(goal)
         all_node_ids.extend(self._kg._node_id(m) for m in kg_matches)
 
@@ -239,7 +245,7 @@ class AVAKnowledgeEngine:
         if verbose:
             print(f"       {len(graph_facts)} relações estruturais do KG")
 
-        # 7c: Cross-encoder reranking
+        # 7c: Cross-encoder reranking — MODIFIED: now uses async rerank via API
         if verbose:
             print("  [7c] Reranking cross-encoder...")
 
@@ -247,7 +253,8 @@ class AVAKnowledgeEngine:
         graph_texts    = graph_facts[:20]
         all_candidates = vector_texts + graph_texts
 
-        ranked = self._reranker.rerank(
+        # ── MODIFIED: rerank is now async via API ─────────────────────────────
+        ranked = await self._reranker.rerank_async(
             query=goal,
             candidates=all_candidates,
             top_k=RETRIEVAL.top_k_final,
@@ -271,12 +278,8 @@ class AVAKnowledgeEngine:
 
         if graph_facts:
             context += "\n\n---\n\nRelações do Knowledge Graph:\n" + "\n".join(graph_facts[:10])
-            
 
         return f"Especialização completa: {context}"
-
-
-
 
     # ─── Utilitários ─────────────────────────────────────────────────────────
 

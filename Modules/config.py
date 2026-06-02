@@ -8,12 +8,12 @@ from pathlib import Path
 
 # ─── Caminhos ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-STORAGE_DIR = BASE_DIR / "storage"
+STORAGE_DIR = BASE_DIR / "memory"
 STORAGE_DIR.mkdir(exist_ok=True)
 
 GRAPH_DB_PATH      = STORAGE_DIR / "knowledge_graph.db"
-FAISS_INDEX_PATH   = STORAGE_DIR / "faiss.index"
-FAISS_META_PATH    = STORAGE_DIR / "faiss_meta.json"
+FAISS_INDEX_PATH   = STORAGE_DIR / "faiss_knowledge.index"
+FAISS_META_PATH    = STORAGE_DIR / "faiss_knowledge_meta.json"
 
 # ─── Endpoints do AVA (microserviços existentes) ──────────────────────────────
 LLM_API_URL        = "http://localhost:2001/v1/chat/completions"   # llama-server

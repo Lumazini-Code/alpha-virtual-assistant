@@ -1,0 +1,465 @@
+INFO:     127.0.0.1:46800 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51318 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51310 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51328 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51500 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51502 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51518 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51342 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51356 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51366 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51382 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51396 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51408 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51394 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51414 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51428 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51436 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51444 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51966 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51454 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51484 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51520 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42722 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51470 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51546 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51536 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51556 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51578 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51568 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51598 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43226 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:43304 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:39390 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:39434 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:36518 - "POST /stream HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:36624 - "POST /stream HTTP/1.1" 400 Bad Request
+cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-01 22:41:16,000 [INFO] Model loaded successfully
+2026-06-01 22:41:16,003 [INFO] Model loaded successfully
+2026-06-01 22:41:16,004 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 22:41:16,004 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-01 22:41:17,221 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-01 22:41:17,375 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-01 22:41:17,499 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-01 22:41:40,727 [INFO] [W0] seq=1 ok (1.28s) 'aí'
+2026-06-01 22:41:40,735 [INFO] [STREAM] 1 sentenças enfileiradas em 1362.2ms
+2026-06-01 22:41:40,757 [WARNING] [PLAY] seq=0 atrasado 29100ms — pula para seq=1
+2026-06-01 22:41:40,802 [INFO] [PLAY] seq=1 (58368 samples)
+2026-06-01 22:41:41,021 [INFO] [W1] seq=0 ok (1.27s) 'E'
+2026-06-01 22:41:41,030 [INFO] [STREAM] 1 sentenças enfileiradas em 1732.27ms
+2026-06-01 22:41:41,039 [INFO] [W2] seq=2 ok (1.27s) ','
+2026-06-01 22:41:41,039 [INFO] [STREAM] 1 sentenças enfileiradas em 1561.41ms
+2026-06-01 22:41:41,995 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:42,037 [INFO] [PLAY] seq=2 (58368 samples)
+2026-06-01 22:41:42,099 [INFO] [W0] seq=3 ok (1.28s) 'Usu'
+2026-06-01 22:41:42,103 [INFO] [STREAM] 1 sentenças enfileiradas em 2474.1ms
+2026-06-01 22:41:42,566 [INFO] [W1] seq=4 ok (1.29s) 'ário'
+2026-06-01 22:41:42,572 [INFO] [STREAM] 1 sentenças enfileiradas em 2864.19ms
+2026-06-01 22:41:42,721 [INFO] [W2] seq=5 ok (1.27s) '!'
+2026-06-01 22:41:42,722 [INFO] [STREAM] 1 sentenças enfileiradas em 2901.95ms
+2026-06-01 22:41:43,253 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:43,296 [INFO] [PLAY] seq=3 (58368 samples)
+2026-06-01 22:41:43,387 [INFO] [W0] seq=6 ok (1.29s) 'Pronto'
+2026-06-01 22:41:43,389 [INFO] [STREAM] 1 sentenças enfileiradas em 3423.88ms
+2026-06-01 22:41:44,411 [INFO] [W2] seq=8 ok (1.28s) 'ter'
+2026-06-01 22:41:44,414 [INFO] [STREAM] 1 sentenças enfileiradas em 4240.17ms
+2026-06-01 22:41:44,517 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:44,549 [INFO] [PLAY] seq=4 (58368 samples)
+2026-06-01 22:41:44,778 [INFO] [W0] seq=9 ok (1.27s) 'a'
+2026-06-01 22:41:44,779 [INFO] [STREAM] 1 sentenças enfileiradas em 4489.18ms
+2026-06-01 22:41:45,092 [INFO] [W1] seq=7 ok (1.29s) 'para'
+2026-06-01 22:41:45,098 [INFO] [STREAM] 1 sentenças enfileiradas em 5018.18ms
+2026-06-01 22:41:45,755 [INFO] [PLAY] seq=5 (58368 samples)
+2026-06-01 22:41:45,883 [INFO] [W2] seq=10 ok (1.29s) 'mente'
+2026-06-01 22:41:45,889 [INFO] [STREAM] 1 sentenças enfileiradas em 5491.86ms
+2026-06-01 22:41:45,917 [INFO] [W0] seq=11 ok (1.29s) 'expl'
+2026-06-01 22:41:45,929 [INFO] [STREAM] 1 sentenças enfileiradas em 5419.42ms
+2026-06-01 22:41:46,919 [INFO] [W1] seq=12 ok (1.27s) 'od'
+2026-06-01 22:41:46,924 [INFO] [STREAM] 1 sentenças enfileiradas em 6300.24ms
+2026-06-01 22:41:46,949 [INFO] [PLAY] seq=6 (58368 samples)
+2026-06-01 22:41:47,153 [INFO] [W2] seq=13 ok (1.28s) 'indo'
+2026-06-01 22:41:47,153 [INFO] [STREAM] 1 sentenças enfileiradas em 6439.74ms
+2026-06-01 22:41:47,249 [INFO] [W0] seq=14 ok (1.27s) 'um'
+2026-06-01 22:41:47,255 [INFO] [STREAM] 1 sentenças enfileiradas em 6420.77ms
+2026-06-01 22:41:48,229 [INFO] [W2] seq=16 ok (1.27s) '?'
+2026-06-01 22:41:48,229 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:48,232 [INFO] [STREAM] 1 sentenças enfileiradas em 7195.57ms
+2026-06-01 22:41:48,271 [INFO] [PLAY] seq=7 (58368 samples)
+2026-06-01 22:41:48,527 [INFO] [W0] seq=17 ok (1.28s) 'Seg'
+2026-06-01 22:41:48,527 [INFO] [STREAM] 1 sentenças enfileiradas em 6995.32ms
+2026-06-01 22:41:48,991 [INFO] [W1] seq=15 ok (1.33s) 'pouquinho'
+2026-06-01 22:41:48,993 [INFO] [STREAM] 1 sentenças enfileiradas em 8063.91ms
+2026-06-01 22:41:49,467 [INFO] [PLAY] seq=8 (58368 samples)
+2026-06-01 22:41:49,545 [INFO] [W0] seq=19 ok (1.29s) 'essa'
+2026-06-01 22:41:49,546 [INFO] [STREAM] 1 sentenças enfileiradas em 7783.27ms
+2026-06-01 22:41:49,715 [INFO] [W2] seq=18 ok (1.28s) 'ura'
+2026-06-01 22:41:49,716 [INFO] [STREAM] 1 sentenças enfileiradas em 8054.44ms
+2026-06-01 22:41:50,639 [INFO] [W1] seq=20 ok (1.27s) ':'
+2026-06-01 22:41:50,648 [INFO] [STREAM] 1 sentenças enfileiradas em 8755.93ms
+2026-06-01 22:41:50,662 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:50,698 [INFO] [W2] seq=22 ok (1.27s) 'A'
+2026-06-01 22:41:50,700 [INFO] [STREAM] 1 sentenças enfileiradas em 8597.77ms
+2026-06-01 22:41:50,704 [INFO] [PLAY] seq=9 (58368 samples)
+2026-06-01 22:41:50,951 [INFO] [W0] seq=21 ok (1.28s) '**'
+2026-06-01 22:41:50,952 [INFO] [STREAM] 1 sentenças enfileiradas em 8954.76ms
+2026-06-01 22:41:51,742 [INFO] [W0] seq=25 ok (1.27s) 'do'
+2026-06-01 22:41:51,746 [INFO] [STREAM] 1 sentenças enfileiradas em 9314.21ms
+2026-06-01 22:41:51,910 [INFO] [PLAY] seq=10 (58368 samples)
+2026-06-01 22:41:52,453 [INFO] [W2] seq=24 ok (1.30s) 'parte'
+2026-06-01 22:41:52,458 [INFO] [STREAM] 1 sentenças enfileiradas em 10145.91ms
+2026-06-01 22:41:52,696 [INFO] [W1] seq=23 ok (1.30s) 'maior'
+2026-06-01 22:41:52,697 [INFO] [STREAM] 1 sentenças enfileiradas em 10493.8ms
+2026-06-01 22:41:52,961 [INFO] [W0] seq=26 ok (1.35s) 'universo'
+2026-06-01 22:41:52,963 [INFO] [STREAM] 1 sentenças enfileiradas em 10406.09ms
+2026-06-01 22:41:53,120 [INFO] [PLAY] seq=11 (58368 samples)
+2026-06-01 22:41:53,985 [INFO] [W1] seq=28 ok (1.28s) 'conhe'
+2026-06-01 22:41:53,986 [INFO] [STREAM] 1 sentenças enfileiradas em 11170.2ms
+2026-06-01 22:41:54,013 [INFO] [W2] seq=27 ok (1.27s) 'que'
+2026-06-01 22:41:54,015 [INFO] [STREAM] 1 sentenças enfileiradas em 11305.11ms
+2026-06-01 22:41:54,358 [INFO] [PLAY] seq=12 (58368 samples)
+2026-06-01 22:41:54,773 [INFO] [W0] seq=29 ok (1.30s) 'cemos'
+2026-06-01 22:41:54,774 [INFO] [STREAM] 1 sentenças enfileiradas em 11868.49ms
+2026-06-01 22:41:55,183 [INFO] [W1] seq=30 ok (1.29s) 'não'
+2026-06-01 22:41:55,184 [INFO] [STREAM] 1 sentenças enfileiradas em 12164.21ms
+2026-06-01 22:41:55,564 [INFO] [PLAY] seq=13 (58368 samples)
+2026-06-01 22:41:55,584 [INFO] [W2] seq=31 ok (1.27s) 'é'
+2026-06-01 22:41:55,585 [INFO] [STREAM] 1 sentenças enfileiradas em 12459.83ms
+2026-06-01 22:41:56,263 [INFO] [W0] seq=32 ok (1.38s) 'composta'
+2026-06-01 22:41:56,265 [INFO] [STREAM] 1 sentenças enfileiradas em 13014.99ms
+2026-06-01 22:41:56,484 [INFO] [W1] seq=33 ok (1.27s) 'por'
+2026-06-01 22:41:56,486 [INFO] [STREAM] 1 sentenças enfileiradas em 13122.76ms
+2026-06-01 22:41:56,800 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:56,843 [INFO] [PLAY] seq=14 (58368 samples)
+2026-06-01 22:41:56,882 [INFO] [W2] seq=34 ok (1.31s) 'estrel'
+2026-06-01 22:41:56,888 [INFO] [STREAM] 1 sentenças enfileiradas em 13387.59ms
+2026-06-01 22:41:57,815 [INFO] [W1] seq=36 ok (1.27s) ','
+2026-06-01 22:41:57,817 [INFO] [STREAM] 1 sentenças enfileiradas em 14098.18ms
+2026-06-01 22:41:57,950 [INFO] [W2] seq=37 ok (1.31s) 'planet'
+2026-06-01 22:41:57,951 [INFO] [STREAM] 1 sentenças enfileiradas em 14140.14ms
+2026-06-01 22:41:58,037 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:58,080 [INFO] [PLAY] seq=15 (61440 samples)
+2026-06-01 22:41:58,307 [INFO] [W0] seq=35 ok (1.28s) 'as'
+2026-06-01 22:41:58,309 [INFO] [STREAM] 1 sentenças enfileiradas em 14731.14ms
+2026-06-01 22:41:59,059 [INFO] [W1] seq=38 ok (1.28s) 'as'
+2026-06-01 22:41:59,060 [INFO] [STREAM] 1 sentenças enfileiradas em 15130.34ms
+2026-06-01 22:41:59,198 [INFO] [W2] seq=39 ok (1.27s) 'ou'
+2026-06-01 22:41:59,200 [INFO] [STREAM] 1 sentenças enfileiradas em 15170.3ms
+2026-06-01 22:41:59,360 [INFO] [PLAY] Fala completa
+2026-06-01 22:41:59,405 [INFO] [PLAY] seq=16 (58368 samples)
+2026-06-01 22:41:59,666 [INFO] [W0] seq=40 ok (1.29s) 'gás'
+2026-06-01 22:41:59,670 [INFO] [STREAM] 1 sentenças enfileiradas em 15543.55ms
+2026-06-01 22:42:00,433 [INFO] [W2] seq=42 ok (1.27s) 'a'
+2026-06-01 22:42:00,434 [INFO] [STREAM] 1 sentenças enfileiradas em 16059.05ms
+2026-06-01 22:42:00,598 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:00,640 [INFO] [PLAY] seq=17 (58368 samples)
+2026-06-01 22:42:00,651 [INFO] [W1] seq=41 ok (1.28s) 'como'
+2026-06-01 22:42:00,655 [INFO] [STREAM] 1 sentenças enfileiradas em 16417.03ms
+2026-06-01 22:42:00,997 [INFO] [W0] seq=43 ok (1.29s) 'gente'
+2026-06-01 22:42:00,998 [INFO] [STREAM] 1 sentenças enfileiradas em 16509.04ms
+2026-06-01 22:42:01,599 [INFO] [W2] seq=44 ok (1.34s) 'imagina'
+2026-06-01 22:42:01,601 [INFO] [STREAM] 1 sentenças enfileiradas em 17039.62ms
+2026-06-01 22:42:01,846 [INFO] [PLAY] seq=18 (58368 samples)
+2026-06-01 22:42:02,193 [INFO] [W0] seq=46 ok (1.28s) 'Sé'
+2026-06-01 22:42:02,194 [INFO] [STREAM] 1 sentenças enfileiradas em 17431.94ms
+2026-06-01 22:42:02,649 [INFO] [W1] seq=45 ok (1.28s) '.**'
+2026-06-01 22:42:02,649 [INFO] [STREAM] 1 sentenças enfileiradas em 17989.94ms
+2026-06-01 22:42:03,040 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:03,083 [INFO] [PLAY] seq=19 (58368 samples)
+2026-06-01 22:42:03,163 [INFO] [W2] seq=47 ok (1.28s) 'rio'
+2026-06-01 22:42:03,165 [INFO] [STREAM] 1 sentenças enfileiradas em 18294.22ms
+2026-06-01 22:42:03,620 [INFO] [W0] seq=48 ok (1.27s) '.'
+2026-06-01 22:42:03,621 [INFO] [STREAM] 1 sentenças enfileiradas em 18619.86ms
+2026-06-01 22:42:04,052 [INFO] [W1] seq=49 ok (1.27s) 'A'
+2026-06-01 22:42:04,053 [INFO] [STREAM] 1 sentenças enfileiradas em 18959.35ms
+2026-06-01 22:42:04,288 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:04,331 [INFO] [PLAY] seq=20 (58368 samples)
+2026-06-01 22:42:04,914 [INFO] [W0] seq=51 ok (1.28s) 'fat'
+2026-06-01 22:42:04,919 [INFO] [STREAM] 1 sentenças enfileiradas em 19590.47ms
+2026-06-01 22:42:05,175 [INFO] [W1] seq=52 ok (1.28s) 'ia'
+2026-06-01 22:42:05,177 [INFO] [STREAM] 1 sentenças enfileiradas em 19746.09ms
+2026-06-01 22:42:05,259 [INFO] [W2] seq=50 ok (1.30s) 'maior'
+2026-06-01 22:42:05,261 [INFO] [STREAM] 1 sentenças enfileiradas em 20063.35ms
+2026-06-01 22:42:05,537 [INFO] [PLAY] seq=21 (58368 samples)
+2026-06-01 22:42:06,256 [INFO] [W0] seq=53 ok (1.30s) 'desse'
+2026-06-01 22:42:06,257 [INFO] [STREAM] 1 sentenças enfileiradas em 20708.86ms
+2026-06-01 22:42:06,368 [INFO] [W1] seq=54 ok (1.28s) 'bolo'
+2026-06-01 22:42:06,369 [INFO] [STREAM] 1 sentenças enfileiradas em 20716.85ms
+2026-06-01 22:42:06,731 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:06,774 [INFO] [PLAY] seq=22 (58368 samples)
+2026-06-01 22:42:07,227 [INFO] [W2] seq=55 ok (1.28s) 'có'
+2026-06-01 22:42:07,229 [INFO] [STREAM] 1 sentenças enfileiradas em 21471.97ms
+2026-06-01 22:42:07,606 [INFO] [W0] seq=56 ok (1.27s) 'sm'
+2026-06-01 22:42:07,608 [INFO] [STREAM] 1 sentenças enfileiradas em 21726.38ms
+2026-06-01 22:42:07,832 [INFO] [W1] seq=57 ok (1.28s) 'ico'
+2026-06-01 22:42:07,834 [INFO] [STREAM] 1 sentenças enfileiradas em 21841.82ms
+2026-06-01 22:42:07,968 [INFO] [PLAY] seq=23 (58368 samples)
+2026-06-01 22:42:08,749 [INFO] [W2] seq=58 ok (1.27s) 'é'
+2026-06-01 22:42:08,752 [INFO] [STREAM] 1 sentenças enfileiradas em 22652.44ms
+2026-06-01 22:42:09,101 [INFO] [W0] seq=59 ok (1.30s) 'feita'
+2026-06-01 22:42:09,103 [INFO] [STREAM] 1 sentenças enfileiradas em 22896.64ms
+2026-06-01 22:42:09,176 [INFO] [PLAY] seq=24 (58368 samples)
+2026-06-01 22:42:09,588 [INFO] [W1] seq=60 ok (1.27s) 'de'
+2026-06-01 22:42:09,589 [INFO] [STREAM] 1 sentenças enfileiradas em 23270.01ms
+2026-06-01 22:42:09,944 [INFO] [W2] seq=61 ok (1.29s) 'duas'
+2026-06-01 22:42:09,944 [INFO] [STREAM] 1 sentenças enfileiradas em 23514.25ms
+2026-06-01 22:42:10,343 [INFO] [W0] seq=62 ok (1.33s) 'coisas'
+2026-06-01 22:42:10,347 [INFO] [STREAM] 1 sentenças enfileiradas em 23799.46ms
+2026-06-01 22:42:10,411 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:10,454 [INFO] [PLAY] seq=25 (58368 samples)
+2026-06-01 22:42:11,406 [INFO] [W1] seq=63 ok (1.28s) 'bem'
+2026-06-01 22:42:11,411 [INFO] [STREAM] 1 sentenças enfileiradas em 24743.52ms
+2026-06-01 22:42:11,649 [INFO] [PLAY] seq=26 (61440 samples)
+2026-06-01 22:42:11,820 [INFO] [W0] seq=65 ok (1.27s) 'uc'
+2026-06-01 22:42:11,821 [INFO] [STREAM] 1 sentenças enfileiradas em 24938.98ms
+2026-06-01 22:42:12,197 [INFO] [W2] seq=64 ok (1.28s) 'mal'
+2026-06-01 22:42:12,204 [INFO] [STREAM] 1 sentenças enfileiradas em 25430.25ms
+2026-06-01 22:42:12,934 [INFO] [PLAY] seq=27 (58368 samples)
+2026-06-01 22:42:13,051 [INFO] [W1] seq=66 ok (1.28s) 'as'
+2026-06-01 22:42:13,052 [INFO] [STREAM] 1 sentenças enfileiradas em 26043.07ms
+2026-06-01 22:42:13,519 [INFO] [W0] seq=67 ok (1.27s) ':'
+2026-06-01 22:42:13,520 [INFO] [STREAM] 1 sentenças enfileiradas em 26406.84ms
+2026-06-01 22:42:13,962 [INFO] [W2] seq=68 ok (1.27s) '1'
+2026-06-01 22:42:13,963 [INFO] [STREAM] 1 sentenças enfileiradas em 26643.82ms
+2026-06-01 22:42:14,144 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:14,187 [INFO] [PLAY] seq=28 (58368 samples)
+2026-06-01 22:42:14,457 [INFO] [W1] seq=69 ok (1.27s) '.'
+2026-06-01 22:42:14,459 [INFO] [STREAM] 1 sentenças enfileiradas em 27008.3ms
+2026-06-01 22:42:14,998 [INFO] [W0] seq=70 ok (1.28s) '**'
+2026-06-01 22:42:14,999 [INFO] [STREAM] 1 sentenças enfileiradas em 27478.3ms
+2026-06-01 22:42:15,387 [INFO] [PLAY] seq=29 (58368 samples)
+2026-06-01 22:42:15,492 [INFO] [W2] seq=71 ok (1.28s) 'Mat'
+2026-06-01 22:42:15,492 [INFO] [STREAM] 1 sentenças enfileiradas em 27860.45ms
+2026-06-01 22:42:15,731 [INFO] [W1] seq=72 ok (1.29s) 'éria'
+2026-06-01 22:42:15,732 [INFO] [STREAM] 1 sentenças enfileiradas em 28008.26ms
+2026-06-01 22:42:16,237 [INFO] [W0] seq=73 ok (1.28s) 'Esc'
+2026-06-01 22:42:16,238 [INFO] [STREAM] 1 sentenças enfileiradas em 28397.16ms
+2026-06-01 22:42:16,592 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:16,624 [INFO] [PLAY] seq=30 (58368 samples)
+2026-06-01 22:42:16,901 [INFO] [W1] seq=75 ok (1.27s) '('
+2026-06-01 22:42:16,901 [INFO] [STREAM] 1 sentenças enfileiradas em 28839.57ms
+2026-06-01 22:42:17,171 [INFO] [W2] seq=74 ok (1.28s) 'ura'
+2026-06-01 22:42:17,173 [INFO] [STREAM] 1 sentenças enfileiradas em 29216.52ms
+2026-06-01 22:42:17,515 [INFO] [W0] seq=76 ok (1.27s) 'c'
+2026-06-01 22:42:17,516 [INFO] [STREAM] 1 sentenças enfileiradas em 29335.25ms
+2026-06-01 22:42:17,830 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:17,872 [INFO] [PLAY] seq=31 (58368 samples)
+2026-06-01 22:42:18,113 [INFO] [W1] seq=77 ok (1.29s) 'erca'
+2026-06-01 22:42:18,114 [INFO] [STREAM] 1 sentenças enfileiradas em 29779.06ms
+2026-06-01 22:42:18,770 [INFO] [W0] seq=79 ok (1.27s) '2'
+2026-06-01 22:42:18,771 [INFO] [STREAM] 1 sentenças enfileiradas em 30101.42ms
+2026-06-01 22:42:19,067 [INFO] [PLAY] seq=32 (61440 samples)
+2026-06-01 22:42:19,196 [INFO] [W2] seq=78 ok (1.27s) 'de'
+2026-06-01 22:42:19,203 [INFO] [STREAM] 1 sentenças enfileiradas em 30771.02ms
+2026-06-01 22:42:19,311 [INFO] [W1] seq=80 ok (1.27s) '7'
+2026-06-01 22:42:19,312 [INFO] [STREAM] 1 sentenças enfileiradas em 30500.04ms
+2026-06-01 22:42:20,133 [INFO] [W0] seq=81 ok (1.35s) 'por cento'
+2026-06-01 22:42:20,134 [INFO] [STREAM] 1 sentenças enfileiradas em 31232.15ms
+2026-06-01 22:42:20,347 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:20,390 [INFO] [PLAY] seq=33 (58368 samples)
+2026-06-01 22:42:20,477 [INFO] [W1] seq=83 ok (1.28s) '**'
+2026-06-01 22:42:20,478 [INFO] [STREAM] 1 sentenças enfileiradas em 31328.06ms
+2026-06-01 22:42:21,026 [INFO] [W2] seq=82 ok (1.27s) '):'
+2026-06-01 22:42:21,027 [INFO] [STREAM] 1 sentenças enfileiradas em 32006.4ms
+2026-06-01 22:42:21,584 [INFO] [PLAY] seq=34 (58368 samples)
+2026-06-01 22:42:21,798 [INFO] [W0] seq=84 ok (1.27s) 'P'
+2026-06-01 22:42:21,799 [INFO] [STREAM] 1 sentenças enfileiradas em 32532.33ms
+2026-06-01 22:42:21,838 [INFO] [W1] seq=85 ok (1.29s) 'ensa'
+2026-06-01 22:42:21,839 [INFO] [STREAM] 1 sentenças enfileiradas em 32431.01ms
+2026-06-01 22:42:22,282 [INFO] [W2] seq=86 ok (1.27s) 'n'
+2026-06-01 22:42:22,283 [INFO] [STREAM] 1 sentenças enfileiradas em 32769.2ms
+2026-06-01 22:42:22,790 [INFO] [PLAY] seq=35 (58368 samples)
+2026-06-01 22:42:22,946 [INFO] [W1] seq=88 ok (1.28s) 'como'
+2026-06-01 22:42:22,947 [INFO] [STREAM] 1 sentenças enfileiradas em 33194.38ms
+2026-06-01 22:42:23,527 [INFO] [W0] seq=87 ok (1.28s) 'ela'
+2026-06-01 22:42:23,527 [INFO] [STREAM] 1 sentenças enfileiradas em 33885.73ms
+2026-06-01 22:42:23,780 [INFO] [W1] seq=90 ok (1.27s) '"'
+2026-06-01 22:42:23,780 [INFO] [STREAM] 1 sentenças enfileiradas em 33788.23ms
+2026-06-01 22:42:24,038 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:24,080 [INFO] [PLAY] seq=36 (58368 samples)
+2026-06-01 22:42:24,446 [INFO] [W0] seq=91 ok (1.32s) 'cimento'
+2026-06-01 22:42:24,447 [INFO] [STREAM] 1 sentenças enfileiradas em 34320.8ms
+2026-06-01 22:42:24,460 [INFO] [W2] seq=89 ok (1.27s) 'o'
+2026-06-01 22:42:24,466 [INFO] [STREAM] 1 sentenças enfileiradas em 34590.05ms
+2026-06-01 22:42:24,977 [INFO] [W1] seq=92 ok (1.27s) '"'
+2026-06-01 22:42:24,983 [INFO] [STREAM] 1 sentenças enfileiradas em 34751.95ms
+2026-06-01 22:42:25,275 [INFO] [PLAY] seq=37 (58368 samples)
+2026-06-01 22:42:25,635 [INFO] [W0] seq=93 ok (1.30s) 'invis'
+2026-06-01 22:42:25,636 [INFO] [STREAM] 1 sentenças enfileiradas em 35286.1ms
+2026-06-01 22:42:25,989 [INFO] [W1] seq=95 ok (1.27s) 'do'
+2026-06-01 22:42:25,989 [INFO] [STREAM] 1 sentenças enfileiradas em 35404.91ms
+2026-06-01 22:42:26,238 [INFO] [W2] seq=94 ok (1.29s) 'ível'
+2026-06-01 22:42:26,240 [INFO] [STREAM] 1 sentenças enfileiradas em 35768.18ms
+2026-06-01 22:42:26,480 [INFO] [PLAY] seq=38 (58368 samples)
+2026-06-01 22:42:26,947 [INFO] [W0] seq=96 ok (1.35s) 'universo'
+2026-06-01 22:42:26,948 [INFO] [STREAM] 1 sentenças enfileiradas em 36194.67ms
+2026-06-01 22:42:27,341 [INFO] [W1] seq=97 ok (1.27s) '.'
+2026-06-01 22:42:27,342 [INFO] [STREAM] 1 sentenças enfileiradas em 36498.82ms
+2026-06-01 22:42:27,744 [INFO] [PLAY] seq=39 (58368 samples)
+2026-06-01 22:42:28,157 [INFO] [W0] seq=99 ok (1.29s) 'gente'
+2026-06-01 22:42:28,157 [INFO] [STREAM] 1 sentenças enfileiradas em 37077.99ms
+2026-06-01 22:42:28,380 [INFO] [W2] seq=98 ok (1.27s) 'A'
+2026-06-01 22:42:28,388 [INFO] [STREAM] 1 sentenças enfileiradas em 37429.67ms
+2026-06-01 22:42:28,548 [INFO] [W1] seq=100 ok (1.29s) 'não'
+2026-06-01 22:42:28,548 [INFO] [STREAM] 1 sentenças enfileiradas em 37357.47ms
+2026-06-01 22:42:28,964 [INFO] [PLAY] seq=40 (58368 samples)
+2026-06-01 22:42:29,201 [INFO] [W0] seq=101 ok (1.29s) 'sabe'
+2026-06-01 22:42:29,202 [INFO] [STREAM] 1 sentenças enfileiradas em 37883.22ms
+2026-06-01 22:42:29,847 [INFO] [W1] seq=103 ok (1.27s) 'ex'
+2026-06-01 22:42:29,847 [INFO] [STREAM] 1 sentenças enfileiradas em 38274.67ms
+2026-06-01 22:42:30,198 [INFO] [PLAY] seq=41 (58368 samples)
+2026-06-01 22:42:30,278 [INFO] [W0] seq=104 ok (1.36s) 'atamente'
+2026-06-01 22:42:30,289 [INFO] [STREAM] 1 sentenças enfileiradas em 38602.67ms
+2026-06-01 22:42:30,462 [INFO] [W2] seq=102 ok (1.27s) '*'
+2026-06-01 22:42:30,465 [INFO] [STREAM] 1 sentenças enfileiradas em 39029.47ms
+2026-06-01 22:42:30,987 [INFO] [W1] seq=105 ok (1.27s) '*'
+2026-06-01 22:42:30,988 [INFO] [STREAM] 1 sentenças enfileiradas em 39176.21ms
+2026-06-01 22:42:31,393 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:31,435 [INFO] [PLAY] seq=42 (58368 samples)
+2026-06-01 22:42:31,478 [INFO] [W0] seq=106 ok (1.27s) 'o'
+2026-06-01 22:42:31,479 [INFO] [STREAM] 1 sentenças enfileiradas em 39587.72ms
+2026-06-01 22:42:31,897 [INFO] [W2] seq=107 ok (1.27s) 'que'
+2026-06-01 22:42:31,899 [INFO] [STREAM] 1 sentenças enfileiradas em 39897.33ms
+2026-06-01 22:42:32,368 [INFO] [W1] seq=108 ok (1.28s) 'ela'
+2026-06-01 22:42:32,369 [INFO] [STREAM] 1 sentenças enfileiradas em 40223.21ms
+2026-06-01 22:42:32,512 [INFO] [W0] seq=109 ok (1.27s) 'é'
+2026-06-01 22:42:32,512 [INFO] [STREAM] 1 sentenças enfileiradas em 40272.47ms
+2026-06-01 22:42:32,641 [INFO] [PLAY] seq=43 (58368 samples)
+2026-06-01 22:42:33,588 [INFO] [W1] seq=111 ok (1.28s) 'mas'
+2026-06-01 22:42:33,589 [INFO] [STREAM] 1 sentenças enfileiradas em 41137.06ms
+2026-06-01 22:42:33,650 [INFO] [W0] seq=112 ok (1.35s) 'sabemos'
+2026-06-01 22:42:33,657 [INFO] [STREAM] 1 sentenças enfileiradas em 41051.79ms
+2026-06-01 22:42:33,685 [INFO] [W2] seq=110 ok (1.27s) ','
+2026-06-01 22:42:33,685 [INFO] [STREAM] 1 sentenças enfileiradas em 41335.59ms
+2026-06-01 22:42:33,837 [INFO] [PLAY] seq=44 (61440 samples)
+2026-06-01 22:42:34,939 [INFO] [W2] seq=115 ok (1.28s) 'tem'
+2026-06-01 22:42:34,940 [INFO] [STREAM] 1 sentenças enfileiradas em 42043.49ms
+2026-06-01 22:42:35,083 [INFO] [W0] seq=114 ok (1.28s) 'ela'
+2026-06-01 22:42:35,084 [INFO] [STREAM] 1 sentenças enfileiradas em 42292.34ms
+2026-06-01 22:42:35,127 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:35,167 [INFO] [W1] seq=113 ok (1.27s) 'que'
+2026-06-01 22:42:35,168 [INFO] [STREAM] 1 sentenças enfileiradas em 42513.53ms
+2026-06-01 22:42:35,169 [INFO] [PLAY] seq=45 (58368 samples)
+2026-06-01 22:42:36,363 [INFO] [PLAY] seq=46 (58368 samples)
+2026-06-01 22:42:36,443 [INFO] [W2] seq=116 ok (1.29s) 'grav'
+2026-06-01 22:42:36,445 [INFO] [STREAM] 1 sentenças enfileiradas em 43464.02ms
+2026-06-01 22:42:36,537 [INFO] [W0] seq=117 ok (1.30s) 'idade'
+2026-06-01 22:42:36,538 [INFO] [STREAM] 1 sentenças enfileiradas em 43421.94ms
+2026-06-01 22:42:37,149 [INFO] [W1] seq=118 ok (1.27s) 'e'
+2026-06-01 22:42:37,151 [INFO] [STREAM] 1 sentenças enfileiradas em 43945.79ms
+2026-06-01 22:42:37,569 [INFO] [PLAY] seq=47 (58368 samples)
+2026-06-01 22:42:37,719 [INFO] [W2] seq=119 ok (1.27s) 'pux'
+2026-06-01 22:42:37,720 [INFO] [STREAM] 1 sentenças enfileiradas em 44382.1ms
+2026-06-01 22:42:37,852 [INFO] [W0] seq=120 ok (1.27s) 'a'
+2026-06-01 22:42:37,852 [INFO] [STREAM] 1 sentenças enfileiradas em 44429.4ms
+2026-06-01 22:42:38,620 [INFO] [W1] seq=121 ok (1.28s) 'as'
+2026-06-01 22:42:38,621 [INFO] [STREAM] 1 sentenças enfileiradas em 45080.19ms
+2026-06-01 22:42:38,806 [INFO] [PLAY] seq=48 (58368 samples)
+2026-06-01 22:42:38,954 [INFO] [W0] seq=123 ok (1.27s) 'á'
+2026-06-01 22:42:38,956 [INFO] [STREAM] 1 sentenças enfileiradas em 45190.41ms
+2026-06-01 22:42:39,561 [INFO] [W2] seq=122 ok (1.28s) 'gal'
+2026-06-01 22:42:39,568 [INFO] [STREAM] 1 sentenças enfileiradas em 45928.65ms
+2026-06-01 22:42:39,929 [INFO] [W1] seq=124 ok (1.27s) 'x'
+2026-06-01 22:42:39,931 [INFO] [STREAM] 1 sentenças enfileiradas em 46051.05ms
+2026-06-01 22:42:39,947 [INFO] [W0] seq=125 ok (1.28s) 'ias'
+2026-06-01 22:42:39,948 [INFO] [STREAM] 1 sentenças enfileiradas em 45967.78ms
+2026-06-01 22:42:40,012 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:40,043 [INFO] [PLAY] seq=49 (58368 samples)
+2026-06-01 22:42:41,132 [INFO] [W2] seq=126 ok (1.33s) 'juntas'
+2026-06-01 22:42:41,133 [INFO] [STREAM] 1 sentenças enfileiradas em 47022.11ms
+2026-06-01 22:42:41,281 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:41,323 [INFO] [PLAY] seq=50 (58368 samples)
+2026-06-01 22:42:41,427 [INFO] [W0] seq=128 ok (1.27s) 'É'
+2026-06-01 22:42:41,428 [INFO] [STREAM] 1 sentenças enfileiradas em 47117.49ms
+2026-06-01 22:42:41,793 [INFO] [W1] seq=127 ok (1.27s) '.'
+2026-06-01 22:42:41,795 [INFO] [STREAM] 1 sentenças enfileiradas em 47594.95ms
+2026-06-01 22:42:42,428 [INFO] [W0] seq=130 ok (1.27s) 'se'
+2026-06-01 22:42:42,430 [INFO] [STREAM] 1 sentenças enfileiradas em 47899.51ms
+2026-06-01 22:42:42,518 [INFO] [PLAY] seq=51 (58368 samples)
+2026-06-01 22:42:42,605 [INFO] [W2] seq=129 ok (1.28s) 'como'
+2026-06-01 22:42:42,607 [INFO] [STREAM] 1 sentenças enfileiradas em 48191.12ms
+2026-06-01 22:42:42,928 [INFO] [W1] seq=131 ok (1.30s) 'fosse'
+2026-06-01 22:42:42,928 [INFO] [STREAM] 1 sentenças enfileiradas em 48278.68ms
+2026-06-01 22:42:43,572 [INFO] [W0] seq=132 ok (1.27s) 'um'
+2026-06-01 22:42:43,572 [INFO] [STREAM] 1 sentenças enfileiradas em 48807.27ms
+2026-06-01 22:42:43,729 [INFO] [PLAY] seq=52 (58368 samples)
+2026-06-01 22:42:44,124 [INFO] [W1] seq=134 ok (1.29s) 'asma'
+2026-06-01 22:42:44,125 [INFO] [STREAM] 1 sentenças enfileiradas em 49141.38ms
+2026-06-01 22:42:44,276 [INFO] [W2] seq=133 ok (1.29s) 'fant'
+2026-06-01 22:42:44,283 [INFO] [STREAM] 1 sentenças enfileiradas em 49379.75ms
+2026-06-01 22:42:44,838 [INFO] [W0] seq=135 ok (1.33s) 'gigante'
+2026-06-01 22:42:44,839 [INFO] [STREAM] 1 sentenças enfileiradas em 49725.26ms
+2026-06-01 22:42:44,966 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:45,009 [INFO] [PLAY] seq=53 (58368 samples)
+2026-06-01 22:42:45,223 [INFO] [W1] seq=136 ok (1.28s) 'com'
+2026-06-01 22:42:45,223 [INFO] [STREAM] 1 sentenças enfileiradas em 49993.45ms
+2026-06-01 22:42:46,061 [INFO] [W0] seq=138 ok (1.27s) '.'
+2026-06-01 22:42:46,062 [INFO] [STREAM] 1 sentenças enfileiradas em 50636.14ms
+2026-06-01 22:42:46,138 [INFO] [W1] seq=139 ok (1.27s) '2'
+2026-06-01 22:42:46,145 [INFO] [STREAM] 1 sentenças enfileiradas em 50470.33ms
+2026-06-01 22:42:46,203 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:46,289 [INFO] [PLAY] seq=54 (58368 samples)
+2026-06-01 22:42:46,297 [INFO] [W2] seq=137 ok (1.28s) 'peso'
+2026-06-01 22:42:46,301 [INFO] [STREAM] 1 sentenças enfileiradas em 50993.56ms
+2026-06-01 22:42:47,478 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:47,521 [INFO] [PLAY] seq=55 (58368 samples)
+2026-06-01 22:42:47,525 [INFO] [W0] seq=140 ok (1.27s) '.'
+2026-06-01 22:42:47,525 [INFO] [STREAM] 1 sentenças enfileiradas em 51778.49ms
+2026-06-01 22:42:47,684 [INFO] [W2] seq=142 ok (1.29s) 'Energ'
+2026-06-01 22:42:47,684 [INFO] [STREAM] 1 sentenças enfileiradas em 51708.04ms
+2026-06-01 22:42:48,061 [INFO] [W1] seq=141 ok (1.28s) '**'
+2026-06-01 22:42:48,062 [INFO] [STREAM] 1 sentenças enfileiradas em 52204.81ms
+2026-06-01 22:42:48,726 [INFO] [PLAY] seq=56 (58368 samples)
+2026-06-01 22:42:49,113 [INFO] [W0] seq=143 ok (1.28s) 'ia'
+2026-06-01 22:42:49,114 [INFO] [STREAM] 1 sentenças enfileiradas em 53026.63ms
+2026-06-01 22:42:49,336 [INFO] [W2] seq=144 ok (1.28s) 'Esc'
+2026-06-01 22:42:49,337 [INFO] [STREAM] 1 sentenças enfileiradas em 53121.6ms
+2026-06-01 22:42:49,832 [INFO] [W1] seq=145 ok (1.28s) 'ura'
+2026-06-01 22:42:49,833 [INFO] [STREAM] 1 sentenças enfileiradas em 53513.4ms
+2026-06-01 22:42:49,958 [INFO] [PLAY] seq=57 (58368 samples)
+2026-06-01 22:42:50,793 [INFO] [W0] seq=146 ok (1.27s) '('
+2026-06-01 22:42:50,802 [INFO] [STREAM] 1 sentenças enfileiradas em 54373.75ms
+2026-06-01 22:42:51,007 [INFO] [W1] seq=148 ok (1.29s) 'erca'
+2026-06-01 22:42:51,009 [INFO] [STREAM] 1 sentenças enfileiradas em 54360.1ms
+2026-06-01 22:42:51,054 [INFO] [W2] seq=147 ok (1.27s) 'c'
+2026-06-01 22:42:51,058 [INFO] [STREAM] 1 sentenças enfileiradas em 54493.22ms
+2026-06-01 22:42:51,225 [INFO] [PLAY] seq=58 (58368 samples)
+2026-06-01 22:42:52,206 [INFO] [W2] seq=151 ok (1.27s) '8'
+2026-06-01 22:42:52,207 [INFO] [STREAM] 1 sentenças enfileiradas em 55119.18ms
+2026-06-01 22:42:52,321 [INFO] [W0] seq=149 ok (1.27s) 'de'
+2026-06-01 22:42:52,322 [INFO] [STREAM] 1 sentenças enfileiradas em 55552.34ms
+2026-06-01 22:42:52,465 [INFO] [PLAY] seq=59 (58368 samples)
+2026-06-01 22:42:52,480 [INFO] [W1] seq=150 ok (1.27s) '6'
+2026-06-01 22:42:52,488 [INFO] [STREAM] 1 sentenças enfileiradas em 55510.95ms
+2026-06-01 22:42:53,303 [INFO] [W2] seq=152 ok (1.35s) 'por cento'
+2026-06-01 22:42:53,305 [INFO] [STREAM] 1 sentenças enfileiradas em 56102.89ms
+2026-06-01 22:42:53,381 [INFO] [W0] seq=153 ok (1.27s) '):'
+2026-06-01 22:42:53,382 [INFO] [STREAM] 1 sentenças enfileiradas em 56069.78ms
+2026-06-01 22:42:53,702 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:53,745 [INFO] [PLAY] seq=60 (58368 samples)
+2026-06-01 22:42:54,056 [INFO] [W2] seq=155 ok (1.30s) 'Essa'
+2026-06-01 22:42:54,057 [INFO] [STREAM] 1 sentenças enfileiradas em 56512.33ms
+2026-06-01 22:42:54,188 [INFO] [W1] seq=154 ok (1.28s) '**'
+2026-06-01 22:42:54,189 [INFO] [STREAM] 1 sentenças enfileiradas em 56764.7ms
+2026-06-01 22:42:54,778 [INFO] [W0] seq=156 ok (1.27s) 'é'
+2026-06-01 22:42:54,779 [INFO] [STREAM] 1 sentenças enfileiradas em 57127.2ms
+2026-06-01 22:42:54,940 [INFO] [PLAY] seq=61 (58368 samples)
+2026-06-01 22:42:55,306 [INFO] [W2] seq=157 ok (1.27s) 'a'
+2026-06-01 22:42:55,307 [INFO] [STREAM] 1 sentenças enfileiradas em 57530.45ms
+2026-06-01 22:42:55,717 [INFO] [W1] seq=158 ok (1.29s) 'rain'
+2026-06-01 22:42:55,717 [INFO] [STREAM] 1 sentenças enfileiradas em 57832.44ms
+2026-06-01 22:42:55,995 [INFO] [W0] seq=159 ok (1.27s) 'ha'
+2026-06-01 22:42:55,996 [INFO] [STREAM] 1 sentenças enfileiradas em 58013.96ms
+2026-06-01 22:42:56,145 [INFO] [PLAY] seq=62 (61440 samples)
+2026-06-01 22:42:56,577 [INFO] [W2] seq=160 ok (1.27s) 'do'
+2026-06-01 22:42:56,578 [INFO] [STREAM] 1 sentenças enfileiradas em 58479.15ms
+2026-06-01 22:42:57,095 [INFO] [W0] seq=162 ok (1.29s) 'ério'
+2026-06-01 22:42:57,097 [INFO] [STREAM] 1 sentenças enfileiradas em 58790.57ms
+2026-06-01 22:42:57,155 [INFO] [W1] seq=161 ok (1.29s) 'mist'
+2026-06-01 22:42:57,163 [INFO] [STREAM] 1 sentenças enfileiradas em 58938.0ms
+2026-06-01 22:42:57,425 [INFO] [PLAY] Fala completa
+2026-06-01 22:42:57,468 [INFO] [PLAY] seq=63 (58368 samples)
+2026-06-01 22:42:57,744 [INFO] [W2] seq=163 ok (1.27s) '!'
+2026-06-01 22:42:57,745 [INFO] [STREAM] 1 sentenças enfileiradas em 59328.4ms
+2026-06-01 22:42:58,523 [INFO] [W0] seq=164 ok (1.28s) 'Ela'
+2026-06-01 22:42:58,526 [INFO] [STREAM] 1 sentenças enfileiradas em 60000.39ms

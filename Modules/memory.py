@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import re
 import time
 import json
@@ -14,9 +13,11 @@ from typing import Optional, Literal
 
 import numpy as np
 import faiss
-import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# ── MODIFIED: Import from onnx_client instead of local ONNX ───────────────────
+from onnx_client import EmbeddingClient, DEFAULT_ONNX_BASE_URL
 
 # ── MODIFIED: Import VectorStore from vector_store (graceful fallback) ────────
 try:
@@ -26,12 +27,11 @@ except ImportError as _imp_err:
     _VS_AVAILABLE = False
     VectorStore = None          # type: ignore[assignment,misc]
     VSVectorEntry = None        # type: ignore[assignment,misc]
-    # Will log after logging is configured below
 
 # ── Configuração ───────────────────────────────────────────────────────────────
 
-EMBED_MODEL_PATH  = "./Models/multilingual-e5-small/multilingual-e5-small.onnx"
-TOKENIZER_PATH    = "./Models/multilingual-e5-small/tokenizer.json"
+# ── REMOVED: EMBED_MODEL_PATH and TOKENIZER_PATH — now served by onnx_serving ─
+ONNX_SERVING_URL = DEFAULT_ONNX_BASE_URL   # "http://localhost:3099"
 
 # Longo prazo
 DB_PATH           = "./memory/ava_memory.db"
@@ -49,12 +49,10 @@ PC_FAISS_INDEX_PATH  = "./memory/ava_plan_cache.index"
 PC_FAISS_ID_MAP_PATH = "./memory/ava_plan_cache_id_map.npy"
 
 # ── NEW: Knowledge (Vector Store / KG-RAG) paths ─────────────────────────────
-# These must match the paths used by vector_store.py / config.
-# If config is available, the actual paths are resolved at init time.
 VS_DB_PATH           = "./memory/ava_kg_chunks.db"
 VS_FAISS_INDEX_PATH  = "./memory/ava_kg_vectors.index"
 VS_FAISS_ID_MAP_PATH = "./memory/ava_kg_vectors_id_map.npy"
-VS_MIN_SCORE         = 0.70   # Lower floor for knowledge retrieval
+VS_MIN_SCORE         = 0.70
 
 EMBED_DIM            = 384
 READ_MIN_SCORE       = 0.83
@@ -66,7 +64,6 @@ DECAY_JOB_INTERVAL_S = 3600
 ST_TTL_HOURS          = 24.0
 ST_CLEANUP_INTERVAL_S = 1800
 
-# Cache de planos: threshold de similaridade para considerar hit
 PC_HIT_THRESHOLD = 0.92
 
 # ── Parâmetros de busca contextual ─────────────────────────────────────────────
@@ -94,7 +91,6 @@ _STOP_WORDS: frozenset[str] = frozenset({
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ava.memory")
 
-# ── NEW: Log VectorStore availability ─────────────────────────────────────────
 if not _VS_AVAILABLE:
     log.warning("vector_store module not available — knowledge search disabled")
 else:
@@ -121,7 +117,7 @@ class ReadRequest(BaseModel):
     top_k:      int   = TOP_K_READ
     min_score:  float = READ_MIN_SCORE
     session_id: Optional[str] = None
-    strategy:   str = "auto"   # "auto" | "expanded" | "dual" | "none"
+    strategy:   str = "auto"
 
 class WriteResponse(BaseModel):
     stored:    bool
@@ -140,11 +136,9 @@ class MemoryEntry(BaseModel):
     confidence:   float
     created_at:   float
     access_count: int
-    # ── MODIFIED: Added "knowledge" to memory_type literal ────────────────────
     memory_type:  Literal["long_term", "short_term", "knowledge"]
     session_id:   Optional[str]        = None
     turns:        Optional[list[Turn]] = None
-    # ── NEW: source field — populated for long_term and knowledge entries ─────
     source:       Optional[str]        = None
 
 class ReadResponse(BaseModel):
@@ -161,7 +155,7 @@ class PlanCacheGetRequest(BaseModel):
 
 class PlanCachePutRequest(BaseModel):
     query: str
-    plan:  dict   # PlanResponse serializado pelo CoT — sem schema fixo aqui
+    plan:  dict
 
 class PlanCacheGetResponse(BaseModel):
     hit:        bool
@@ -174,82 +168,34 @@ class PlanCacheDeleteResponse(BaseModel):
     deleted: int
 
 
-# ── Tokenizer ──────────────────────────────────────────────────────────────────
-
-class FastTokenizer:
-    def __init__(self, path: str):
-        try:
-            from tokenizers import Tokenizer
-            self._tok = Tokenizer.from_file(path)
-            self._tok.enable_padding(length=128)
-            self._tok.enable_truncation(max_length=128)
-            self._backend = "tokenizers"
-        except ImportError:
-            self._backend = "simple"
-            log.warning("tokenizers não encontrado — usando tokenizer simples.")
-
-    def encode_batch(self, texts: list[str]) -> dict[str, np.ndarray]:
-        if self._backend == "tokenizers":
-            encoded = self._tok.encode_batch(texts)
-            return {
-                "input_ids":      np.array([e.ids            for e in encoded], dtype=np.int64),
-                "attention_mask": np.array([e.attention_mask for e in encoded], dtype=np.int64),
-                "token_type_ids": np.zeros((len(texts), 128), dtype=np.int64),
-            }
-        max_len = 128
-        ids, masks = [], []
-        for t in texts:
-            tokens = t.lower().split()[:max_len - 2]
-            pad    = max_len - len(tokens) - 2
-            ids.append([101] + [hash(w) % 30000 + 100 for w in tokens] + [102] + [0] * pad)
-            masks.append([1] * (len(tokens) + 2) + [0] * pad)
-        return {
-            "input_ids":      np.array(ids,   dtype=np.int64),
-            "attention_mask": np.array(masks, dtype=np.int64),
-            "token_type_ids": np.zeros((len(texts), max_len), dtype=np.int64),
-        }
-
-
-# ── Engine de embeddings ───────────────────────────────────────────────────────
+# ── MODIFIED: EmbeddingEngine now delegates to EmbeddingClient ────────────────
 
 class EmbeddingEngine:
-    def __init__(self, model_path: str, tokenizer_path: str):
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads     = 4
-        opts.inter_op_num_threads     = 2
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+    """
+    Motor de embeddings via ONNX Serving API.
+    Mantém a mesma interface síncrona + adiciona métodos async nativos.
+    """
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self._session   = ort.InferenceSession(model_path, opts, providers=providers)
-        self._tokenizer = FastTokenizer(tokenizer_path)
-        ep = self._session.get_providers()[0]
-        log.info(f"EmbeddingEngine carregado — provider: {ep}")
+    def __init__(self, base_url: str = ONNX_SERVING_URL):
+        self._client = EmbeddingClient(base_url=base_url)
+        log.info(f"EmbeddingEngine carregado — via API: {base_url}")
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    async def embed(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.empty((0, EMBED_DIM), dtype=np.float32)
-        inputs = self._tokenizer.encode_batch(texts)
-        output = self._session.run(None, {
-            "input_ids":      inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"],
-            "token_type_ids": inputs["token_type_ids"],
-        })
-        token_embeddings = output[0]
-        mask    = inputs["attention_mask"][:, :, np.newaxis]
-        summed  = np.sum(token_embeddings * mask, axis=1)
-        counts  = np.clip(mask.sum(axis=1), a_min=1e-9, a_max=None)
-        embeddings = (summed / counts).astype(np.float32)
-        norms   = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        return embeddings / np.clip(norms, a_min=1e-9, a_max=None)
+        return await self._client.embed(texts)
 
-    def embed_one(self, text: str) -> np.ndarray:
-        return self.embed([text])[0]
+    async def embed_one(self, text: str) -> np.ndarray:
+        result = await self._client.embed([text])
+        return result[0]
 
-    def embed_batch_two(self, text_a: str, text_b: str) -> tuple[np.ndarray, np.ndarray]:
-        """Dois textos numa única chamada ONNX — evita overhead duplo."""
-        results = self.embed([text_a, text_b])
+    async def embed_batch_two(self, text_a: str, text_b: str) -> tuple[np.ndarray, np.ndarray]:
+        results = await self._client.embed([text_a, text_b])
         return results[0], results[1]
+
+    @property
+    def client(self) -> EmbeddingClient:
+        return self._client
 
 
 # ── Banco de dados de longo prazo ──────────────────────────────────────────────
@@ -412,16 +358,6 @@ class ShortTermDB:
 # ── Banco de dados do cache de planos ─────────────────────────────────────────
 
 class PlanCacheDB:
-    """
-    Armazena pares (query_text → plan_json) para o CoT generator.
-
-    Diferenças intencionais em relação à MemoryDB:
-    - Sem decay de confiança: um plano válido não fica "menos válido" com o tempo.
-    - Sem deduplicação na gravação: o CoT controla quando cachear.
-    - hit_count rastreado para análise de utilização.
-    - Invalidação apenas por DELETE explícito (módulos mudaram, etc.).
-    """
-
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -522,7 +458,6 @@ class MemoryIndex:
         log.info(f"FAISS: {len(record_ids)} vetores removidos [{self._index_path}]")
 
     def reset(self):
-        """Zera o índice completamente — usado para invalidar o cache de planos."""
         self._index  = faiss.IndexFlatIP(EMBED_DIM)
         self._id_map = []
         if self._persist:
@@ -557,17 +492,13 @@ class MemoryIndex:
 @dataclass
 class AppState:
     embed_engine: EmbeddingEngine = field(default=None)
-    # Memória conversacional
     lt_db:        MemoryDB        = field(default=None)
     lt_index:     MemoryIndex     = field(default=None)
     st_db:        ShortTermDB     = field(default=None)
     st_index:     MemoryIndex     = field(default=None)
-    # Cache de planos CoT
     pc_db:        PlanCacheDB     = field(default=None)
     pc_index:     MemoryIndex     = field(default=None)
-    # ── NEW: VectorStore (knowledge / KG-RAG) ─────────────────────────────────
     vs:           Optional[VectorStore] = field(default=None)
-    # Tasks
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
 
@@ -605,10 +536,6 @@ async def st_cleanup_job():
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 def _resolve_vs_paths() -> tuple[str, str, str]:
-    """
-    Resolve VectorStore paths — tries config first, falls back to local constants.
-    Ensures memory.py reads the same data written by vector_store.py.
-    """
     try:
         from config import FAISS_INDEX_PATH as _cfg_idx, FAISS_META_PATH as _cfg_meta
         idx_path    = str(_cfg_idx)
@@ -625,11 +552,18 @@ def _resolve_vs_paths() -> tuple[str, str, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Memory API...")
-    for path in (EMBED_MODEL_PATH, TOKENIZER_PATH):
-        if not Path(path).exists():
-            raise RuntimeError(f"Arquivo não encontrado: {path}")
 
-    state.embed_engine = EmbeddingEngine(EMBED_MODEL_PATH, TOKENIZER_PATH)
+    # ── MODIFIED: Connect to ONNX serving API instead of loading local models ─
+    # No need to check for model files — they are served by onnx_serving
+    try:
+        from onnx_client import check_health
+        health = await check_health(ONNX_SERVING_URL)
+        log.info(f"ONNX Serving API healthy: {health}")
+    except Exception as e:
+        log.warning(f"ONNX Serving API not reachable at {ONNX_SERVING_URL}: {e}")
+        log.warning("Memory API will start but embedding calls will fail until ONNX serving is available.")
+
+    state.embed_engine = EmbeddingEngine(base_url=ONNX_SERVING_URL)
 
     state.lt_db    = MemoryDB(DB_PATH)
     state.lt_index = MemoryIndex(FAISS_INDEX_PATH, FAISS_ID_MAP_PATH)
@@ -640,7 +574,6 @@ async def lifespan(app: FastAPI):
     state.pc_db    = PlanCacheDB(PC_DB_PATH)
     state.pc_index = MemoryIndex(PC_FAISS_INDEX_PATH, PC_FAISS_ID_MAP_PATH)
 
-    # ── NEW: Initialize VectorStore for knowledge retrieval ───────────────────
     if _VS_AVAILABLE:
         try:
             vs_idx, vs_db, vs_idmap = _resolve_vs_paths()
@@ -650,9 +583,7 @@ async def lifespan(app: FastAPI):
                 id_map_path = vs_idmap,
                 embed_dim   = EMBED_DIM,
             )
-            log.info(
-                f"VectorStore integrado — {state.vs.total} chunks de conhecimento"
-            )
+            log.info(f"VectorStore integrado — {state.vs.total} chunks de conhecimento")
         except Exception as e:
             log.error(f"VectorStore initialization failed: {e} — knowledge search disabled")
             state.vs = None
@@ -670,6 +601,9 @@ async def lifespan(app: FastAPI):
         f"{state.vs.total if state.vs else 0} chunks de conhecimento"
     )
     yield
+
+    # ── MODIFIED: Close the embedding client ──────────────────────────────────
+    await state.embed_engine.client.close()
 
     state.decay_task.cancel()
     state.cleanup_task.cancel()
@@ -729,8 +663,9 @@ async def _search_expanded(
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     expanded = f"{context_block}\n\nquery atual: {query}" if context_block else query
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    emb = await state.embed_engine.embed_one(expanded)
     loop = asyncio.get_event_loop()
-    emb  = await loop.run_in_executor(None, state.embed_engine.embed_one, expanded)
     lt_raw, st_raw = await asyncio.gather(
         loop.run_in_executor(None, state.lt_index.search, emb, top_k * 2),
         loop.run_in_executor(None, state.st_index.search, emb, top_k * 2),
@@ -743,10 +678,9 @@ async def _search_dual(
     context_block: str,
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    # ── MODIFIED: embed_batch_two is now async ────────────────────────────────
+    emb_query, emb_ctx = await state.embed_engine.embed_batch_two(query, context_block)
     loop = asyncio.get_event_loop()
-    emb_query, emb_ctx = await loop.run_in_executor(
-        None, state.embed_engine.embed_batch_two, query, context_block
-    )
     lt_q, st_q, lt_c, st_c = await asyncio.gather(
         loop.run_in_executor(None, state.lt_index.search, emb_query, top_k * 2),
         loop.run_in_executor(None, state.st_index.search, emb_query, top_k * 2),
@@ -777,7 +711,7 @@ def _build_lt_entries(
             created_at   = row["created_at"],
             access_count = row["access_count"],
             memory_type  = "long_term",
-            source       = row["source"],            # ── MODIFIED: expose source
+            source       = row["source"],
         ))
         loop.run_in_executor(None, state.lt_db.update_access, row["id"])
     return entries
@@ -812,19 +746,10 @@ def _build_st_entries(
     return entries
 
 
-# ── NEW: Build knowledge entries from VectorStore results ─────────────────────
-
 def _build_vs_entries(
     vs_results: list,
     min_score: float,
 ) -> list[MemoryEntry]:
-    """
-    Converte resultados do VectorStore em MemoryEntry com memory_type="knowledge".
-
-    VectorStore.search() retorna List[Tuple[VectorEntry, float]].
-    A filtragem por min_score já é feita dentro de VectorStore.search(),
-    mas aplicamos novamente como salvaguarda.
-    """
     if not vs_results:
         return []
     entries = []
@@ -835,11 +760,11 @@ def _build_vs_entries(
             id           = ventry.id,
             text         = ventry.text,
             score        = round(score, 4),
-            confidence   = 1.0,              # Knowledge entries have full confidence
-            created_at   = 0.0,              # Not tracked by VectorStore
-            access_count = 0,                # Not tracked by VectorStore
+            confidence   = 1.0,
+            created_at   = 0.0,
+            access_count = 0,
             memory_type  = "knowledge",
-            source       = ventry.source,     # Document source path/URL
+            source       = ventry.source,
         ))
     return entries
 
@@ -854,8 +779,8 @@ async def write_memory(req: WriteRequest):
     if state.lt_db.exists_exact(text):
         return WriteResponse(stored=False, reason="duplicate_exact")
 
-    loop      = asyncio.get_event_loop()
-    embedding = await loop.run_in_executor(None, state.embed_engine.embed_one, text)
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    embedding = await state.embed_engine.embed_one(text)
 
     max_sim = state.lt_index.search_similar(embedding)
     if max_sim >= DEDUP_THRESHOLD:
@@ -879,8 +804,8 @@ async def write_short_term(req: WriteSTRequest):
         return WriteSTResponse(stored=False, reason="too_short")
 
     embed_text = "\n".join(f"{t.role}: {t.content}" for t in req.turns)
-    loop       = asyncio.get_event_loop()
-    embedding  = await loop.run_in_executor(None, state.embed_engine.embed_one, embed_text)
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    embedding = await state.embed_engine.embed_one(embed_text)
 
     max_sim = state.st_index.search_similar(embedding)
     if max_sim >= DEDUP_THRESHOLD:
@@ -893,25 +818,9 @@ async def write_short_term(req: WriteSTRequest):
 
 
 # ── POST /read ─────────────────────────────────────────────────────────────────
-# ── POST /read ─────────────────────────────────────────────────────────────────
 
 @app.post("/read", response_model=ReadResponse)
 async def read_memory(req: ReadRequest):
-    """
-    Busca nas memórias de longo prazo, curto prazo E na base de conhecimento
-    (VectorStore / KG-RAG) com suporte a busca contextual.
-
-    session_id ausente  → busca simples.
-    session_id presente → busca contextual com estratégia automática ou forçada:
-      "auto"     → classifica por comprimento/stop-words → expanded ou dual
-      "expanded" → um embed (contexto + query)
-      "dual"     → dois embeds separados com fusão ponderada de scores
-      "none"     → ignora session_id, busca simples
-
-    A busca na base de conhecimento (VectorStore) é sempre feita com o embedding
-    da query original — o contexto conversacional não é aplicado ao VS, pois o
-    conhecimento não é conversacional.
-    """
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query vazia")
@@ -919,12 +828,10 @@ async def read_memory(req: ReadRequest):
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
 
-    # ── Always compute base query embedding (used for VS + simple search) ─────
-    query_emb = await loop.run_in_executor(None, state.embed_engine.embed_one, query)
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    query_emb = await state.embed_engine.embed_one(query)
 
-    # ── Start VS search in background (parallel with LT/ST search) ────────────
-    # FIX: use ensure_future() — run_in_executor returns a Future, not a coroutine.
-    #      asyncio.create_task() only accepts coroutines.
+    # Start VS search in background
     vs_future = None
     if state.vs is not None and state.vs.total > 0:
         vs_min_score = min(req.min_score, VS_MIN_SCORE) if req.min_score < VS_MIN_SCORE else VS_MIN_SCORE
@@ -938,7 +845,6 @@ async def read_memory(req: ReadRequest):
             )
         )
 
-    # ── Search LT and ST memories (existing logic) ────────────────────────────
     if req.session_id and req.strategy != "none":
         context_block = await loop.run_in_executor(None, _build_context_block, req.session_id)
 
@@ -972,7 +878,6 @@ async def read_memory(req: ReadRequest):
             loop.run_in_executor(None, state.st_index.search, query_emb, req.top_k * 2),
         )
 
-    # ── Collect VS results ────────────────────────────────────────────────────
     vs_results = []
     if vs_future is not None:
         try:
@@ -981,7 +886,6 @@ async def read_memory(req: ReadRequest):
             log.error(f"VectorStore search failed: {e}")
             vs_results = []
 
-    # ── Build all entry lists ─────────────────────────────────────────────────
     results: list[MemoryEntry] = (
         _build_lt_entries(lt_raw, req.min_score, loop) +
         _build_st_entries(st_raw, req.min_score, loop) +
@@ -989,6 +893,7 @@ async def read_memory(req: ReadRequest):
     )
     results.sort(key=lambda r: r.score * r.confidence, reverse=True)
     return ReadResponse(results=results[:req.top_k], query=query, strategy=effective_strategy)
+
 
 # ── DELETE /session/{session_id} ───────────────────────────────────────────────
 
@@ -1015,24 +920,14 @@ async def clear_session(session_id: str):
 
 @app.post("/cache/get", response_model=PlanCacheGetResponse)
 async def cache_get(req: PlanCacheGetRequest):
-    """
-    Busca um plano cacheado semanticamente similar à query.
-
-    Fluxo no CoT:
-      1. Chama /cache/get antes de inferir.
-      2. Se hit=True, usa o plano diretamente (latência ~5ms vs ~800ms).
-      3. Se hit=False, infere e chama /cache/put com o plano gerado.
-
-    O threshold padrão é PC_HIT_THRESHOLD (0.92). O CoT pode passar um valor
-    mais conservador (ex: 0.95) para domínios onde erros de plano são custosos.
-    """
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query vazia")
 
-    loop      = asyncio.get_event_loop()
-    embedding = await loop.run_in_executor(None, state.embed_engine.embed_one, query)
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    embedding = await state.embed_engine.embed_one(query)
 
+    loop = asyncio.get_event_loop()
     results = await loop.run_in_executor(None, state.pc_index.search, embedding, 1)
 
     if not results:
@@ -1045,11 +940,9 @@ async def cache_get(req: PlanCacheGetRequest):
 
     row = state.pc_db.get_by_id(cache_id)
     if row is None:
-        # Índice e DB dessincronizados — silenciosamente retorna miss
         log.warning(f"/cache/get: id={cache_id} no índice mas ausente no DB")
         return PlanCacheGetResponse(hit=False)
 
-    # Atualiza hit_count em background sem bloquear a resposta
     loop.run_in_executor(None, state.pc_db.update_hit, cache_id)
 
     log.info(f"/cache/get HIT — id={cache_id} score={score:.3f} query='{query[:60]}'")
@@ -1064,22 +957,14 @@ async def cache_get(req: PlanCacheGetRequest):
 
 @app.post("/cache/put")
 async def cache_put(req: PlanCachePutRequest):
-    """
-    Grava um novo par (query → plano) no cache.
-
-    Não faz deduplicação interna — o CoT já verificou com /cache/get antes
-    de inferir, então chegou aqui porque não havia hit. Gravar duplicatas não
-    é catastrófico (aumenta o índice), mas o CoT deve evitar chamadas
-    desnecessárias a este endpoint.
-    """
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query vazia")
     if not req.plan:
         raise HTTPException(status_code=400, detail="plano vazio")
 
-    loop      = asyncio.get_event_loop()
-    embedding = await loop.run_in_executor(None, state.embed_engine.embed_one, query)
+    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
+    embedding = await state.embed_engine.embed_one(query)
 
     cache_id = state.pc_db.insert(query, req.plan)
     state.pc_index.add(embedding, cache_id)
@@ -1090,15 +975,6 @@ async def cache_put(req: PlanCachePutRequest):
 
 @app.delete("/cache", response_model=PlanCacheDeleteResponse)
 async def cache_clear_all():
-    """
-    Invalida todo o cache de planos.
-
-    Usar quando:
-    - Módulos do AVA foram adicionados/removidos (planos existentes referenciam
-      executores que podem não existir mais).
-    - System prompt do CoT foi alterado significativamente.
-    - Detecção de planos incorretos em produção.
-    """
     deleted = state.pc_db.delete_all()
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, state.pc_index.reset)
@@ -1108,7 +984,6 @@ async def cache_clear_all():
 
 @app.delete("/cache/{cache_id}", response_model=PlanCacheDeleteResponse)
 async def cache_delete_one(cache_id: int):
-    """Remove uma entrada específica do cache pelo ID retornado em /cache/get."""
     deleted = state.pc_db.delete_by_id(cache_id)
     if deleted:
         loop = asyncio.get_event_loop()
@@ -1145,8 +1020,11 @@ async def status():
             "context_turns_fetch":   CONTEXT_TURNS_FETCH,
             "dual_context_weight":   DUAL_CONTEXT_WEIGHT,
         },
+        "onnx_serving": {
+            "url": ONNX_SERVING_URL,
+            "mode": "remote_api",
+        },
     }
-    # ── NEW: Include VectorStore / knowledge status ───────────────────────────
     if state.vs is not None:
         vs_status = state.vs.status()
         resp["knowledge"] = {

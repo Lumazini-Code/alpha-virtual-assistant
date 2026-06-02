@@ -10,7 +10,6 @@ from pptx import Presentation
 import socket
 import onnxruntime as ort
 from tokenizers import Tokenizer
-
 session = ort.InferenceSession(
     "semanticSearch_onnx/model.onnx",
     providers=["CPUExecutionProvider"]

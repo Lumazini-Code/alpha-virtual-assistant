@@ -6,14 +6,14 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-
+import asyncio
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ── Configuração ───────────────────────────────────────────────────────────────
 
-LLAMA_SERVER_URL  = "http://localhost:8081"
+LLAMA_SERVER_URL  = "http://localhost:2001"
 LLAMA_TIMEOUT_S   = 60.0
 MEMORY_API_URL    = "http://localhost:3001"
 MEMORY_TIMEOUT_S  = 5.0
@@ -53,7 +53,7 @@ MODULES_BLOCK = "\n".join(f"  - {k}: {v}" for k, v in AVA_MODULES.items())
 # para maximizar o reuso do KV cache do llama-server (cache_prompt: true).
 # O _build_prompt injeta os dados variáveis apenas no turno <|user|>.
 
-SYSTEM_PROMPT = f"""You are a planning module for an AI assistant called AVA.
+SYSTEM_PROMPT = f"""You are a planning module..
 Your ONLY job is to break down a user request into a sequence of concrete, actionable steps.
 
 Available modules:
@@ -148,50 +148,41 @@ state = AppState()
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("Iniciando AVA CoT API...")
+async def lifespan(app):
+    # 1. Aguarda llama-server
+    async with httpx.AsyncClient() as probe:
+        for attempt in range(60):
+            try:
+                r = await probe.get(f"{LLAMA_SERVER_URL}/health", timeout=5)
+                if r.status_code == 200:
+                    log.info(f"[CoT] llama-server pronto após {attempt * 5}s")
+                    break
+            except Exception:
+                pass
+            log.info(f"[CoT] Aguardando llama-server... ({attempt+1}/60)")
+            await asyncio.sleep(5)
+        else:
+            raise RuntimeError(f"llama-server não respondeu em {LLAMA_SERVER_URL}")
 
-    # Verifica llama-server
-    async with httpx.AsyncClient(timeout=5.0) as probe:
-        try:
-            r = await probe.get(f"{LLAMA_SERVER_URL}/health")
-            if r.status_code != 200:
-                raise RuntimeError(f"llama-server retornou {r.status_code}")
-            log.info(f"llama-server OK em {LLAMA_SERVER_URL}")
-        except httpx.ConnectError:
-            raise RuntimeError(
-                f"llama-server não encontrado em {LLAMA_SERVER_URL}\n"
-                f"Inicie com: llama-server -m Phi-3.5-mini-instruct-Q4_K_M.gguf --port 8081"
-            )
-
-    # Verifica Memory API
-    async with httpx.AsyncClient(timeout=5.0) as probe:
-        try:
-            r = await probe.get(f"{MEMORY_API_URL}/status")
-            if r.status_code != 200:
-                raise RuntimeError(f"Memory API retornou {r.status_code}")
-            log.info(f"Memory API OK em {MEMORY_API_URL}")
-        except httpx.ConnectError:
-            raise RuntimeError(
-                f"Memory API não encontrada em {MEMORY_API_URL}\n"
-                f"Inicie com: uvicorn memory:app --port 3001"
-            )
-
+    # 2. Inicializa clientes
     state.llama_client = httpx.AsyncClient(
-        base_url = LLAMA_SERVER_URL,
-        timeout  = httpx.Timeout(LLAMA_TIMEOUT_S),
-        limits   = httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        base_url=LLAMA_SERVER_URL,
+        timeout=httpx.Timeout(LLAMA_TIMEOUT_S),
+        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
     )
     state.memory_client = httpx.AsyncClient(
-        base_url = MEMORY_API_URL,
-        timeout  = httpx.Timeout(MEMORY_TIMEOUT_S),
-        limits   = httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        base_url=MEMORY_API_URL,
+        timeout=httpx.Timeout(MEMORY_TIMEOUT_S),
+        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
     )
-
     log.info("CoT API pronta")
-    yield
 
+    yield  # ← único yield
+
+    # 3. Shutdown
     await state.llama_client.aclose()
     await state.memory_client.aclose()
     log.info("AVA CoT API encerrada")

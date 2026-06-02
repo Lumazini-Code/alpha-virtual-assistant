@@ -1,64 +1,95 @@
 """
-AVA KG-RAG — Motor de Embeddings (ONNX Runtime)
-Usa tokenizers Rust (sem transformers) — padrão do AVA.
-Implementa mean pooling correto com attention mask.
+AVA KG-RAG — Motor de Embeddings (via ONNX Serving API)
+Substitui o carregamento local do ONNX por chamadas HTTP ao servidor unificado.
+Mantém a mesma interface pública — drop-in replacement.
 """
 
 import numpy as np
-import onnxruntime as ort
-from tokenizers import Tokenizer
-from pathlib import Path
-from typing import List, Union
+from typing import List, Optional
 import logging
 
-from config import EMBEDDING_ONNX, EMBEDDING_TOKENIZER, RETRIEVAL
+from onnx_client import EmbeddingClient, DEFAULT_ONNX_BASE_URL
 
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingEngine:
     """
-    Motor de embeddings sobre ONNX Runtime.
+    Motor de embeddings via API REST (onnx_serving).
     Compatível com multilingual-e5-small (prefixos query:/passage:).
-    Usa tokenizers Rust — sem overhead do transformers.
+    Interface idêntica à versão ONNX local — substituição transparente.
     """
 
     def __init__(
         self,
-        onnx_path: str = EMBEDDING_ONNX,
-        tokenizer_path: str = EMBEDDING_TOKENIZER,
+        onnx_path: str = None,         # Ignorado — mantido para compatibilidade
+        tokenizer_path: str = None,    # Ignorado — mantido para compatibilidade
+        base_url: str = DEFAULT_ONNX_BASE_URL,
     ):
-        if not Path(onnx_path).exists():
-            raise FileNotFoundError(
-                f"Modelo ONNX não encontrado: {onnx_path}\n"
-                "Baixe o multilingual-e5-small convertido para ONNX e coloque em models/."
-            )
-
-        sess_opts = ort.SessionOptions()
-        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_opts.intra_op_num_threads = 4
-
-        self._session = ort.InferenceSession(
-            onnx_path,
-            sess_options=sess_opts,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
-        self._tokenizer = Tokenizer.from_file(tokenizer_path)
-        self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
-        self._tokenizer.enable_truncation(max_length=512)
-
-        logger.info("EmbeddingEngine iniciado — %s", Path(onnx_path).name)
+        self._client = EmbeddingClient(base_url=base_url)
+        self._base_url = base_url
+        logger.info("EmbeddingEngine iniciado — via API: %s", base_url)
 
     # ─── API pública ─────────────────────────────────────────────────────────
 
-    def embed_query(self, text: str) -> np.ndarray:
-        """Embed de query — usa prefixo 'query:' (padrão e5)."""
-        return self._embed_batch([f"query: {text}"])[0]
+    def embed(self, texts: List[str]) -> np.ndarray:
+        """
+        Embed batch de textos (sem prefixo).
+        ATENÇÃO: Este método é síncrono por compatibilidade, mas faz chamada HTTP assíncrona
+        internamente via asyncio.run(). Prefira embed_async() quando possível.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Estamos dentro de um event loop — usar nest_asyncio ou thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(asyncio.run, self._client.embed(texts))
+                    return future.result()
+        except RuntimeError:
+            pass
+        return asyncio.run(self._client.embed(texts))
 
-    def embed_passages(self, texts: List[str]) -> np.ndarray:
-        """Embed de passagens/chunks — usa prefixo 'passage:'."""
-        prefixed = [f"passage: {t}" for t in texts]
-        return self._embed_batch(prefixed)
+    def embed_one(self, text: str) -> np.ndarray:
+        """Embed de texto único — retorna vetor 1D."""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(asyncio.run, self._client.embed_one(text))
+                    return future.result()
+        except RuntimeError:
+            pass
+        return asyncio.run(self._client.embed_one(text))
+
+    def embed_batch_two(self, text_a: str, text_b: str) -> tuple:
+        """Dois textos numa única chamada — evita overhead duplo."""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(asyncio.run, self._client.embed_batch_two(text_a, text_b))
+                    return future.result()
+        except RuntimeError:
+            pass
+        return asyncio.run(self._client.embed_batch_two(text_a, text_b))
+
+    async def embed_async(self, texts: List[str]) -> np.ndarray:
+        """Embed batch — versão assíncrona nativa (preferida em contexto async)."""
+        return await self._client.embed(texts)
+
+    async def embed_query(self, text: str) -> np.ndarray:
+        """Embed de query — usa prefixo 'query:' (padrão e5)."""
+        return await self._client.embed_query(text)
+
+    async def embed_passages(self, texts: List[str]) -> np.ndarray:
+        """Embed de passagens/chunks — usa prefixo 'passage:'. """
+        return await self._client.embed_passages(texts)
 
     def cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Similaridade cosseno entre dois vetores normalizados."""
@@ -70,36 +101,7 @@ class EmbeddingEngine:
         normalized = matrix / norms
         return normalized @ query / (np.linalg.norm(query) + 1e-9)
 
-    # ─── Internals ───────────────────────────────────────────────────────────
-
-    def _embed_batch(self, texts: List[str]) -> np.ndarray:
-        """
-        Executa ONNX inference e aplica mean pooling com attention mask.
-        Retorna embeddings L2-normalizados — prontos para cosine similarity.
-        """
-        encoded = self._tokenizer.encode_batch(texts)
-
-        input_ids      = np.array([e.ids          for e in encoded], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
-
-        # Alguns modelos e5 também usam token_type_ids
-        input_names = {i.name for i in self._session.get_inputs()}
-        ort_inputs: dict = {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-        }
-        if "token_type_ids" in input_names:
-            ort_inputs["token_type_ids"] = np.zeros_like(input_ids)
-
-        # last_hidden_state shape: (batch, seq_len, hidden_dim)
-        last_hidden: np.ndarray = self._session.run(None, ort_inputs)[0]
-
-        # Mean pooling — média apenas sobre tokens não-padding
-        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
-        sum_hidden    = (last_hidden * mask_expanded).sum(axis=1)
-        count         = mask_expanded.sum(axis=1).clip(min=1e-9)
-        pooled        = sum_hidden / count                              # (batch, hidden_dim)
-
-        # L2 normalização — compatível com FAISS cosine (IndexFlatIP após normalize)
-        norms     = np.linalg.norm(pooled, axis=1, keepdims=True) + 1e-9
-        return (pooled / norms).astype(np.float32)
+    @property
+    def client(self) -> EmbeddingClient:
+        """Acesso direto ao cliente HTTP para chamadas assíncronas avançadas."""
+        return self._client

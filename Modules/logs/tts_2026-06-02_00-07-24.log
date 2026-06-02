@@ -1,0 +1,93 @@
+INFO:     127.0.0.1:58694 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37320 - "POST /stream HTTP/1.1" 400 Bad Request
+oviders: ['CPUExecutionProvider']
+2026-06-02 00:07:24,313 [INFO] Loading model from /root/.cache/supertonic3
+2026-06-02 00:07:24,313 [INFO] TTSPool iniciado com 3 workers
+2026-06-02 00:07:24,313 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-02 00:07:24,448 [INFO] TTS API pronta
+INFO:     Application startup complete.
+2026-06-02 00:07:24,690 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-02 00:07:25,354 [INFO] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-02 00:07:25,354 [INFO] Successfully loaded all ONNX models
+2026-06-02 00:07:25,369 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-02 00:07:26,340 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-02 00:07:26,345 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 00:07:26,493 [INFO] Successfully loaded all ONNX models
+2026-06-02 00:07:26,562 [INFO] Model loaded successfully
+2026-06-02 00:07:26,690 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 00:07:26,690 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 00:07:27,173 [INFO] Successfully loaded all ONNX models
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-02 00:07:27,175 [INFO] Model loaded successfully
+2026-06-02 00:07:27,181 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 00:07:27,184 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 00:07:27,187 [INFO] Model loaded successfully
+2026-06-02 00:07:27,188 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 00:07:28,478 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-02 00:07:28,679 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-02 00:07:28,941 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-02 00:09:12,531 [INFO] [W1] seq=1 ok (1.38s) 'Usuário!'
+2026-06-02 00:09:12,537 [INFO] [W0] seq=0 ok (1.30s) 'E aí,'
+2026-06-02 00:09:12,538 [INFO] [STREAM] 2 sentenças enfileiradas em 842.07ms
+2026-06-02 00:09:12,560 [INFO] [PLAY] seq=0 (58368 samples)
+2026-06-02 00:09:13,762 [INFO] [PLAY] seq=1 (61440 samples)
+2026-06-02 00:09:15,053 [INFO] [PLAY] Fala completa
+2026-06-02 00:09:15,610 [INFO] [W1] seq=3 ok (2.81s) 'vou te dar outro bomb pra refletir.'
+2026-06-02 00:09:16,011 [INFO] [W2] seq=2 ok (6.04s) 'Já que você tá insistindo (e é bom saber que o ass'
+2026-06-02 00:09:16,012 [INFO] [STREAM] 2 sentenças enfileiradas em 1721.48ms
+2026-06-02 00:09:16,014 [INFO] [PLAY] seq=2 (267264 samples)
+2026-06-02 00:09:16,730 [INFO] [W0] seq=4 ok (3.13s) 'Prepare-se para ter a cabeça girando!'
+2026-06-02 00:09:16,730 [INFO] [STREAM] 1 sentenças enfileiradas em 715.15ms
+2026-06-02 00:09:20,913 [INFO] [W1] seq=5 ok (1.58s) 'Segura essa:'
+2026-06-02 00:09:21,032 [INFO] [W0] seq=7 ok (1.57s) 'onde vivemos,'
+2026-06-02 00:09:21,571 [INFO] [PLAY] seq=3 (125952 samples)
+2026-06-02 00:09:22,296 [INFO] [W0] seq=9 ok (1.47s) 'ela é só *'
+2026-06-02 00:09:22,839 [INFO] [W1] seq=8 ok (3.36s) 'não é só uma ilha no mar de estrelas;'
+2026-06-02 00:09:23,114 [INFO] [W2] seq=6 ok (6.39s) 'O tamanho da nossa vizinhança cósmica é ABSURDO. N'
+2026-06-02 00:09:23,115 [INFO] [STREAM] 5 sentenças enfileiradas em 3416.83ms
+2026-06-02 00:09:23,597 [INFO] [W0] seq=10 ok (1.36s) 'um* ponto.'
+2026-06-02 00:09:23,598 [INFO] [STREAM] 1 sentenças enfileiradas em 478.7ms
+2026-06-02 00:09:24,173 [INFO] [PLAY] seq=4 (138240 samples)
+2026-06-02 00:09:24,779 [INFO] [W1] seq=11 ok (5.92s) 'Estima-se que haja mais de 2 trilhões de galáxias '
+2026-06-02 00:09:24,780 [INFO] [STREAM] 1 sentenças enfileiradas em 1179.11ms
+2026-06-02 00:09:25,771 [INFO] [W2] seq=12 ok (4.50s) 'Cada uma dessas galáxias contém bilhões de estrela'
+2026-06-02 00:09:25,772 [INFO] [STREAM] 1 sentenças enfileiradas em 989.47ms
+2026-06-02 00:09:27,053 [INFO] [PLAY] seq=5 (70656 samples)
+2026-06-02 00:09:28,525 [INFO] [PLAY] seq=6 (282624 samples)
+2026-06-02 00:09:29,112 [INFO] [W0] seq=14 ok (3.78s) 'se a Via Láctea fosse um grão de areia,'
+2026-06-02 00:09:29,243 [INFO] [W1] seq=13 ok (3.64s) 'Para você ter uma noção do quão pequeno somos:'
+2026-06-02 00:09:29,590 [INFO] [W2] seq=15 ok (3.71s) 'o universo observável seria o oceano inteiro.'
+2026-06-02 00:09:29,590 [INFO] [STREAM] 3 sentenças enfileiradas em 2577.2ms
+2026-06-02 00:09:30,610 [INFO] [W0] seq=16 ok (4.87s) 'E esse oceano tem trilhões desses grãos de areia f'
+2026-06-02 00:09:30,611 [INFO] [STREAM] 1 sentenças enfileiradas em 1012.49ms
+2026-06-02 00:09:31,608 [INFO] [W1] seq=17 ok (4.62s) 'É impressionante pensar que tudo isso existe lá fo'
+2026-06-02 00:09:31,609 [INFO] [STREAM] 1 sentenças enfileiradas em 995.23ms
+2026-06-02 00:09:32,515 [INFO] [W0] seq=18 ok (1.52s) 'e a gente aqui,'
+2026-06-02 00:09:32,623 [INFO] [W2] seq=19 ok (2.60s) 'pensando no que vai comer no jantar.'
+2026-06-02 00:09:32,624 [INFO] [STREAM] 2 sentenças enfileiradas em 1011.84ms
+2026-06-02 00:09:34,413 [INFO] [PLAY] seq=7 (70656 samples)
+2026-06-02 00:09:35,885 [INFO] [PLAY] seq=8 (150528 samples)
+2026-06-02 00:09:39,053 [INFO] [PLAY] seq=9 (67584 samples)
+2026-06-02 00:09:40,450 [INFO] [PLAY] seq=10 (61440 samples)
+2026-06-02 00:09:41,731 [INFO] [PLAY] seq=11 (261120 samples)
+2026-06-02 00:09:47,170 [INFO] [PLAY] Fala completa
+2026-06-02 00:09:47,213 [INFO] [PLAY] seq=12 (199680 samples)
+2026-06-02 00:09:51,373 [INFO] [PLAY] seq=13 (162816 samples)
+2026-06-02 00:09:54,733 [INFO] [PLAY] seq=14 (168960 samples)
+2026-06-02 00:09:58,253 [INFO] [PLAY] seq=15 (165888 samples)
+2026-06-02 00:10:01,731 [INFO] [PLAY] seq=16 (215040 samples)
+2026-06-02 00:10:06,211 [INFO] [PLAY] seq=17 (205824 samples)
+2026-06-02 00:10:10,488 [INFO] [PLAY] seq=18 (67584 samples)
+2026-06-02 00:10:11,886 [INFO] [PLAY] seq=19 (116736 samples)
+2026-06-02 00:10:14,328 [INFO] [PLAY] Fala completa

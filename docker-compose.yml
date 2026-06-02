@@ -1,0 +1,175 @@
+
+services:
+  ava-cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LLAMA_BACKEND: cpu
+        BASE_IMAGE: ubuntu:22.04
+    image: ava:cpu
+    container_name: ava-cpu
+    restart: unless-stopped
+    
+    ports:
+      - "2001:2001"
+      - "2004:2004"
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+      - "3004:3004"
+      - "4002:4002"
+      - "4003:4003"
+      - "4005:4005"
+      - "9000:9000"
+    
+    volumes:
+      - ./Modules/Models:/app/Modules/Models:ro
+      - ./Ctxbin:/app/Ctxbin:ro
+      - ./resource:/app/resource:ro
+      - ava-cache-cpu:/root/.cache
+      - ava-logs-cpu:/app/logs
+    
+    environment:
+      AVA_N_GPU_LAYERS: "0"
+      ONNX_PROVIDERS: "CPUExecutionProvider"
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: "/root/.cache/huggingface"
+      HF_HUB_TIMEOUT: "600"
+      HF_HUB_DOWNLOAD_TIMEOUT: "600"
+      HF_HUB_ETAG_TIMEOUT: "600"
+      
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 240s
+      retries: 5
+
+    network_mode: host
+
+  ava-cuda:
+    profiles: ["cuda"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LLAMA_BACKEND: cuda
+        BASE_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+    image: ava:cuda
+    container_name: ava-cuda
+    restart: unless-stopped
+    
+    ports:
+      - "2001:2001"
+      - "2004:2004"
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+      - "3004:3004"
+      - "4002:4002"
+      - "4003:4003"
+      - "4005:4005"
+      - "9000:9000"
+    
+    volumes:
+      - ./Modules/Models:/app/Modules/Models:ro
+      - ./Ctxbin:/app/Ctxbin:ro
+      - ./resource:/app/resource:ro
+      - ava-cache-cuda:/root/.cache
+      - ava-logs-cuda:/app/logs
+    
+    environment:
+      AVA_N_GPU_LAYERS: "99"
+      ONNX_PROVIDERS: "CUDAExecutionProvider,CPUExecutionProvider"
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: "/root/.cache/huggingface"
+      HF_HUB_TIMEOUT: "600"
+      HF_HUB_DOWNLOAD_TIMEOUT: "600"
+      HF_HUB_ETAG_TIMEOUT: "600"
+
+    network_mode: host
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 240s
+      retries: 5
+
+  ava-vulkan:
+    profiles: ["vulkan"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LLAMA_BACKEND: vulkan
+        BASE_IMAGE: ubuntu:22.04
+    image: ava:vulkan
+    container_name: ava-vulkan
+    restart: unless-stopped
+    
+    # REMOVIDO: A seção "ports" foi removida porque "network_mode: host" está ativo.
+    # Com o modo host, as portas do container já são expostas diretamente no host.
+    
+    volumes:
+    - ./Modules/Models:/app/Modules/Models:ro
+    - ./Ctxbin:/app/Ctxbin:ro
+    - ./resource:/app/resource:ro
+    - ./Modules:/app/Modules
+    - ./orchestrator.py:/app/orchestrator.py
+    - ava-cache-vulkan:/root/.cache
+    - ava-logs-vulkan:/app/logs
+    - /run/user/1000/pulse/native:/run/user/1000/pulse/native:rw
+
+    environment:
+      AVA_N_GPU_LAYERS: "99"
+      ONNX_PROVIDERS: "CPUExecutionProvider"
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: "/root/.cache/huggingface"
+      HF_HUB_TIMEOUT: "600"
+      HF_HUB_DOWNLOAD_TIMEOUT: "600"
+      HF_HUB_ETAG_TIMEOUT: "600"
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/snd:/dev/snd
+
+    # Adiciona o grupo audio e render para acesso sem sudo
+    group_add:
+      - audio   # acesso ao /dev/snd
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 240s
+      retries: 5
+    
+    network_mode: host
+
+volumes:
+  ava-cache-cpu:
+    driver: local
+  ava-cache-cuda:
+    driver: local
+  ava-cache-vulkan:
+    driver: local
+  ava-logs-cpu:
+    driver: local
+  ava-logs-cuda:
+    driver: local
+  ava-logs-vulkan:
+    driver: local
