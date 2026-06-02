@@ -180,7 +180,7 @@ class AVAKnowledgeEngine:
 
             # Etapa 4: Semantic chunking
             if self._embed:
-                chunks = self._chunker.chunk(text)
+                chunks = await self._chunker.chunk(text)    # ← await adicionado
             else:
                 chunks = self._chunker.chunk_simple(text)
 

@@ -123,9 +123,10 @@ services:
     # Com o modo host, as portas do container já são expostas diretamente no host.
     
     volumes:
+    - ./start.sh:/app/start.sh
     - ./Modules/Models:/app/Modules/Models:ro
     - ./Ctxbin:/app/Ctxbin:ro
-    - ./resource:/app/resource:ro
+    - ./resource:/app/resource
     - ./Modules:/app/Modules
     - ./orchestrator.py:/app/orchestrator.py
     - ava-cache-vulkan:/root/.cache

@@ -51,26 +51,26 @@ class SemanticChunker:
         self._min_sentences = 2
         self._max_sentences = 20
 
-    def chunk(self, text: str) -> List[SemanticChunk]:
-        """
-        Divide texto em chunks semanticamente coerentes.
-        Requer embedding_engine configurado.
-        """
-        if self._embed is None:
-            raise RuntimeError("SemanticChunker precisa de um EmbeddingEngine para chunking semântico.")
+    async def chunk(self, text: str) -> List[SemanticChunk]:
+            """
+            Divide texto em chunks semanticamente coerentes.
+            Requer embedding_engine configurado.
+            """
+            if self._embed is None:
+                raise RuntimeError("SemanticChunker precisa de um EmbeddingEngine para chunking semântico.")
 
-        sentences = self._split_sentences(text)
-        if len(sentences) <= self._min_sentences:
-            return [SemanticChunk(text=text, sentences=sentences, start_sentence=0)]
+            sentences = self._split_sentences(text)
+            if len(sentences) <= self._min_sentences:
+                return [SemanticChunk(text=text, sentences=sentences, start_sentence=0)]
 
-        embeddings = self._embed.embed_passages(sentences)  # (N, D)
-        distances  = self._consecutive_distances(embeddings)
-        threshold  = float(np.percentile(distances, self._pct))
-        breakpoints = [i + 1 for i, d in enumerate(distances) if d > threshold]
+            embeddings = await self._embed.embed_passages(sentences)  # ← await adicionado
+            distances  = self._consecutive_distances(embeddings)
+            threshold  = float(np.percentile(distances, self._pct))
+            breakpoints = [i + 1 for i, d in enumerate(distances) if d > threshold]
 
-        chunks = self._build_chunks(sentences, embeddings, breakpoints)
-        logger.debug("SemanticChunker: %d sentenças → %d chunks", len(sentences), len(chunks))
-        return chunks
+            chunks = self._build_chunks(sentences, embeddings, breakpoints)
+            logger.debug("SemanticChunker: %d sentenças → %d chunks", len(sentences), len(chunks))
+            return chunks
 
     def chunk_simple(self, text: str, max_chars: int = 1000) -> List[SemanticChunk]:
         """

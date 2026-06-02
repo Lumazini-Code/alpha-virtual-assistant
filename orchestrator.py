@@ -80,7 +80,7 @@ DEFAULT_MIN_SCORE = 0.30
 # Router Configuration
 CONFIDENCE_THRESHOLD = float(os.environ.get("ROUTER_CONFIDENCE", "0.65"))
 HEURISTIC_MIN_SCORE  = 0.35
-ONNX_PROVIDERS = os.environ.get("ONNX_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",")
+ONNX_PROVIDERS = os.environ.get("ONNX_PROVIDERS", "AzureExecutionProvider,CPUExecutionProvider").split(",")
 
 # Direct Route Mapping
 ROUTE_TO_EXECUTOR: dict[str, str] = {

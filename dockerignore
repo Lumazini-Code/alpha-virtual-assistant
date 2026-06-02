@@ -18,7 +18,9 @@ build
 *.egg
 test
 logs/*
-compiler
+Modules/logs/**
+compiler/
+Modules/memory/**
 
 # IDE
 .vscode/
