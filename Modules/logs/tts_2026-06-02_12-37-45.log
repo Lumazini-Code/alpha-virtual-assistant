@@ -1,0 +1,142 @@
+INFO:     127.0.0.1:57476 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48758 - "POST /stream HTTP/1.1" 200 OK
+ 12:37:46,498 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-02 12:37:47,456 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 12:37:47,509 [INFO] Model loaded successfully
+2026-06-02 12:37:47,656 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 12:37:47,656 [INFO] Successfully loaded all ONNX models
+2026-06-02 12:37:48,137 [INFO] Successfully loaded all ONNX models
+2026-06-02 12:37:48,140 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 12:37:48,143 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-02 12:37:48,146 [INFO] Model loaded successfully
+2026-06-02 12:37:48,149 [INFO] Model loaded successfully
+2026-06-02 12:37:48,149 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 12:37:48,149 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-02 12:37:49,693 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-02 12:37:49,954 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-02 12:37:50,134 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-02 12:48:31,492 [INFO] [W1] seq=0 ok (1.30s) 'E aí,'
+2026-06-02 12:48:31,542 [INFO] [PLAY] seq=0 (58368 samples)
+2026-06-02 12:48:32,534 [INFO] [W0] seq=1 ok (1.38s) 'Usuário!'
+2026-06-02 12:48:32,535 [INFO] [STREAM] 2 sentenças enfileiradas em 1705.47ms
+2026-06-02 12:48:32,734 [INFO] [PLAY] seq=1 (61440 samples)
+2026-06-02 12:48:33,522 [INFO] [W2] seq=2 ok (2.60s) 'Essa pergunta é de peso mesmo!'
+2026-06-02 12:48:33,523 [INFO] [STREAM] 1 sentenças enfileiradas em 974.92ms
+2026-06-02 12:48:34,013 [INFO] [PLAY] Fala completa
+2026-06-02 12:48:34,056 [INFO] [PLAY] seq=2 (116736 samples)
+2026-06-02 12:48:36,024 [INFO] [W0] seq=3 ok (2.46s) 'Não é só um nome bonito,'
+2026-06-02 12:48:36,456 [INFO] [PLAY] Fala completa
+2026-06-02 12:48:36,499 [INFO] [PLAY] seq=3 (110592 samples)
+2026-06-02 12:48:36,956 [INFO] [W1] seq=4 ok (8.81s) 'é um campo inteiro de física que explica por que a'
+2026-06-02 12:48:36,956 [INFO] [STREAM] 2 sentenças enfileiradas em 2092.28ms
+2026-06-02 12:48:38,784 [INFO] [PLAY] seq=4 (390144 samples)
+2026-06-02 12:48:40,234 [INFO] [W2] seq=5 ok (2.44s) 'Pra simplificar ao máximo,'
+2026-06-02 12:48:40,517 [INFO] [W1] seq=7 ok (2.07s) 'com foco especial nas'
+2026-06-02 12:48:41,157 [INFO] [W0] seq=6 ok (7.69s) 'a Astrofísica Termonuclear é o estudo de como as e'
+2026-06-02 12:48:41,157 [INFO] [STREAM] 3 sentenças enfileiradas em 2632.95ms
+2026-06-02 12:48:41,858 [INFO] [W2] seq=8 ok (3.13s) 'reações nucleares que geram calor e luz.'
+2026-06-02 12:48:41,860 [INFO] [STREAM] 1 sentenças enfileiradas em 700.36ms
+2026-06-02 12:48:45,061 [INFO] [W2] seq=11 ok (2.56s) 'aqui está a versão completa,'
+2026-06-02 12:48:45,322 [INFO] [W0] seq=9 ok (2.97s) 'É basicamente a ciência que responde:'
+2026-06-02 12:48:46,099 [INFO] [W2] seq=12 ok (1.81s) 'dividida nos pil'
+2026-06-02 12:48:46,125 [INFO] [W1] seq=10 ok (5.01s) '"De onde vem a energia deles?" Mas se você quer ir'
+2026-06-02 12:48:46,126 [INFO] [STREAM] 4 sentenças enfileiradas em 2889.39ms
+2026-06-02 12:48:46,899 [INFO] [PLAY] Fala completa
+2026-06-02 12:48:46,942 [INFO] [PLAY] seq=5 (110592 samples)
+2026-06-02 12:48:47,406 [INFO] [W2] seq=13 ok (2.31s) 'ares que o material aponta:'
+2026-06-02 12:48:47,637 [INFO] [W0] seq=14 ok (4.16s) 'Os Três Pilares da Astrofísica Termonuclear 1.'
+2026-06-02 12:48:47,638 [INFO] [STREAM] 2 sentenças enfileiradas em 1353.41ms
+2026-06-02 12:48:49,214 [INFO] [PLAY] seq=6 (340992 samples)
+2026-06-02 12:48:50,593 [INFO] [W1] seq=15 ok (7.84s) 'Teoria da Radiação (A Luz e a Matéria) Isso é sobr'
+2026-06-02 12:48:50,595 [INFO] [STREAM] 1 sentenças enfileiradas em 1477.4ms
+2026-06-02 12:48:54,066 [INFO] [W2] seq=16 ok (9.95s) 'É aqui que a gente entende coisas como a Lei de Pl'
+2026-06-02 12:48:54,066 [INFO] [STREAM] 1 sentenças enfileiradas em 1796.0ms
+2026-06-02 12:48:55,596 [INFO] [W0] seq=17 ok (6.92s) 'ria e espectroscopia para "ler" as estrelas e desc'
+2026-06-02 12:48:55,597 [INFO] [STREAM] 1 sentenças enfileiradas em 1265.83ms
+2026-06-02 12:48:56,339 [INFO] [PLAY] seq=7 (92160 samples)
+2026-06-02 12:48:58,259 [INFO] [PLAY] seq=8 (138240 samples)
+2026-06-02 12:48:58,601 [INFO] [W1] seq=18 ok (7.50s) 'Equações da Estrutura Estelar (O Esqueleto da Estr'
+2026-06-02 12:48:58,602 [INFO] [STREAM] 1 sentenças enfileiradas em 1355.69ms
+2026-06-02 12:49:00,207 [INFO] [W2] seq=19 ok (6.01s) 'São as equações que ditam como uma estrela se mant'
+2026-06-02 12:49:00,207 [INFO] [STREAM] 1 sentenças enfileiradas em 1148.25ms
+2026-06-02 12:49:01,139 [INFO] [PLAY] Fala completa
+2026-06-02 12:49:01,182 [INFO] [PLAY] seq=9 (132096 samples)
+2026-06-02 12:49:03,940 [INFO] [PLAY] seq=10 (221184 samples)
+2026-06-02 12:49:04,131 [INFO] [W1] seq=22 ok (2.78s) 'e a gravidade puxa para dentro,'
+2026-06-02 12:49:04,872 [INFO] [W0] seq=20 ok (4.42s) 'O conceito central aqui é o Equilíbrio Hidrostátic'
+2026-06-02 12:49:05,103 [INFO] [W2] seq=21 ok (3.35s) 'a pressão interna empurra para fora,'
+2026-06-02 12:49:05,375 [INFO] [W1] seq=23 ok (2.61s) 'e eles estão em uma disputa'
+2026-06-02 12:49:05,379 [INFO] [STREAM] 4 sentenças enfileiradas em 3097.59ms
+2026-06-02 12:49:05,945 [INFO] [W0] seq=24 ok (2.14s) 'constante onde se anulam.'
+2026-06-02 12:49:05,945 [INFO] [STREAM] 1 sentenças enfileiradas em 563.91ms
+2026-06-02 12:49:06,970 [INFO] [W2] seq=25 ok (4.88s) 'A gente modela isso usando as equações da mecânica'
+2026-06-02 12:49:06,971 [INFO] [STREAM] 1 sentenças enfileiradas em 1022.22ms
+2026-06-02 12:49:08,389 [INFO] [W1] seq=26 ok (6.36s) 'Modelagem Estelar (A Simulação) Aqui é onde tudo v'
+2026-06-02 12:49:08,390 [INFO] [STREAM] 1 sentenças enfileiradas em 1182.23ms
+2026-06-02 12:49:08,579 [INFO] [PLAY] seq=11 (113664 samples)
+2026-06-02 12:49:10,937 [INFO] [PLAY] seq=12 (79872 samples)
+2026-06-02 12:49:12,336 [INFO] [W2] seq=28 ok (4.76s) 'geralmente usando coisas famosas como a Equação de'
+2026-06-02 12:49:12,580 [INFO] [PLAY] seq=13 (104448 samples)
+2026-06-02 12:49:12,607 [INFO] [W0] seq=27 ok (5.96s) 'A gente pega as leis do Ponto 1 e do Ponto 2 e faz'
+2026-06-02 12:49:12,608 [INFO] [STREAM] 2 sentenças enfileiradas em 2005.85ms
+2026-06-02 12:49:13,777 [INFO] [W1] seq=29 ok (2.53s) 'Isso permite prever o tamanho,'
+2026-06-02 12:49:13,948 [INFO] [W2] seq=30 ok (3.64s) 'a temperatura e a evolução de uma estrela.'
+2026-06-02 12:49:13,949 [INFO] [STREAM] 2 sentenças enfileiradas em 1338.56ms
+2026-06-02 12:49:14,777 [INFO] [PLAY] seq=14 (184320 samples)
+2026-06-02 12:49:17,561 [INFO] [W0] seq=32 ok (1.68s) 'para os nerds,'
+2026-06-02 12:49:17,850 [INFO] [W1] seq=31 ok (1.27s) 'E,'
+2026-06-02 12:49:18,618 [INFO] [PLAY] seq=15 (347136 samples)
+2026-06-02 12:49:18,880 [INFO] [W2] seq=33 ok (5.09s) 'a cereja do bolo é ver isso funcionando em cenário'
+2026-06-02 12:49:19,302 [INFO] [W0] seq=34 ok (5.58s) 'tipo quando a gravidade começa a ficar meio "maluc'
+2026-06-02 12:49:19,303 [INFO] [STREAM] 4 sentenças enfileiradas em 3136.74ms
+2026-06-02 12:49:19,958 [INFO] [W1] seq=35 ok (2.76s) 'de teorias beyond-Horndeski!).'
+2026-06-02 12:49:19,959 [INFO] [STREAM] 1 sentenças enfileiradas em 652.48ms
+2026-06-02 12:49:21,717 [INFO] [W2] seq=36 ok (1.41s) 'Em resumo:'
+2026-06-02 12:49:22,752 [INFO] [W0] seq=37 ok (8.34s) 'É o estudo de como a fusão nuclear gera calor esse'
+2026-06-02 12:49:22,752 [INFO] [STREAM] 2 sentenças enfileiradas em 1799.2ms
+2026-06-02 12:49:23,868 [INFO] [W1] seq=38 ok (5.48s) 'gravitacional e a gente usa modelos matemáticos pa'
+2026-06-02 12:49:23,868 [INFO] [STREAM] 1 sentenças enfileiradas em 1058.31ms
+2026-06-02 12:49:25,243 [INFO] [W2] seq=39 ok (1.49s) 'Basicamente,'
+2026-06-02 12:49:25,384 [INFO] [W0] seq=40 ok (3.07s) 'é a física do show de fogos cósmico!'
+2026-06-02 12:49:25,384 [INFO] [STREAM] 2 sentenças enfileiradas em 1114.15ms
+2026-06-02 12:49:25,862 [INFO] [PLAY] seq=16 (439296 samples)
+2026-06-02 12:49:26,116 [INFO] [W1] seq=41 ok (2.81s) 'Quer que eu detalhe algum desses pontos?'
+2026-06-02 12:49:26,116 [INFO] [STREAM] 1 sentenças enfileiradas em 727.96ms
+2026-06-02 12:49:28,409 [INFO] [W2] seq=42 ok (7.18s) 'Ou prefere uma curiosidade sobre buracos negros pa'
+2026-06-02 12:49:28,409 [INFO] [STREAM] 1 sentenças enfileiradas em 1227.92ms
+2026-06-02 12:49:34,980 [INFO] [PLAY] Fala completa
+2026-06-02 12:49:35,012 [INFO] [PLAY] seq=17 (307200 samples)
+2026-06-02 12:49:41,412 [INFO] [PLAY] Fala completa
+2026-06-02 12:49:41,455 [INFO] [PLAY] seq=18 (331776 samples)
+2026-06-02 12:49:48,335 [INFO] [PLAY] seq=19 (267264 samples)
+2026-06-02 12:49:53,935 [INFO] [PLAY] Fala completa
+2026-06-02 12:49:53,977 [INFO] [PLAY] seq=20 (196608 samples)
+2026-06-02 12:49:58,052 [INFO] [PLAY] seq=21 (150528 samples)
+2026-06-02 12:50:01,177 [INFO] [PLAY] seq=22 (122880 samples)
+2026-06-02 12:50:03,737 [INFO] [PLAY] seq=23 (116736 samples)
+2026-06-02 12:50:06,180 [INFO] [PLAY] seq=24 (95232 samples)
+2026-06-02 12:50:08,175 [INFO] [PLAY] seq=25 (218112 samples)

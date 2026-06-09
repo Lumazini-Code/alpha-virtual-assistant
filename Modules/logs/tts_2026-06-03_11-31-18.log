@@ -1,0 +1,141 @@
+INFO:     127.0.0.1:56850 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54234 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /stream HTTP/1.1" 200 OK
+ models with providers: ['CPUExecutionProvider']
+2026-06-03 11:31:18,942 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-03 11:31:18,972 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-03 11:31:18,942 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-03 11:31:19,110 [INFO] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-03 11:31:21,777 [INFO] Successfully loaded all ONNX models
+2026-06-03 11:31:22,641 [INFO] Successfully loaded all ONNX models
+2026-06-03 11:31:22,692 [INFO] Successfully loaded all ONNX models
+2026-06-03 11:31:22,724 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-03 11:31:22,727 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-03 11:31:22,730 [INFO] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-03 11:31:22,733 [INFO] Model loaded successfully
+2026-06-03 11:31:22,735 [INFO] Model loaded successfully
+2026-06-03 11:31:22,738 [INFO] Model loaded successfully
+2026-06-03 11:31:22,738 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-03 11:31:22,738 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-03 11:31:22,739 [INFO] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-03 11:31:24,194 [INFO] [W1] Pronto (pré-aquecido)
+2026-06-03 11:31:24,422 [INFO] [W0] Pronto (pré-aquecido)
+2026-06-03 11:31:24,506 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-03 11:33:11,479 [INFO] [W1] seq=0 ok (1.30s) 'E aí,'
+2026-06-03 11:33:11,520 [INFO] [PLAY] seq=0 (58368 samples)
+2026-06-03 11:33:11,621 [INFO] [W0] seq=1 ok (1.38s) 'Usuário!'
+2026-06-03 11:33:11,623 [INFO] [STREAM] 2 sentenças enfileiradas em 933.76ms
+2026-06-03 11:33:12,205 [INFO] [W2] seq=2 ok (2.22s) 'Essa pergunta é de peso!'
+2026-06-03 11:33:12,207 [INFO] [STREAM] 1 sentenças enfileiradas em 578.18ms
+2026-06-03 11:33:12,712 [INFO] [PLAY] seq=1 (61440 samples)
+2026-06-03 11:33:13,992 [INFO] [PLAY] seq=2 (98304 samples)
+2026-06-03 11:33:16,040 [INFO] [PLAY] Fala completa
+2026-06-03 11:33:16,220 [INFO] [W2] seq=5 ok (1.54s) 'mas na real,'
+2026-06-03 11:33:16,395 [INFO] [W1] seq=3 ok (1.37s) 'Olha só,'
+2026-06-03 11:33:16,435 [INFO] [PLAY] seq=3 (61440 samples)
+2026-06-03 11:33:17,516 [INFO] [W2] seq=6 ok (3.27s) 'ela é o motor que faz o universo funcionar.'
+2026-06-03 11:33:17,929 [INFO] [W0] seq=4 ok (5.84s) 'a Astrofísica Termonuclear pode parecer um nome gi'
+2026-06-03 11:33:17,930 [INFO] [STREAM] 4 sentenças enfileiradas em 2970.99ms
+2026-06-03 11:33:17,945 [INFO] [PLAY] seq=4 (258048 samples)
+2026-06-03 11:33:19,871 [INFO] [W1] seq=7 ok (2.45s) 'Pra simplificar ao máximo:'
+2026-06-03 11:33:21,131 [INFO] [W2] seq=8 ok (9.49s) 'é o ramo da física que estuda como as estrelas (e '
+2026-06-03 11:33:21,132 [INFO] [STREAM] 2 sentenças enfileiradas em 2345.62ms
+2026-06-03 11:33:21,921 [INFO] [W0] seq=9 ok (1.27s) ','
+2026-06-03 11:33:21,970 [INFO] [W1] seq=10 ok (1.64s) 'fusão nuclear.'
+2026-06-03 11:33:21,970 [INFO] [STREAM] 2 sentenças enfileiradas em 833.73ms
+2026-06-03 11:33:23,315 [INFO] [PLAY] seq=5 (70656 samples)
+2026-06-03 11:33:23,682 [INFO] [W2] seq=11 ok (1.84s) 'Pensa nela assim:'
+2026-06-03 11:33:24,102 [INFO] [W0] seq=12 ok (2.41s) 'se a estrela é um carro,'
+2026-06-03 11:33:24,430 [INFO] [W1] seq=13 ok (3.98s) 'a termonuclear é o motor V8 que faz tudo girar.'
+2026-06-03 11:33:24,432 [INFO] [STREAM] 3 sentenças enfileiradas em 2060.16ms
+2026-06-03 11:33:24,798 [INFO] [PLAY] seq=6 (144384 samples)
+2026-06-03 11:33:25,078 [INFO] [W2] seq=14 ok (2.25s) 'O Que Acontece no "Motor"?'
+2026-06-03 11:33:25,079 [INFO] [STREAM] 1 sentenças enfileiradas em 644.8ms
+2026-06-03 11:33:26,759 [INFO] [W2] seq=17 ok (1.27s) '1.'
+2026-06-03 11:33:26,762 [INFO] [W0] seq=15 ok (1.49s) 'Basicamente,'
+2026-06-03 11:33:27,145 [INFO] [W1] seq=16 ok (2.86s) 'ela lida com três grandes pilares:'
+2026-06-03 11:33:27,146 [INFO] [STREAM] 3 sentenças enfileiradas em 1749.01ms
+2026-06-03 11:33:27,800 [INFO] [PLAY] Fala completa
+2026-06-03 11:33:27,843 [INFO] [PLAY] seq=7 (110592 samples)
+2026-06-03 11:33:28,668 [INFO] [W2] seq=18 ok (2.80s) 'A Fornalha (Fusão Nuclear):'
+2026-06-03 11:33:28,695 [INFO] [W0] seq=19 ok (2.31s) 'É onde a mágica acontece.'
+2026-06-03 11:33:28,696 [INFO] [STREAM] 2 sentenças enfileiradas em 1208.62ms
+2026-06-03 11:33:30,154 [INFO] [PLAY] seq=8 (420864 samples)
+2026-06-03 11:33:30,310 [INFO] [W1] seq=20 ok (2.39s) 'No interior das estrelas,'
+2026-06-03 11:33:30,545 [INFO] [W2] seq=21 ok (4.21s) 'a pressão e a temperatura são tão absurdas que os'
+2026-06-03 11:33:30,545 [INFO] [STREAM] 2 sentenças enfileiradas em 1329.51ms
+2026-06-03 11:33:38,910 [INFO] [PLAY] seq=9 (58368 samples)
+2026-06-03 11:33:40,147 [INFO] [PLAY] seq=10 (73728 samples)
+2026-06-03 11:33:41,672 [INFO] [PLAY] seq=11 (82944 samples)
+2026-06-03 11:33:43,390 [INFO] [PLAY] seq=12 (107520 samples)
+2026-06-03 11:33:45,630 [INFO] [PLAY] seq=13 (178176 samples)
+2026-06-03 11:33:49,352 [INFO] [PLAY] Fala completa
+2026-06-03 11:33:49,395 [INFO] [PLAY] seq=14 (101376 samples)
+2026-06-03 11:33:51,475 [INFO] [PLAY] seq=15 (67584 samples)
+2026-06-03 11:33:52,915 [INFO] [PLAY] seq=16 (129024 samples)
+2026-06-03 11:33:55,593 [INFO] [PLAY] seq=17 (58368 samples)
+2026-06-03 11:33:56,787 [INFO] [PLAY] Fala completa
+2026-06-03 11:33:56,830 [INFO] [PLAY] seq=18 (125952 samples)
+2026-06-03 11:33:59,433 [INFO] [PLAY] seq=19 (104448 samples)
+2026-06-03 11:34:01,630 [INFO] [PLAY] Fala completa
+2026-06-03 11:34:01,673 [INFO] [PLAY] seq=20 (107520 samples)
+2026-06-03 11:34:03,913 [INFO] [PLAY] seq=21 (187392 samples)
+2026-06-03 11:34:07,795 [INFO] [PLAY] Fala completa
+2026-06-03 11:39:49,823 [INFO] [W1] seq=23 ok (2.80s) '[user] oque é astrofisica termonuclear?'
+2026-06-03 11:39:49,851 [WARNING] [PLAY] seq=22 atrasado 342055ms — pula para seq=23
+2026-06-03 11:39:49,898 [INFO] [PLAY] seq=23 (125952 samples)
+2026-06-03 11:39:50,159 [INFO] [W0] seq=22 ok (5.18s) 'Resgatando contexto relevante da minha memória ant'
+2026-06-03 11:39:50,159 [INFO] [STREAM] 2 sentenças enfileiradas em 1870.13ms
+2026-06-03 11:39:50,874 [INFO] [W1] seq=25 ok (1.38s) 'Usuário!'
+2026-06-03 11:39:51,103 [INFO] [W2] seq=24 ok (2.01s) '[assistant] E aí,'
+2026-06-03 11:39:51,105 [INFO] [STREAM] 2 sentenças enfileiradas em 941.98ms
+2026-06-03 11:39:51,632 [INFO] [W0] seq=26 ok (2.22s) 'Essa pergunta é de peso!'
+2026-06-03 11:39:51,634 [INFO] [STREAM] 1 sentenças enfileiradas em 526.45ms
+2026-06-03 11:39:52,496 [INFO] [PLAY] Fala completa
+2026-06-03 11:39:52,542 [INFO] [PLAY] seq=24 (89088 samples)
+2026-06-03 11:39:54,381 [INFO] [PLAY] seq=25 (61440 samples)
+2026-06-03 11:39:54,865 [INFO] [W1] seq=27 ok (1.76s) 'Pra simplificar,'
+2026-06-03 11:39:55,133 [INFO] [W0] seq=29 ok (1.28s) 'com'
+2026-06-03 11:39:55,654 [INFO] [PLAY] seq=26 (98304 samples)
+2026-06-03 11:39:56,421 [INFO] [W2] seq=28 ok (9.79s) 'a Astrofísica Termonuclear é basicamente o ramo da'
+2026-06-03 11:39:56,421 [INFO] [STREAM] 3 sentenças enfileiradas em 2806.65ms
+2026-06-03 11:39:57,684 [INFO] [W0] seq=31 ok (2.13s) 'a teoria da radiação,'
+2026-06-03 11:39:57,691 [INFO] [PLAY] Fala completa
+2026-06-03 11:39:57,734 [INFO] [PLAY] seq=27 (79872 samples)
+2026-06-03 11:39:58,081 [INFO] [W1] seq=30 ok (2.78s) 'foco em três áreas principais:'
+2026-06-03 11:39:58,495 [INFO] [W2] seq=32 ok (4.33s) 'as equações da estrutura estelar e a modelagem est'
+2026-06-03 11:39:58,496 [INFO] [STREAM] 3 sentenças enfileiradas em 2059.02ms
+2026-06-03 11:39:59,383 [INFO] [PLAY] seq=28 (433152 samples)
+2026-06-03 11:40:01,886 [INFO] [W1] seq=34 ok (3.54s) 'destacando a formulação da Lei de Planck,'
+2026-06-03 11:40:02,341 [INFO] [W0] seq=33 ok (4.94s) 'A primeira parte discute a interação entre luz e m'
+2026-06-03 11:40:02,373 [INFO] [W2] seq=35 ok (4.25s) 'além das aplicações da fotometria e espectroscopia'
+2026-06-03 11:40:02,374 [INFO] [STREAM] 3 sentenças enfileiradas em 2662.54ms
+2026-06-03 11:40:02,817 [INFO] [W1] seq=36 ok (1.87s) 'na determinação de'
+2026-06-03 11:40:02,818 [INFO] [STREAM] 1 sentenças enfileiradas em 441.49ms
+2026-06-03 11:40:08,411 [INFO] [PLAY] seq=29 (58368 samples)
+2026-06-03 11:40:09,616 [INFO] [PLAY] Fala completa
+2026-06-03 11:40:09,659 [INFO] [PLAY] seq=30 (122880 samples)
+2026-06-03 11:40:12,219 [INFO] [PLAY] seq=31 (95232 samples)
+2026-06-03 11:40:14,171 [INFO] [PLAY] seq=32 (193536 samples)
+2026-06-03 11:40:18,214 [INFO] [PLAY] Fala completa
+2026-06-03 11:40:18,257 [INFO] [PLAY] seq=33 (218112 samples)
+2026-06-03 11:40:22,779 [INFO] [PLAY] seq=34 (156672 samples)
+2026-06-03 11:40:26,054 [INFO] [PLAY] seq=35 (190464 samples)
+2026-06-03 11:40:30,011 [INFO] [PLAY] seq=36 (82944 samples)
+2026-06-03 11:40:31,739 [INFO] [PLAY] Fala completa

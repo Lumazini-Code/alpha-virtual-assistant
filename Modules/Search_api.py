@@ -46,7 +46,7 @@ CACHE_MAX_SIZE        = 128
 _IO_POOL  = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="io")
 _CPU_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="cpu")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Search API] %(message)s")
 log = logging.getLogger("ava.search")
 
 # ── Modelos de request/response ────────────────────────────────────────────────

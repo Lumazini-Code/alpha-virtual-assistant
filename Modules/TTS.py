@@ -85,7 +85,7 @@ class _LogDuplicado:
 sys.stdout = _LogDuplicado(sys.stdout, log_path)
 sys.stderr = _LogDuplicado(sys.stderr, log_path)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [TTS] %(message)s")
 log = logging.getLogger("ava.tts")
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -240,29 +240,94 @@ def normalizar_texto(texto: str) -> str:
     return _RE_ESPACO_MULTI.sub(" ", texto).strip()
 
 
+# Substitua as duas regex e a função split_chunks inteiras
+
+_RE_RETICENCIAS    = re.compile(r"\.{2,}")
+_RE_SPLIT_SENTENCA = re.compile(
+    r'(?<!\w\.\w)'          # não corta abreviações tipo e.g.
+    r'(?<![A-Z][a-z]\.)'    # não corta Dr. Sr. etc.
+    r'(?<![A-Z]\.)'         # não corta siglas tipo U.S.A.
+    r'(?<=\.|\!|\?)'        # só corta APÓS . ! ?
+    r'(?!\.)'               # não corta reticências
+    r'\s+'
+)
+
+# _RE_SPLIT_SUBPARTE removida — não usamos mais vírgula como corte primário
+
+MIN_PALAVRAS = 12   # sobe para forçar frases mais longas antes de aceitar corte
+
+
 def split_chunks(texto: str) -> list[str]:
     """
-    Divide texto em chunks para TTS com mínimo delay.
-    Respeita abreviações (Dr., Sr., e.g.) e reticências.
+    Divide texto em chunks naturais para TTS.
+    
+    Estratégia:
+    - Corte primário: fim de sentença (. ! ?)
+    - Corte secundário: só em vírgula/; se o chunk já tiver MIN_PALAVRAS
+      E a vírgula estiver seguida de conjunção/pronome (pausa oracional real)
+    - Chunks curtos são fundidos com o próximo
     """
     if not texto:
         return []
 
-    # Protege reticências durante split
+    # Protege reticências
     texto_prot = _RE_RETICENCIAS.sub("\u2026", texto)
-    partes     = _RE_SPLIT_SENTENCA.split(texto_prot)
-    resultado  = []
 
+    # Corte primário: sentenças completas
+    partes = _RE_SPLIT_SENTENCA.split(texto_prot)
+    partes = [p.replace("\u2026", "...").strip() for p in partes if p.strip()]
+
+    if not partes:
+        return [texto.strip()] if texto.strip() else []
+
+    # Corte secundário: vírgula oracional (só se chunk longo o suficiente)
+    # Padrão: vírgula seguida de conjunção/pronome subordinativo
+    _RE_VIRGULA_ORACIONAL = re.compile(
+        r',\s+(?=(?:mas|porém|contudo|entretanto|todavia|pois|porque|'
+        r'quando|enquanto|embora|se |caso |para que|de modo|além|'
+        r'que |o que|o qual|a qual|os quais|as quais)\b)',
+        re.IGNORECASE
+    )
+
+    resultado = []
     for parte in partes:
-        parte = parte.replace("\u2026", "...").strip()
-        if not parte:
-            continue
-        for sub in _RE_SPLIT_SUBPARTE.split(parte):
-            sub = sub.strip()
-            if sub:
-                resultado.append(sub)
+        palavras = parte.split()
+        if len(palavras) >= MIN_PALAVRAS * 2:
+            # Chunk muito longo — tenta cortar em vírgula oracional
+            subs = _RE_VIRGULA_ORACIONAL.split(parte)
+            # Recoloca a vírgula que o split consumiu
+            subs_com_virgula = []
+            for j, s in enumerate(subs):
+                s = s.strip()
+                if not s:
+                    continue
+                if j < len(subs) - 1:
+                    subs_com_virgula.append(s + ",")
+                else:
+                    subs_com_virgula.append(s)
+            resultado.extend(subs_com_virgula)
+        else:
+            resultado.append(parte)
 
-    return resultado or ([texto.strip()] if texto.strip() else [])
+    # Fusão: chunks com menos de MIN_PALAVRAS são fundidos com o próximo
+    fundidos = []
+    acum = ""
+    for chunk in resultado:
+        if acum:
+            acum = acum + " " + chunk
+        else:
+            acum = chunk
+        if len(acum.split()) >= MIN_PALAVRAS:
+            fundidos.append(acum.strip())
+            acum = ""
+
+    if acum:  # sobra do final — junta com o último ou adiciona sozinho
+        if fundidos:
+            fundidos[-1] = fundidos[-1] + " " + acum.strip()
+        else:
+            fundidos.append(acum.strip())
+
+    return fundidos if fundidos else ([texto.strip()] if texto.strip() else [])
 
 
 # ════════════════════════════════════════════════════════════════════════════

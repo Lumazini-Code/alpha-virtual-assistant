@@ -32,6 +32,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langdetect import detect
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM] %(message)s")
+log = logging.getLogger("ava.llm")
 
 # ─────────────────────────────────────────────────────────────
 #                          CONFIG
@@ -179,19 +183,37 @@ except FileNotFoundError:
 # FIX: Split into:
 #   1. STABLE system prompt (context + username + instructions)
 #      → This part is cached by llama-server after the first request
-#   2. DYNAMIC memory block (injected as a separate "user" message)
-#      → Only this part changes, and it's appended AFTER the cached prefix
+#   2. DYNAMIC memory block expressed in the ASSISTANT voice
+#      → Model "recalls" its own knowledge instead of receiving external data
 #   3. Timestamp moved to a user message (not in the system prompt)
 #
-# Result: After the first request, subsequent requests with the same
-# system prompt skip prefill for the entire system prompt portion
-# (potentially saving hundreds of milliseconds).
+# MEMORY SEMANTICS FIX (v2.2):
+# Injecting memories as role:user causes the model to treat them as
+# external data provided by the user, not as its own knowledge.
+# The fix is two-pronged:
+#   a) The system prompt explicitly explains the memory injection mechanism
+#      so the model understands the semantic contract.
+#   b) The memories are expressed in the ASSISTANT voice (role:assistant),
+#      as a first-person recall, so the model "owns" that knowledge.
+#
+# CACHE IMPACT: The stable prefix [system: _SYSTEM_PROMPT_BASE] is always
+# the same → KV cache HIT. The assistant memory recall turn varies but is
+# small and comes AFTER the cached prefix.
 
-# Pre-compute the STABLE system prompt — this NEVER changes at runtime
 _SYSTEM_PROMPT_BASE = (
     f"{context}\n\n"
     f"O nome do usuário é {username}. "
-    f"Responda sempre no idioma em que o usuário escrever."
+    f"Responda sempre no idioma em que o usuário escrever.\n\n"
+    # ── MEMORY SEMANTICS INSTRUCTION ─────────────────────────────────────────
+    # This tells the model HOW to interpret the injected memory block.
+    # Without this, the model may treat the assistant recall turn as a
+    # previous response rather than as retrieved self-knowledge.
+    "Você possui um sistema de memória persistente. Antes de cada resposta, "
+    "fragmentos relevantes da sua memória de longo prazo e do histórico recente "
+    "são recuperados e apresentados em uma mensagem sua anterior nesta conversa. "
+    "Trate essas informações como conhecimento próprio e utilize-as naturalmente, "
+    "sem mencionar explicitamente que são 'memórias recuperadas' ou citar o "
+    "mecanismo de memória ao usuário."
 )
 
 
@@ -201,7 +223,7 @@ async def _warmup():
     This pre-allocates the KV cache for the actual context sizes we use,
     so the first real request doesn't pay the allocation cost.
     """
-    print("[MAIN] Warmup do modelo (representative prompt)...")
+    log.info("[MAIN] Warmup do modelo (representative prompt)...")
     try:
         client = await _get_llama_client()
 
@@ -226,12 +248,12 @@ async def _warmup():
             # Check if prompt was cached
             usage = r.json().get("usage", {})
             cached_tokens = usage.get("prompt_tokens_cached", 0)
-            print(f"[MAIN] Warmup concluído. Cached tokens: {cached_tokens}")
+            log.info(f"[MAIN] Warmup concluído. Cached tokens: {cached_tokens}")
         else:
-            print(f"[MAIN] Warmup response: {r.status_code}")
+            log.info(f"[MAIN] Warmup response: {r.status_code}")
 
     except Exception as e:
-        print(f"[MAIN] Warmup falhou (não crítico): {e}")
+        log.info(f"[MAIN] Warmup falhou (não crítico): {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -257,7 +279,7 @@ async def memory_read(query: str, session_id: Optional[str] = None, top_k: int =
         )
         return r.json().get("results", [])
     except Exception as e:
-        print(f"[MEMORY] Falha na leitura: {e}")
+        log.info(f"[MEMORY] Falha na leitura: {e}")
         return []
 
 
@@ -278,7 +300,7 @@ async def memory_save_turn(session_id: str, user_input: str, assistant_response:
             },
         )
     except Exception as e:
-        print(f"[MEMORY] Falha ao salvar turno ST: {e}")
+        log.info(f"[MEMORY] Falha ao salvar turno ST: {e}")
 
 
 async def memory_write_fact(text: str, source: str = "chat", confidence: float = 0.7):
@@ -290,7 +312,7 @@ async def memory_write_fact(text: str, source: str = "chat", confidence: float =
             json={"text": text, "source": source, "confidence": confidence},
         )
     except Exception as e:
-        print(f"[MEMORY] Falha na escrita LT: {e}")
+        log.info(f"[MEMORY] Falha na escrita LT: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -313,9 +335,9 @@ async def _tts_sender_worker():
                 json={"text": text, "voice": voice, "lang": lang},
             )
             if r.status_code >= 400:
-                print(f"[TTS] Chunk rejeitado ({r.status_code}): '{text[:60]}'")
+                log.info(f"[TTS] Chunk rejeitado ({r.status_code}): '{text[:60]}'")
         except Exception as e:
-            print(f"[TTS] Falha no chunk: {type(e).__name__}: {e}")
+            log.info(f"[TTS] Falha no chunk: {type(e).__name__}: {e}")
         finally:
             _tts_queue.task_done()
 
@@ -336,6 +358,42 @@ async def tts_speak(text: str, voice: str, lang: str):
 #          OPTIMIZATION 2 (cont): PROMPT CONSTRUCTION
 # ─────────────────────────────────────────────────────────────
 
+def _build_memory_recall(memories: list[dict]) -> str | None:
+    """
+    Formata o bloco de memórias como texto de recall em primeira pessoa.
+
+    Returns None se não houver memórias válidas.
+
+    SEMANTIC RATIONALE:
+    The memory block is expressed as an ASSISTANT turn (first-person recall)
+    instead of a USER turn (external data injection). This ensures the model
+    treats the information as self-knowledge it's retrieving, not as
+    instructions or data provided by the user.
+
+    The phrasing uses verbs of recall ("Lembro que", "Sei que") to reinforce
+    the epistemic ownership. The closing line signals readiness, anchoring
+    the model's stance before the actual user message arrives.
+    """
+    if not memories:
+        return None
+
+    lines = [
+        f"- {m.get('text', m.get('content', ''))}"
+        for m in memories
+        if m.get("text") or m.get("content")
+    ]
+    if not lines:
+        return None
+
+    mem_block = "\n".join(lines)
+
+    return (
+        "Resgatando contexto relevante da minha memória antes de responder:\n\n"
+        f"{mem_block}\n\n"
+        "Tenho isso em mente e vou usar esse conhecimento de forma natural na conversa."
+    )
+
+
 def _build_messages(
     user_input: str,
     lang: str,
@@ -352,40 +410,41 @@ def _build_messages(
     gets cached after the first request, and subsequent requests
     only need to prefill the NEW tokens.
 
-    Structure:
-      [0] system:  STABLE prompt (context + username + instructions)
-      [1] user:    "[Memória]\n..." (dynamic, but AFTER cached prefix)
-      [2] user:    "[Data: DD/MM/YYYY]\n{user_input}"
+    Structure (with memories):
+      [0] system:    STABLE prompt — context + username + memory semantics instruction
+      [1] assistant: first-person memory recall (dynamic, AFTER cached prefix)
+      [2] user:      "[Data: DD/MM/YYYY]\n{user_input}"
 
-    This means:
-    - Message [0] is always the same → KV cache HIT (huge savings)
-    - Message [1] varies → needs prefill (but small)
-    - Message [2] varies → needs prefill (but small)
+    Structure (without memories):
+      [0] system:    STABLE prompt
+      [1] user:      "[Data: DD/MM/YYYY]\n{user_input}"
 
-    Compare with the ORIGINAL where message [0] changed every request
-    because it included memory + timestamp → KV cache NEVER hit.
+    MEMORY SEMANTICS:
+    Memories are expressed in the ASSISTANT voice (role:assistant) as a
+    first-person recall. This is semantically correct: the model is
+    "remembering" its own knowledge, not receiving external data from
+    the user. The system prompt explains this contract so the model
+    understands why an assistant turn appears before the user's message.
+
+    KV CACHE IMPACT:
+    - Message [0] (system) is always identical → KV cache HIT
+    - Message [1] (assistant recall) varies by query → small prefill cost
+    - Message [2] (user input) varies → small prefill cost
     """
     messages = [
-        # STABLE: This is the cached portion
+        # STABLE: This is the cached portion — never changes at runtime
         {"role": "system", "content": _SYSTEM_PROMPT_BASE},
     ]
 
-    # DYNAMIC: Memory block — injected as user message AFTER the stable prefix
-    if memories:
-        mem_lines = "\n".join(
-            f"- {m.get('text', m.get('content', ''))}"
-            for m in memories if m.get("text") or m.get("content")
-        )
-        if mem_lines:
-            messages.append({
-                "role": "user",
-                "content": f"[Contexto e Memórias Relevantes]\n{mem_lines}",
-            })
-            # Assistant acknowledgment keeps the conversation flow natural
-            messages.append({
-                "role": "assistant",
-                "content": "Entendido, vou usar essas informações para responder.",
-            })
+    # DYNAMIC: Memory recall expressed in the assistant's own voice.
+    # Role is "assistant" so the model treats this as self-knowledge,
+    # not as external input from the user.
+    recall_text = _build_memory_recall(memories)
+    if recall_text:
+        messages.append({
+            "role": "assistant",
+            "content": recall_text,
+        })
 
     # DYNAMIC: Current date + user input
     today = datetime.datetime.now().strftime("%d/%m/%Y")
@@ -401,7 +460,7 @@ def _build_messages(
 #                           FASTAPI
 # ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="AVA — LLM API", version="2.1.0")
+app = FastAPI(title="AVA — LLM API", version="2.2.0")
 
 # ── Schemas ───────────────────────────────────────────────────
 
@@ -488,6 +547,7 @@ async def chat(req: ChatRequest):
 
     # 4. Inferência — OPTIMIZED: persistent client
     t0 = time.perf_counter()
+    log.info(messages)
     try:
         client = await _get_llama_client()
         r = await client.post(
@@ -511,7 +571,7 @@ async def chat(req: ChatRequest):
     usage = resp_data.get("usage", {})
     cached = usage.get("prompt_tokens_cached", 0)
     total_prompt = usage.get("prompt_tokens", 0)
-    print(
+    log.info(
         f"[CHAT] {elapsed:.2f}s | {len(response_text)} chars | "
         f"prompt: {total_prompt} tokens (cached: {cached})"
     )
@@ -646,7 +706,7 @@ async def chat_stream(req: ChatRequest):
             _flush_tts_buf()
 
         elapsed = time.perf_counter() - t0
-        print(
+        log.info(
             f"[STREAM] {elapsed:.2f}s | {len(full_response)} chars | "
             f"cached: {cached_tokens} tokens"
         )
@@ -695,7 +755,7 @@ async def get_history(session_id: str = "default", last_n: int = 20):
         raise HTTPException(status_code=502, detail=f"Falha ao buscar histórico: {e}")
 
 
-# ── NEW: Cache stats endpoint ────────────────────────────────
+# ── Cache stats endpoint ─────────────────────────────────────
 
 @app.get("/cache_stats")
 async def cache_stats():
@@ -738,10 +798,7 @@ async def cache_stats():
 # ─────────────────────────────────────────────────────────────
 
 def _safe_detect(text: str) -> str:
-    try:
-        return detect(text)
-    except Exception:
-        return "pt"
+    return "pt"
 
 
 # ─────────────────────────────────────────────────────────────

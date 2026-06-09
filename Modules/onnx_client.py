@@ -17,7 +17,8 @@ from typing import Optional
 import numpy as np
 import httpx
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Memory] %(message)s")
+log = logging.getLogger("ava.memory")
 
 # Default ONNX serving endpoint
 DEFAULT_ONNX_BASE_URL = "http://localhost:2002"

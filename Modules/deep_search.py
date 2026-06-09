@@ -21,7 +21,7 @@ from engine import AVAKnowledgeEngine
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] [Deep_Search]: %(message)s",
 )
 logger = logging.getLogger("ava.kg_rag")
 

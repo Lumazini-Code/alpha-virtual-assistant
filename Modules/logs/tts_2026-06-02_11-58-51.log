@@ -1,14 +1,14 @@
 INFO:     127.0.0.1:45512 - "GET /status HTTP/1.1" 200 OK
-r application startup.
-2026-06-02 11:58:51,941 [INFO] Iniciando AVA TTS API...
-2026-06-02 11:58:51,942 [INFO] [W0] Carregando Supertonic...
-2026-06-02 11:58:51,953 [INFO] [W1] Carregando Supertonic...
-2026-06-02 11:58:51,953 [INFO] [W2] Carregando Supertonic...
-2026-06-02 11:58:51,954 [INFO] TTSPool iniciado com 3 workers
-2026-06-02 11:58:51,954 [INFO] TTS API pronta
-2026-06-02 11:58:51,954 [INFO] Loading model from /root/.cache/supertonic3
-INFO:     Application startup complete.
-2026-06-02 11:58:51,954 [INFO] Loading model from /root/.cache/supertonic3
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53442 - "POST /stream HTTP/1.1" 200 OK
+rom /root/.cache/supertonic3
 2026-06-02 11:58:51,954 [INFO] Loading model from /root/.cache/supertonic3
 2026-06-02 11:58:51,958 [INFO] Using ONNX providers: ['CPUExecutionProvider']
 2026-06-02 11:58:51,958 [INFO] ONNX Runtime config: intra_threads=auto, inter_threads=auto
@@ -35,3 +35,50 @@ INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
 2026-06-02 11:58:55,649 [INFO] [W0] Pronto (pré-aquecido)
 2026-06-02 11:58:56,005 [INFO] [W1] Pronto (pré-aquecido)
 2026-06-02 11:58:56,110 [INFO] [W2] Pronto (pré-aquecido)
+2026-06-02 12:15:47,181 [ERROR] [W0] seq=0 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,185 [ERROR] [W1] seq=1 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,187 [ERROR] [STREAM] Erro seq=0: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,187 [ERROR] [STREAM] Erro seq=1: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,189 [INFO] [STREAM] 2 sentenças enfileiradas em 24.46ms
+2026-06-02 12:15:47,189 [WARNING] [PLAY] seq=0 atrasado 1015139ms — pula para seq=2
+2026-06-02 12:15:47,231 [INFO] [PLAY] Fala completa
+2026-06-02 12:15:47,654 [ERROR] [W2] seq=2 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,655 [ERROR] [STREAM] Erro seq=2: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:47,655 [INFO] [STREAM] 1 sentenças enfileiradas em 1.16ms
+2026-06-02 12:15:51,013 [ERROR] [W0] seq=3 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,013 [ERROR] [W1] seq=4 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,014 [ERROR] [STREAM] Erro seq=3: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,014 [ERROR] [STREAM] Erro seq=4: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,014 [INFO] [STREAM] 2 sentenças enfileiradas em 0.93ms
+2026-06-02 12:15:51,960 [ERROR] [W2] seq=5 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,960 [ERROR] [STREAM] Erro seq=5: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:51,960 [INFO] [STREAM] 1 sentenças enfileiradas em 0.62ms
+2026-06-02 12:15:52,234 [WARNING] [PLAY] seq=2 atrasado 5002ms — pula para seq=3
+2026-06-02 12:15:52,266 [INFO] [PLAY] Fala completa
+2026-06-02 12:15:55,557 [ERROR] [W0] seq=6 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,557 [ERROR] [W1] seq=7 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,557 [ERROR] [W2] seq=8 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,557 [ERROR] [STREAM] Erro seq=6: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,557 [ERROR] [STREAM] Erro seq=7: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,557 [ERROR] [STREAM] Erro seq=8: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:55,558 [INFO] [STREAM] 3 sentenças enfileiradas em 2.88ms
+2026-06-02 12:15:56,481 [ERROR] [W0] seq=9 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:56,482 [ERROR] [STREAM] Erro seq=9: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:56,482 [INFO] [STREAM] 1 sentenças enfileiradas em 0.47ms
+2026-06-02 12:15:57,268 [WARNING] [PLAY] seq=3 atrasado 5003ms — pula para seq=5
+2026-06-02 12:15:57,311 [INFO] [PLAY] Fala completa
+2026-06-02 12:15:58,421 [ERROR] [W1] seq=10 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:58,421 [ERROR] [W2] seq=11 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:58,421 [ERROR] [STREAM] Erro seq=10: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:58,422 [ERROR] [STREAM] Erro seq=11: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:58,422 [INFO] [STREAM] 2 sentenças enfileiradas em 0.92ms
+2026-06-02 12:15:59,173 [ERROR] [W0] seq=12 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:59,174 [ERROR] [STREAM] Erro seq=12: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:15:59,174 [INFO] [STREAM] 1 sentenças enfileiradas em 0.47ms
+2026-06-02 12:16:00,185 [ERROR] [W1] seq=13 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:16:00,185 [ERROR] [W2] seq=14 erro: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:16:00,186 [ERROR] [STREAM] Erro seq=13: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:16:00,186 [ERROR] [STREAM] Erro seq=14: Invalid language: 'ca'. Supported languages: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na
+2026-06-02 12:16:00,186 [INFO] [STREAM] 2 sentenças enfileiradas em 0.71ms
+2026-06-02 12:16:02,314 [WARNING] [PLAY] seq=5 atrasado 5003ms — pula para seq=6
+2026-06-02 12:16:02,346 [INFO] [PLAY] Fala completa

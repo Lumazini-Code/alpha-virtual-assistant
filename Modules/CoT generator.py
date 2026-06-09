@@ -27,7 +27,7 @@ REPEAT_PENALTY = 1.1
 # Valor mais alto (ex: 0.95) = só aceita hits muito próximos = menos falsos positivos.
 CACHE_HIT_THRESHOLD = 0.92
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [COT] %(message)s")
 log = logging.getLogger("ava.cot")
 
 

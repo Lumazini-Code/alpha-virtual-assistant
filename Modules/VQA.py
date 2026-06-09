@@ -14,6 +14,11 @@ from pydantic import BaseModel
 import time
 import uvicorn
 import httpx
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [VQA] %(message)s")
+log = logging.getLogger("ava.vqa")
+
 qwen_adress = ""
 # ── Detecta suporte a visão de forma síncrona ─────────────────────────────────
 def is_vision_supported(base_url: str = "http://localhost:2001") -> bool:

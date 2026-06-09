@@ -88,7 +88,7 @@ _STOP_WORDS: frozenset[str] = frozenset({
     "how","when","where","why","which","who","then","there","here","also",
 })
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Memory] %(message)s")
 log = logging.getLogger("ava.memory")
 
 if not _VS_AVAILABLE:

@@ -59,7 +59,7 @@ SERVER_PORT        = 2002
 EMBED_POOL_WORKERS = 4
 RERANK_POOL_WORKERS = 2
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONNX Manager] %(message)s")
 log = logging.getLogger("ava.onnx_serving")
 
 

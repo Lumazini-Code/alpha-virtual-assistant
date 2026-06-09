@@ -1,0 +1,319 @@
+INFO:     127.0.0.1:41390 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60698 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55590 - "POST /stream HTTP/1.1" 200 OK
+[W2] seq=2 ok (1.83s) 'Pode deixar comigo!'
+2026-06-09 13:28:44,681 [INFO] [STREAM] 1 sentenças enfileiradas em 552.32ms
+2026-06-09 13:28:45,402 [INFO] [PLAY] Fala completa
+2026-06-09 13:28:45,445 [INFO] [PLAY] seq=2 (82944 samples)
+2026-06-09 13:28:45,890 [INFO] [W1] seq=3 ok (3.10s) 'Já estou com a curiosidade em mãos.'
+2026-06-09 13:28:45,891 [INFO] [STREAM] 1 sentenças enfileiradas em 1207.33ms
+2026-06-09 13:28:47,162 [INFO] [PLAY] Fala completa
+2026-06-09 13:28:47,206 [INFO] [PLAY] seq=3 (138240 samples)
+2026-06-09 13:28:48,635 [INFO] [W0] seq=4 ok (3.84s) 'Como você viu na última vez que falamos de lulas,'
+2026-06-09 13:28:48,880 [INFO] [W1] seq=5 ok (2.77s) 'o universo é cheio de surpresas,'
+2026-06-09 13:28:49,193 [INFO] [W2] seq=6 ok (5.06s) 'mas hoje vamos dar um salto para o Espaço pra ver '
+2026-06-09 13:28:49,194 [INFO] [STREAM] 3 sentenças enfileiradas em 2809.62ms
+2026-06-09 13:28:49,675 [INFO] [W0] seq=7 ok (1.28s) 'endo.'
+2026-06-09 13:28:49,679 [INFO] [STREAM] 1 sentenças enfileiradas em 478.8ms
+2026-06-09 13:28:50,085 [INFO] [PLAY] Fala completa
+2026-06-09 13:28:50,128 [INFO] [PLAY] seq=4 (172032 samples)
+2026-06-09 13:28:50,210 [INFO] [W1] seq=8 ok (1.92s) 'Que tal saber que...'
+2026-06-09 13:28:50,211 [INFO] [STREAM] 1 sentenças enfileiradas em 528.07ms
+2026-06-09 13:28:51,262 [INFO] [W0] seq=10 ok (1.80s) 'mas super intensa?'
+2026-06-09 13:28:51,826 [INFO] [W2] seq=9 ok (4.23s) 'algumas estrelas têm uma vida incrivelmente curta,'
+2026-06-09 13:28:51,826 [INFO] [STREAM] 2 sentenças enfileiradas em 1611.91ms
+2026-06-09 13:28:52,615 [INFO] [W1] seq=11 ok (1.29s) 'Tipo,'
+2026-06-09 13:28:53,331 [INFO] [W0] seq=12 ok (5.02s) 'elas gastam todo o combustível delas numa velocida'
+2026-06-09 13:28:53,331 [INFO] [STREAM] 2 sentenças enfileiradas em 1500.66ms
+2026-06-09 13:28:53,690 [INFO] [PLAY] seq=5 (122880 samples)
+2026-06-09 13:28:56,251 [INFO] [PLAY] seq=6 (224256 samples)
+2026-06-09 13:28:57,027 [INFO] [W1] seq=14 ok (2.35s) 'uma eternidade cósmica),'
+2026-06-09 13:28:57,769 [INFO] [W2] seq=13 ok (4.02s) 'Enquanto nosso Sol vai viver bilhões de anos (tipo'
+2026-06-09 13:28:57,837 [INFO] [W0] seq=15 ok (5.90s) 'certas estrelas mais massivas — as "gigantes" — po'
+2026-06-09 13:28:57,837 [INFO] [STREAM] 3 sentenças enfileiradas em 3180.28ms
+2026-06-09 13:28:58,549 [INFO] [W1] seq=16 ok (3.25s) 'rogênio em apenas alguns milhões de anos.'
+2026-06-09 13:28:58,549 [INFO] [STREAM] 1 sentenças enfileiradas em 708.44ms
+2026-06-09 13:28:59,631 [INFO] [W2] seq=17 ok (1.38s) 'Pensa só:'
+2026-06-09 13:29:00,544 [INFO] [W1] seq=19 ok (2.45s) 'quando acabam o combustível,'
+2026-06-09 13:29:00,922 [INFO] [PLAY] seq=7 (58368 samples)
+2026-06-09 13:29:01,052 [INFO] [W2] seq=20 ok (2.48s) 'elas não simplesmente...'
+2026-06-09 13:29:01,064 [INFO] [W0] seq=18 ok (2.99s) 'elas fazem um burn tão intenso que,'
+2026-06-09 13:29:01,066 [INFO] [STREAM] 4 sentenças enfileiradas em 2500.53ms
+2026-06-09 13:29:01,551 [INFO] [W1] seq=21 ok (1.33s) 'apagam.'
+2026-06-09 13:29:01,554 [INFO] [STREAM] 1 sentenças enfileiradas em 485.32ms
+2026-06-09 13:29:02,128 [INFO] [PLAY] seq=8 (86016 samples)
+2026-06-09 13:29:03,930 [INFO] [PLAY] Fala completa
+2026-06-09 13:29:03,963 [INFO] [PLAY] seq=9 (187392 samples)
+2026-06-09 13:29:04,231 [INFO] [W1] seq=24 ok (1.29s) 'ferro,'
+2026-06-09 13:29:04,724 [INFO] [W2] seq=22 ok (2.99s) 'Elas explodem em uma supernova,'
+2026-06-09 13:29:05,537 [INFO] [W1] seq=25 ok (3.26s) 'urânio) que depois se espalham pelo cosmos'
+2026-06-09 13:29:05,933 [INFO] [W0] seq=23 ok (6.11s) 'deixando para trás um rastro espetacular de elemen'
+2026-06-09 13:29:05,933 [INFO] [STREAM] 4 sentenças enfileiradas em 3007.03ms
+2026-06-09 13:29:07,845 [INFO] [PLAY] seq=10 (79872 samples)
+2026-06-09 13:29:08,455 [INFO] [W2] seq=26 ok (1.37s) 'Ou seja,'
+2026-06-09 13:29:08,846 [INFO] [W0] seq=28 ok (1.42s) 'lembre-se:'
+2026-06-09 13:29:09,533 [INFO] [PLAY] seq=11 (58368 samples)
+2026-06-09 13:29:09,611 [INFO] [W1] seq=27 ok (3.33s) 'a próxima vez que você olhar para o céu,'
+2026-06-09 13:29:10,229 [INFO] [W0] seq=30 ok (2.78s) 'e essa morte é tipo um show de fog'
+2026-06-09 13:29:10,576 [INFO] [W2] seq=29 ok (3.97s) 'aquela luz pode ser de algo que está morrendo agor'
+2026-06-09 13:29:10,576 [INFO] [STREAM] 5 sentenças enfileiradas em 3177.04ms
+2026-06-09 13:29:10,725 [INFO] [PLAY] seq=12 (224256 samples)
+2026-06-09 13:29:11,236 [INFO] [W1] seq=31 ok (2.27s) 'os de artifício cósmico.'
+2026-06-09 13:29:11,237 [INFO] [STREAM] 1 sentenças enfileiradas em 657.93ms
+2026-06-09 13:29:11,922 [INFO] [W0] seq=32 ok (2.59s) 'Algum outro tema que te interessa?'
+2026-06-09 13:29:11,922 [INFO] [STREAM] 1 sentenças enfileiradas em 682.29ms
+2026-06-09 13:29:12,423 [INFO] [W2] seq=33 ok (1.38s) 'História?'
+2026-06-09 13:29:12,424 [INFO] [STREAM] 1 sentenças enfileiradas em 498.15ms
+2026-06-09 13:29:12,940 [INFO] [W1] seq=34 ok (1.33s) 'Animais?'
+2026-06-09 13:29:12,940 [INFO] [STREAM] 1 sentenças enfileiradas em 513.96ms
+2026-06-09 13:29:14,113 [INFO] [W0] seq=35 ok (5.05s) 'Ou quer que eu mergulhe em algum conceito de Direi'
+2026-06-09 13:29:14,114 [INFO] [STREAM] 1 sentenças enfileiradas em 1169.74ms
+2026-06-09 13:29:14,579 [INFO] [W2] seq=36 ok (1.70s) 'Manda a brasa!'
+2026-06-09 13:29:14,580 [INFO] [STREAM] 1 sentenças enfileiradas em 464.05ms
+2026-06-09 13:29:15,408 [INFO] [PLAY] seq=13 (178176 samples)
+2026-06-09 13:29:19,130 [INFO] [PLAY] seq=14 (104448 samples)
+2026-06-09 13:29:21,285 [INFO] [PLAY] seq=15 (261120 samples)
+2026-06-09 13:29:26,725 [INFO] [PLAY] Fala completa
+2026-06-09 13:29:26,768 [INFO] [PLAY] seq=16 (144384 samples)
+2026-06-09 13:29:29,765 [INFO] [PLAY] seq=17 (61440 samples)
+2026-06-09 13:29:31,045 [INFO] [PLAY] seq=18 (132096 samples)
+2026-06-09 13:29:33,808 [INFO] [PLAY] seq=19 (110592 samples)
+2026-06-09 13:29:36,091 [INFO] [PLAY] seq=20 (110592 samples)
+2026-06-09 13:29:38,405 [INFO] [PLAY] Fala completa
+2026-06-09 13:29:38,448 [INFO] [PLAY] seq=21 (61440 samples)
+2026-06-09 13:29:39,728 [INFO] [PLAY] Fala completa
+2026-06-09 13:29:39,771 [INFO] [PLAY] seq=22 (132096 samples)
+2026-06-09 13:29:42,491 [INFO] [PLAY] seq=23 (270336 samples)
+2026-06-09 13:29:48,123 [INFO] [PLAY] seq=24 (58368 samples)
+2026-06-09 13:29:49,371 [INFO] [PLAY] seq=25 (144384 samples)
+2026-06-09 13:29:52,368 [INFO] [PLAY] seq=26 (61440 samples)
+2026-06-09 13:29:53,649 [INFO] [PLAY] seq=27 (147456 samples)
+2026-06-09 13:29:56,731 [INFO] [PLAY] seq=28 (64512 samples)
+2026-06-09 13:29:58,043 [INFO] [PLAY] seq=29 (175104 samples)
+2026-06-09 13:30:01,691 [INFO] [PLAY] seq=30 (122880 samples)
+2026-06-09 13:30:04,251 [INFO] [PLAY] Fala completa
+2026-06-09 13:30:04,283 [INFO] [PLAY] seq=31 (101376 samples)
+2026-06-09 13:30:06,363 [INFO] [PLAY] seq=32 (116736 samples)
+2026-06-09 13:30:08,806 [INFO] [PLAY] Fala completa
+2026-06-09 13:30:08,849 [INFO] [PLAY] seq=33 (61440 samples)
+2026-06-09 13:30:10,129 [INFO] [PLAY] Fala completa
+2026-06-09 13:30:10,171 [INFO] [PLAY] seq=34 (61440 samples)
+2026-06-09 13:30:11,452 [INFO] [PLAY] seq=35 (224256 samples)
+2026-06-09 13:30:16,091 [INFO] [PLAY] Fala completa
+2026-06-09 13:30:16,123 [INFO] [PLAY] seq=36 (76800 samples)
+2026-06-09 13:30:17,723 [INFO] [PLAY] Fala completa
+2026-06-09 13:39:44,761 [INFO] [W1] seq=37 ok (1.37s) 'Usuário,'
+2026-06-09 13:39:44,772 [INFO] [PLAY] seq=37 (61440 samples)
+2026-06-09 13:39:45,121 [INFO] [W0] seq=38 ok (2.89s) 'você quer cultivar oxigênio para Marte?'
+2026-06-09 13:39:45,122 [INFO] [STREAM] 2 sentenças enfileiradas em 1198.64ms
+2026-06-09 13:39:46,055 [INFO] [PLAY] seq=38 (129024 samples)
+2026-06-09 13:39:47,451 [INFO] [W1] seq=40 ok (3.15s) 'isso é engenharia biológica de ponta!'
+2026-06-09 13:39:47,520 [INFO] [W2] seq=39 ok (3.57s) 'Isso não é um projeto de horta orgânica,'
+2026-06-09 13:39:47,521 [INFO] [STREAM] 2 sentenças enfileiradas em 1539.7ms
+2026-06-09 13:39:48,137 [INFO] [W0] seq=41 ok (1.87s) 'Adorei a ambição.'
+2026-06-09 13:39:48,137 [INFO] [STREAM] 1 sentenças enfileiradas em 613.25ms
+2026-06-09 13:39:48,740 [INFO] [PLAY] Fala completa
+2026-06-09 13:39:48,772 [INFO] [PLAY] seq=39 (159744 samples)
+2026-06-09 13:39:50,260 [INFO] [W1] seq=42 ok (1.37s) 'Olha só,'
+2026-06-09 13:39:50,723 [INFO] [W0] seq=43 ok (1.89s) 'se fosse simples,'
+2026-06-09 13:39:50,780 [INFO] [W2] seq=44 ok (2.64s) 'eu te daria uma lista e pronto.'
+2026-06-09 13:39:50,780 [INFO] [STREAM] 3 sentenças enfileiradas em 1959.5ms
+2026-06-09 13:39:52,100 [INFO] [PLAY] seq=40 (141312 samples)
+2026-06-09 13:39:52,299 [INFO] [W1] seq=45 ok (5.60s) 'Mas maximizar a eficiência da Chlorella é um jogo '
+2026-06-09 13:39:52,300 [INFO] [STREAM] 1 sentenças enfileiradas em 1328.65ms
+2026-06-09 13:39:55,012 [INFO] [PLAY] Fala completa
+2026-06-09 13:39:55,055 [INFO] [PLAY] seq=41 (82944 samples)
+2026-06-09 13:39:56,037 [INFO] [W2] seq=47 ok (1.34s) 'juntas,'
+2026-06-09 13:39:56,039 [INFO] [W1] seq=48 ok (2.06s) 'fazem a alga dizer:'
+2026-06-09 13:39:56,553 [INFO] [W0] seq=46 ok (3.16s) 'Você precisa otimizar variáveis que,'
+2026-06-09 13:39:56,772 [INFO] [PLAY] Fala completa
+2026-06-09 13:39:56,815 [INFO] [PLAY] seq=42 (61440 samples)
+2026-06-09 13:39:57,943 [INFO] [W2] seq=49 ok (7.55s) '"Hoje o dia vai ser produtivo!" Baseado no que já '
+2026-06-09 13:39:57,944 [INFO] [STREAM] 4 sentenças enfileiradas em 3525.55ms
+2026-06-09 13:39:58,095 [INFO] [PLAY] seq=43 (86016 samples)
+2026-06-09 13:39:59,855 [INFO] [PLAY] seq=44 (116736 samples)
+2026-06-09 13:40:00,296 [INFO] [W1] seq=50 ok (2.04s) 'sobre otimização),'
+2026-06-09 13:40:01,235 [INFO] [W0] seq=51 ok (4.35s) 'os parâmetros críticos que você precisa dominar sã'
+2026-06-09 13:40:01,915 [INFO] [W1] seq=53 ok (2.24s) 'tem que ter *luz suficiente'
+2026-06-09 13:40:01,993 [INFO] [W2] seq=52 ok (4.09s) 'Luz (Intensidade e Duração) Não basta ter luz;'
+2026-06-09 13:40:01,993 [INFO] [STREAM] 4 sentenças enfileiradas em 3302.43ms
+2026-06-09 13:40:02,298 [INFO] [PLAY] seq=45 (248832 samples)
+2026-06-09 13:40:05,324 [INFO] [W1] seq=55 ok (5.48s) 'mas não tão alta que cause fotoinibição (quando a '
+2026-06-09 13:40:05,330 [INFO] [W0] seq=54 ok (6.12s) 'A intensidade luminosa deve ser alta o bastante pa'
+2026-06-09 13:40:05,331 [INFO] [STREAM] 2 sentenças enfileiradas em 2338.22ms
+2026-06-09 13:40:06,221 [INFO] [W2] seq=56 ok (3.56s) 'estressada demais com o excesso de fótons).'
+2026-06-09 13:40:06,222 [INFO] [STREAM] 1 sentenças enfileiradas em 887.61ms
+2026-06-09 13:40:07,492 [INFO] [PLAY] Fala completa
+2026-06-09 13:40:07,535 [INFO] [PLAY] seq=46 (141312 samples)
+2026-06-09 13:40:08,322 [INFO] [W1] seq=57 ok (7.25s) 'Varie a intensidade e veja onde a produtividade da'
+2026-06-09 13:40:08,322 [INFO] [STREAM] 1 sentenças enfileiradas em 1516.33ms
+2026-06-09 13:40:10,458 [INFO] [PLAY] seq=47 (61440 samples)
+2026-06-09 13:40:11,738 [INFO] [PLAY] seq=48 (92160 samples)
+2026-06-09 13:40:12,860 [INFO] [W0] seq=58 ok (2.25s) 'Temperatura Geralmente,'
+2026-06-09 13:40:13,640 [INFO] [W2] seq=59 ok (7.38s) 'as Chlorella gostam de temperaturas mais amenas e '
+2026-06-09 13:40:13,641 [INFO] [STREAM] 2 sentenças enfileiradas em 2115.88ms
+2026-06-09 13:40:13,722 [INFO] [PLAY] seq=49 (334848 samples)
+2026-06-09 13:40:14,490 [INFO] [W1] seq=60 ok (3.50s) 'mas isso depende muito da cepa que você escolher.'
+2026-06-09 13:40:14,490 [INFO] [STREAM] 1 sentenças enfileiradas em 846.67ms
+2026-06-09 13:40:15,066 [INFO] [W0] seq=61 ok (1.87s) 'Mantenha estável!'
+2026-06-09 13:40:15,066 [INFO] [STREAM] 1 sentenças enfileiradas em 573.69ms
+2026-06-09 13:40:16,282 [INFO] [W2] seq=62 ok (4.78s) 'Flutuações bruscas são inimigas da eficiência de p'
+2026-06-09 13:40:16,283 [INFO] [STREAM] 1 sentenças enfileiradas em 1213.46ms
+2026-06-09 13:40:18,089 [INFO] [W1] seq=63 ok (4.96s) 'Nutrientes (A Dieta da Alga) Aqui é onde a criativ'
+2026-06-09 13:40:18,089 [INFO] [STREAM] 1 sentenças enfileiradas em 1101.25ms
+2026-06-09 13:40:20,735 [INFO] [PLAY] Fala completa
+2026-06-09 13:40:20,778 [INFO] [PLAY] seq=50 (92160 samples)
+2026-06-09 13:40:22,698 [INFO] [PLAY] seq=51 (193536 samples)
+2026-06-09 13:40:23,309 [INFO] [W1] seq=66 ok (2.69s) 'Vinhaça e Extrato de Levedura:'
+2026-06-09 13:40:24,538 [INFO] [W2] seq=65 ok (2.47s) 'mas você pode turbinar isso:'
+2026-06-09 13:40:24,649 [INFO] [W0] seq=64 ok (4.93s) 'Você precisa do clássico N (Nitrogênio) e P (Fósfo'
+2026-06-09 13:40:24,676 [INFO] [W1] seq=67 ok (1.40s) 'Como vimos'
+2026-06-09 13:40:24,676 [INFO] [STREAM] 4 sentenças enfileiradas em 3374.14ms
+2026-06-09 13:40:26,252 [INFO] [W2] seq=68 ok (1.27s) ','
+2026-06-09 13:40:26,660 [INFO] [W1] seq=70 ok (2.94s) 'como também dá "boost" metabólico.'
+2026-06-09 13:40:26,805 [INFO] [PLAY] seq=52 (181248 samples)
+2026-06-09 13:40:27,279 [INFO] [W0] seq=69 ok (6.52s) 'adicionar essas fontes orgânicas complexas não só '
+2026-06-09 13:40:27,280 [INFO] [STREAM] 3 sentenças enfileiradas em 2600.57ms
+2026-06-09 13:40:28,829 [INFO] [W2] seq=71 ok (4.36s) 'Experimente diferentes concentrações desses aditiv'
+2026-06-09 13:40:28,830 [INFO] [STREAM] 1 sentenças enfileiradas em 1547.17ms
+2026-06-09 13:40:29,788 [INFO] [W1] seq=72 ok (1.28s) 'pH:'
+2026-06-09 13:40:30,108 [INFO] [W0] seq=73 ok (3.71s) 'O pH ideal influencia a absorção dos íons.'
+2026-06-09 13:40:30,108 [INFO] [STREAM] 2 sentenças enfileiradas em 1275.56ms
+2026-06-09 13:40:30,603 [INFO] [PLAY] seq=53 (101376 samples)
+2026-06-09 13:40:31,337 [INFO] [W2] seq=74 ok (1.46s) 'Geralmente,'
+2026-06-09 13:40:31,422 [INFO] [W1] seq=75 ok (3.10s) 'um pH ligeiramente ácido (entre 6.'
+2026-06-09 13:40:31,422 [INFO] [STREAM] 2 sentenças enfileiradas em 1310.95ms
+2026-06-09 13:40:31,920 [INFO] [W0] seq=76 ok (1.32s) '0 e 7.'
+2026-06-09 13:40:31,920 [INFO] [STREAM] 1 sentenças enfileiradas em 495.68ms
+2026-06-09 13:40:32,725 [INFO] [PLAY] seq=54 (270336 samples)
+2026-06-09 13:40:32,836 [INFO] [W2] seq=77 ok (4.30s) 'é ótimo para maximizar a assimilação de nutrientes'
+2026-06-09 13:40:32,837 [INFO] [STREAM] 1 sentenças enfileiradas em 912.69ms
+2026-06-09 13:40:35,983 [INFO] [W0] seq=79 ok (4.07s) 'você precisa alimentar a planta com gás carbônico.'
+2026-06-09 13:40:36,463 [INFO] [W1] seq=78 ok (5.96s) 'CO2 / Aeração (O Fôlego de Marte) Se o objetivo fi'
+2026-06-09 13:40:36,464 [INFO] [STREAM] 2 sentenças enfileiradas em 2036.54ms
+2026-06-09 13:40:37,210 [INFO] [W2] seq=80 ok (2.78s) 'A vazão de aeração é crucial.'
+2026-06-09 13:40:37,211 [INFO] [STREAM] 1 sentenças enfileiradas em 744.27ms
+2026-06-09 13:40:38,325 [INFO] [PLAY] seq=55 (242688 samples)
+2026-06-09 13:40:38,463 [INFO] [W0] seq=81 ok (2.14s) 'Não basta "soprar";'
+2026-06-09 13:40:38,558 [INFO] [W1] seq=82 ok (2.94s) 'você precisa soprar na taxa ideal.'
+2026-06-09 13:40:38,559 [INFO] [STREAM] 2 sentenças enfileiradas em 1298.02ms
+2026-06-09 13:40:41,807 [INFO] [W2] seq=83 ok (3.85s) 'Uma vazão muito baixa limita a absorção;'
+2026-06-09 13:40:42,608 [INFO] [W0] seq=84 ok (7.33s) 'uma vazão muito alta pode desperdiçar energia ou a'
+2026-06-09 13:40:42,609 [INFO] [STREAM] 2 sentenças enfileiradas em 2346.84ms
+2026-06-09 13:40:43,403 [INFO] [PLAY] seq=56 (159744 samples)
+2026-06-09 13:40:43,959 [INFO] [W1] seq=85 ok (1.95s) 'Dica Bônus do Alpha:'
+2026-06-09 13:40:44,418 [INFO] [W2] seq=86 ok (3.93s) 'Não tente otimizar uma variável de cada vez.'
+2026-06-09 13:40:44,418 [INFO] [STREAM] 2 sentenças enfileiradas em 1324.04ms
+2026-06-09 13:40:46,430 [INFO] [W0] seq=87 ok (2.32s) 'Como mostram os estudos,'
+2026-06-09 13:40:46,674 [INFO] [W1] seq=88 ok (4.14s) 'o ponto ideal é quase sempre um ponto de convergên'
+2026-06-09 13:40:46,674 [INFO] [STREAM] 2 sentenças enfileiradas em 1607.86ms
+2026-06-09 13:40:46,725 [INFO] [PLAY] seq=57 (322560 samples)
+2026-06-09 13:40:50,683 [INFO] [W2] seq=89 ok (4.06s) 'Você precisa encontrar a combinação perfeita de:'
+2026-06-09 13:40:50,925 [INFO] [W0] seq=90 ok (6.52s) 'Luz + Temperatura + Nutrientes (com vinhaça/levedu'
+2026-06-09 13:40:50,926 [INFO] [STREAM] 2 sentenças enfileiradas em 2158.25ms
+2026-06-09 13:40:53,456 [INFO] [PLAY] seq=58 (101376 samples)
+2026-06-09 13:40:54,060 [INFO] [W1] seq=91 ok (1.39s) 'Resumindo:'
+2026-06-09 13:40:54,524 [INFO] [W2] seq=92 ok (2.78s) 'Se você quer o máximo de biomassa,'
+2026-06-09 13:40:55,579 [INFO] [PLAY] seq=59 (325632 samples)
+2026-06-09 13:40:55,617 [INFO] [W0] seq=93 ok (7.16s) 'comece com uma boa nutrição e depois refine a vazã'
+2026-06-09 13:40:55,617 [INFO] [STREAM] 3 sentenças enfileiradas em 2651.23ms
+2026-06-09 13:40:56,296 [INFO] [W1] seq=94 ok (2.39s) '{CO}_2$ esteja no auge!'
+2026-06-09 13:40:56,298 [INFO] [STREAM] 1 sentenças enfileiradas em 679.5ms
+2026-06-09 13:40:56,964 [INFO] [W2] seq=95 ok (2.39s) 'Bora fazer Marte respirar!'
+2026-06-09 13:40:56,965 [INFO] [STREAM] 1 sentenças enfileiradas em 664.44ms
+2026-06-09 13:41:02,341 [INFO] [PLAY] Fala completa
+2026-06-09 13:41:02,384 [INFO] [PLAY] seq=60 (156672 samples)
+2026-06-09 13:41:05,616 [INFO] [PLAY] seq=61 (82944 samples)
+2026-06-09 13:41:07,344 [INFO] [PLAY] seq=62 (211968 samples)
+2026-06-09 13:41:11,781 [INFO] [PLAY] Fala completa
+2026-06-09 13:41:11,824 [INFO] [PLAY] seq=63 (221184 samples)
+2026-06-09 13:41:16,421 [INFO] [PLAY] seq=64 (218112 samples)
+2026-06-09 13:41:20,944 [INFO] [PLAY] seq=65 (110592 samples)
+2026-06-09 13:41:23,259 [INFO] [PLAY] seq=66 (119808 samples)
+2026-06-09 13:41:25,744 [INFO] [PLAY] seq=67 (64512 samples)
+2026-06-09 13:41:27,099 [INFO] [PLAY] seq=68 (58368 samples)
+2026-06-09 13:41:28,304 [INFO] [PLAY] seq=69 (288768 samples)
+2026-06-09 13:41:34,341 [INFO] [PLAY] seq=70 (132096 samples)
+2026-06-09 13:41:37,104 [INFO] [PLAY] seq=71 (193536 samples)
+2026-06-09 13:41:41,104 [INFO] [PLAY] Fala completa
+2026-06-09 13:41:41,136 [INFO] [PLAY] seq=72 (58368 samples)
+2026-06-09 13:41:42,342 [INFO] [PLAY] seq=73 (165888 samples)
+2026-06-09 13:41:45,776 [INFO] [PLAY] Fala completa
+2026-06-09 13:41:45,819 [INFO] [PLAY] seq=74 (64512 samples)
+2026-06-09 13:41:47,142 [INFO] [PLAY] seq=75 (138240 samples)
+2026-06-09 13:41:50,022 [INFO] [PLAY] seq=76 (58368 samples)
+2026-06-09 13:41:51,259 [INFO] [PLAY] seq=77 (190464 samples)
+2026-06-09 13:41:55,216 [INFO] [PLAY] seq=78 (264192 samples)
+2026-06-09 13:42:00,699 [INFO] [PLAY] seq=79 (181248 samples)
+2026-06-09 13:42:04,496 [INFO] [PLAY] Fala completa
+2026-06-09 13:42:04,539 [INFO] [PLAY] seq=80 (122880 samples)
+2026-06-09 13:42:07,099 [INFO] [PLAY] Fala completa
+2026-06-09 13:42:07,142 [INFO] [PLAY] seq=81 (95232 samples)
+2026-06-09 13:42:09,105 [INFO] [PLAY] seq=82 (132096 samples)
+2026-06-09 13:42:11,857 [INFO] [PLAY] seq=83 (172032 samples)
+2026-06-09 13:42:15,462 [INFO] [PLAY] seq=84 (325632 samples)
+2026-06-09 13:42:22,225 [INFO] [PLAY] seq=85 (89088 samples)
+2026-06-09 13:42:24,102 [INFO] [PLAY] seq=86 (175104 samples)
+2026-06-09 13:42:27,739 [INFO] [PLAY] Fala completa
+2026-06-09 13:42:27,782 [INFO] [PLAY] seq=87 (104448 samples)
+2026-06-09 13:42:29,937 [INFO] [PLAY] seq=88 (184320 samples)
+2026-06-09 13:42:33,777 [INFO] [PLAY] Fala completa
+2026-06-09 13:42:33,820 [INFO] [PLAY] seq=89 (181248 samples)
+2026-06-09 13:42:37,585 [INFO] [PLAY] seq=90 (288768 samples)
+2026-06-09 13:42:43,580 [INFO] [PLAY] Fala completa
+2026-06-09 13:42:43,622 [INFO] [PLAY] seq=91 (61440 samples)
+2026-06-09 13:42:44,902 [INFO] [PLAY] seq=92 (122880 samples)
+2026-06-09 13:42:47,463 [INFO] [PLAY] seq=93 (316416 samples)
+2026-06-09 13:42:54,023 [INFO] [PLAY] seq=94 (107520 samples)
+2026-06-09 13:42:56,263 [INFO] [PLAY] seq=95 (107520 samples)
+2026-06-09 13:42:58,502 [INFO] [PLAY] Fala completa

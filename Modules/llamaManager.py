@@ -46,9 +46,10 @@ PID_DIR = Path(os.environ.get("LLAMA_PID_DIR", "/tmp/ava_llama_pids"))
 #   added: draft model support for speculative decoding
 TEXT_PARAMS = {
     # ── Context & batching ───────────────────────────────────────────────────
-    "ctx_size": 8192,          # Max context window
+    "ctx_size": 4096,          # Max context window
     "batch_size": 2048,        # CHANGED: 512 → 2048 — fewer passes over prompt
     "ubatch_size": 512,        # CHANGED: 256 → 512 — faster prefill per micro-batch
+    "fit":  "off",
     # ── GPU ───────────────────────────────────────────────────────────────────
     "gpu_layers": 999,         # Offload all layers to GPU
     "split_mode": "layer",     # Layer-wise GPU split
@@ -61,7 +62,7 @@ TEXT_PARAMS = {
     "threads_batch": 4,        # CPU threads for batch processing
     "threads_http": 4,         # HTTP server threads
     # ── Concurrency ──────────────────────────────────────────────────────────
-    "parallel": 4,             # CHANGED: 2 → 4 — more concurrent sequences
+    "parallel": 1,             # CHANGED: 2 → 4 — more concurrent sequences
     "cont_batching": True,     # Continuous batching — don't wait for seq completion
     "cache_prompt": True,      # CRITICAL: reuses KV cache across requests
     # ── Memory & I/O ─────────────────────────────────────────────────────────
@@ -74,15 +75,18 @@ TEXT_PARAMS = {
     "top_p": 0.95,
     "min_p": 0.05,
     "repeat_penalty": 1.05,
+    "override_kv": "tokenizer.ggml.add_bos_token=bool:false",
     # ── Network ──────────────────────────────────────────────────────────────
     "host": "0.0.0.0",
-    "port": 2001,
+    "port": 2001,  # Optional draft model for speculative decoding
+    
 }
 
 # ── OPTIMIZED: Multimodal (Vision) server defaults ───────────────────────────
 VISION_PARAMS = {
     "mmproj_offload": True,    # Offload vision projection to GPU
-    "ctx_size": 4096,          # Vision models typically need less context
+    "ctx_size": 4096,
+    "fit":  "off",             # Vision models typically need less context
     "batch_size": 1024,        # CHANGED: 512 → 1024
     "ubatch_size": 256,        # CHANGED: 128 → 256
     "gpu_layers": 999,
@@ -93,7 +97,7 @@ VISION_PARAMS = {
     "threads": 4,
     "threads_batch": 4,
     "threads_http": 2,
-    "parallel": 2,             # CHANGED: 1 → 2
+    "parallel": 1,             # CHANGED: 1 → 2
     "cont_batching": True,
     "cache_prompt": True,
     "mmap": True,
@@ -208,11 +212,11 @@ def build_command(
 
     # ── NEW: Draft model for speculative decoding ─────────────────────────────
     if draft_path and os.path.exists(draft_path):
-        cmd.extend(["--draft", str(draft_path)])
+        cmd.extend(["--model-draft", str(draft_path)])
         # Number of speculative tokens (default 5, max useful ~8)
-        cmd.extend(["--draft-max", "6"])
+        cmd.extend(["--spec-draft-n-max", "6"])
         # Minimum draft probability to accept
-        cmd.extend(["--draft-p-min", "0.4"])
+        cmd.extend(["--spec-draft-n-min", "0.4"])
         print(f"[Config] Speculative decoding with draft: {draft_path}")
 
     return cmd
