@@ -129,6 +129,7 @@ services:
     - ./resource:/app/resource
     - ./Modules:/app/Modules
     - ./orchestrator.py:/app/orchestrator.py
+    - ./scraping_client.py:/app/scraping_client.py
     - ava-cache-vulkan:/root/.cache
     - ava-logs-vulkan:/app/logs
     - /run/user/1000/pulse/native:/run/user/1000/pulse/native:rw

@@ -18,13 +18,11 @@ LLAMA_TIMEOUT_S   = 60.0
 MEMORY_API_URL    = "http://localhost:3001"
 MEMORY_TIMEOUT_S  = 5.0
 
-MAX_TOKENS     = 160   # margem para 7 steps verbosos sem whitespace (~100-140 tokens reais)
+MAX_TOKENS     = 220   # margem para 7 steps com "local_scraping" (~14 chars)
 TEMPERATURE    = 0.1
 TOP_P          = 0.9
 REPEAT_PENALTY = 1.1
 
-# Threshold de similaridade para aceitar um plano do cache semântico.
-# Valor mais alto (ex: 0.95) = só aceita hits muito próximos = menos falsos positivos.
 CACHE_HIT_THRESHOLD = 0.92
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [COT] %(message)s")
@@ -34,26 +32,23 @@ log = logging.getLogger("ava.cot")
 # ── Módulos disponíveis no AVA ─────────────────────────────────────────────────
 
 AVA_MODULES: dict[str, str] = {
-    "llm":        "responder perguntas, explicar conceitos, gerar texto, análise geral",
-    "memory":     "buscar ou gravar informações de longo prazo sobre o usuário",
-    "search":     "buscar informações atuais na internet",
-    "vision":     "analisar imagens, descrever cenas, ler texto em imagens",
-    "tts":        "converter texto em fala, ajustar voz ou velocidade",
-    "stt":        "transcrever áudio para texto",
-    "commander":  "executar comandos do sistema operacional, abrir programas",
-    "translator": "traduzir texto entre idiomas",
-    "calculator": "realizar cálculos matemáticos complexos",
+    "llm":            "responder perguntas, explicar conceitos, gerar texto, análise geral",
+    "memory":         "buscar ou gravar informações de longo prazo sobre o usuário",
+    "search":         "buscar informações atuais na internet",
+    "vision":         "analisar imagens, descrever cenas, ler texto em imagens",
+    "tts":            "converter texto em fala, ajustar voz ou velocidade",
+    "stt":            "transcrever áudio para texto",
+    "translator":     "traduzir texto entre idiomas",
+    "calculator":     "realizar cálculos matemáticos complexos",
+    "local_scraping": "buscar e ler arquivos locais no computador do usuário, indexar conteúdo de documentos locais",
+    "deep_search":     "realizar pesquisas web automáticas avançadas com múltiplas etapas, agregando e resumindo informações de várias fontes online e aprendendo com base nelas",
 }
 
 MODULES_BLOCK = "\n".join(f"  - {k}: {v}" for k, v in AVA_MODULES.items())
 
 # ── System prompt ──────────────────────────────────────────────────────────────
-#
-# Separado em bloco estático puro — nunca concatenado com dados dinâmicos —
-# para maximizar o reuso do KV cache do llama-server (cache_prompt: true).
-# O _build_prompt injeta os dados variáveis apenas no turno <|user|>.
 
-SYSTEM_PROMPT = f"""You are a planning module..
+SYSTEM_PROMPT = f"""You are a planning module.
 Your ONLY job is to break down a user request into a sequence of concrete, actionable steps.
 
 Available modules:
@@ -68,9 +63,13 @@ Rules:
 6. Never include explanations outside the JSON structure
 7. If a step needs output from a previous step, reference it as "result of step N"
 8. Mark independent steps with depends_on:null; dependent steps list their dependencies
+9. Use "local_scraping" (NOT "commander") when the user wants to READ or SEARCH a local file on their computer
+10. Use "commander" only to OPEN/launch applications or execute OS commands — never to read file contents
+11. When a file is read via local_scraping and the user asks about its content, the next step should use "llm" to analyze result of step N
+12. When is asked to learn or research something, don't use search, instead use deep search to make a deep search on the topic and learn from it
 
 Output format — output ONLY the inner content, starting from the first step object:
-{{"step":1,"action":"...","executor":"llm","depends_on":null}},{{"step":2,...}}]}}
+{{"step":1,"action":"...","executor":"llm","depends_on":null}},{{"step":2,"action":"...","executor":"search","depends_on":[1]}}]}}
 
 Examples:
 Input: "what GPU should I buy for gaming under R$2000"
@@ -78,36 +77,34 @@ Output: {{"step":1,"action":"search RTX 4060 RX 7600 benchmark price Brazil 2024
 
 Input: "play some jazz music"
 Output: {{"step":1,"action":"search jazz playlist Spotify","executor":"search","depends_on":null}},{{"step":2,"action":"open music player with result of step 1","executor":"commander","depends_on":[1]}}]}}
+
+Input: "leia o arquivo relatório de vendas e me diga o total"
+Output: {{"step":1,"action":"buscar e ler arquivo relatório de vendas","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"analisar o conteúdo e informar o total de vendas com base em result of step 1","executor":"llm","depends_on":[1]}}]}}
+
+Input: "read the local report file and compare with web search results"
+Output: {{"step":1,"action":"search latest industry report data online","executor":"search","depends_on":null}},{{"step":2,"action":"buscar e ler arquivo de relatório local","executor":"local_scraping","depends_on":null}},{{"step":3,"action":"compare result of step 1 with result of step 2 and summarize key differences","executor":"llm","depends_on":[1,2]}}]}}
+
+Input: "leia o arquivo notas.txt e grave as informações na memória"
+Output: {{"step":1,"action":"buscar e ler arquivo notas.txt","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"gravar na memória as informações de result of step 1","executor":"memory","depends_on":[1]}}]}}
+
+Input: "traduza o conteúdo do arquivo contrato.docx para inglês"
+Output: {{"step":1,"action":"buscar e ler arquivo contrato.docx","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"traduzir result of step 1 para inglês","executor":"translator","depends_on":[1]}}]}}
+
+Input: "leia o relatório financeiro e calcule a soma das despesas"
+Output: {{"step":1,"action":"buscar e ler arquivo relatório financeiro","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"calcular a soma das despesas em result of step 1","executor":"calculator","depends_on":[1]}}]}}
 """
 
 # ── Grammar GBNF otimizada ─────────────────────────────────────────────────────
-#
-# Melhorias em relação à versão anterior:
-#
-# 1. PREFIXO INJETADO NO PROMPT: o modelo começa a gerar a partir do primeiro
-#    step object — pula os ~12 tokens fixos do envelope {"steps":[ que foram
-#    pré-injetados no prompt. O grammar começa correspondentemente no meio do array.
-#
-# 2. SEM WHITESPACE ENTRE LITERAIS: ws removido entre campos fixos. Literais
-#    contíguos são processados como uma única restrição no FSM do llama.cpp.
-#
-# 3. number RESTRITO A [1-7]: elimina o estado de "pode continuar com dígito?"
-#    após o primeiro caractere. Um único token resolve o campo step.
-#
-# 4. depends_on TIPADO: null | array de dígitos. O orquestrador usa isso para
-#    paralelizar steps independentes sem heurísticas extras.
 
 GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
 steps-cont  ::= step ("," step)*
 step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
 step-num    ::= [1-7]
-executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\""
+executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\"" | "\"local_scraping\""
 depends     ::= "null" | "[" step-num ("," step-num)* "]"
 string      ::= "\"" ([^"\\] | "\\" .)* "\""
 """
 
-# Prefixo que é injetado no prompt — o modelo continua daqui.
-# Recomposto junto com o output do modelo para formar o JSON final.
 JSON_PREFIX = '{"steps":['
 
 
@@ -118,7 +115,6 @@ class PlanRequest(BaseModel):
     context:    Optional[str] = None
     max_steps:  Optional[int] = None
     use_cache:  bool = True
-    # threshold sobrescrevível por request (ex: domínios críticos usam 0.95)
     cache_threshold: float = CACHE_HIT_THRESHOLD
 
 class PlanStep(BaseModel):
@@ -131,8 +127,8 @@ class PlanResponse(BaseModel):
     steps:         list[PlanStep]
     input:         str
     from_cache:    bool
-    cache_score:   Optional[float] = None   # score de similaridade se from_cache=True
-    tokens_used:   Optional[int]   = None   # tokens_predicted do llama-server
+    cache_score:   Optional[float] = None
+    tokens_used:   Optional[int]   = None
     latency_ms:    float
 
 
@@ -148,11 +144,8 @@ state = AppState()
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
-
-
 @asynccontextmanager
 async def lifespan(app):
-    # 1. Aguarda llama-server
     async with httpx.AsyncClient() as probe:
         for attempt in range(60):
             try:
@@ -167,7 +160,6 @@ async def lifespan(app):
         else:
             raise RuntimeError(f"llama-server não respondeu em {LLAMA_SERVER_URL}")
 
-    # 2. Inicializa clientes
     state.llama_client = httpx.AsyncClient(
         base_url=LLAMA_SERVER_URL,
         timeout=httpx.Timeout(LLAMA_TIMEOUT_S),
@@ -180,9 +172,8 @@ async def lifespan(app):
     )
     log.info("CoT API pronta")
 
-    yield  # ← único yield
+    yield
 
-    # 3. Shutdown
     await state.llama_client.aclose()
     await state.memory_client.aclose()
     log.info("AVA CoT API encerrada")
@@ -196,33 +187,19 @@ app = FastAPI(title="AVA CoT API", lifespan=lifespan)
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _build_prompt(user_input: str, context: Optional[str], max_steps: Optional[int]) -> str:
-    """
-    Monta o prompt com o system prompt completamente estático no bloco <|system|>
-    e os dados dinâmicos isolados no bloco <|user|>.
-
-    Isso garante que o llama-server possa reutilizar o KV cache do system prompt
-    entre todas as chamadas, independente do user input.
-
-    O prompt termina com o JSON_PREFIX pré-injetado no bloco <|assistant|> —
-    o modelo começa a gerar a partir do primeiro step object.
-    """
     steps_hint   = f" Use no máximo {max_steps} passos." if max_steps else ""
     user_content = f"Plan the following request:{steps_hint}\n\n{user_input}"
     if context:
         user_content += f"\n\nRelevant context:\n{context}"
 
     return (
-        f"<|system|>\n{SYSTEM_PROMPT}<|end|>\n"
-        f"<|user|>\n{user_content}<|end|>\n"
-        f"<|assistant|>\n{JSON_PREFIX}"   # modelo continua daqui
+        f" />\n{SYSTEM_PROMPT}<|end|>\n"
+        f" />\n{user_content}<|end|>\n"
+        f" />\n{JSON_PREFIX}"
     )
 
 
 async def _call_llama(prompt: str) -> tuple[str, int]:
-    """
-    Chama o llama-server e retorna (raw_content, tokens_predicted).
-    raw_content é o que o modelo gerou APÓS o JSON_PREFIX injetado.
-    """
     payload = {
         "prompt":         prompt,
         "grammar":        GRAMMAR_GBNF,
@@ -243,30 +220,20 @@ async def _call_llama(prompt: str) -> tuple[str, int]:
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="llama-server não acessível")
 
-    data            = response.json()
-    raw             = data.get("content", "").strip()
-    tokens_used     = data.get("tokens_predicted", 0)
+    data        = response.json()
+    raw         = data.get("content", "").strip()
+    tokens_used = data.get("tokens_predicted", 0)
     return raw, tokens_used
 
 
 def _parse_steps(raw: str) -> list[PlanStep]:
-    """
-    Reconstrói o JSON completo prefixando JSON_PREFIX ao output do modelo,
-    parseia e valida os steps.
-
-    Estratégia de fallback: se o JSON completo falhar (quantizações INT4 podem
-    cortar o output), tenta parsear steps individuais que estejam completos.
-    """
     valid_executors = set(AVA_MODULES.keys())
     full_json       = JSON_PREFIX + raw
 
-    # Tentativa 1: parse normal do JSON completo
     try:
         result    = json.loads(full_json)
         raw_steps = result.get("steps", [])
     except json.JSONDecodeError:
-        # Tentativa 2: o modelo cortou antes do fechamento — tenta recuperar
-        # steps que já estão completos no output truncado
         log.warning("JSON incompleto do llama-server — tentando recuperação parcial")
         raw_steps = _recover_partial_steps(raw)
         if not raw_steps:
@@ -286,7 +253,6 @@ def _parse_steps(raw: str) -> list[PlanStep]:
             continue
         depends_on = s.get("depends_on")
         if isinstance(depends_on, list):
-            # Filtra referências para steps que ainda não existem
             depends_on = [d for d in depends_on if isinstance(d, int) and d < i]
             depends_on = depends_on or None
         elif depends_on is not None:
@@ -300,10 +266,6 @@ def _parse_steps(raw: str) -> list[PlanStep]:
 
 
 def _recover_partial_steps(raw: str) -> list[dict]:
-    """
-    Tenta extrair steps completos de um JSON truncado.
-    Procura por objetos {...} fechados no output.
-    """
     steps = []
     depth, start = 0, None
     for i, ch in enumerate(raw):
@@ -326,11 +288,6 @@ def _recover_partial_steps(raw: str) -> list[dict]:
 # ── Cache semântico via Memory API ─────────────────────────────────────────────
 
 async def _cache_get(query: str, threshold: float) -> Optional[tuple[dict, float, int]]:
-    """
-    Busca no cache semântico da Memory API.
-    Retorna (plan_dict, score, cache_id) se hit, None se miss.
-    Falhas de rede retornam None silenciosamente — o CoT continua sem cache.
-    """
     try:
         r = await state.memory_client.post(
             "/cache/get",
@@ -346,10 +303,6 @@ async def _cache_get(query: str, threshold: float) -> Optional[tuple[dict, float
 
 
 async def _cache_put(query: str, plan: dict):
-    """
-    Grava um plano no cache semântico da Memory API.
-    Falhas de rede são logadas mas não propagadas.
-    """
     try:
         r = await state.memory_client.post(
             "/cache/put",
@@ -364,31 +317,12 @@ async def _cache_put(query: str, plan: dict):
 
 @app.post("/plan", response_model=PlanResponse)
 async def plan(req: PlanRequest):
-    """
-    Gera um plano de execução para o input do usuário.
-
-    Fluxo:
-      1. Consulta o cache semântico na Memory API (se use_cache=True).
-         Hit  → retorna imediatamente (~5ms, sem inferência).
-         Miss → continua para o passo 2.
-
-      2. Infere com o Phi-3.5-mini via llama-server.
-         O prompt usa prefixo JSON pré-injetado para reduzir tokens gerados.
-         Grammar GBNF garante output estruturado com depends_on para paralelismo.
-
-      3. Cacheia o plano gerado na Memory API para requests futuros similares.
-
-    O campo depends_on em cada step indica quais steps anteriores precisam
-    terminar antes deste começar. Steps com depends_on=null podem ser
-    executados em paralelo pelo orquestrador do AVA.
-    """
     user_input = req.input.strip()
     if not user_input:
         raise HTTPException(status_code=400, detail="input vazio")
 
     t0 = time.perf_counter()
 
-    # ── 1. Consulta cache semântico ────────────────────────────────────────────
     if req.use_cache:
         cache_result = await _cache_get(user_input, req.cache_threshold)
         if cache_result:
@@ -397,35 +331,24 @@ async def plan(req: PlanRequest):
             latency = round((time.perf_counter() - t0) * 1000, 2)
             log.info(f"Cache HIT em {latency}ms — score={score:.3f}: {user_input[:60]}")
             return PlanResponse(
-                steps       = steps,
-                input       = user_input,
-                from_cache  = True,
-                cache_score = score,
-                latency_ms  = latency,
+                steps=steps, input=user_input, from_cache=True,
+                cache_score=score, latency_ms=latency,
             )
 
-    # ── 2. Inferência ──────────────────────────────────────────────────────────
     prompt      = _build_prompt(user_input, req.context, req.max_steps)
     raw, tokens = await _call_llama(prompt)
     steps       = _parse_steps(raw)
 
-    # ── 3. Cacheia o plano gerado ──────────────────────────────────────────────
     if req.use_cache:
         plan_dict = {"steps": [s.model_dump() for s in steps]}
         await _cache_put(user_input, plan_dict)
 
     latency = round((time.perf_counter() - t0) * 1000, 2)
-    log.info(
-        f"Plano em {latency}ms — {len(steps)} steps | "
-        f"{tokens} tokens: {user_input[:60]}"
-    )
+    log.info(f"Plano em {latency}ms — {len(steps)} steps | {tokens} tokens: {user_input[:60]}")
 
     return PlanResponse(
-        steps       = steps,
-        input       = user_input,
-        from_cache  = False,
-        tokens_used = tokens,
-        latency_ms  = latency,
+        steps=steps, input=user_input, from_cache=False,
+        tokens_used=tokens, latency_ms=latency,
     )
 
 
@@ -458,14 +381,10 @@ async def status():
     }
 
 
-# ── DELETE /cache — invalida todo o cache de planos ───────────────────────────
+# ── DELETE /cache ──────────────────────────────────────────────────────────────
 
 @app.delete("/cache")
 async def invalidate_cache():
-    """
-    Proxy para DELETE /cache da Memory API.
-    Chamar quando módulos do AVA mudarem ou o system prompt for atualizado.
-    """
     try:
         r = await state.memory_client.delete("/cache", timeout=10.0)
         r.raise_for_status()

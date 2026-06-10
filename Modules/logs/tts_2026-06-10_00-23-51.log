@@ -1,0 +1,37 @@
+INFO:     127.0.0.1:54392 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54408 - "GET /status HTTP/1.1" 200 OK
+] Iniciando AVA TTS API...
+2026-06-10 00:23:51,313 [INFO] [TTS] [W0] Carregando Supertonic...
+2026-06-10 00:23:51,327 [INFO] [TTS] [W1] Carregando Supertonic...
+2026-06-10 00:23:51,327 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:23:51,327 [INFO] [TTS] [W2] Carregando Supertonic...
+2026-06-10 00:23:51,328 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:23:51,328 [INFO] [TTS] TTSPool iniciado com 3 workers
+2026-06-10 00:23:51,328 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:23:51,328 [INFO] [TTS] TTS API pronta
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-10 00:23:51,329 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:23:51,329 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:23:51,333 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:23:51,333 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:23:51,330 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:23:51,333 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:23:51,333 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:23:51,333 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:23:51,690 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:23:53,621 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:23:54,526 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:23:54,605 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:23:54,612 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 00:23:54,615 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 00:23:54,619 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 00:23:54,622 [INFO] [TTS] Model loaded successfully
+2026-06-10 00:23:54,626 [INFO] [TTS] Model loaded successfully
+2026-06-10 00:23:54,630 [INFO] [TTS] Model loaded successfully
+2026-06-10 00:23:54,630 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 00:23:54,630 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 00:23:54,630 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 00:23:55,958 [INFO] [TTS] [W1] Pronto (pré-aquecido)
+2026-06-10 00:23:55,973 [INFO] [TTS] [W2] Pronto (pré-aquecido)
+2026-06-10 00:23:56,188 [INFO] [TTS] [W0] Pronto (pré-aquecido)

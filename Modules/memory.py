@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import re
 import time
 import json
@@ -30,8 +31,7 @@ except ImportError as _imp_err:
 
 # ── Configuração ───────────────────────────────────────────────────────────────
 
-# ── REMOVED: EMBED_MODEL_PATH and TOKENIZER_PATH — now served by onnx_serving ─
-ONNX_SERVING_URL = DEFAULT_ONNX_BASE_URL   # "http://localhost:3099"
+ONNX_SERVING_URL = DEFAULT_ONNX_BASE_URL
 
 # Longo prazo
 DB_PATH           = "./memory/ava_memory.db"
@@ -48,11 +48,22 @@ PC_DB_PATH           = "./memory/ava_plan_cache.db"
 PC_FAISS_INDEX_PATH  = "./memory/ava_plan_cache.index"
 PC_FAISS_ID_MAP_PATH = "./memory/ava_plan_cache_id_map.npy"
 
-# ── NEW: Knowledge (Vector Store / KG-RAG) paths ─────────────────────────────
+# Knowledge (Vector Store / KG-RAG)
 VS_DB_PATH           = "./memory/ava_kg_chunks.db"
 VS_FAISS_INDEX_PATH  = "./memory/ava_kg_vectors.index"
 VS_FAISS_ID_MAP_PATH = "./memory/ava_kg_vectors_id_map.npy"
 VS_MIN_SCORE         = 0.70
+
+# ── NEW: Indexed Files (local-scraping) ────────────────────────────────────────
+IF_DB_PATH           = "./memory/ava_indexed_files.db"
+IF_FAISS_INDEX_PATH  = "./memory/ava_indexed_files.index"
+IF_FAISS_ID_MAP_PATH = "./memory/ava_indexed_files_id_map.npy"
+IF_MIN_SCORE         = 0.75
+IF_MAX_CONTENT_SIZE  = 500_000    # 500 KB — mesmo limite do local-scraping
+IF_MAX_CHUNKS        = 2000       # máx chunks por arquivo
+CHUNK_SIZE           = 500        # chars por chunk
+CHUNK_OVERLAP        = 100        # chars de sobreposição entre chunks
+IF_EMBED_BATCH_SIZE  = 64         # chunks por batch de embedding
 
 EMBED_DIM            = 384
 READ_MIN_SCORE       = 0.83
@@ -136,10 +147,16 @@ class MemoryEntry(BaseModel):
     confidence:   float
     created_at:   float
     access_count: int
-    memory_type:  Literal["long_term", "short_term", "knowledge"]
+    memory_type:  Literal["long_term", "short_term", "knowledge", "indexed_file"]
     session_id:   Optional[str]        = None
     turns:        Optional[list[Turn]] = None
     source:       Optional[str]        = None
+    # ── NEW: Indexed file metadata ──
+    file_path:    Optional[str]        = None
+    file_name:    Optional[str]        = None
+    extension:    Optional[str]        = None
+    content_hash: Optional[str]        = None
+    file_hash:    Optional[str]        = None
 
 class ReadResponse(BaseModel):
     results:  list[MemoryEntry]
@@ -168,13 +185,69 @@ class PlanCacheDeleteResponse(BaseModel):
     deleted: int
 
 
+# ── NEW: Modelos de request/response — arquivos indexados ─────────────────────
+
+class IndexedFileWriteRequest(BaseModel):
+    """Store a complete indexed file with full content, hash, and auto-chunking."""
+    file_path:    str
+    file_name:    str
+    extension:    str   = ""
+    content:      str
+    file_hash:    str   = ""     # SHA-256 do arquivo original no disco
+    size:         int   = 0
+    modified:     str   = ""     # data de modificação ISO
+    source:       str   = "local_scraping"
+    confidence:   float = 1.0
+    force_reindex: bool = False
+
+class IndexedFileWriteResponse(BaseModel):
+    stored:         bool
+    reason:         str
+    file_id:        Optional[int] = None
+    chunks_created: int  = 0
+    was_reindexed:  bool = False
+    hash_match:     bool = True
+
+class IndexedFileReadRequest(BaseModel):
+    query:     str
+    top_k:     int   = 5
+    min_score: float = IF_MIN_SCORE
+
+class IndexedFileEntry(BaseModel):
+    file_id:      int
+    file_path:    str
+    file_name:    str
+    extension:    str
+    content:      str                   # conteúdo completo do arquivo
+    file_hash:    str
+    content_hash: str
+    size:         int
+    modified:     str
+    score:        float
+    confidence:   float
+    created_at:   float
+    access_count: int
+    source:       str = "local_scraping"
+    chunk_text:   Optional[str] = None  # chunk específico que deu match
+
+class IndexedFileReadResponse(BaseModel):
+    results: list[IndexedFileEntry]
+    query:   str
+
+class IndexedFileCheckResponse(BaseModel):
+    indexed:          bool
+    hash_match:       Optional[bool]   = None
+    file_id:          Optional[int]    = None
+    stored_file_hash: Optional[str]    = None
+    stored_content_hash: Optional[str] = None
+    stored_modified:  Optional[str]    = None
+    chunks_count:     Optional[int]    = None
+
+
 # ── MODIFIED: EmbeddingEngine now delegates to EmbeddingClient ────────────────
 
 class EmbeddingEngine:
-    """
-    Motor de embeddings via ONNX Serving API.
-    Mantém a mesma interface síncrona + adiciona métodos async nativos.
-    """
+    """Motor de embeddings via ONNX Serving API."""
 
     def __init__(self, base_url: str = ONNX_SERVING_URL):
         self._client = EmbeddingClient(base_url=base_url)
@@ -414,6 +487,267 @@ class PlanCacheDB:
         return self._conn.execute("SELECT COUNT(*) FROM plan_cache").fetchone()[0]
 
 
+# ── NEW: Banco de dados de arquivos indexados ──────────────────────────────────
+
+class IndexedFilesDB:
+    """
+    Armazena o conteúdo COMPLETO dos arquivos indexados pelo local-scraping,
+    com hash para detectar mudanças e chunks para busca semântica via FAISS.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS indexed_files (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path     TEXT    NOT NULL UNIQUE,
+                file_name     TEXT    NOT NULL,
+                extension     TEXT    NOT NULL DEFAULT '',
+                content       TEXT    NOT NULL,
+                content_hash  TEXT    NOT NULL,
+                file_hash     TEXT    NOT NULL DEFAULT '',
+                size          INTEGER NOT NULL DEFAULT 0,
+                modified      TEXT    NOT NULL DEFAULT '',
+                source        TEXT    NOT NULL DEFAULT 'local_scraping',
+                confidence    REAL    NOT NULL DEFAULT 1.0,
+                created_at    REAL    NOT NULL,
+                last_accessed REAL    NOT NULL,
+                access_count  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_if_path      ON indexed_files(file_path);
+            CREATE INDEX IF NOT EXISTS idx_if_file_hash ON indexed_files(file_hash);
+
+            CREATE TABLE IF NOT EXISTS indexed_file_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id     INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text  TEXT    NOT NULL,
+                char_start  INTEGER NOT NULL DEFAULT 0,
+                char_end    INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (file_id) REFERENCES indexed_files(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_ifc_file_id ON indexed_file_chunks(file_id);
+        """)
+
+    # ── File operations ──
+
+    def insert_file(
+        self,
+        file_path:   str,
+        file_name:   str,
+        extension:   str,
+        content:     str,
+        content_hash: str,
+        file_hash:   str,
+        size:        int,
+        modified:    str,
+        source:      str,
+        confidence:  float,
+    ) -> int:
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO indexed_files "
+            "(file_path, file_name, extension, content, content_hash, file_hash, "
+            "size, modified, source, confidence, created_at, last_accessed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_path, file_name, extension, content, content_hash, file_hash,
+             size, modified, source, confidence, now, now),
+        )
+        return cur.lastrowid
+
+    def update_file(
+        self,
+        file_id:     int,
+        content:     str,
+        content_hash: str,
+        file_hash:   str,
+        size:        int,
+        modified:    str,
+    ):
+        now = time.time()
+        self._conn.execute(
+            "UPDATE indexed_files SET content=?, content_hash=?, file_hash=?, "
+            "size=?, modified=?, last_accessed=? WHERE id=?",
+            (content, content_hash, file_hash, size, modified, now, file_id),
+        )
+
+    def get_by_path(self, file_path: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM indexed_files WHERE file_path = ?", (file_path,)
+        ).fetchone()
+
+    def get_by_id(self, file_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM indexed_files WHERE id = ?", (file_id,)
+        ).fetchone()
+
+    def update_access(self, file_id: int):
+        try:
+            self._conn.execute(
+                "UPDATE indexed_files SET access_count = access_count + 1, "
+                "last_accessed = ? WHERE id = ?",
+                (time.time(), file_id),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def delete_file(self, file_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM indexed_files WHERE id = ?", (file_id,))
+        return cur.rowcount
+
+    def count_files(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM indexed_files").fetchone()[0]
+
+    def list_files(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, file_path, file_name, extension, content_hash, file_hash, "
+            "size, modified, created_at, access_count FROM indexed_files "
+            "ORDER BY last_accessed DESC"
+        ).fetchall()
+
+    # ── Chunk operations ──
+
+    def insert_chunks(self, file_id: int, chunks: list[dict]):
+        """Insert multiple chunks for a file. chunks = [{text, index, char_start, char_end}]"""
+        rows = [
+            (file_id, c["index"], c["text"], c["char_start"], c["char_end"])
+            for c in chunks
+        ]
+        self._conn.executemany(
+            "INSERT INTO indexed_file_chunks (file_id, chunk_index, chunk_text, char_start, char_end) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    def get_chunks_by_file(self, file_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM indexed_file_chunks WHERE file_id = ? ORDER BY chunk_index",
+            (file_id,),
+        ).fetchall()
+
+    def get_chunk_ids_by_file(self, file_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM indexed_file_chunks WHERE file_id = ?", (file_id,)
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def count_chunks(self, file_id: Optional[int] = None) -> int:
+        if file_id:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM indexed_file_chunks WHERE file_id = ?", (file_id,)
+            ).fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM indexed_file_chunks"
+        ).fetchone()[0]
+
+    def delete_chunks_by_file(self, file_id: int) -> int:
+        cur = self._conn.execute(
+            "DELETE FROM indexed_file_chunks WHERE file_id = ?", (file_id,)
+        )
+        return cur.rowcount
+
+    def get_chunks_by_ids(self, chunk_ids: list[int]) -> list[sqlite3.Row]:
+        if not chunk_ids:
+            return []
+        ph = ",".join("?" * len(chunk_ids))
+        return self._conn.execute(
+            f"SELECT * FROM indexed_file_chunks WHERE id IN ({ph})", chunk_ids
+        ).fetchall()
+
+    def get_total_chunks(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM indexed_file_chunks").fetchone()[0]
+
+
+# ── NEW: Chunking de texto ─────────────────────────────────────────────────────
+
+def _chunk_text(
+    text:         str,
+    chunk_size:   int = CHUNK_SIZE,
+    overlap:      int = CHUNK_OVERLAP,
+) -> list[dict]:
+    """
+    Divide texto em chunks sobrepostos com metadados de posição.
+
+    Estratégia de split (prioridade):
+      1. Quebra de parágrafo (\\n\\n)
+      2. Quebra de linha (\\n)
+      3. Fim de sentença (. ! ?)
+      4. Espaço (limite de palavra)
+      5. Corte duro no chunk_size
+
+    Retorna lista de dicts:
+      {"text": str, "index": int, "char_start": int, "char_end": int}
+    """
+    if not text or not text.strip():
+        return []
+
+    chunks = []
+    start = 0
+    chunk_index = 0
+
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+
+        if end < len(text):
+            # Tenta encontrar um ponto de quebra natural na segunda metade do chunk
+            search_start = start + chunk_size // 2
+
+            # 1. Parágrafo duplo
+            split_pos = text.rfind('\n\n', search_start, end)
+            if split_pos != -1:
+                end = split_pos + 2  # inclui o \n\n
+            else:
+                # 2. Linha simples
+                split_pos = text.rfind('\n', search_start, end)
+                if split_pos != -1:
+                    end = split_pos + 1
+                else:
+                    # 3. Fim de sentença
+                    best_sep = -1
+                    for sep in ('. ', '.\n', '! ', '? ', '。', '！', '？', '; ', ';\n'):
+                        pos = text.rfind(sep, search_start, end)
+                        if pos != -1 and pos > best_sep:
+                            best_sep = pos + len(sep)
+                    if best_sep != -1:
+                        end = best_sep
+                    else:
+                        # 4. Espaço
+                        split_pos = text.rfind(' ', search_start, end)
+                        if split_pos != -1:
+                            end = split_pos + 1
+                        # 5. Corte duro — end já está setado
+
+        chunk_text = text[start:end].strip()
+        if chunk_text:
+            chunks.append({
+                "text":       chunk_text,
+                "index":      chunk_index,
+                "char_start": start,
+                "char_end":   end,
+            })
+            chunk_index += 1
+
+        # Avança com sobreposição
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)  # garante progresso
+
+        # Limite de chunks
+        if chunk_index >= IF_MAX_CHUNKS:
+            log.warning(f"Chunking atingiu limite de {IF_MAX_CHUNKS} — truncando")
+            break
+
+    return chunks
+
+
 # ── Índice FAISS genérico ──────────────────────────────────────────────────────
 
 class MemoryIndex:
@@ -437,6 +771,20 @@ class MemoryIndex:
     def add(self, embedding: np.ndarray, record_id: int):
         self._index.add(embedding.reshape(1, -1))
         self._id_map.append(record_id)
+        if self._persist:
+            self._save()
+
+    def add_batch(self, embeddings: np.ndarray, record_ids: list[int]):
+        """Adiciona múltiplos vetores de uma vez — mais eficiente que add() individual."""
+        if embeddings.shape[0] != len(record_ids):
+            raise ValueError(
+                f"embeddings ({embeddings.shape[0]}) e record_ids ({len(record_ids)}) "
+                f"devem ter o mesmo tamanho"
+            )
+        if embeddings.shape[0] == 0:
+            return
+        self._index.add(embeddings)
+        self._id_map.extend(record_ids)
         if self._persist:
             self._save()
 
@@ -499,6 +847,9 @@ class AppState:
     pc_db:        PlanCacheDB     = field(default=None)
     pc_index:     MemoryIndex     = field(default=None)
     vs:           Optional[VectorStore] = field(default=None)
+    # ── NEW: Indexed files ──
+    if_db:        IndexedFilesDB  = field(default=None)
+    if_index:     MemoryIndex     = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
 
@@ -553,8 +904,6 @@ def _resolve_vs_paths() -> tuple[str, str, str]:
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Memory API...")
 
-    # ── MODIFIED: Connect to ONNX serving API instead of loading local models ─
-    # No need to check for model files — they are served by onnx_serving
     try:
         from onnx_client import check_health
         health = await check_health(ONNX_SERVING_URL)
@@ -573,6 +922,10 @@ async def lifespan(app: FastAPI):
 
     state.pc_db    = PlanCacheDB(PC_DB_PATH)
     state.pc_index = MemoryIndex(PC_FAISS_INDEX_PATH, PC_FAISS_ID_MAP_PATH)
+
+    # ── NEW: Indexed files ──
+    state.if_db    = IndexedFilesDB(IF_DB_PATH)
+    state.if_index = MemoryIndex(IF_FAISS_INDEX_PATH, IF_FAISS_ID_MAP_PATH)
 
     if _VS_AVAILABLE:
         try:
@@ -598,11 +951,11 @@ async def lifespan(app: FastAPI):
         f"Pronto — {state.lt_db.count()} memórias LT | "
         f"{state.st_db.count()} grupos ST | "
         f"{state.pc_db.count()} planos em cache | "
-        f"{state.vs.total if state.vs else 0} chunks de conhecimento"
+        f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
+        f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks)"
     )
     yield
 
-    # ── MODIFIED: Close the embedding client ──────────────────────────────────
     await state.embed_engine.client.close()
 
     state.decay_task.cancel()
@@ -663,7 +1016,6 @@ async def _search_expanded(
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     expanded = f"{context_block}\n\nquery atual: {query}" if context_block else query
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     emb = await state.embed_engine.embed_one(expanded)
     loop = asyncio.get_event_loop()
     lt_raw, st_raw = await asyncio.gather(
@@ -678,7 +1030,6 @@ async def _search_dual(
     context_block: str,
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    # ── MODIFIED: embed_batch_two is now async ────────────────────────────────
     emb_query, emb_ctx = await state.embed_engine.embed_batch_two(query, context_block)
     loop = asyncio.get_event_loop()
     lt_q, st_q, lt_c, st_c = await asyncio.gather(
@@ -769,6 +1120,83 @@ def _build_vs_entries(
     return entries
 
 
+# ── NEW: Build indexed file entries from FAISS search results ─────────────────
+
+def _build_if_entries(
+    if_raw: list[tuple[int, float]],
+    min_score: float,
+    loop: asyncio.AbstractEventLoop,
+    return_full_content: bool = False,
+) -> list[MemoryEntry]:
+    """
+    Converte resultados de busca FAISS de chunks em MemoryEntry.
+
+    Se return_full_content=True, text contém o conteúdo completo do arquivo.
+    Se False, text contém apenas o chunk que deu match (mais conciso para /read).
+    Deduplica por file_id — mantém apenas o melhor score por arquivo.
+    """
+    if not if_raw:
+        return []
+
+    # Filtra por score mínimo
+    filtered = [(cid, score) for cid, score in if_raw if score >= min_score]
+    if not filtered:
+        return []
+
+    # Busca chunk records
+    chunk_ids = [cid for cid, _ in filtered]
+    chunk_rows = state.if_db.get_chunks_by_ids(chunk_ids)
+    chunk_map = {row["id"]: row for row in chunk_rows}
+
+    # Agrupa por file_id — mantém melhor score por arquivo
+    file_best: dict[int, tuple[float, sqlite3.Row]] = {}
+    for cid, score in filtered:
+        chunk_row = chunk_map.get(cid)
+        if chunk_row is None:
+            continue
+        fid = chunk_row["file_id"]
+        if fid not in file_best or score > file_best[fid][0]:
+            file_best[fid] = (score, chunk_row)
+
+    if not file_best:
+        return []
+
+    # Busca file records
+    file_ids = list(file_best.keys())
+    file_rows = state.if_db._conn.execute(
+        f"SELECT * FROM indexed_files WHERE id IN ({','.join('?' * len(file_ids))})",
+        file_ids,
+    ).fetchall()
+    file_map = {row["id"]: row for row in file_rows}
+
+    entries = []
+    for fid, (score, chunk_row) in file_best.items():
+        file_row = file_map.get(fid)
+        if file_row is None:
+            continue
+
+        text = file_row["content"] if return_full_content else chunk_row["chunk_text"]
+
+        entries.append(MemoryEntry(
+            id           = fid,
+            text         = text,
+            score        = round(score, 4),
+            confidence   = round(file_row["confidence"], 4),
+            created_at   = file_row["created_at"],
+            access_count = file_row["access_count"],
+            memory_type  = "indexed_file",
+            source       = file_row["source"],
+            file_path    = file_row["file_path"],
+            file_name    = file_row["file_name"],
+            extension    = file_row["extension"],
+            content_hash = file_row["content_hash"],
+            file_hash    = file_row["file_hash"],
+        ))
+        loop.run_in_executor(None, state.if_db.update_access, fid)
+
+    return entries
+
+
 # ── POST /write ────────────────────────────────────────────────────────────────
 
 @app.post("/write", response_model=WriteResponse)
@@ -779,7 +1207,6 @@ async def write_memory(req: WriteRequest):
     if state.lt_db.exists_exact(text):
         return WriteResponse(stored=False, reason="duplicate_exact")
 
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     embedding = await state.embed_engine.embed_one(text)
 
     max_sim = state.lt_index.search_similar(embedding)
@@ -804,7 +1231,6 @@ async def write_short_term(req: WriteSTRequest):
         return WriteSTResponse(stored=False, reason="too_short")
 
     embed_text = "\n".join(f"{t.role}: {t.content}" for t in req.turns)
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     embedding = await state.embed_engine.embed_one(embed_text)
 
     max_sim = state.st_index.search_similar(embedding)
@@ -828,7 +1254,6 @@ async def read_memory(req: ReadRequest):
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
 
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     query_emb = await state.embed_engine.embed_one(query)
 
     # Start VS search in background
@@ -843,6 +1268,13 @@ async def read_memory(req: ReadRequest):
                 req.top_k,
                 vs_min_score,
             )
+        )
+
+    # ── NEW: Start indexed files search in background ──
+    if_future = None
+    if state.if_index.total > 0:
+        if_future = asyncio.ensure_future(
+            loop.run_in_executor(None, state.if_index.search, query_emb, req.top_k * 2)
         )
 
     if req.session_id and req.strategy != "none":
@@ -878,6 +1310,7 @@ async def read_memory(req: ReadRequest):
             loop.run_in_executor(None, state.st_index.search, query_emb, req.top_k * 2),
         )
 
+    # Await VS results
     vs_results = []
     if vs_future is not None:
         try:
@@ -886,10 +1319,20 @@ async def read_memory(req: ReadRequest):
             log.error(f"VectorStore search failed: {e}")
             vs_results = []
 
+    # ── NEW: Await indexed files results ──
+    if_raw = []
+    if if_future is not None:
+        try:
+            if_raw = await if_future
+        except Exception as e:
+            log.error(f"Indexed files search failed: {e}")
+            if_raw = []
+
     results: list[MemoryEntry] = (
         _build_lt_entries(lt_raw, req.min_score, loop) +
         _build_st_entries(st_raw, req.min_score, loop) +
-        _build_vs_entries(vs_results, req.min_score)
+        _build_vs_entries(vs_results, req.min_score) +
+        _build_if_entries(if_raw, min(req.min_score, IF_MIN_SCORE), loop)  # NEW
     )
     results.sort(key=lambda r: r.score * r.confidence, reverse=True)
     return ReadResponse(results=results[:req.top_k], query=query, strategy=effective_strategy)
@@ -924,7 +1367,6 @@ async def cache_get(req: PlanCacheGetRequest):
     if not query:
         raise HTTPException(status_code=400, detail="query vazia")
 
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     embedding = await state.embed_engine.embed_one(query)
 
     loop = asyncio.get_event_loop()
@@ -963,7 +1405,6 @@ async def cache_put(req: PlanCachePutRequest):
     if not req.plan:
         raise HTTPException(status_code=400, detail="plano vazio")
 
-    # ── MODIFIED: embed_one is now async ──────────────────────────────────────
     embedding = await state.embed_engine.embed_one(query)
 
     cache_id = state.pc_db.insert(query, req.plan)
@@ -989,6 +1430,361 @@ async def cache_delete_one(cache_id: int):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, state.pc_index.remove_ids, {cache_id})
     return PlanCacheDeleteResponse(deleted=deleted)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Arquivos Indexados — /indexed-file/*
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/indexed-file/write", response_model=IndexedFileWriteResponse)
+async def indexed_file_write(req: IndexedFileWriteRequest):
+    """
+    Armazena o conteúdo COMPLETO de um arquivo indexado.
+
+    Fluxo:
+      1. Verifica se o arquivo já está indexado (por file_path)
+      2. Se existe e file_hash é igual → sem reindexação necessária
+      3. Se existe e file_hash difere → remove chunks antigos, reindexa
+      4. Se não existe → insere e indexa
+
+    O conteúdo é dividido em chunks, cada chunk é embedado e
+    adicionado ao FAISS para busca semântica. O hash do arquivo
+    é armazenado para detectar mudanças futuras.
+    """
+    content = req.content
+    if not content or not content.strip():
+        return IndexedFileWriteResponse(stored=False, reason="content_empty")
+
+    if len(content) > IF_MAX_CONTENT_SIZE:
+        return IndexedFileWriteResponse(
+            stored=False,
+            reason=f"content_too_large:{len(content)}>{IF_MAX_CONTENT_SIZE}",
+        )
+
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    loop = asyncio.get_event_loop()
+
+    # ── Check existing ──
+    existing = state.if_db.get_by_path(req.file_path)
+
+    if existing and not req.force_reindex:
+        if existing["file_hash"] == req.file_hash and existing["content_hash"] == content_hash:
+            # Arquivo inalterado — nada a fazer
+            log.info(f"Indexed file unchanged: {req.file_path} (hash_match=True)")
+            return IndexedFileWriteResponse(
+                stored=False,
+                reason="unchanged",
+                file_id=existing["id"],
+                chunks_created=0,
+                was_reindexed=False,
+                hash_match=True,
+            )
+
+    # ── Remove old chunks if re-indexing ──
+    if existing:
+        old_chunk_ids = state.if_db.get_chunk_ids_by_file(existing["id"])
+        if old_chunk_ids:
+            await loop.run_in_executor(None, state.if_index.remove_ids, set(old_chunk_ids))
+            state.if_db.delete_chunks_by_file(existing["id"])
+            log.info(f"Removed {len(old_chunk_ids)} old chunks for: {req.file_path}")
+
+    # ── Chunk the content ──
+    chunks = _chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
+    if not chunks:
+        return IndexedFileWriteResponse(stored=False, reason="chunking_failed")
+
+    # ── Embed chunks in batches ──
+    chunk_texts = [c["text"] for c in chunks]
+    all_embeddings = []
+
+    for batch_start in range(0, len(chunk_texts), IF_EMBED_BATCH_SIZE):
+        batch = chunk_texts[batch_start:batch_start + IF_EMBED_BATCH_SIZE]
+        try:
+            batch_embs = await state.embed_engine.embed(batch)
+            all_embeddings.append(batch_embs)
+        except Exception as e:
+            log.error(f"Embedding batch failed for {req.file_path}: {e}")
+            return IndexedFileWriteResponse(
+                stored=False,
+                reason=f"embedding_failed:{e}",
+            )
+
+    embeddings = np.vstack(all_embeddings) if all_embeddings else np.empty((0, EMBED_DIM), dtype=np.float32)
+
+    # ── Insert or update file record ──
+    was_reindexed = existing is not None
+    if existing:
+        file_id = existing["id"]
+        state.if_db.update_file(
+            file_id=file_id,
+            content=content,
+            content_hash=content_hash,
+            file_hash=req.file_hash,
+            size=req.size or len(content),
+            modified=req.modified,
+        )
+    else:
+        file_id = state.if_db.insert_file(
+            file_path=req.file_path,
+            file_name=req.file_name,
+            extension=req.extension,
+            content=content,
+            content_hash=content_hash,
+            file_hash=req.file_hash,
+            size=req.size or len(content),
+            modified=req.modified,
+            source=req.source,
+            confidence=req.confidence,
+        )
+
+    # ── Insert chunks into DB ──
+    state.if_db.insert_chunks(file_id, chunks)
+
+    # ── Get chunk IDs (just inserted) ──
+    chunk_rows = state.if_db.get_chunks_by_file(file_id)
+    chunk_ids = [row["id"] for row in chunk_rows]
+
+    if len(chunk_ids) != len(chunks):
+        log.warning(
+            f"Chunk ID mismatch: expected {len(chunks)}, got {len(chunk_ids)} "
+            f"for {req.file_path}"
+        )
+
+    # ── Add embeddings to FAISS in batch ──
+    if len(chunk_ids) == embeddings.shape[0]:
+        await loop.run_in_executor(
+            None,
+            state.if_index.add_batch,
+            embeddings,
+            chunk_ids,
+        )
+    else:
+        # Fallback: add one by one if sizes don't match
+        log.warning("Chunk/embedding size mismatch — adding individually")
+        for i, (emb, cid) in enumerate(zip(embeddings, chunk_ids)):
+            state.if_index.add(emb, cid)
+
+    hash_match = (
+        existing is not None
+        and existing["file_hash"] == req.file_hash
+        and existing["content_hash"] == content_hash
+    )
+
+    log.info(
+        f"Indexed file: {req.file_path} → file_id={file_id} "
+        f"chunks={len(chunks)} reindexed={was_reindexed} "
+        f"hash_match={hash_match} content_size={len(content)}"
+    )
+
+    return IndexedFileWriteResponse(
+        stored=True,
+        reason="ok" if not was_reindexed else "reindexed",
+        file_id=file_id,
+        chunks_created=len(chunks),
+        was_reindexed=was_reindexed,
+        hash_match=hash_match,
+    )
+
+
+@app.post("/indexed-file/read", response_model=IndexedFileReadResponse)
+async def indexed_file_read(req: IndexedFileReadRequest):
+    """
+    Busca semântica nos arquivos indexados.
+
+    Retorna o conteúdo COMPLETO de cada arquivo que teve um chunk
+    com similaridade acima do threshold, junto com o chunk que
+    deu match para contexto.
+    """
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query vazia")
+
+    if state.if_index.total == 0:
+        return IndexedFileReadResponse(results=[], query=query)
+
+    loop = asyncio.get_event_loop()
+    query_emb = await state.embed_engine.embed_one(query)
+
+    if_raw = await loop.run_in_executor(
+        None, state.if_index.search, query_emb, req.top_k * 2
+    )
+
+    # Filtra por score
+    filtered = [(cid, score) for cid, score in if_raw if score >= req.min_score]
+    if not filtered:
+        return IndexedFileReadResponse(results=[], query=query)
+
+    # Busca chunk records
+    chunk_ids = [cid for cid, _ in filtered]
+    chunk_rows = state.if_db.get_chunks_by_ids(chunk_ids)
+    chunk_map = {row["id"]: row for row in chunk_rows}
+
+    # Agrupa por file_id — melhor score por arquivo
+    file_best: dict[int, tuple[float, sqlite3.Row]] = {}
+    for cid, score in filtered:
+        chunk_row = chunk_map.get(cid)
+        if chunk_row is None:
+            continue
+        fid = chunk_row["file_id"]
+        if fid not in file_best or score > file_best[fid][0]:
+            file_best[fid] = (score, chunk_row)
+
+    if not file_best:
+        return IndexedFileReadResponse(results=[], query=query)
+
+    # Busca file records
+    file_ids = list(file_best.keys())
+    file_rows = state.if_db._conn.execute(
+        f"SELECT * FROM indexed_files WHERE id IN ({','.join('?' * len(file_ids))})",
+        file_ids,
+    ).fetchall()
+    file_map = {row["id"]: row for row in file_rows}
+
+    results = []
+    for fid, (score, chunk_row) in sorted(file_best.items(), key=lambda x: x[1][0], reverse=True):
+        file_row = file_map.get(fid)
+        if file_row is None:
+            continue
+
+        results.append(IndexedFileEntry(
+            file_id      = fid,
+            file_path    = file_row["file_path"],
+            file_name    = file_row["file_name"],
+            extension    = file_row["extension"],
+            content      = file_row["content"],          # conteúdo COMPLETO
+            file_hash    = file_row["file_hash"],
+            content_hash = file_row["content_hash"],
+            size         = file_row["size"],
+            modified     = file_row["modified"],
+            score        = round(score, 4),
+            confidence   = round(file_row["confidence"], 4),
+            created_at   = file_row["created_at"],
+            access_count = file_row["access_count"],
+            source       = file_row["source"],
+            chunk_text   = chunk_row["chunk_text"],       # chunk que deu match
+        ))
+        loop.run_in_executor(None, state.if_db.update_access, fid)
+
+    return IndexedFileReadResponse(results=results[:req.top_k], query=query)
+
+
+@app.get("/indexed-file/check", response_model=IndexedFileCheckResponse)
+async def indexed_file_check(file_path: str):
+    """
+    Verifica se um arquivo está indexado e se o hash bate.
+
+    Usado pelo local-scraping para decidir se precisa reindexar:
+      - indexed=False  → arquivo nunca foi indexado
+      - hash_match=True → já indexado e inalterado
+      - hash_match=False → indexado mas arquivo mudou → reindexar
+    """
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path vazio")
+
+    row = state.if_db.get_by_path(file_path)
+    if row is None:
+        return IndexedFileCheckResponse(indexed=False)
+
+    chunks_count = state.if_db.count_chunks(row["id"])
+
+    return IndexedFileCheckResponse(
+        indexed            = True,
+        file_id            = row["id"],
+        stored_file_hash   = row["file_hash"],
+        stored_content_hash = row["content_hash"],
+        stored_modified    = row["modified"],
+        chunks_count       = chunks_count,
+        hash_match         = None,  # caller compara com o hash atual
+    )
+
+
+@app.get("/indexed-file/{file_id}")
+async def indexed_file_get(file_id: int):
+    """
+    Retorna o conteúdo completo de um arquivo indexado pelo seu ID.
+    """
+    row = state.if_db.get_by_id(file_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Arquivo indexado #{file_id} não encontrado")
+
+    chunks = state.if_db.get_chunks_by_file(file_id)
+
+    return {
+        "file_id":      row["id"],
+        "file_path":    row["file_path"],
+        "file_name":    row["file_name"],
+        "extension":    row["extension"],
+        "content":      row["content"],
+        "content_hash": row["content_hash"],
+        "file_hash":    row["file_hash"],
+        "size":         row["size"],
+        "modified":     row["modified"],
+        "source":       row["source"],
+        "confidence":   row["confidence"],
+        "created_at":   row["created_at"],
+        "access_count": row["access_count"],
+        "chunks_count": len(chunks),
+    }
+
+
+@app.delete("/indexed-file/{file_id}")
+async def indexed_file_delete(file_id: int):
+    """
+    Remove um arquivo indexado e todos os seus chunks (DB + FAISS).
+    """
+    row = state.if_db.get_by_id(file_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Arquivo indexado #{file_id} não encontrado")
+
+    # Remove FAISS vectors first
+    chunk_ids = state.if_db.get_chunk_ids_by_file(file_id)
+    if chunk_ids:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, state.if_index.remove_ids, set(chunk_ids))
+
+    # Delete from DB (cascades to chunks)
+    deleted = state.if_db.delete_file(file_id)
+
+    log.info(f"Indexed file deleted: #{file_id} ({len(chunk_ids)} chunks removed)")
+    return {"deleted": deleted, "file_id": file_id, "chunks_removed": len(chunk_ids)}
+
+
+@app.delete("/indexed-file/path")
+async def indexed_file_delete_by_path(file_path: str):
+    """
+    Remove um arquivo indexado pelo caminho.
+    """
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path vazio")
+
+    row = state.if_db.get_by_path(file_path)
+    if row is None:
+        return {"deleted": 0, "file_path": file_path, "message": "not indexed"}
+
+    return await indexed_file_delete(row["id"])
+
+
+@app.get("/indexed-file")
+async def indexed_file_list():
+    """
+    Lista todos os arquivos indexados com metadados.
+    """
+    rows = state.if_db.list_files()
+    files = []
+    for row in rows:
+        files.append({
+            "file_id":      row["id"],
+            "file_path":    row["file_path"],
+            "file_name":    row["file_name"],
+            "extension":    row["extension"],
+            "content_hash": row["content_hash"],
+            "file_hash":    row["file_hash"],
+            "size":         row["size"],
+            "modified":     row["modified"],
+            "created_at":   row["created_at"],
+            "access_count": row["access_count"],
+        })
+    return {"total": len(files), "files": files}
 
 
 # ── GET /status ────────────────────────────────────────────────────────────────
@@ -1023,6 +1819,17 @@ async def status():
         "onnx_serving": {
             "url": ONNX_SERVING_URL,
             "mode": "remote_api",
+        },
+        # ── NEW: Indexed files status ──
+        "indexed_files": {
+            "files_total":    state.if_db.count_files(),
+            "chunks_total":   state.if_db.get_total_chunks(),
+            "index_vectors":  state.if_index.total,
+            "min_score":      IF_MIN_SCORE,
+            "chunk_size":     CHUNK_SIZE,
+            "chunk_overlap":  CHUNK_OVERLAP,
+            "max_content":    IF_MAX_CONTENT_SIZE,
+            "max_chunks":     IF_MAX_CHUNKS,
         },
     }
     if state.vs is not None:

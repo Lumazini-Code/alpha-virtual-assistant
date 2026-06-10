@@ -1,0 +1,69 @@
+INFO:     127.0.0.1:60626 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44426 - "POST /stream HTTP/1.1" 200 OK
+ads=auto
+2026-06-10 01:13:31,051 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 01:13:31,050 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 01:13:31,050 [INFO] [TTS] [W2] Carregando Supertonic...
+2026-06-10 01:13:31,075 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 01:13:31,075 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 01:13:31,075 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 01:13:31,075 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 01:13:31,075 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 01:13:31,129 [INFO] [TTS] TTSPool iniciado com 3 workers
+2026-06-10 01:13:31,261 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 01:13:32,447 [INFO] [TTS] TTS API pronta
+INFO:     Application startup complete.
+2026-06-10 01:13:33,057 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 01:13:33,057 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 01:13:33,297 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 01:13:33,525 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 01:13:33,790 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 01:13:34,056 [INFO] [TTS] Model loaded successfully
+2026-06-10 01:13:34,202 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 01:13:34,202 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:13:34,205 [INFO] [TTS] Model loaded successfully
+INFO:     Uvicorn running on http://0.0.0.0:3004 (Press CTRL+C to quit)
+2026-06-10 01:13:34,210 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 01:13:34,210 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:13:34,212 [INFO] [TTS] Model loaded successfully
+2026-06-10 01:13:34,213 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:13:35,579 [INFO] [TTS] [W1] Pronto (pré-aquecido)
+2026-06-10 01:13:35,718 [INFO] [TTS] [W0] Pronto (pré-aquecido)
+2026-06-10 01:13:35,900 [INFO] [TTS] [W2] Pronto (pré-aquecido)
+2026-06-10 01:14:30,048 [INFO] [TTS] [W1] seq=0 ok (1.82s) 'Usuário, entendi.'
+2026-06-10 01:14:30,053 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 543.82ms
+2026-06-10 01:14:30,068 [INFO] [TTS] [PLAY] seq=0 (82944 samples)
+2026-06-10 01:14:31,782 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:14:31,961 [INFO] [TTS] [W0] seq=1 ok (4.04s) 'Você quer que eu "desembrulhe" essa frase para voc'
+2026-06-10 01:14:31,961 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1003.14ms
+2026-06-10 01:14:31,986 [INFO] [TTS] [PLAY] seq=1 (178176 samples)
+2026-06-10 01:14:33,292 [INFO] [TTS] [W2] seq=2 ok (4.40s) 'Basicamente, o conteúdo é uma confirmação de suces'
+2026-06-10 01:14:33,292 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 856.66ms
+2026-06-10 01:14:35,665 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:14:35,708 [INFO] [TTS] [PLAY] seq=2 (196608 samples)
+2026-06-10 01:14:35,855 [INFO] [TTS] [W1] seq=3 ok (6.87s) 'É um aviso clássico, quase como um check de sistem'
+2026-06-10 01:14:35,856 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1373.56ms
+2026-06-10 01:14:39,782 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:14:39,826 [INFO] [TTS] [PLAY] seq=3 (304128 samples)
+2026-06-10 01:14:40,149 [INFO] [TTS] [W0] seq=4 ok (11.57s) 'Se sim, significa que o processo chamado 'scraping'
+2026-06-10 01:14:40,149 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2354.25ms
+2026-06-10 01:14:40,862 [INFO] [TTS] [W2] seq=5 ok (2.24s) '"Pode respirar, Usuário.'
+2026-06-10 01:14:40,862 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 708.96ms
+2026-06-10 01:14:42,334 [INFO] [TTS] [W1] seq=6 ok (7.34s) 'O scraping local funcionou!" É a prova de que a co'
+2026-06-10 01:14:42,334 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1468.59ms
+2026-06-10 01:14:43,971 [INFO] [TTS] [W0] seq=7 ok (5.89s) 'Se você leu isso, o sistema não só funcionou, como'
+2026-06-10 01:14:43,971 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1331.22ms
+2026-06-10 01:14:46,159 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:14:46,203 [INFO] [TTS] [PLAY] seq=4 (513024 samples)
+2026-06-10 01:14:56,879 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:14:56,922 [INFO] [TTS] [PLAY] seq=5 (101376 samples)
+2026-06-10 01:14:59,002 [INFO] [TTS] [PLAY] seq=6 (325632 samples)
+2026-06-10 01:15:05,808 [INFO] [TTS] [PLAY] seq=7 (261120 samples)
+2026-06-10 01:15:11,247 [INFO] [TTS] [PLAY] Fala completa

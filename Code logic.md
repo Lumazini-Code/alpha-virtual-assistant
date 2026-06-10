@@ -572,20 +572,6 @@ python llama_manager.py status ./Models/Phi-3.5-mini-instruct-Q4_K_M.gguf
 
 
 
-
-
-# AVA — Assistente Virtual Autônomo
-
-<p align="center">
-  <strong>Microserviços de IA modulares com roteamento inteligente, memória persistente, visão e fala</strong>
-</p>
-
----
-
-## Visão Geral
-
-O AVA é um sistema de assistente virtual composto por microserviços independentes que se comunicam via REST API. O **Orchestrator** central recebe requisições do usuário, classifica a intenção via modelo ONNX interno + heurísticas, e roteia para o módulo adequado — diretamente ou através de um plano de execução multi-etapa gerado pelo **CoT Generator**.
-
 ### Arquitetura
 
 ```

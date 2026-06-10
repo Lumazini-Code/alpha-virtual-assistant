@@ -10,6 +10,7 @@ Integrates ALL AVA microservices:
   - CoT Generator   (port 3000)  — plan generation + semantic cache
   - Memory          (port 3001)  — long-term, short-term, knowledge
   - Search          (port 3002)  — web search + cross-encoder rerank
+  - Local Scraping  (port 3003)  — local file search, read & indexing
   - TTS             (port 3004)  — text-to-speech (Supertonic)
   - LLM Chat        (port 4003)  — conversational inference (llama-server)
   - Vision / VQA    (port 4002)  — image understanding (Qwen3VL)
@@ -47,28 +48,31 @@ MODELS_DIR =  "./Modules/Models"
 DEBERTA_DIR  = os.path.join(MODELS_DIR, "DebertaV2ForSequenceClassification")
 MINILM_DIR   = os.path.join(MODELS_DIR, "ms-marco-MiniLM-L-6-v2")
 
-COT_URL         = "http://localhost:3000"
-MEMORY_URL      = "http://localhost:3001"
-SEARCH_URL      = "http://localhost:3002"
-TTS_URL         = "http://localhost:3004"
-LLM_URL         = "http://localhost:4003"
-VISION_URL      = "http://localhost:4002"
-DEEP_SEARCH_URL = "http://localhost:4005"
+COT_URL              = "http://localhost:3000"
+MEMORY_URL           = "http://localhost:3001"
+SEARCH_URL           = "http://localhost:3002"
+LOCAL_SCRAPING_URL   = "http://localhost:3003"   # ← NEW: local file scraping
+TTS_URL              = "http://localhost:3004"
+LLM_URL              = "http://localhost:4003"
+VISION_URL           = "http://localhost:4002"
+DEEP_SEARCH_URL      = "http://localhost:4005"
 
 HEALTH_PATHS: dict[str, str] = {
     "cot": "/status", "memory": "/status", "search": "/status",
-    "tts": "/status", "llm": "/health", "vision": "/health", "deep_search": "/health",
+    "local_scraping": "/status", "tts": "/status",          # ← NEW
+    "llm": "/health", "vision": "/health", "deep_search": "/health",
 }
 
 EXECUTOR_TIMEOUTS: dict[str, float] = {
     "llm": 120.0, "memory": 5.0, "search": 25.0, "deep_search": 90.0,
     "vision": 60.0, "tts": 15.0, "stt": 30.0, "commander": 10.0,
-    "translator": 30.0, "calculator": 5.0,
+    "translator": 30.0, "calculator": 5.0, "local_scraping": 45.0,  # ← NEW
 }
 
 EXECUTOR_MAX_RETRIES: dict[str, int] = {
     "llm": 2, "memory": 3, "search": 2, "deep_search": 1, "vision": 1,
     "tts": 2, "stt": 0, "commander": 0, "translator": 2, "calculator": 3,
+    "local_scraping": 2,  # ← NEW
 }
 
 RETRY_BACKOFF_S   = 0.15
@@ -87,6 +91,7 @@ ROUTE_TO_EXECUTOR: dict[str, str] = {
     "llm": "llm", "search": "search", "memory_read": "memory", "memory_write": "memory",
     "vision": "vision", "deep_search": "deep_search", "calculator": "calculator",
     "commander": "commander", "translator": "translator", "tts": "tts",
+    "local_scraping": "local_scraping",  # ← NEW
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -141,6 +146,22 @@ class MemoryReadRequest(BaseModel):
 class MemoryWriteRequest(BaseModel):
     text: str; source: str = "chat"; confidence: float = 1.0
 
+# ── NEW: Local Scraping Models ──────────────────────────────────────────────
+
+class LocalScrapingRequest(BaseModel):
+    """Request to search and read a local file on the user's machine."""
+    query: str = Field(..., description="Nome ou descrição do arquivo a buscar")
+    search_path: Optional[str] = Field(None, description="Caminho base para a busca (padrão: diretório da Alpha)")
+    force_reindex: bool = Field(False, description="Forçar reindexação mesmo se o arquivo não mudou")
+    session_id: Optional[str] = None
+
+class LocalScrapingChooseRequest(BaseModel):
+    """Choose a specific file when multiple matches are found."""
+    query: str = Field(..., description="Query original da busca")
+    file_path: str = Field(..., description="Caminho completo do arquivo escolhido")
+    force_reindex: bool = Field(False, description="Forçar reindexação")
+    session_id: Optional[str] = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL ROUTER — ONNX + Heuristics
@@ -149,9 +170,10 @@ class MemoryWriteRequest(BaseModel):
 class RouteLabel(IntEnum):
     COT = 0; LLM = 1; SEARCH = 2; MEMORY_READ = 3; MEMORY_WRITE = 4
     VISION = 5; DEEP_SEARCH = 6; CALCULATOR = 7; COMMANDER = 8; TRANSLATOR = 9; TTS = 10
+    LOCAL_SCRAPING = 11   # ← NEW
 
 LABEL_NAMES: list[str] = [rl.name.lower() for rl in RouteLabel]
-NUM_LABELS = len(RouteLabel)
+NUM_LABELS = len(RouteLabel)   # agora 12
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
     e = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
@@ -224,11 +246,17 @@ class OnnxMiniLMRouter:
         "memory_read": ["what do you remember", "recall my conversation", "what do you know about me"],
         "memory_write": ["remember my favorite color", "save this info", "grave na memória"],
         "vision": ["describe this image", "analyze photo", "what does picture show"],
-        "deep_search": ["deep research about", "investigate causes of", "pesquisa profunda"],
+        "deep_search": ["deep research about", "learn about", "pesquisa profunda"],
         "calculator": ["calculate 15 times 37", "square root of 144", "quanto é 100"],
         "commander": ["open firefox", "launch vscode", "abrir spotify"],
         "translator": ["translate to english", "traduzir para espanhol"],
         "tts": ["speak text aloud", "fale em voz alta"],
+        "local_scraping": [                                       # ← NEW
+            "leia o arquivo", "read the file", "abra o arquivo relatório",
+            "mostre o conteúdo do arquivo", "read file from disk",
+            "leia o documento pdf", "abra o arquivo de texto",
+            "show me the file", "conteúdo do arquivo",
+        ],
     }
     def __init__(self): self.ready = False; self.tokenizer = None; self.session = None; self.input_names = []; self.output_names = []; self.provider = ""; self._prototype_embeddings = None
     def load(self, model_dir: str) -> bool:
@@ -261,12 +289,28 @@ class OnnxMiniLMRouter:
         scores = {LABEL_NAMES[i]: round(float(probs[i]), 4) for i in range(NUM_LABELS)}
         idx = int(probs.argmax()); return LABEL_NAMES[idx], round(float(probs[idx]), 4), scores
 
-# Heuristic Rules
+# Heuristic Rules — now includes local_scraping
 _HEURISTIC_RULES = [
+    # ── local_scraping must come BEFORE commander "open/abrir" to disambiguate ──
+    ("local_scraping", ["leia o arquivo", "ler arquivo", "read file", "abra o arquivo", "conteúdo do arquivo"],
+     re.compile(
+         r"(leia\s+o?\s*arquivo|ler\s+o?\s*arquivo|read\s+(the\s+)?file|"
+         r"abra\s+o?\s*arquivo|open\s+(the\s+)?file|"
+         r"conte[úu]do\s+do?\s*arquivo|show\s+(me\s+)?(the\s+)?file|"
+         r"mostre\s+o?\s*arquivo|abrir\s+arquivo|"
+         r"leia\s+o?\s*documento|read\s+(the\s+)?document|"
+         r"leia\s+o?\s*(pdf|txt|csv|xlsx|docx|json|md|py|js|ts)|"
+         r"read\s+(the\s+)?(pdf|txt|csv|xlsx|docx|json|md|py|js|ts)|"
+         r"abra\s+o?\s*(pdf|txt|csv|xlsx|docx|json|md)|"
+         r"conte[úu]do\s+do?\s*(pdf|txt|csv|docx|json|md)|"
+         r"index[ae]?\s+(o?\s*)?arquivo|index\s+(the\s+)?file|"
+         r"reindex[ae]?\s+(o?\s*)?arquivo|reindex\s+(the\s+)?file)"
+         , re.I)),
     ("memory_write", ["lembrar","memorizar","gravar","salvar","remember","save"], re.compile(r"(lembrar|memorizar|gravar|salvar|remember|save|store|memo)\b", re.I)),
     ("memory_read", ["o que você sabe","recall"], re.compile(r"(o que (você|voce) (sabe|lembra)|recall|what do you (know|remember))", re.I)),
     ("translator", ["traduz","translate"], re.compile(r"(traduz|tradu[çc][aã]|translate|em (ingl[eê]s|espanhol)|to (english|spanish))", re.I)),
     ("calculator", ["quanto é","calcule"], re.compile(r"(quanto [eé]|calcule?|calculate|\d+\s*[\+\-\*\/\^x×÷]\s*\d+)", re.I)),
+    # ── commander "abrir/open" — lower priority than local_scraping for file patterns ──
     ("commander", ["abrir","open"], re.compile(r"^(abrir|open|launch|iniciar|executar|start|run)\b", re.I)),
     ("vision", ["imagem","foto","image"], re.compile(r"(imagem|foto|picture|image|screenshot|descreva a|what is in the)", re.I)),
     ("deep_search", ["pesquisa profunda","research"], re.compile(r"(pesquisa profunda|investigue|deep.?search|research|estude sobre)", re.I)),
@@ -333,6 +377,7 @@ class AppState:
     search_client: httpx.AsyncClient = field(default=None); tts_client: httpx.AsyncClient = field(default=None)
     llm_client: httpx.AsyncClient = field(default=None); vision_client: httpx.AsyncClient = field(default=None)
     deep_search_client: httpx.AsyncClient = field(default=None)
+    local_scraping_client: httpx.AsyncClient = field(default=None)  # ← NEW
 
 state = AppState()
 
@@ -344,15 +389,21 @@ async def lifespan(app: FastAPI):
     d_loaded = deberta_router.load(DEBERTA_DIR)
     m_loaded = minilm_router.load(MINILM_DIR)
     log.info(f"Router Init → Deberta: {'✓' if d_loaded else '✗'} | MiniLM: {'✓' if m_loaded else '✗'} | Heuristic: ✓")
+    if d_loaded and not deberta_router.fine_tuned:
+        log.warning(f"  ⚠ DeBERTa labels={deberta_router.num_labels}, expected={NUM_LABELS} — fallback to MiniLM+Heuristic")
 
     # Probe external services
-    service_urls = {"cot": COT_URL, "memory": MEMORY_URL, "search": SEARCH_URL, "tts": TTS_URL, "llm": LLM_URL, "vision": VISION_URL, "deep_search": DEEP_SEARCH_URL}
+    service_urls = {
+        "cot": COT_URL, "memory": MEMORY_URL, "search": SEARCH_URL,
+        "local_scraping": LOCAL_SCRAPING_URL, "tts": TTS_URL,          # ← NEW
+        "llm": LLM_URL, "vision": VISION_URL, "deep_search": DEEP_SEARCH_URL,
+    }
     async with httpx.AsyncClient(timeout=5.0) as probe:
         for name, url in service_urls.items():
             try:
                 r = await probe.get(f"{url}{HEALTH_PATHS.get(name, '/status')}")
-                log.info(f"  ✓ {name:12s} OK" if r.status_code == 200 else f"  ⚠ {name:12s} {r.status_code}")
-            except httpx.ConnectError: log.warning(f"  ✗ {name:12s} OFFLINE")
+                log.info(f"  ✓ {name:16s} OK" if r.status_code == 200 else f"  ⚠ {name:16s} {r.status_code}")
+            except httpx.ConnectError: log.warning(f"  ✗ {name:16s} OFFLINE")
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
@@ -361,10 +412,14 @@ async def lifespan(app: FastAPI):
     state.search_client = _make_client(SEARCH_URL, EXECUTOR_TIMEOUTS["search"]); state.tts_client = _make_client(TTS_URL, EXECUTOR_TIMEOUTS["tts"])
     state.llm_client = _make_client(LLM_URL, EXECUTOR_TIMEOUTS["llm"]); state.vision_client = _make_client(VISION_URL, EXECUTOR_TIMEOUTS["vision"])
     state.deep_search_client = _make_client(DEEP_SEARCH_URL, EXECUTOR_TIMEOUTS["deep_search"])
+    state.local_scraping_client = _make_client(LOCAL_SCRAPING_URL, EXECUTOR_TIMEOUTS["local_scraping"])  # ← NEW
     
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
-    for c in (state.cot_client, state.memory_client, state.search_client, state.tts_client, state.llm_client, state.vision_client, state.deep_search_client): await c.aclose()
+    for c in (state.cot_client, state.memory_client, state.search_client, state.tts_client,
+              state.llm_client, state.vision_client, state.deep_search_client,
+              state.local_scraping_client):                             # ← NEW
+        await c.aclose()
     log.info("AVA Orchestrator encerrado")
 
 
@@ -437,7 +492,7 @@ async def _adapt_llm(action, context, req, stream_tts=False) -> str:
         msg,
         voice=req.voice,
         lang=req.lang,
-        tts=stream_tts,          # ← True = user hears audio in real-time
+        tts=stream_tts,
         session_id=req.session_id or "default",
         max_turns=10,
     )
@@ -503,7 +558,93 @@ async def _adapt_calculator(action, context, req) -> str:
         max_turns=1,
     )
 
-EXECUTOR_ADAPTERS = {"llm": _adapt_llm, "memory": _adapt_memory, "search": _adapt_search, "deep_search": _adapt_deep_search, "vision": _adapt_vision, "tts": _adapt_tts, "stt": _adapt_stt, "commander": _adapt_commander, "translator": _adapt_translator, "calculator": _adapt_calculator}
+# ── NEW: Local Scraping Adapter ─────────────────────────────────────────────
+
+async def _adapt_local_scraping(action, context, req) -> dict:
+    """
+    Adapter for the local-scraping microservice.
+    
+    Flow:
+      1. Orchestrator forwards the user query to local-scraping /scrape
+      2. local-scraping uses a model to generate a file search command
+      3. A REST API client on the user's machine executes the command
+         in the Alpha execution directory
+      4. Returns file content + path
+      5. If multiple files with the same name are found, returns a
+         list for the user to choose
+      6. If the file was already indexed, compares hashes:
+         - Same hash  → use cached index
+         - Different  → reindex
+      7. Indexed info is saved to the memory folder
+    """
+    query = _resolve_action_text(action, context) or action
+    
+    r = await state.local_scraping_client.post(
+        "/scrape",
+        json={
+            "query":         query,
+            "search_path":   None,   # let the service use the Alpha path
+            "force_reindex": False,
+            "session_id":    req.session_id,
+        },
+    )
+    r.raise_for_status()
+    data = r.json()
+    
+    # ── If multiple files matched, return the choice list to the caller ──
+    # The caller (orchestrator /execute or direct endpoint) will present
+    # the choices and the user picks via /local-scraping/choose.
+    if data.get("multiple_matches"):
+        return {
+            "status":           "multiple_matches",
+            "matches":          data["matches"],
+            "message":          data.get("message", "Múltiplos arquivos encontrados. Escolha qual deseja ler."),
+            "requires_choice":  True,
+        }
+    
+    # ── Single file result ──
+    # If the file was just indexed or reindexed, also persist to memory
+    file_content = data.get("content", "")
+    file_path    = data.get("file_path", "")
+    was_reindexed = data.get("was_reindexed", False)
+    hash_match    = data.get("hash_match", True)
+    
+    # Persist indexed file info to AVA memory (long-term)
+    if file_content and file_path:
+        try:
+            summary = file_content[:500] if len(file_content) > 500 else file_content
+            await state.memory_client.post("/indexed-file/write", json={
+                "file_path":   file_path,
+                "file_name":   Path(file_path).name,
+                "extension":   Path(file_path).suffix.lower(),
+                "content":     file_content,           # conteúdo COMPLETO
+                "file_hash":   data.get("file_hash"),  # hash do arquivo no disco
+                "size":        len(file_content),
+                "modified":    data.get("modified", ""),
+                "source":      "local_scraping",
+                "confidence":  1.0 if hash_match else 0.9,
+                "force_reindex": False,
+            })
+            log.info(f"Local scraping: arquivo '{file_path}' salvo na memória (reindexed={was_reindexed}, hash_match={hash_match})")
+        except Exception as e:
+            log.warning(f"Falha ao salvar arquivo indexado na memória: {e}")
+    
+    return {
+        "status":        "success",
+        "content":       file_content,
+        "file_path":     file_path,
+        "was_reindexed": was_reindexed,
+        "hash_match":    hash_match,
+        "requires_choice": False,
+    }
+
+
+EXECUTOR_ADAPTERS = {
+    "llm": _adapt_llm, "memory": _adapt_memory, "search": _adapt_search,
+    "deep_search": _adapt_deep_search, "vision": _adapt_vision, "tts": _adapt_tts,
+    "stt": _adapt_stt, "commander": _adapt_commander, "translator": _adapt_translator,
+    "calculator": _adapt_calculator, "local_scraping": _adapt_local_scraping,  # ← NEW
+}
 
 def _resolve_action_text(action, context):
     return re.sub(r"result of step (\d+)", lambda m: _result_to_text(context.get(f"step_{m.group(1)}")) if context.get(f"step_{m.group(1)}") else m.group(0), action, flags=re.IGNORECASE)
@@ -511,8 +652,16 @@ def _resolve_action_text(action, context):
 def _result_to_text(res):
     if not res: return ""
     if isinstance(res, str): return res[:MAX_CONTEXT_CHARS]
+    # ── Handle local_scraping result dicts ──
+    if isinstance(res, dict):
+        if res.get("status") == "multiple_matches":
+            matches = res.get("matches", [])
+            lines = [f"  [{i+1}] {m.get('file_path','?')} ({m.get('size','?')})" for i, m in enumerate(matches[:10])]
+            return f"Múltiplos arquivos encontrados:\n" + "\n".join(lines)
+        if res.get("status") == "success" and res.get("content"):
+            return res["content"][:MAX_CONTEXT_CHARS]
+        return str(res.get("text") or res.get("content") or res.get("response") or res)[:MAX_CONTEXT_CHARS]
     if isinstance(res, list): return "\n".join([f"- {(i.get('text') or i.get('content') or str(i))[:300]}" for i in res[:6]])[:MAX_CONTEXT_CHARS]
-    if isinstance(res, dict): return str(res.get("text") or res.get("content") or res.get("response") or res)[:MAX_CONTEXT_CHARS]
     return str(res)[:MAX_CONTEXT_CHARS]
 
 def _format_context_for_llm(action, context):
@@ -569,9 +718,6 @@ async def _execute_plan(steps, req, strategy) -> tuple[list[StepResult], dict[st
     pending = set(step_map.keys())
     tts_fired = False
 
-    # ── Identify "output steps" — steps no other step depends on ──
-    # These are the final/terminal steps whose output reaches the user.
-    # For LLM output steps, we stream with TTS so audio plays in real-time.
     dependents = set()
     for s in steps:
         for d in (s.get("depends_on") or []):
@@ -601,7 +747,6 @@ async def _execute_plan(steps, req, strategy) -> tuple[list[StepResult], dict[st
         if strategy == "sequential":
             ready = [ready[0]]
 
-        # ── For terminal LLM steps, enable streaming TTS ──
         batch = await asyncio.gather(*[
             _run_step_with_retry(
                 sn, step_map[sn]["action"], step_map[sn]["executor"], context, req,
@@ -613,7 +758,6 @@ async def _execute_plan(steps, req, strategy) -> tuple[list[StepResult], dict[st
             results[sr.step] = sr
             pending.discard(sr.step)
             context[f"step_{sr.step}"] = sr.result if sr.success else None
-            # Track whether TTS was fired during execution
             if sr.success and sr.step in output_steps and sr.executor == "llm" and req.tts:
                 tts_fired = True
 
@@ -628,24 +772,44 @@ async def _build_final_response(orig, steps, context, req) -> tuple[str, bool]:
     if not succ:
         return f"Erros: {'; '.join(s.error for s in steps if s.error)}", False
     last = succ[-1]
-    # If the last step was LLM/deep_search, return its result directly (no re-synthesis)
+    
+    # ── Handle local_scraping results specially ──
+    # If any step returned multiple_matches, format a choice message
+    for s in succ:
+        if s.executor == "local_scraping" and isinstance(s.result, dict):
+            if s.result.get("status") == "multiple_matches":
+                matches = s.result.get("matches", [])
+                msg = s.result.get("message", "Múltiplos arquivos encontrados.")
+                lines = [f"  [{i+1}] {m.get('file_path','?')}  ({m.get('size','?')}, modificado: {m.get('modified','?')})" for i, m in enumerate(matches[:10])]
+                return f"{msg}\n\n" + "\n".join(lines), False
+            if s.result.get("status") == "success" and s.result.get("content"):
+                content = s.result["content"]
+                file_path = s.result.get("file_path", "")
+                header = f"📄 Arquivo: {file_path}"
+                reindex_info = ""
+                if s.result.get("was_reindexed"):
+                    reindex_info = " (reindexado — arquivo foi modificado)"
+                elif not s.result.get("hash_match", True):
+                    reindex_info = " (hash diferente — reindexado)"
+                return f"{header}{reindex_info}\n\n{content}", False
+    
+    # If the last step was LLM/deep_search, return its result directly
     if last.executor in ("llm", "deep_search") and isinstance(last.result, str) and len(last.result) > 20:
-        return last.result, False  # TTS may have been fired during step execution
+        return last.result, False
     parts = [f"[{s.executor.upper()} — step {s.step}]\n{_result_to_text(s.result)}"
              for s in succ if _result_to_text(s.result)]
     if not parts:
         return "Tarefa concluída sem resultado textual.", False
     ctx = "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
     try:
-        # Stream synthesis with TTS → user hears audio in real-time
         text = await _stream_llm(
             f"Original: {orig}\nInfo:\n{ctx}\nDirect response in same language:",
             voice=req.voice,
             lang=req.lang,
-            tts=True,           # ← KEY CHANGE: TTS plays during generation
+            tts=True,
             max_turns=1,
         )
-        return text or ctx, True  # tts_already_fired = True
+        return text or ctx, True
     except Exception:
         return ctx, False
 
@@ -659,14 +823,13 @@ async def _execute_direct(route: str, req: ExecuteRequest) -> tuple[list[StepRes
     tts_fired = False
 
     if executor == "llm":
-        # ── Stream with TTS so user hears audio in real-time ──
         t0 = time.perf_counter()
         try:
             text = await _stream_llm(
                 action,
                 voice=req.voice,
                 lang=req.lang,
-                tts=req.tts,      # ← TTS fires during generation
+                tts=req.tts,
                 session_id=req.session_id or "default",
             )
             lat = round((time.perf_counter() - t0) * 1000, 2)
@@ -700,7 +863,7 @@ async def _save_lt(text, src="chat"):
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AVA Unified Orchestrator", version="3.0.0", description="Central Execution + Internal ONNX Routing Engine", lifespan=lifespan)
+app = FastAPI(title="AVA Unified Orchestrator", version="3.1.0", description="Central Execution + Internal ONNX Routing Engine + Local Scraping", lifespan=lifespan)
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute(req: ExecuteRequest):
@@ -719,7 +882,7 @@ async def execute(req: ExecuteRequest):
     step_results = []
     context = {}
     plan_cache = False
-    tts_already_fired = False              # ← NEW
+    tts_already_fired = False
 
     if not needs_cot and route_name in ROUTE_TO_EXECUTOR:
         log.info(f"[{eid[:8]}] ⚡ Direct route: {route_name}")
@@ -741,7 +904,7 @@ async def execute(req: ExecuteRequest):
     errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
     final, synthesis_tts_fired = await _build_final_response(req.input, step_results, context, req)
 
-    # ── Only fire TTS if it wasn't already streamed during LLM generation ──
+    # Only fire TTS if it wasn't already streamed during LLM generation
     any_tts_fired = tts_already_fired or synthesis_tts_fired
     if req.tts and final and not any_tts_fired:
         asyncio.create_task(_fire_tts(final, req))
@@ -757,6 +920,7 @@ async def execute(req: ExecuteRequest):
         errors=errors, route=route_name, route_confidence=route_conf,
         route_method=route_method, routed_directly=routed_directly,
     )
+
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_endpoint(req: ClassifyRequest):
     t0 = time.perf_counter(); ri = _internal_classify(req.text, req.image_path)
@@ -794,10 +958,169 @@ async def chat(message: str, voice: str = "M1", lang: str = "pt", tts: bool = Tr
     try: r = await state.llm_client.post("/chat", json={"message": message, "voice": voice, "lang": lang, "max_turns": 10, "tts": tts}); r.raise_for_status(); return r.json()
     except Exception as e: raise HTTPException(502, f"Chat falhou: {e}")
 
+# ── NEW: Local Scraping Endpoints ───────────────────────────────────────────
+
+@app.post("/local-scraping")
+async def local_scraping(req: LocalScrapingRequest):
+    """
+    Search and read a local file on the user's machine.
+    
+    Flow:
+      1. Orchestrator forwards query to local-scraping service
+      2. Service generates a search command via model
+      3. REST API client on user's machine executes the command
+      4. Returns file content + path
+      5. If multiple files match → returns list for user choice
+      6. If file was indexed → hash comparison → reindex if changed
+      7. Indexed info saved to memory
+    """
+    if not req.query.strip():
+        raise HTTPException(400, "query vazio")
+    try:
+        r = await state.local_scraping_client.post(
+            "/scrape",
+            json={
+                "query":         req.query,
+                "search_path":   req.search_path,
+                "force_reindex": req.force_reindex,
+                "session_id":    req.session_id,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        
+        # If multiple matches, return the choice list
+        if data.get("multiple_matches"):
+            return data
+        
+        # Single file — persist indexed info to memory
+        file_content = data.get("content", "")
+        file_path    = data.get("file_path", "")
+        was_reindexed = data.get("was_reindexed", False)
+        hash_match    = data.get("hash_match", True)
+        
+        if file_content and file_path:
+            try:
+                summary = file_content[:500] if len(file_content) > 500 else file_content
+                await state.memory_client.post(
+                    "/write",
+                    json={
+                        "text":       f"[ARQUIVO INDEXADO] {file_path}: {summary}",
+                        "source":     "local_scraping",
+                        "confidence": 1.0 if hash_match else 0.9,
+                    },
+                )
+            except Exception as e:
+                log.warning(f"Falha ao salvar arquivo indexado na memória: {e}")
+        
+        return data
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Local Scraping falhou: HTTP {e.response.status_code}")
+    except httpx.ConnectError:
+        raise HTTPException(502, "Local Scraping serviço offline")
+    except Exception as e:
+        raise HTTPException(502, f"Local Scraping falhou: {e}")
+
+
+@app.post("/local-scraping/choose")
+async def local_scraping_choose(req: LocalScrapingChooseRequest):
+    """
+    Choose a specific file when multiple matches were found.
+    
+    After a /local-scraping call returns `multiple_matches: true`,
+    the user selects one file_path from the list and calls this
+    endpoint to actually read and index the chosen file.
+    """
+    if not req.file_path.strip():
+        raise HTTPException(400, "file_path vazio")
+    try:
+        r = await state.local_scraping_client.post(
+            "/choose",
+            json={
+                "query":         req.query,
+                "file_path":     req.file_path,
+                "force_reindex": req.force_reindex,
+                "session_id":    req.session_id,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        
+        # Persist chosen file to memory
+        file_content = data.get("content", "")
+        file_path    = data.get("file_path", req.file_path)
+        hash_match   = data.get("hash_match", True)
+        
+        if file_content and file_path:
+            try:
+                summary = file_content[:500] if len(file_content) > 500 else file_content
+                await state.memory_client.post(
+                    "/write",
+                    json={
+                        "text":       f"[ARQUIVO INDEXADO] {file_path}: {summary}",
+                        "source":     "local_scraping",
+                        "confidence": 1.0 if hash_match else 0.9,
+                    },
+                )
+            except Exception as e:
+                log.warning(f"Falha ao salvar arquivo escolhido na memória: {e}")
+        
+        return data
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Local Scraping choose falhou: HTTP {e.response.status_code}")
+    except httpx.ConnectError:
+        raise HTTPException(502, "Local Scraping serviço offline")
+    except Exception as e:
+        raise HTTPException(502, f"Local Scraping choose falhou: {e}")
+
+
+@app.get("/local-scraping/indexed")
+async def local_scraping_indexed(file_path: Optional[str] = None):
+    """
+    List indexed files, or check if a specific file is indexed.
+    Optionally filter by file_path to check indexing status and hash.
+    """
+    try:
+        params = {}
+        if file_path:
+            params["file_path"] = file_path
+        r = await state.local_scraping_client.get("/indexed", params=params)
+        r.raise_for_status()
+        return r.json()
+    except httpx.ConnectError:
+        raise HTTPException(502, "Local Scraping serviço offline")
+    except Exception as e:
+        raise HTTPException(502, f"Local Scraping indexed falhou: {e}")
+
+
+@app.delete("/local-scraping/index/{file_id}")
+async def local_scraping_delete_index(file_id: str):
+    """Remove a specific file from the local-scraping index."""
+    try:
+        r = await state.local_scraping_client.delete(f"/index/{file_id}")
+        r.raise_for_status()
+        return r.json()
+    except httpx.ConnectError:
+        raise HTTPException(502, "Local Scraping serviço offline")
+    except Exception as e:
+        raise HTTPException(502, f"Local Scraping delete falhou: {e}")
+
+
+# ── Existing Endpoints (unchanged) ──────────────────────────────────────────
+
 @app.get("/status")
 async def status():
     checks = {}
-    cfg = {"cot": (state.cot_client, HEALTH_PATHS["cot"]), "memory": (state.memory_client, HEALTH_PATHS["memory"]), "search": (state.search_client, HEALTH_PATHS["search"]), "tts": (state.tts_client, HEALTH_PATHS["tts"]), "llm": (state.llm_client, HEALTH_PATHS["llm"]), "vision": (state.vision_client, HEALTH_PATHS["vision"]), "deep_search": (state.deep_search_client, HEALTH_PATHS["deep_search"])}
+    cfg = {
+        "cot": (state.cot_client, HEALTH_PATHS["cot"]),
+        "memory": (state.memory_client, HEALTH_PATHS["memory"]),
+        "search": (state.search_client, HEALTH_PATHS["search"]),
+        "local_scraping": (state.local_scraping_client, HEALTH_PATHS["local_scraping"]),  # ← NEW
+        "tts": (state.tts_client, HEALTH_PATHS["tts"]),
+        "llm": (state.llm_client, HEALTH_PATHS["llm"]),
+        "vision": (state.vision_client, HEALTH_PATHS["vision"]),
+        "deep_search": (state.deep_search_client, HEALTH_PATHS["deep_search"]),
+    }
     for n, (c, p) in cfg.items():
         try: r = await c.get(p, timeout=2.0); checks[n] = {"healthy": r.status_code == 200, "status_code": r.status_code}
         except: checks[n] = {"healthy": False, "status_code": None}

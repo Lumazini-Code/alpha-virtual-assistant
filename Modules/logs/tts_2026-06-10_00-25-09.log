@@ -1,0 +1,33 @@
+INFO:     Started server process [461]
+INFO:     Waiting for application startup.
+2026-06-10 00:25:09,655 [INFO] [TTS] Iniciando AVA TTS API...
+2026-06-10 00:25:09,655 [INFO] [TTS] [W0] Carregando Supertonic...
+2026-06-10 00:25:09,657 [INFO] [TTS] [W1] Carregando Supertonic...
+2026-06-10 00:25:09,658 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:09,658 [INFO] [TTS] [W2] Carregando Supertonic...
+2026-06-10 00:25:09,658 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:09,658 [INFO] [TTS] TTSPool iniciado com 3 workers
+2026-06-10 00:25:09,658 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:09,658 [INFO] [TTS] TTS API pronta
+INFO:     Application startup complete.
+2026-06-10 00:25:09,658 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:09,659 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:09,659 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:09,659 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:09,659 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:09,659 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:09,659 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:09,660 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:09,676 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 3004): address already in use
+2026-06-10 00:25:10,655 [INFO] [TTS] Successfully loaded all ONNX models
+INFO:     Waiting for application shutdown.
+2026-06-10 00:25:11,044 [INFO] [TTS] AVA TTS API encerrada
+2026-06-10 00:25:11,222 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+INFO:     Application shutdown complete.
+2026-06-10 00:25:11,460 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:25:11,463 [INFO] [TTS] Model loaded successfully
+2026-06-10 00:25:11,538 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:25:11,538 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 00:25:11,541 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 00:25:11,544 [INFO] [TTS] Model loaded successfully

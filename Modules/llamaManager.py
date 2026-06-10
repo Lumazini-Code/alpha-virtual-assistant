@@ -75,7 +75,6 @@ TEXT_PARAMS = {
     "top_p": 0.95,
     "min_p": 0.05,
     "repeat_penalty": 1.05,
-    "override_kv": "tokenizer.ggml.add_bos_token=bool:false",
     # ── Network ──────────────────────────────────────────────────────────────
     "host": "0.0.0.0",
     "port": 2001,  # Optional draft model for speculative decoding
@@ -216,7 +215,7 @@ def build_command(
         # Number of speculative tokens (default 5, max useful ~8)
         cmd.extend(["--spec-draft-n-max", "6"])
         # Minimum draft probability to accept
-        cmd.extend(["--spec-draft-n-min", "0.4"])
+        cmd.extend(["--spec-draft-n-min", "0.7"])
         print(f"[Config] Speculative decoding with draft: {draft_path}")
 
     return cmd

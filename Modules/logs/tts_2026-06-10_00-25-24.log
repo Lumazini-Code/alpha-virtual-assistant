@@ -1,0 +1,21 @@
+INFO:     Started server process [643]
+INFO:     Waiting for application startup.
+2026-06-10 00:25:24,452 [INFO] [TTS] Iniciando AVA TTS API...
+2026-06-10 00:25:24,452 [INFO] [TTS] [W0] Carregando Supertonic...
+2026-06-10 00:25:24,455 [INFO] [TTS] [W1] Carregando Supertonic...
+2026-06-10 00:25:24,455 [INFO] [TTS] [W2] Carregando Supertonic...
+2026-06-10 00:25:24,455 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:24,455 [INFO] [TTS] TTSPool iniciado com 3 workers
+2026-06-10 00:25:24,455 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:24,455 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:24,455 [INFO] [TTS] TTS API pronta
+2026-06-10 00:25:24,456 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+INFO:     Application startup complete.
+2026-06-10 00:25:24,456 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:24,456 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:24,457 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:24,457 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:24,457 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:24,523 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:24,669 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:25,027 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']

@@ -1,0 +1,134 @@
+INFO:     127.0.0.1:41008 - "GET /status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33824 - "POST /stream HTTP/1.1" 200 OK
+er from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 01:29:15,164 [INFO] [TTS] Loaded unicode indexer from /root/.cache/supertonic3/onnx/unicode_indexer.json (65536 entries)
+2026-06-10 01:29:15,166 [INFO] [TTS] Model loaded successfully
+2026-06-10 01:29:15,170 [INFO] [TTS] Model loaded successfully
+2026-06-10 01:29:15,173 [INFO] [TTS] Model loaded successfully
+2026-06-10 01:29:15,173 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:29:15,173 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:29:15,173 [INFO] [TTS] Initialized Supertonic engine (sample_rate=44100Hz, latent_dim=24)
+2026-06-10 01:29:16,267 [INFO] [TTS] [W2] Pronto (pré-aquecido)
+2026-06-10 01:29:16,533 [INFO] [TTS] [W1] Pronto (pré-aquecido)
+2026-06-10 01:29:16,662 [INFO] [TTS] [W0] Pronto (pré-aquecido)
+2026-06-10 01:37:23,125 [INFO] [TTS] [W2] seq=0 ok (1.77s) 'Olá, Usuário!'
+2026-06-10 01:37:23,133 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 737.09ms
+2026-06-10 01:37:23,155 [INFO] [TTS] [PLAY] seq=0 (79872 samples)
+2026-06-10 01:37:23,794 [INFO] [TTS] [W1] seq=1 ok (1.91s) 'Que pedido excelente!'
+2026-06-10 01:37:23,795 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 627.8ms
+2026-06-10 01:37:24,771 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:24,814 [INFO] [TTS] [PLAY] seq=1 (86016 samples)
+2026-06-10 01:37:24,817 [INFO] [TTS] [W0] seq=2 ok (3.60s) '"Deep search" em Química Orgânica Avançada?'
+2026-06-10 01:37:24,817 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 957.51ms
+2026-06-10 01:37:26,573 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:26,617 [INFO] [TTS] [PLAY] seq=2 (159744 samples)
+2026-06-10 01:37:29,297 [INFO] [TTS] [W2] seq=3 ok (10.72s) 'Isso já diz tudo: você não quer só saber que o rea'
+2026-06-10 01:37:29,298 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1920.73ms
+2026-06-10 01:37:29,848 [INFO] [TTS] [W1] seq=4 ok (1.78s) 'Pode deixar comigo.'
+2026-06-10 01:37:29,849 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 527.71ms
+2026-06-10 01:37:29,934 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:29,979 [INFO] [TTS] [PLAY] seq=3 (473088 samples)
+2026-06-10 01:37:30,708 [INFO] [TTS] [W0] seq=5 ok (3.72s) 'Já estou mergulhando no banco de dados molecular.'
+2026-06-10 01:37:30,709 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 856.56ms
+2026-06-10 01:37:33,057 [INFO] [TTS] [W2] seq=6 ok (8.54s) 'Se a química orgânica básica é o "modo fácil", a a'
+2026-06-10 01:37:33,057 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1533.59ms
+2026-06-10 01:37:35,057 [INFO] [TTS] [W1] seq=7 ok (6.71s) 'Para dar uma visão geral do que um deep search abr'
+2026-06-10 01:37:35,058 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1444.42ms
+2026-06-10 01:37:39,248 [INFO] [TTS] [W0] seq=8 ok (10.69s) 'A Química Orgânica Avançada não é um único tópico;'
+2026-06-10 01:37:39,248 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 3323.82ms
+2026-06-10 01:37:39,811 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:39,854 [INFO] [TTS] [PLAY] seq=4 (79872 samples)
+2026-06-10 01:37:40,251 [INFO] [TTS] [W2] seq=9 ok (4.47s) 'Aqui está um panorama dos tópicos centrais: 1.'
+2026-06-10 01:37:40,251 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 998.79ms
+2026-06-10 01:37:41,497 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:41,539 [INFO] [TTS] [PLAY] seq=5 (165888 samples)
+2026-06-10 01:37:43,368 [INFO] [TTS] [W1] seq=10 ok (12.14s) 'Estratégia Sintética e Retrossíntese (O Planejamen'
+2026-06-10 01:37:43,369 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2170.94ms
+2026-06-10 01:37:44,975 [INFO] [TTS] [PLAY] seq=6 (377856 samples)
+2026-06-10 01:37:45,382 [INFO] [TTS] [W0] seq=11 ok (8.37s) 'ao alvo, você começa pelo alvo e desmembra ele em '
+2026-06-10 01:37:45,382 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1656.09ms
+2026-06-10 01:37:48,655 [INFO] [TTS] [W2] seq=12 ok (9.93s) 'Retrossíntese: Usando ferramentas como as de Woodw'
+2026-06-10 01:37:48,655 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1839.58ms
+2026-06-10 01:37:52,307 [INFO] [TTS] [W1] seq=13 ok (11.32s) 'Análise de Grupos Funcionais: Entender a reativida'
+2026-06-10 01:37:52,307 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2079.08ms
+2026-06-10 01:37:52,857 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:37:52,900 [INFO] [TTS] [PLAY] seq=7 (297984 samples)
+2026-06-10 01:37:53,152 [INFO] [TTS] [W0] seq=14 ok (3.66s) 'eles não interfiram em reações indesejadas.'
+2026-06-10 01:37:53,153 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 841.33ms
+2026-06-10 01:37:53,626 [INFO] [TTS] [W2] seq=15 ok (1.27s) '2.'
+2026-06-10 01:37:53,627 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 470.42ms
+2026-06-10 01:37:55,082 [INFO] [TTS] [W1] seq=16 ok (5.93s) 'Reações Catalíticas Avançadas (O Turbo) Aqui é ond'
+2026-06-10 01:37:55,083 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1168.58ms
+2026-06-10 01:37:58,766 [INFO] [TTS] [W0] seq=17 ok (10.75s) 'Não basta misturar reagentes; você precisa de um c'
+2026-06-10 01:37:58,768 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1965.59ms
+2026-06-10 01:37:59,098 [INFO] [TTS] [PLAY] seq=8 (473088 samples)
+2026-06-10 01:38:02,511 [INFO] [TTS] [W2] seq=18 ok (9.59s) 'Catálise por Metais de Transição: Especialmente as'
+2026-06-10 01:38:02,512 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1767.81ms
+2026-06-10 01:38:05,044 [INFO] [TTS] [W1] seq=19 ok (7.83s) 'Exemplos clássicos:* Reações de Acoplamento (Suzuk'
+2026-06-10 01:38:05,044 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1491.51ms
+2026-06-10 01:38:08,932 [INFO] [TTS] [PLAY] seq=9 (199680 samples)
+2026-06-10 01:38:09,561 [INFO] [TTS] [W0] seq=20 ok (12.48s) 'Catálise Orgânica (Organocatalisadores): Usar molé'
+2026-06-10 01:38:09,562 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2254.52ms
+2026-06-10 01:38:10,043 [INFO] [TTS] [W2] seq=21 ok (1.35s) 'pesados.'
+2026-06-10 01:38:10,044 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 480.02ms
+2026-06-10 01:38:10,528 [INFO] [TTS] [W1] seq=22 ok (1.27s) '3.'
+2026-06-10 01:38:10,528 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 481.32ms
+2026-06-10 01:38:11,946 [INFO] [TTS] [W0] seq=23 ok (7.16s) 'Estereoquímica e Enantioseletividade (A Direção) E'
+2026-06-10 01:38:11,947 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1332.14ms
+2026-06-10 01:38:12,812 [INFO] [TTS] [W2] seq=24 ok (3.76s) 'É sobre a forma tridimensional das moléculas.'
+2026-06-10 01:38:12,812 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 862.41ms
+2026-06-10 01:38:13,091 [INFO] [TTS] [PLAY] Fala completa
+2026-06-10 01:38:13,135 [INFO] [TTS] [PLAY] seq=10 (537600 samples)
+2026-06-10 01:38:16,265 [INFO] [TTS] [W1] seq=25 ok (10.92s) 'Duas moléculas podem ter a mesma fórmula, mas se f'
+2026-06-10 01:38:16,266 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1972.12ms
+2026-06-10 01:38:16,966 [INFO] [TTS] [W0] seq=26 ok (2.53s) 'nossos receptores biológicos).'
+2026-06-10 01:38:16,966 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 697.78ms
+2026-06-10 01:38:19,136 [INFO] [TTS] [W2] seq=27 ok (8.94s) 'Síntese Assimétrica: Forçar uma reação a produzir '
+2026-06-10 01:38:19,136 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1721.92ms
+2026-06-10 01:38:23,086 [INFO] [TTS] [W1] seq=28 ok (12.06s) 'Auxiliares Quirais: Moléculas "ajudantes" que se l'
+2026-06-10 01:38:23,087 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2153.83ms
+2026-06-10 01:38:23,564 [INFO] [TTS] [W0] seq=29 ok (1.27s) '4.'
+2026-06-10 01:38:23,565 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 475.54ms
+2026-06-10 01:38:24,335 [INFO] [TTS] [PLAY] seq=11 (371712 samples)
+2026-06-10 01:38:27,079 [INFO] [TTS] [W2] seq=30 ok (11.95s) 'Reações Periódicas (As Grandiosas) São reações ond'
+2026-06-10 01:38:27,080 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 2109.72ms
+2026-06-10 01:38:27,564 [INFO] [TTS] [W1] seq=31 ok (1.37s) 'molecular.'
+2026-06-10 01:38:27,566 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 483.18ms
+2026-06-10 01:38:28,654 [INFO] [TTS] [W0] seq=32 ok (5.43s) 'Diels-Alder: A reação clássica de cicloadição [4+2'
+2026-06-10 01:38:28,654 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1083.85ms
+2026-06-10 01:38:30,535 [INFO] [TTS] [W2] seq=33 ok (6.19s) 'Um dieno reage com um alcino (dienófilo) para form'
+2026-06-10 01:38:30,535 [INFO] [TTS] [STREAM] 1 sentenças enfileiradas em 1210.32ms
+2026-06-10 01:38:32,059 [INFO] [TTS] [PLAY] seq=12 (439296 samples)

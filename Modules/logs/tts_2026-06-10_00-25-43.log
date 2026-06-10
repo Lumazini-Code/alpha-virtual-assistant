@@ -1,0 +1,28 @@
+INFO:     Started server process [68]
+INFO:     Waiting for application startup.
+2026-06-10 00:25:43,427 [INFO] [TTS] Iniciando AVA TTS API...
+2026-06-10 00:25:43,441 [INFO] [TTS] [W0] Carregando Supertonic...
+2026-06-10 00:25:43,442 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:43,442 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:43,442 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:43,442 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:43,512 [INFO] [TTS] [W1] Carregando Supertonic...
+2026-06-10 00:25:43,513 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:43,513 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:43,513 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:43,513 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+2026-06-10 00:25:43,513 [INFO] [TTS] [W2] Carregando Supertonic...
+2026-06-10 00:25:43,514 [INFO] [TTS] TTSPool iniciado com 3 workers
+2026-06-10 00:25:43,514 [INFO] [TTS] TTS API pronta
+INFO:     Application startup complete.
+2026-06-10 00:25:43,516 [INFO] [TTS] Loading model from /root/.cache/supertonic3
+2026-06-10 00:25:43,517 [INFO] [TTS] Using ONNX providers: ['CPUExecutionProvider']
+2026-06-10 00:25:43,517 [INFO] [TTS] ONNX Runtime config: intra_threads=auto, inter_threads=auto
+2026-06-10 00:25:43,795 [INFO] [TTS] Loading ONNX models with providers: ['CPUExecutionProvider']
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 3004): address already in use
+INFO:     Waiting for application shutdown.
+2026-06-10 00:25:46,112 [INFO] [TTS] AVA TTS API encerrada
+INFO:     Application shutdown complete.
+2026-06-10 00:25:46,183 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:25:46,304 [INFO] [TTS] Successfully loaded all ONNX models
+2026-06-10 00:25:46,348 [INFO] [TTS] Successfully loaded all ONNX models

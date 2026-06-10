@@ -54,6 +54,9 @@ restart_on_fail "TTS" "python3 TTS.py" &
 echo "  • VQA..."
 restart_on_fail "VQA" "python3 VQA.py" &
 
+echo "  • Local Scraping & Client..."
+restart_on_fail "Local Scraping" "python3 local_scraping.py" &
+
 echo "✓ Todos os serviços iniciados"
 echo ""
 echo "Aguardando processos..."
