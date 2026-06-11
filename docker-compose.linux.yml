@@ -1,0 +1,74 @@
+# Override Linux — adiciona network_mode: host, PulseAudio e device passthrough.
+# Uso: docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile <cpu|cuda|vulkan> up
+
+services:
+
+  # ─────────────────────────────────────────────
+  # CPU — Linux
+  # ─────────────────────────────────────────────
+  ava-cpu:
+    network_mode: host
+
+    volumes:
+      # PulseAudio socket — áudio nativo do host
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native:rw
+
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+    devices:
+      # GPU via Vulkan (DRI) + placa de som
+      - /dev/dri:/dev/dri
+      - /dev/snd:/dev/snd
+
+    group_add:
+      # Acesso ao áudio e render sem sudo
+      - audio
+
+  # ─────────────────────────────────────────────
+  # CUDA — Linux
+  # ─────────────────────────────────────────────
+  ava-cuda:
+    network_mode: host
+
+    volumes:
+      # PulseAudio socket — áudio nativo do host
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native:rw
+
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+    devices:
+      # GPU via Vulkan (DRI) + placa de som
+      - /dev/dri:/dev/dri
+      - /dev/snd:/dev/snd
+
+    group_add:
+      # Acesso ao áudio e render sem sudo
+      - audio
+
+  # ─────────────────────────────────────────────
+  # Vulkan — Linux
+  # Inclui PulseAudio, DRI e acesso ao som.
+  # ─────────────────────────────────────────────
+  ava-vulkan:
+    network_mode: host
+
+    volumes:
+      # PulseAudio socket — áudio nativo do host
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native:rw
+
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+    devices:
+      # GPU via Vulkan (DRI) + placa de som
+      - /dev/dri:/dev/dri
+      - /dev/snd:/dev/snd
+
+    group_add:
+      # Acesso ao áudio e render sem sudo
+      - audio

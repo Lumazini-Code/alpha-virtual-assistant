@@ -37,6 +37,8 @@ Modules/memory/**
 Dockerfile
 docker-compose.yml
 .dockerignore
+docker-compose.windows.yml
+docker-compose.linux.yml
 
 # Documentação
 *.md
@@ -52,6 +54,8 @@ Thumbs.db
 *.bak
 *.log
 
-
 *.gguf
 *.onnx
+
+docker-start.sh
+docker-start.bat

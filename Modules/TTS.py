@@ -60,30 +60,6 @@ MIN_PALAVRAS     = 4        # mínimo de palavras por chunk
 
 AVAILABLE_VOICES = ["M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"]
 
-# ════════════════════════════════════════════════════════════════════════════
-# LOGGER DUAL (terminal + arquivo)
-# ════════════════════════════════════════════════════════════════════════════
-
-BASEFOLDER = Path(__file__).parent
-log_dir    = BASEFOLDER / "logs"
-log_dir.mkdir(parents=True, exist_ok=True)
-log_path   = log_dir / f"tts_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-
-class _LogDuplicado:
-    def __init__(self, terminal, caminho: Path):
-        self.terminal = terminal
-        self._f = open(caminho, "w", encoding="utf-8")
-    def write(self, msg: str):
-        self.terminal.write(msg)
-        self._f.write(msg)
-    def flush(self):
-        self.terminal.flush()
-        self._f.flush()
-    def isatty(self) -> bool:
-        return self.terminal.isatty()
-
-sys.stdout = _LogDuplicado(sys.stdout, log_path)
-sys.stderr = _LogDuplicado(sys.stderr, log_path)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [TTS] %(message)s")
 log = logging.getLogger("ava.tts")

@@ -92,6 +92,10 @@ Output: {{"step":1,"action":"buscar e ler arquivo contrato.docx","executor":"loc
 
 Input: "leia o relatório financeiro e calcule a soma das despesas"
 Output: {{"step":1,"action":"buscar e ler arquivo relatório financeiro","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"calcular a soma das despesas em result of step 1","executor":"calculator","depends_on":[1]}}]}}
+
+Input: "aprenda sobre química orgânica avançada"
+Output: {{"step":1,"action":"estudar sobre Química orgânica avançada","executor":"deep_search","depends_on":null}},{{"step":2,"action":"Fazer um resumo dos conhecimentos obtidos para o usuário","executor":"LLM","depends_on":[1]}}]}}
+
 """
 
 # ── Grammar GBNF otimizada ─────────────────────────────────────────────────────
@@ -100,7 +104,7 @@ GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
 steps-cont  ::= step ("," step)*
 step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
 step-num    ::= [1-7]
-executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\"" | "\"local_scraping\""
+executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\"" | "\"local_scraping\"" | "\"deep_search\""
 depends     ::= "null" | "[" step-num ("," step-num)* "]"
 string      ::= "\"" ([^"\\] | "\\" .)* "\""
 """

@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-CLIENT_PORT  = int(os.environ.get("CLIENT_PORT", "3005"))
+CLIENT_PORT  = "3005"
 CLIENT_TOKEN = os.environ.get("CLIENT_TOKEN", "")
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_CMD_TIME  = 30.0

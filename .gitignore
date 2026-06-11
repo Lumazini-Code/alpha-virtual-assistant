@@ -1,8 +1,4 @@
 dist/
-logs/*.log
-
-*.onnx
-*.gguf
 
 .vscode
 compiler/
@@ -19,7 +15,8 @@ test/*
 
 openclaude
 
-
-
+*.log
+*.onnx
+*.gguf
 
 !.gitkeep

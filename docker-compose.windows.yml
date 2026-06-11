@@ -1,0 +1,81 @@
+
+services:
+
+  # ─────────────────────────────────────────────
+  # CPU — Windows
+  # ─────────────────────────────────────────────
+  ava-cpu:
+    ports:
+      - "3000:3000"
+      - "4005:4005"
+      - "4003:4003"
+      - "3003:3003"
+      - "3001:3001"
+      - "2002:2002"
+      - "3002:3002"
+      - "3004:3004"
+      - "4002:4002"
+      - "9000:9000"
+      - "3005:3005"
+      - "2001:2001" 
+
+    volumes:
+    - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+
+  # ─────────────────────────────────────────────
+  # CUDA — Windows
+  # Requer NVIDIA Container Toolkit no Docker Desktop
+  # ─────────────────────────────────────────────
+  ava-cuda:
+    ports:
+      - "3000:3000"
+      - "4005:4005"
+      - "4003:4003"
+      - "3003:3003"
+      - "3001:3001"
+      - "2002:2002"
+      - "3002:3002"
+      - "3004:3004"
+      - "4002:4002"
+      - "9000:9000"
+      - "3005:3005"
+      - "2001:2001" 
+
+    volumes:
+    - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+  # ─────────────────────────────────────────────
+  # Vulkan — Windows
+  # Sem suporte a PulseAudio, /dev/dri ou /dev/snd.
+  # GPU Vulkan via WSL2 pode funcionar com drivers recentes da NVIDIA/AMD/Intel.
+  # ─────────────────────────────────────────────
+  ava-vulkan:
+    ports:
+      - "3000:3000"
+      - "4005:4005"
+      - "4003:4003"
+      - "3003:3003"
+      - "3001:3001"
+      - "2002:2002"
+      - "3002:3002"
+      - "3004:3004"
+      - "4002:4002"
+      - "9000:9000"
+      - "3005:3005"
+      - "2001:2001"                              
+
+
+    volumes:
+    - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+    environment:
+      PULSE_SERVER: "unix:/run/user/1000/pulse/native"
+      PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+
+

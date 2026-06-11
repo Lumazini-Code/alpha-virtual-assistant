@@ -215,7 +215,17 @@ def build_command(
         # Number of speculative tokens (default 5, max useful ~8)
         cmd.extend(["--spec-draft-n-max", "6"])
         # Minimum draft probability to accept
-        cmd.extend(["--spec-draft-n-min", "0.7"])
+        cmd.extend(["--spec-draft-n-min", "2"])
+        cmd.extend(["-ngld", "999"])
+        cmd.extend(["--spec-draft-p-split", "0.08"])
+        cmd.extend(["--spec-draft-p-min", "0.03"])
+        cmd.extend(["--spec-draft-threads", "6 "])
+        cmd.extend(["--spec-draft-threads-batch", "8 "])
+        cmd.extend(["--spec-draft-backend-sampling"])
+        cmd.extend(["--spec-draft-prio", "2"])
+        cmd.extend(["--spec-draft-prio-batch", " 2"])
+        
+        
         print(f"[Config] Speculative decoding with draft: {draft_path}")
 
     return cmd
