@@ -39,6 +39,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from tokenizers import Tokenizer
+from fastapi.responses import StreamingResponse
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -89,8 +90,7 @@ ONNX_PROVIDERS = os.environ.get("ONNX_PROVIDERS", "AzureExecutionProvider,CPUExe
 # Direct Route Mapping
 ROUTE_TO_EXECUTOR: dict[str, str] = {
     "llm": "llm", "search": "search", "memory_read": "memory", "memory_write": "memory",
-    "vision": "vision", "deep_search": "deep_search", "calculator": "calculator",
-    "commander": "commander", "translator": "translator", "tts": "tts",
+    "vision": "vision", "deep_search": "deep_search", "tts": "tts",
     "local_scraping": "local_scraping",  # ← NEW
 }
 
@@ -112,6 +112,7 @@ class ExecuteRequest(BaseModel):
     image_path:  Optional[str]  = None
     search_pdfs: bool           = False
     strategy:    Literal["parallel", "sequential", "fail_fast"] = "parallel"
+    stream:      bool           = True   # ← NOVO: ativa resposta em streaming
 
 class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
@@ -247,9 +248,6 @@ class OnnxMiniLMRouter:
         "memory_write": ["remember my favorite color", "save this info", "grave na memória"],
         "vision": ["describe this image", "analyze photo", "what does picture show"],
         "deep_search": ["deep research about", "learn about", "pesquisa profunda"],
-        "calculator": ["calculate 15 times 37", "square root of 144", "quanto é 100"],
-        "commander": ["open firefox", "launch vscode", "abrir spotify"],
-        "translator": ["translate to english", "traduzir para espanhol"],
         "tts": ["speak text aloud", "fale em voz alta"],
         "local_scraping": [                                       # ← NEW
             "leia o arquivo", "read the file", "abra o arquivo relatório",
@@ -308,10 +306,6 @@ _HEURISTIC_RULES = [
          , re.I)),
     ("memory_write", ["lembrar","memorizar","gravar","salvar","remember","save"], re.compile(r"(lembrar|memorizar|gravar|salvar|remember|save|store|memo)\b", re.I)),
     ("memory_read", ["o que você sabe","recall"], re.compile(r"(o que (você|voce) (sabe|lembra)|recall|what do you (know|remember))", re.I)),
-    ("translator", ["traduz","translate"], re.compile(r"(traduz|tradu[çc][aã]|translate|em (ingl[eê]s|espanhol)|to (english|spanish))", re.I)),
-    ("calculator", ["quanto é","calcule"], re.compile(r"(quanto [eé]|calcule?|calculate|\d+\s*[\+\-\*\/\^x×÷]\s*\d+)", re.I)),
-    # ── commander "abrir/open" — lower priority than local_scraping for file patterns ──
-    ("commander", ["abrir","open"], re.compile(r"^(abrir|open|launch|iniciar|executar|start|run)\b", re.I)),
     ("vision", ["imagem","foto","image"], re.compile(r"(imagem|foto|picture|image|screenshot|descreva a|what is in the)", re.I)),
     ("deep_search", ["pesquisa profunda","research"], re.compile(r"(pesquisa profunda|investigue|deep.?search|research|estude sobre)", re.I)),
     ("search", ["procure","busque","search"], re.compile(r"(procure|busque|pesquis|search|look up|find|not[ií]cia|news)", re.I)),
@@ -519,46 +513,6 @@ async def _adapt_tts(action, context, req) -> str:
 
 async def _adapt_stt(action, context, req) -> str: return action
 
-async def _adapt_commander(action, context, req) -> str:
-    res = _resolve_action_text(action, context) or action; cl = res.lower()
-    if any(cl.startswith(p) for p in _OPEN_PREFIXES): cmd = ["xdg-open", res.split(None, 1)[1] if len(res.split()) > 1 else res]
-    else:
-        try: cmd = shlex.split(res)
-        except ValueError as e: raise RuntimeError(f"Comando inválido: {e}")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8.0); out = proc.stdout.strip() or proc.stderr.strip() or "ok"
-        if proc.returncode != 0: raise RuntimeError(f"Exit {proc.returncode}: {out}"); return out
-    except subprocess.TimeoutExpired: raise RuntimeError("Timeout 8s")
-    except FileNotFoundError: raise RuntimeError(f"Cmd não encontrado: {cmd[0]}")
-
-async def _adapt_translator(action, context, req) -> str:
-    txt = _resolve_action_text(action, context) or action
-    return await _stream_llm(
-        f"Translate accurately. Return ONLY translation:\n\n{txt}",
-        voice=req.voice,
-        lang=req.lang,
-        tts=False,
-        max_turns=1,
-    )
-
-async def _adapt_calculator(action, context, req) -> str:
-    res = _resolve_action_text(action, context) or action
-    m = re.search(r"[\d\s\+\-\*\/\(\)\.\^%]+", res)
-    if m:
-        expr = m.group().strip().replace("^", "**")
-        try:
-            return str(eval(expr, {"__builtins__": {}}, {}))
-        except Exception:
-            pass
-    return await _stream_llm(
-        f"Solve calculation, return ONLY numeric result:\n{res}",
-        voice=req.voice,
-        lang=req.lang,
-        tts=False,
-        max_turns=1,
-    )
-
-# ── NEW: Local Scraping Adapter ─────────────────────────────────────────────
 
 async def _adapt_local_scraping(action, context, req) -> dict:
     """
@@ -637,13 +591,12 @@ async def _adapt_local_scraping(action, context, req) -> dict:
         "hash_match":    hash_match,
         "requires_choice": False,
     }
-
+sse
 
 EXECUTOR_ADAPTERS = {
     "llm": _adapt_llm, "memory": _adapt_memory, "search": _adapt_search,
     "deep_search": _adapt_deep_search, "vision": _adapt_vision, "tts": _adapt_tts,
-    "stt": _adapt_stt, "commander": _adapt_commander, "translator": _adapt_translator,
-    "calculator": _adapt_calculator, "local_scraping": _adapt_local_scraping,  # ← NEW
+    "stt": _adapt_stt, "local_scraping": _adapt_local_scraping,  # ← NEW
 }
 
 def _resolve_action_text(action, context):
@@ -857,6 +810,327 @@ async def _save_turn(u, a, sid):
 async def _save_lt(text, src="chat"):
     try: await state.memory_client.post("/write", json={"text": text[:500], "source": src, "confidence": 0.8})
     except: pass
+async def _execute_stream_generator(req: ExecuteRequest):
+    """
+    Gerador assíncrono que emite Server-Sent Events para o /execute.
+
+    Tipos de evento:
+      meta   – metadados de roteamento (route, confidence, execution_id)
+      delta  – fragmento de token LLM (streaming em tempo real, TEXTO PURO)
+      step   – notificação de conclusão de step do plano CoT
+      result – resultado completo (busca, memória, local_scraping, etc., TEXTO PURO)
+      error  – mensagem de erro
+      done   – evento final com resposta completa + estatísticas
+    """
+    t0 = time.perf_counter()
+    eid = str(uuid.uuid4())
+    sid = req.session_id or str(uuid.uuid4())
+    log.info(f"[{eid[:8]}] Executando (stream): '{req.input[:80]}'")
+
+    route_info   = _internal_classify(req.input, req.image_path)
+    route_name   = route_info["route"]
+    route_conf   = route_info["confidence"]
+    route_method = route_info["method"]
+    needs_cot    = route_info["needs_cot"]
+    routed_directly = not needs_cot and route_name in ROUTE_TO_EXECUTOR
+
+    log.info(
+        f"[{eid[:8]}] Router → {route_name} ({route_conf:.0%} via {route_method})"
+        f" {'→ CoT' if needs_cot else '→ Direct'}"
+    )
+
+    # ── 1. Metadados iniciais ───────────────────────────────────────────
+    yield _sse("meta", {
+        "execution_id": eid,
+        "session_id": sid,
+        "route": route_name,
+        "route_confidence": route_conf,
+        "route_method": route_method,
+        "routed_directly": routed_directly,
+    })
+
+    step_results: list[StepResult] = []
+    context: dict[str, Any] = {}
+    plan_cache = False
+    tts_already_fired = False
+    final_response = ""
+
+    try:
+        # ────────────────────────────────────────────────────────────────
+        #  ROTA DIRETA
+        # ────────────────────────────────────────────────────────────────
+        if not needs_cot and route_name in ROUTE_TO_EXECUTOR:
+            executor = ROUTE_TO_EXECUTOR.get(route_name, "llm")
+            action = f"gravar {req.input}" if route_name == "memory_write" else req.input
+
+            if executor == "llm":
+                # ── Stream LLM tokens diretamente ao cliente ──
+                t0_step = time.perf_counter()
+                try:
+                    async for delta in _stream_llm_chunks(
+                        action,
+                        voice=req.voice,
+                        lang=req.lang,
+                        tts=req.tts,
+                        session_id=sid,
+                    ):
+                        final_response += delta
+                        yield _sse("delta", delta)  # TEXTO PURO
+
+                    lat = round((time.perf_counter() - t0_step) * 1000, 2)
+                    step_results = [StepResult(
+                        step=1, executor="llm", action=action,
+                        success=True, result=final_response,
+                        latency_ms=lat,
+                    )]
+                    tts_already_fired = req.tts
+                except Exception as e:
+                    lat = round((time.perf_counter() - t0_step) * 1000, 2)
+                    step_results = [StepResult(
+                        step=1, executor="llm", action=action,
+                        success=False, error=str(e), latency_ms=lat,
+                    )]
+                    final_response = f"Erro: {e}"
+                    yield _sse("error", {"error": str(e)})
+            else:
+                # ── Rota direta não-LLM ──
+                sr = await _run_step_with_retry(1, action, executor, {}, req)
+                step_results = [sr]
+                context = {"step_1": sr.result} if sr.success else {}
+                final_response = (
+                    _result_to_text(sr.result) if sr.success
+                    else f"Erro: {sr.error}"
+                )
+                yield _sse("result", final_response)  # TEXTO PURO
+
+        # ────────────────────────────────────────────────────────────────
+        #  PIPELINE CoT
+        # ────────────────────────────────────────────────────────────────
+        else:
+            log.info(f"[{eid[:8]}] 🧠 CoT pipeline")
+            raw = []
+            try:
+                cr = await state.cot_client.post(
+                    "/plan", json={"input": req.input, "use_cache": req.use_cache}
+                )
+                cr.raise_for_status()
+                pd = cr.json()
+                raw = pd.get("steps", [])
+                plan_cache = pd.get("from_cache", False)
+            except Exception as e:
+                yield _sse("error", {"error": f"CoT falhou: {e}"})
+                final_response = f"CoT falhou: {e}"
+
+            if raw:
+                # Executa todos os steps do plano (acumula internamente)
+                step_results, context, tts_already_fired = await _execute_plan(
+                    raw, req, req.strategy
+                )
+
+                # Notifica o cliente sobre cada step concluído
+                for sr in step_results:
+                    yield _sse("step", {
+                        "step": sr.step,
+                        "executor": sr.executor,
+                        "success": sr.success,
+                        "latency_ms": sr.latency_ms,
+                        "error": sr.error,
+                    })
+
+                # ── Monta resposta final ──
+                succ = [s for s in step_results if s.success]
+                if not succ:
+                    final_response = (
+                        f"Erros: {'; '.join(s.error for s in step_results if s.error)}"
+                    )
+                    yield _sse("error", {"error": final_response})
+                else:
+                    # Caso especial: local_scraping com múltiplos matches
+                    local_scraping_handled = False
+                    for s in succ:
+                        if s.executor == "local_scraping" and isinstance(s.result, dict):
+                            if s.result.get("status") == "multiple_matches":
+                                matches = s.result.get("matches", [])
+                                msg = s.result.get(
+                                    "message", "Múltiplos arquivos encontrados."
+                                )
+                                lines = [
+                                    f"  [{i+1}] {m.get('file_path','?')}  "
+                                    f"({m.get('size','?')})"
+                                    for i, m in enumerate(matches[:10])
+                                ]
+                                final_response = f"{msg}\n\n" + "\n".join(lines)
+                                yield _sse("result", final_response)  # TEXTO PURO
+                                local_scraping_handled = True
+                                break
+
+                            if (
+                                s.result.get("status") == "success"
+                                and s.result.get("content")
+                            ):
+                                content   = s.result["content"]
+                                file_path = s.result.get("file_path", "")
+                                reindex_info = ""
+                                if s.result.get("was_reindexed"):
+                                    reindex_info = " (reindexado)"
+                                elif not s.result.get("hash_match", True):
+                                    reindex_info = " (hash diferente — reindexado)"
+                                final_response = (
+                                    f"📄 Arquivo: {file_path}{reindex_info}"
+                                    f"\n\n{content}"
+                                )
+                                yield _sse("result", final_response)  # TEXTO PURO
+                                local_scraping_handled = True
+                                break
+
+                    if not local_scraping_handled:
+                        last = succ[-1]
+                        # Último step é LLM/deep_search com texto útil → enviar direto
+                        if (
+                            last.executor in ("llm", "deep_search")
+                            and isinstance(last.result, str)
+                            and len(last.result) > 20
+                        ):
+                            final_response = last.result
+                            yield _sse("result", final_response)  # TEXTO PURO
+                        else:
+                            # ── Síntese via LLM em streaming ──
+                            parts = [
+                                f"[{s.executor.upper()} — step {s.step}]\n"
+                                f"{_result_to_text(s.result)}"
+                                for s in succ
+                                if _result_to_text(s.result)
+                            ]
+                            if parts:
+                                ctx_text = "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
+                                synthesis_prompt = (
+                                    f"Original: {req.input}\nInfo:\n{ctx_text}\n"
+                                    f"Direct response in same language:"
+                                )
+                                try:
+                                    async for delta in _stream_llm_chunks(
+                                        synthesis_prompt,
+                                        voice=req.voice,
+                                        lang=req.lang,
+                                        tts=req.tts,
+                                        session_id=sid,
+                                        max_turns=1,
+                                    ):
+                                        final_response += delta
+                                        yield _sse("delta", delta)  # TEXTO PURO
+                                    tts_already_fired = req.tts
+                                except Exception:
+                                    final_response = ctx_text
+                                    yield _sse("result", final_response)  # TEXTO PURO
+                            else:
+                                final_response = (
+                                    "Tarefa concluída sem resultado textual."
+                                )
+                                yield _sse("result", final_response)  # TEXTO PURO
+
+    except Exception as e:
+        final_response = f"Erro interno: {e}"
+        yield _sse("error", {"error": str(e)})
+
+    # ── TTS se não foi disparado durante o streaming ──
+    if req.tts and final_response and not tts_already_fired:
+        asyncio.create_task(_fire_tts(final_response, req))
+
+    # ── Persistir turno ──
+    if final_response:
+        asyncio.create_task(_save_turn(req.input, final_response, sid))
+        asyncio.create_task(_save_lt(f"Usuário disse: {req.input[:200]}"))
+
+    # ── Evento final ──
+    lat = round((time.perf_counter() - t0) * 1000, 2)
+    errors = [
+        f"Step {s.step} [{s.executor}]: {s.error}"
+        for s in step_results
+        if not s.success
+    ]
+
+    yield _sse("done", {
+        "execution_id": eid,
+        "final_response": final_response,
+        "steps": [s.model_dump() for s in step_results],
+        "plan_from_cache": plan_cache,
+        "total_latency_ms": lat,
+        "errors": errors,
+        "route": route_name,
+        "route_confidence": route_conf,
+        "route_method": route_method,
+        "routed_directly": routed_directly,
+    })
+
+async def _stream_llm_chunks(
+    message: str,
+    voice: str = "M1",
+    lang: str = "pt",
+    tts: bool = False,
+    session_id: str = "default",
+    max_turns: int = 10,
+):
+    """
+    Gerador assíncrono que faz yield de cada delta recebido do LLM
+    via /chat/stream.  Usado por _execute_stream_generator para
+    encaminhar tokens ao cliente em tempo real.
+    """
+    try:
+        async with state.llm_client.stream(
+            "POST",
+            "/chat/stream",
+            json={
+                "message":    message,
+                "voice":      voice,
+                "lang":       lang,
+                "tts":        tts,
+                "session_id": session_id,
+                "max_turns":  max_turns,
+            },
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                try:
+                    chunk = json.loads(payload)
+                    if "delta" in chunk:
+                        yield chunk["delta"]
+                    elif "done" in chunk:
+                        break
+                    elif "error" in chunk:
+                        log.warning(f"LLM stream error: {chunk['error']}")
+                        break
+                except json.JSONDecodeError:
+                    continue
+    except httpx.StreamError as e:
+        log.warning(f"LLM stream interrupted: {e}")
+    except Exception as e:
+        log.warning(f"LLM stream failed: {e}")
+
+
+def _sse(event: str, data: Any) -> str:
+    """
+    Formata um frame Server-Sent Events robusto.
+    - Usa o campo 'event' do SSE para tipificar a mensagem.
+    - Se `data` for dict, serializa como JSON (single-line).
+    - Se `data` for str, envia como TEXTO PURO, sem serialização JSON,
+      preservando Markdown e LaTeX perfeitamente (sem duplo escape).
+    - Quebras de linha internas viram múltiplas linhas 'data:' conforme a spec SSE.
+    """
+    if isinstance(data, dict):
+        payload = json.dumps(data, ensure_ascii=False)
+    else:
+        payload = str(data)
+    
+    # A spec do SSE exige que quebras de linha no dado virem múltiplas linhas "data:"
+    lines = payload.split('\n')
+    frame = f"event: {event}\n"
+    for line in lines:
+        frame += f"data: {line}\n"
+    frame += "\n"  # Fim do evento (linha em branco)
+    return frame
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -865,19 +1139,46 @@ async def _save_lt(text, src="chat"):
 
 app = FastAPI(title="AVA Unified Orchestrator", version="3.1.0", description="Central Execution + Internal ONNX Routing Engine + Local Scraping", lifespan=lifespan)
 
-@app.post("/execute", response_model=ExecuteResponse)
+@app.post("/execute")
 async def execute(req: ExecuteRequest):
+    """
+    Streaming execution endpoint.
+    Retorna Server-Sent Events (SSE) com tokens LLM em tempo real.
+
+    Eventos SSE:
+      meta   – metadados de roteamento (route, confidence, execution_id)
+      delta  – fragmento de token LLM (streaming em tempo real)
+      step   – notificação de conclusão de step do plano CoT
+      result – resultado completo não-streaming (search, memory, etc.)
+      error  – mensagem de erro
+      done   – evento final com resposta completa + estatísticas
+
+    Para resposta JSON tradicional, envie stream=false no body.
+    """
+    if req.stream:
+        return StreamingResponse(
+            _execute_stream_generator(req),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",   # evita buffering em reverse-proxy
+            },
+        )
+
+    # ── Modo não-streaming (comportamento original) ──
     t0 = time.perf_counter()
     eid = str(uuid.uuid4())
     sid = req.session_id or str(uuid.uuid4())
     log.info(f"[{eid[:8]}] Executando: '{req.input[:80]}'")
 
-    route_info = _internal_classify(req.input, req.image_path)
-    route_name  = route_info["route"]
-    route_conf  = route_info["confidence"]
+    route_info   = _internal_classify(req.input, req.image_path)
+    route_name   = route_info["route"]
+    route_conf   = route_info["confidence"]
     route_method = route_info["method"]
-    needs_cot   = route_info["needs_cot"]
-    log.info(f"[{eid[:8]}] Router → {route_name} ({route_conf:.0%} via {route_method}) {'→ CoT' if needs_cot else '→ Direct'}")
+    needs_cot    = route_info["needs_cot"]
+    log.info(f"[{eid[:8]}] Router → {route_name} ({route_conf:.0%} via {route_method})"
+             f" {'→ CoT' if needs_cot else '→ Direct'}")
 
     step_results = []
     context = {}
@@ -904,7 +1205,6 @@ async def execute(req: ExecuteRequest):
     errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
     final, synthesis_tts_fired = await _build_final_response(req.input, step_results, context, req)
 
-    # Only fire TTS if it wasn't already streamed during LLM generation
     any_tts_fired = tts_already_fired or synthesis_tts_fired
     if req.tts and final and not any_tts_fired:
         asyncio.create_task(_fire_tts(final, req))

@@ -166,25 +166,6 @@ class ReadResponse(BaseModel):
 
 # ── Modelos de request/response — cache de planos ─────────────────────────────
 
-class PlanCacheGetRequest(BaseModel):
-    query:     str
-    threshold: float = PC_HIT_THRESHOLD
-
-class PlanCachePutRequest(BaseModel):
-    query: str
-    plan:  dict
-
-class PlanCacheGetResponse(BaseModel):
-    hit:        bool
-    plan:       Optional[dict] = None
-    score:      Optional[float] = None
-    cache_id:   Optional[int]  = None
-    hit_count:  Optional[int]  = None
-
-class PlanCacheDeleteResponse(BaseModel):
-    deleted: int
-
-
 # ── NEW: Modelos de request/response — arquivos indexados ─────────────────────
 
 class IndexedFileWriteRequest(BaseModel):
@@ -1355,81 +1336,6 @@ async def clear_session(session_id: str):
     await loop.run_in_executor(None, state.st_index.remove_ids, ids_to_remove)
     log.info(f"Sessão {session_id}: {len(ids_to_remove)} grupos removidos")
     return {"cleared": len(ids_to_remove), "session_id": session_id}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Cache de planos CoT — /cache/*
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/cache/get", response_model=PlanCacheGetResponse)
-async def cache_get(req: PlanCacheGetRequest):
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="query vazia")
-
-    embedding = await state.embed_engine.embed_one(query)
-
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, state.pc_index.search, embedding, 1)
-
-    if not results:
-        return PlanCacheGetResponse(hit=False)
-
-    cache_id, score = results[0]
-    if score < req.threshold:
-        log.debug(f"/cache/get miss — score={score:.3f} < threshold={req.threshold}")
-        return PlanCacheGetResponse(hit=False)
-
-    row = state.pc_db.get_by_id(cache_id)
-    if row is None:
-        log.warning(f"/cache/get: id={cache_id} no índice mas ausente no DB")
-        return PlanCacheGetResponse(hit=False)
-
-    loop.run_in_executor(None, state.pc_db.update_hit, cache_id)
-
-    log.info(f"/cache/get HIT — id={cache_id} score={score:.3f} query='{query[:60]}'")
-    return PlanCacheGetResponse(
-        hit       = True,
-        plan      = json.loads(row["plan_json"]),
-        score     = round(score, 4),
-        cache_id  = cache_id,
-        hit_count = row["hit_count"] + 1,
-    )
-
-
-@app.post("/cache/put")
-async def cache_put(req: PlanCachePutRequest):
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="query vazia")
-    if not req.plan:
-        raise HTTPException(status_code=400, detail="plano vazio")
-
-    embedding = await state.embed_engine.embed_one(query)
-
-    cache_id = state.pc_db.insert(query, req.plan)
-    state.pc_index.add(embedding, cache_id)
-
-    log.info(f"/cache/put #{cache_id} — query='{query[:60]}'")
-    return {"stored": True, "cache_id": cache_id}
-
-
-@app.delete("/cache", response_model=PlanCacheDeleteResponse)
-async def cache_clear_all():
-    deleted = state.pc_db.delete_all()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, state.pc_index.reset)
-    log.info(f"/cache DELETE ALL — {deleted} entradas removidas")
-    return PlanCacheDeleteResponse(deleted=deleted)
-
-
-@app.delete("/cache/{cache_id}", response_model=PlanCacheDeleteResponse)
-async def cache_delete_one(cache_id: int):
-    deleted = state.pc_db.delete_by_id(cache_id)
-    if deleted:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, state.pc_index.remove_ids, {cache_id})
-    return PlanCacheDeleteResponse(deleted=deleted)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

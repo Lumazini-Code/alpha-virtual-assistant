@@ -38,10 +38,8 @@ AVA_MODULES: dict[str, str] = {
     "vision":         "analisar imagens, descrever cenas, ler texto em imagens",
     "tts":            "converter texto em fala, ajustar voz ou velocidade",
     "stt":            "transcrever áudio para texto",
-    "translator":     "traduzir texto entre idiomas",
-    "calculator":     "realizar cálculos matemáticos complexos",
     "local_scraping": "buscar e ler arquivos locais no computador do usuário, indexar conteúdo de documentos locais",
-    "deep_search":     "realizar pesquisas web automáticas avançadas com múltiplas etapas, agregando e resumindo informações de várias fontes online e aprendendo com base nelas",
+    "deep_search":    "realizar pesquisas web automáticas avançadas com múltiplas etapas, agregando e resumindo informações de várias fontes online e aprendendo com base nelas",
 }
 
 MODULES_BLOCK = "\n".join(f"  - {k}: {v}" for k, v in AVA_MODULES.items())
@@ -63,8 +61,7 @@ Rules:
 6. Never include explanations outside the JSON structure
 7. If a step needs output from a previous step, reference it as "result of step N"
 8. Mark independent steps with depends_on:null; dependent steps list their dependencies
-9. Use "local_scraping" (NOT "commander") when the user wants to READ or SEARCH a local file on their computer
-10. Use "commander" only to OPEN/launch applications or execute OS commands — never to read file contents
+9. Use "local_scraping" when the user wants to READ or SEARCH a local file on their computer
 11. When a file is read via local_scraping and the user asks about its content, the next step should use "llm" to analyze result of step N
 12. When is asked to learn or research something, don't use search, instead use deep search to make a deep search on the topic and learn from it
 
@@ -104,7 +101,7 @@ GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
 steps-cont  ::= step ("," step)*
 step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
 step-num    ::= [1-7]
-executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"commander\"" | "\"translator\"" | "\"calculator\"" | "\"local_scraping\"" | "\"deep_search\""
+executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"translator\"" | "\"local_scraping\"" | "\"deep_search\""
 depends     ::= "null" | "[" step-num ("," step-num)* "]"
 string      ::= "\"" ([^"\\] | "\\" .)* "\""
 """
@@ -289,32 +286,6 @@ def _recover_partial_steps(raw: str) -> list[dict]:
     return steps
 
 
-# ── Cache semântico via Memory API ─────────────────────────────────────────────
-
-async def _cache_get(query: str, threshold: float) -> Optional[tuple[dict, float, int]]:
-    try:
-        r = await state.memory_client.post(
-            "/cache/get",
-            json={"query": query, "threshold": threshold},
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("hit"):
-            return data["plan"], data["score"], data["cache_id"]
-    except Exception as e:
-        log.warning(f"cache_get falhou (continuando sem cache): {e}")
-    return None
-
-
-async def _cache_put(query: str, plan: dict):
-    try:
-        r = await state.memory_client.post(
-            "/cache/put",
-            json={"query": query, "plan": plan},
-        )
-        r.raise_for_status()
-    except Exception as e:
-        log.warning(f"cache_put falhou (plano não cacheado): {e}")
 
 
 # ── POST /plan ─────────────────────────────────────────────────────────────────
@@ -327,25 +298,9 @@ async def plan(req: PlanRequest):
 
     t0 = time.perf_counter()
 
-    if req.use_cache:
-        cache_result = await _cache_get(user_input, req.cache_threshold)
-        if cache_result:
-            cached_plan, score, _ = cache_result
-            steps = [PlanStep(**s) for s in cached_plan["steps"]]
-            latency = round((time.perf_counter() - t0) * 1000, 2)
-            log.info(f"Cache HIT em {latency}ms — score={score:.3f}: {user_input[:60]}")
-            return PlanResponse(
-                steps=steps, input=user_input, from_cache=True,
-                cache_score=score, latency_ms=latency,
-            )
-
     prompt      = _build_prompt(user_input, req.context, req.max_steps)
     raw, tokens = await _call_llama(prompt)
     steps       = _parse_steps(raw)
-
-    if req.use_cache:
-        plan_dict = {"steps": [s.model_dump() for s in steps]}
-        await _cache_put(user_input, plan_dict)
 
     latency = round((time.perf_counter() - t0) * 1000, 2)
     log.info(f"Plano em {latency}ms — {len(steps)} steps | {tokens} tokens: {user_input[:60]}")
