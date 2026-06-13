@@ -46,7 +46,7 @@ PID_DIR = Path(os.environ.get("LLAMA_PID_DIR", "/tmp/ava_llama_pids"))
 #   added: draft model support for speculative decoding
 TEXT_PARAMS = {
     # ── Context & batching ───────────────────────────────────────────────────
-    "ctx_size": 4096,          # Max context window
+    "ctx_size": 8192,          # Max context window
     "batch_size": 2048,        # CHANGED: 512 → 2048 — fewer passes over prompt
     "ubatch_size": 512,        # CHANGED: 256 → 512 — faster prefill per micro-batch
     "fit":  "off",
@@ -84,7 +84,7 @@ TEXT_PARAMS = {
 # ── OPTIMIZED: Multimodal (Vision) server defaults ───────────────────────────
 VISION_PARAMS = {
     "mmproj_offload": True,    # Offload vision projection to GPU
-    "ctx_size": 4096,
+    "ctx_size": 8192,
     "fit":  "off",             # Vision models typically need less context
     "batch_size": 1024,        # CHANGED: 512 → 1024
     "ubatch_size": 256,        # CHANGED: 128 → 256

@@ -50,10 +50,10 @@ from pydantic import BaseModel, Field
 # ══════════════════════════════════════════════════════════════════════════════
 
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://localhost:2001")
-LLAMA_TIMEOUT_S  = 30.0
+LLAMA_TIMEOUT_S  = 9999999.0
 
 MEMORY_API_URL   = os.environ.get("MEMORY_API_URL", "http://localhost:3001")
-MEMORY_TIMEOUT_S = 5.0
+MEMORY_TIMEOUT_S = 9999999.0
 
 # Alpha execution directory — base path for file searches
 ALPHA_DIR = os.environ.get(
@@ -64,7 +64,7 @@ ALPHA_DIR = os.environ.get(
 # REST API client on the user's machine (optional)
 # If set, commands are forwarded to this client instead of executed locally
 CLIENT_API_URL = "http://localhost:3005"  # Set to None to disable and execute
-CLIENT_TIMEOUT_S = 15.0
+CLIENT_TIMEOUT_S = 9999999.0
 
 # Index storage
 INDEX_DIR  = os.path.join(os.path.dirname(__file__), "local_scraping_index")

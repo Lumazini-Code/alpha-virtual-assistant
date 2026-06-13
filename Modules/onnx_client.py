@@ -17,8 +17,8 @@ from typing import Optional
 import numpy as np
 import httpx
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Memory] %(message)s")
-log = logging.getLogger("ava.memory")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONNX] %(message)s")
+log = logging.getLogger("ava.onnx_client")
 
 # Default ONNX serving endpoint
 DEFAULT_ONNX_BASE_URL = "http://localhost:2002"
@@ -41,7 +41,7 @@ class EmbeddingClient:
     def __init__(
         self,
         base_url: str = DEFAULT_ONNX_BASE_URL,
-        timeout: float = 30.0,
+        timeout: float = 9999999.0,
         max_connections: int = 20,
     ):
         self._base_url = base_url.rstrip("/")
@@ -140,7 +140,7 @@ class RerankerClient:
     def __init__(
         self,
         base_url: str = DEFAULT_ONNX_BASE_URL,
-        timeout: float = 30.0,
+        timeout: float = 9999999.0,
         max_connections: int = 20,
     ):
         self._base_url = base_url.rstrip("/")
@@ -224,7 +224,7 @@ class RerankerClient:
 
 async def check_health(base_url: str = DEFAULT_ONNX_BASE_URL) -> dict:
     """Quick health check of the ONNX serving API."""
-    async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=5.0) as client:
+    async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=9999999.0) as client:
         resp = await client.get("/health")
         resp.raise_for_status()
         return resp.json()

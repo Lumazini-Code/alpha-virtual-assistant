@@ -72,7 +72,7 @@ async def _get_llama_client() -> httpx.AsyncClient:
     if _llama_client is None or _llama_client.is_closed:
         _llama_client = httpx.AsyncClient(
             base_url=LLAMA_URL,
-            timeout=httpx.Timeout(120.0, connect=5.0),
+            timeout=httpx.Timeout(9999999.0, connect=5.0),
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=6,
@@ -89,7 +89,7 @@ async def _get_memory_client() -> httpx.AsyncClient:
     if _memory_client is None or _memory_client.is_closed:
         _memory_client = httpx.AsyncClient(
             base_url=MEMORY_URL,
-            timeout=httpx.Timeout(8.0, connect=3.0),
+            timeout=httpx.Timeout(9999999.0, connect=3.0),
             limits=httpx.Limits(
                 max_connections=6,
                 max_keepalive_connections=4,
@@ -104,7 +104,7 @@ def _get_tts_client() -> httpx.AsyncClient:
     if _tts_http is None or _tts_http.is_closed:
         _tts_http = httpx.AsyncClient(
             base_url=TTS_URL,
-            timeout=httpx.Timeout(15.0),
+            timeout=httpx.Timeout(9999999.0),
             limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
         )
     return _tts_http

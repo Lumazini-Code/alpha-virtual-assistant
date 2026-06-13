@@ -65,19 +65,17 @@ HEALTH_PATHS: dict[str, str] = {
 }
 
 EXECUTOR_TIMEOUTS: dict[str, float] = {
-    "llm": 120.0, "memory": 5.0, "search": 25.0, "deep_search": 90.0,
-    "vision": 60.0, "tts": 15.0, "stt": 30.0, "commander": 10.0,
-    "translator": 30.0, "calculator": 5.0, "local_scraping": 45.0,  # ← NEW
+    "llm": 9999999.0, "memory": 9999999.0, "search": 9999999.0, "deep_search": 9999999.0,
+    "vision": 9999999.0, "tts": 9999999.0, "local_scraping": 9999999.0,  # ← NEW
 }
 
 EXECUTOR_MAX_RETRIES: dict[str, int] = {
     "llm": 2, "memory": 3, "search": 2, "deep_search": 1, "vision": 1,
-    "tts": 2, "stt": 0, "commander": 0, "translator": 2, "calculator": 3,
-    "local_scraping": 2,  # ← NEW
+    "tts": 2,"local_scraping": 2,  # ← NEW
 }
 
 RETRY_BACKOFF_S   = 0.15
-COT_TIMEOUT_S     = 45.0
+COT_TIMEOUT_S     = 9999999.0
 MAX_CONTEXT_CHARS = 1500
 DEFAULT_TOP_K     = 5
 DEFAULT_MIN_SCORE = 0.30
@@ -92,6 +90,64 @@ ROUTE_TO_EXECUTOR: dict[str, str] = {
     "llm": "llm", "search": "search", "memory_read": "memory", "memory_write": "memory",
     "vision": "vision", "deep_search": "deep_search", "tts": "tts",
     "local_scraping": "local_scraping",  # ← NEW
+}
+
+THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
+    0: (
+        "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. "
+        "Respond naturally and briefly. No reasoning needed."
+    ),
+    1: (
+        "This is a simple factual question with a direct answer. "
+        "Retrieve the fact and respond concisely. No chain of thought needed."
+    ),
+    2: (
+        "This requires minimal reasoning — a basic comparison, definition, or short explanation. "
+        "Answer directly and clearly in a few sentences."
+    ),
+    3: (
+        "This requires light reasoning. Think step by step briefly before answering, "
+        "but keep your response focused and avoid unnecessary elaboration."
+    ),
+    4: (
+        "This requires moderate reasoning. Break the problem into clear parts, "
+        "think through each one, then synthesize a coherent answer."
+    ),
+    5: (
+        "This requires balanced analytical thinking. Identify the key variables, "
+        "consider different angles, weigh trade-offs, and build your answer progressively. "
+        "Show your reasoning where helpful."
+    ),
+    6: (
+        "This is a complex question. Think carefully before answering: "
+        "identify assumptions, explore multiple perspectives, anticipate edge cases, "
+        "and structure your response logically."
+    ),
+    7: (
+        "This requires deep reasoning. Use a thorough chain of thought: "
+        "decompose the problem, reason through each component independently, "
+        "identify dependencies between parts, and synthesize a well-argued response."
+    ),
+    8: (
+        "This is a highly complex task. Think extensively before responding. "
+        "Map out the full problem space, consider competing hypotheses, "
+        "validate intermediate conclusions, and build your final answer step by step. "
+        "Precision and completeness matter here."
+    ),
+    9: (
+        "This requires expert-level reasoning. Engage in rigorous multi-step thinking: "
+        "define the problem formally, reason from first principles, explore edge cases, "
+        "challenge your own intermediate conclusions, and produce a thorough, well-structured response. "
+        "Do not skip reasoning steps."
+    ),
+    10: (
+        "This is a maximally complex task requiring deep, exhaustive reasoning. "
+        "Think as carefully and thoroughly as possible before responding. "
+        "Decompose every sub-problem, reason from first principles at each step, "
+        "validate every intermediate conclusion, consider all relevant edge cases and counter-arguments, "
+        "and synthesize a complete, precise, and well-justified response. "
+        "Take as much reasoning space as needed — correctness and depth are the priority."
+    ),
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -170,8 +226,7 @@ class LocalScrapingChooseRequest(BaseModel):
 
 class RouteLabel(IntEnum):
     COT = 0; LLM = 1; SEARCH = 2; MEMORY_READ = 3; MEMORY_WRITE = 4
-    VISION = 5; DEEP_SEARCH = 6; CALCULATOR = 7; COMMANDER = 8; TRANSLATOR = 9; TTS = 10
-    LOCAL_SCRAPING = 11   # ← NEW
+    VISION = 5; DEEP_SEARCH = 6; TTS = 10; LOCAL_SCRAPING = 11   # ← NEW
 
 LABEL_NAMES: list[str] = [rl.name.lower() for rl in RouteLabel]
 NUM_LABELS = len(RouteLabel)   # agora 12
@@ -212,32 +267,7 @@ def _encode_for_onnx(tokenizer: Tokenizer, text: str) -> dict[str, np.ndarray]:
     if encoding.type_ids: result["token_type_ids"] = np.array([encoding.type_ids], dtype=np.int64)
     return result
 
-class OnnxDebertaRouter:
-    def __init__(self): self.ready = False; self.fine_tuned = False; self.tokenizer = None; self.session = None; self.input_names = []; self.output_names = []; self.num_labels = 0; self.provider = ""; self.model_path = ""
-    def load(self, model_dir: str) -> bool:
-        try:
-            import onnxruntime as ort
-        except ImportError: return False
-        self.tokenizer = _load_tokenizer(model_dir)
-        if not self.tokenizer: return False
-        onnx_path = _find_onnx_file(model_dir)
-        if not onnx_path: return False
-        try:
-            opts = ort.SessionOptions(); opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL; opts.intra_op_num_threads = 4
-            self.session = ort.InferenceSession(onnx_path, sess_options=opts, providers=[p for p in ONNX_PROVIDERS if p in ort.get_available_providers()] or ["CPUExecutionProvider"])
-            self.input_names = [i.name for i in self.session.get_inputs()]; self.output_names = [o.name for o in self.session.get_outputs()]
-            self.provider = self.session.get_providers()[0]; self.model_path = onnx_path
-            shape = self.session.get_outputs()[0].shape
-            self.num_labels = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else 0
-            self.fine_tuned = (self.num_labels == NUM_LABELS); self.ready = True; return True
-        except Exception: return False
-    def predict(self, text: str) -> tuple[str, float, dict[str, float]]:
-        if not self.ready or not self.fine_tuned: raise RuntimeError("Not ready")
-        feed = {k: v for k, v in _encode_for_onnx(self.tokenizer, text).items() if k in self.input_names}
-        logits = self.session.run(self.output_names, feed)[0].squeeze().astype(np.float64)
-        probs = _softmax(logits)
-        scores = {LABEL_NAMES[i]: round(float(probs[i]), 4) for i in range(min(len(probs), NUM_LABELS)) if i < len(LABEL_NAMES)}
-        idx = int(probs[:NUM_LABELS].argmax()); return LABEL_NAMES[idx], round(float(probs[idx]), 4), scores
+
 
 class OnnxMiniLMRouter:
     ROUTE_PROTOTYPES: dict[str, list[str]] = {
@@ -332,33 +362,45 @@ def _heuristic_classify(text: str, image_path: Optional[str] = None) -> tuple[st
     return best, round(bscore, 4), scores
 
 # Global Router State
-deberta_router = OnnxDebertaRouter()
 minilm_router  = OnnxMiniLMRouter()
 
 def _internal_classify(text: str, image_path: Optional[str] = None) -> dict:
-    route, confidence, method, all_scores = "cot", 0.0, "default", {n: 0.0 for n in LABEL_NAMES}
-    d_scores, m_scores = {}, {}
-    if deberta_router.ready and deberta_router.fine_tuned:
-        try: route, confidence, d_scores = deberta_router.predict(text); method = "onnx_deberta"
-        except Exception: pass
+    route, confidence, method = "cot", 0.0, "default"
+    all_scores = {n: 0.0 for n in LABEL_NAMES}
+    m_scores = {}
+
+    # DeBERTa desabilitado — usar apenas MiniLM + Heuristic
     if minilm_router.ready:
-        try: _, _, m_scores = minilm_router.predict(text); method = "onnx_minilm" if method == "default" else method + "+minilm"
-        except Exception: pass
+        try:
+            _, _, m_scores = minilm_router.predict(text)
+            method = "onnx_minilm"
+        except Exception:
+            pass
+
     h_route, h_conf, h_scores = _heuristic_classify(text, image_path)
-    if method == "default": method = "heuristic"
-    else: method += "+heuristic"
-    
-    if d_scores and m_scores:
-        for n in LABEL_NAMES: all_scores[n] = round(d_scores.get(n,0)*0.5 + m_scores.get(n,0)*0.2 + h_scores.get(n,0)*0.3, 4)
-    elif d_scores:
-        for n in LABEL_NAMES: all_scores[n] = round(d_scores.get(n,0)*0.6 + h_scores.get(n,0)*0.4, 4)
-    elif m_scores:
-        for n in LABEL_NAMES: all_scores[n] = round(m_scores.get(n,0)*0.4 + h_scores.get(n,0)*0.6, 4)
-    else: all_scores = h_scores
-        
-    route = max(all_scores, key=all_scores.get); confidence = all_scores[route]
-    if confidence < HEURISTIC_MIN_SCORE: route, confidence, method = "cot", 0.3, "default_safe"
-    return {"route": route, "confidence": confidence, "method": method, "all_scores": all_scores, "needs_cot": route == "cot"}
+    if method == "default":
+        method = "heuristic"
+    else:
+        method += "+heuristic"
+
+    if m_scores:
+        for n in LABEL_NAMES:
+            all_scores[n] = round(m_scores.get(n, 0.0) * 0.55 + h_scores.get(n, 0.0) * 0.45, 4)
+    else:
+        all_scores = h_scores
+
+    route = max(all_scores, key=all_scores.get)
+    confidence = all_scores[route]
+    if confidence < HEURISTIC_MIN_SCORE:
+        route, confidence, method = "cot", 0.3, "default_safe"
+
+    return {
+        "route": route,
+        "confidence": confidence,
+        "method": method,
+        "all_scores": all_scores,
+        "needs_cot": route == "cot",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -380,11 +422,8 @@ async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Unified Orchestrator & Router...")
     
     # Load internal ONNX Routers
-    d_loaded = deberta_router.load(DEBERTA_DIR)
     m_loaded = minilm_router.load(MINILM_DIR)
-    log.info(f"Router Init → Deberta: {'✓' if d_loaded else '✗'} | MiniLM: {'✓' if m_loaded else '✗'} | Heuristic: ✓")
-    if d_loaded and not deberta_router.fine_tuned:
-        log.warning(f"  ⚠ DeBERTa labels={deberta_router.num_labels}, expected={NUM_LABELS} — fallback to MiniLM+Heuristic")
+    log.info(f"Router Init →  MiniLM: {'✓' if m_loaded else '✗'} | Heuristic: ✓")
 
     # Probe external services
     service_urls = {
@@ -591,7 +630,7 @@ async def _adapt_local_scraping(action, context, req) -> dict:
         "hash_match":    hash_match,
         "requires_choice": False,
     }
-sse
+
 
 EXECUTOR_ADAPTERS = {
     "llm": _adapt_llm, "memory": _adapt_memory, "search": _adapt_search,
@@ -765,7 +804,7 @@ async def _build_final_response(orig, steps, context, req) -> tuple[str, bool]:
         return text or ctx, True
     except Exception:
         return ctx, False
-
+    
 async def _execute_direct(route: str, req: ExecuteRequest) -> tuple[list[StepResult], dict[str, Any], bool]:
     """
     Returns (step_results, context, tts_already_fired).
@@ -826,6 +865,11 @@ async def _execute_stream_generator(req: ExecuteRequest):
     eid = str(uuid.uuid4())
     sid = req.session_id or str(uuid.uuid4())
     log.info(f"[{eid[:8]}] Executando (stream): '{req.input[:80]}'")
+    try:
+        req.input = await _add_think_instruction(req)
+        log.info(f"[{eid[:8]}] Think depth aplicado")
+    except Exception as e:
+        log.warning(f"[{eid[:8]}] _verify_think falhou, usando input original: {e}")
 
     route_info   = _internal_classify(req.input, req.image_path)
     route_name   = route_info["route"]
@@ -1133,6 +1177,63 @@ def _sse(event: str, data: Any) -> str:
     return frame
 
 
+async def _verify_think(req: ExecuteRequest) -> int:
+    grammar = r"""
+root   ::= single-digit | double-digit
+double-digit ::= "10"
+single-digit ::= [0-9]
+"""
+
+    payload = {
+        "model": "local",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a thinking-depth classifier. "
+                    "Given a user input, respond with a single integer from 0 to 10 "
+                    "representing how much deep reasoning or complex thinking is required. "
+                    "0 = trivial (greetings, simple facts). "
+                    "10 = very complex (multi-step reasoning, math proofs, deep research). "
+                    "Respond with the number only. No explanation, no punctuation."
+                ),
+            },
+            # Few-shot examples so the model calibrates correctly
+            {"role": "user",      "content": "Oi, tudo bem?"},
+            {"role": "assistant", "content": "0"},
+            {"role": "user",      "content": "Qual a capital da França?"},
+            {"role": "assistant", "content": "1"},
+            {"role": "user",      "content": "Explique o que é machine learning."},
+            {"role": "assistant", "content": "4"},
+            {"role": "user",      "content": "Pesquise sobre os impactos econômicos da IA e resuma em tópicos."},
+            {"role": "assistant", "content": "7"},
+            {"role": "user",      "content": "Prove que existem infinitos números primos e explique cada passo."},
+            {"role": "assistant", "content": "10"},
+            # Actual user input
+            {"role": "user",      "content": req.input},
+        ],
+        "grammar":     grammar,
+        "temperature": 0.0,
+        "max_tokens":  4,
+        "stream":      False,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(9999999.0)) as client:
+        response = await client.post(
+            "http://localhost:2001/v1/chat/completions",
+            json=payload,
+        )
+        response.raise_for_status()
+
+    content = response.json()["choices"][0]["message"]["content"].strip()
+    return int(content)
+
+async def _add_think_instruction(req: ExecuteRequest) -> str:
+    depth = await _verify_think(req)
+    think_instruction = THINK_DEPTH_INSTRUCTIONS[depth]
+
+    # Injeta como system message adicional ou prefixo do contexto
+    return f"[Reasoning depth: {depth}/10]\n{think_instruction}\n\n{req.input}"
 # ══════════════════════════════════════════════════════════════════════════════
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1140,86 +1241,18 @@ def _sse(event: str, data: Any) -> str:
 app = FastAPI(title="AVA Unified Orchestrator", version="3.1.0", description="Central Execution + Internal ONNX Routing Engine + Local Scraping", lifespan=lifespan)
 
 @app.post("/execute")
+    
 async def execute(req: ExecuteRequest):
-    """
-    Streaming execution endpoint.
-    Retorna Server-Sent Events (SSE) com tokens LLM em tempo real.
-
-    Eventos SSE:
-      meta   – metadados de roteamento (route, confidence, execution_id)
-      delta  – fragmento de token LLM (streaming em tempo real)
-      step   – notificação de conclusão de step do plano CoT
-      result – resultado completo não-streaming (search, memory, etc.)
-      error  – mensagem de erro
-      done   – evento final com resposta completa + estatísticas
-
-    Para resposta JSON tradicional, envie stream=false no body.
-    """
-    if req.stream:
-        return StreamingResponse(
-            _execute_stream_generator(req),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",   # evita buffering em reverse-proxy
-            },
-        )
-
-    # ── Modo não-streaming (comportamento original) ──
-    t0 = time.perf_counter()
-    eid = str(uuid.uuid4())
-    sid = req.session_id or str(uuid.uuid4())
-    log.info(f"[{eid[:8]}] Executando: '{req.input[:80]}'")
-
-    route_info   = _internal_classify(req.input, req.image_path)
-    route_name   = route_info["route"]
-    route_conf   = route_info["confidence"]
-    route_method = route_info["method"]
-    needs_cot    = route_info["needs_cot"]
-    log.info(f"[{eid[:8]}] Router → {route_name} ({route_conf:.0%} via {route_method})"
-             f" {'→ CoT' if needs_cot else '→ Direct'}")
-
-    step_results = []
-    context = {}
-    plan_cache = False
-    tts_already_fired = False
-
-    if not needs_cot and route_name in ROUTE_TO_EXECUTOR:
-        log.info(f"[{eid[:8]}] ⚡ Direct route: {route_name}")
-        step_results, context, tts_already_fired = await _execute_direct(route_name, req)
-    else:
-        log.info(f"[{eid[:8]}] 🧠 CoT pipeline")
-        try:
-            cr = await state.cot_client.post("/plan", json={"input": req.input, "use_cache": req.use_cache})
-            cr.raise_for_status()
-            pd = cr.json()
-            raw = pd.get("steps", [])
-            plan_cache = pd.get("from_cache", False)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"CoT falhou: {e}")
-        if not raw:
-            raise HTTPException(status_code=500, detail="CoT plano vazio")
-        step_results, context, tts_already_fired = await _execute_plan(raw, req, req.strategy)
-
-    errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
-    final, synthesis_tts_fired = await _build_final_response(req.input, step_results, context, req)
-
-    any_tts_fired = tts_already_fired or synthesis_tts_fired
-    if req.tts and final and not any_tts_fired:
-        asyncio.create_task(_fire_tts(final, req))
-
-    asyncio.create_task(_save_turn(req.input, final, sid))
-    asyncio.create_task(_save_lt(f"Usuário disse: {req.input[:200]}"))
-
-    lat = round((time.perf_counter() - t0) * 1000, 2)
-    routed_directly = not needs_cot and route_name in ROUTE_TO_EXECUTOR
-    return ExecuteResponse(
-        execution_id=eid, input=req.input, session_id=sid, final_response=final,
-        steps=step_results, plan_from_cache=plan_cache, total_latency_ms=lat,
-        errors=errors, route=route_name, route_confidence=route_conf,
-        route_method=route_method, routed_directly=routed_directly,
+    return StreamingResponse(
+        _execute_stream_generator(req),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
 
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_endpoint(req: ClassifyRequest):
@@ -1424,8 +1457,8 @@ async def status():
     for n, (c, p) in cfg.items():
         try: r = await c.get(p, timeout=2.0); checks[n] = {"healthy": r.status_code == 200, "status_code": r.status_code}
         except: checks[n] = {"healthy": False, "status_code": None}
-    return {"orchestrator": "ok", "internal_router": {"deberta_loaded": deberta_router.ready, "minilm_loaded": minilm_router.ready}, "services": checks, "executors": list(EXECUTOR_ADAPTERS.keys())}
-
+    return {"orchestrator": "ok", "internal_router": {"minilm_loaded": minilm_router.ready}, "services": checks, "executors": list(EXECUTOR_ADAPTERS.keys())}
+    
 @app.delete("/cache")
 async def invalidate_cot_cache():
     try: r = await state.cot_client.delete("/cache", timeout=10.0); r.raise_for_status(); return r.json()
@@ -1449,3 +1482,4 @@ async def list_voices():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("orchestrator:app", host="0.0.0.0", port=9000, log_level="info")
+    

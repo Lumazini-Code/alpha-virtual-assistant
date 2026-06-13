@@ -288,43 +288,83 @@ def _append_markdown_lines(result: Text, text: str):
 
 
 _INLINE_RE = re.compile(
-    r"\$\$(.+?)\$\$"       # $$LaTeX$$     r"|\$([^$\n]+?)\$"     # $LaTeX$     r"|\*\*(.+?)\*\*"      # **bold**
-    r"|__(.+?)__"          # __bold__
-    r"|\*(.+?)\*"          # *italic*
-    r"|_(.+?)_"            # _italic_
-    r"|`([^`]+?)`"         # `code`
-    r"|\[([^\]]+)\]\(([^)]+)\)",  # [link](url)
+    r"\$\$(.+?)\$\$"              # group(1)  $$LaTeX$$
+    r"|\$([^$\n]+?)\$"            # group(2)  $LaTeX$
+    r"|\*\*(.+?)\*\*"             # group(3)  **bold**
+    r"|__(.+?)__"                 # group(4)  __bold__
+    r"|\*(.+?)\*"                 # group(5)  *italic*
+    r"|_(.+?)_"                   # group(6)  _italic_
+    r"|`([^`]+?)`"                # group(7)  `code`
+    r"|\[([^\]]+)\]\(([^)]+)\)",  # group(8)  [link](url), group(9) url
     re.DOTALL,
 )
 
+def _latex_to_plain(expr: str) -> str:
+    """
+    Converte expressão LaTeX para texto legível no terminal.
+    Remove comandos LaTeX e formata de forma legível.
+    """
+    # \text{...} → conteúdo literal
+    expr = re.sub(r"\\text\{([^}]*)\}", r"\1", expr)
+    # \frac{a}{b} → a/b
+    expr = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"(\1/\2)", expr)
+    # \sqrt{a} → √a
+    expr = re.sub(r"\\sqrt\{([^}]*)\}", r"√(\1)", expr)
+    # \cdot → ·
+    expr = expr.replace(r"\cdot", "·")
+    # \times → ×
+    expr = expr.replace(r"\times", "×")
+    # \pm → ±
+    expr = expr.replace(r"\pm", "±")
+    # \rightarrow / \to → →
+    expr = expr.replace(r"\rightarrow", "→").replace(r"\to", "→")
+    # \leftarrow → ←
+    expr = expr.replace(r"\leftarrow", "←")
+    # ^{...} → superscript unicode ou ^...
+    expr = re.sub(r"\^\{([^}]*)\}", r"^\1", expr)
+    expr = re.sub(r"\^(\w)", r"^\1", expr)
+    # _{...} → subscript
+    expr = re.sub(r"_\{([^}]*)\}", r"_\1", expr)
+    # Remove comandos desconhecidos restantes: \comando
+    expr = re.sub(r"\\[a-zA-Z]+\*?", "", expr)
+    # Remove chaves soltas
+    expr = expr.replace("{", "").replace("}", "")
+    return expr.strip()
+
 
 def _append_inline(result: Text, text: str):
-    """Aplica estilos inline (bold, italic, code, LaTeX, link) em um trecho."""
     last = 0
     for m in _INLINE_RE.finditer(text):
-        # texto antes do match
         if m.start() > last:
             result.append(text[last:m.start()], style=WHITE)
 
-        latex_block, latex_inline = m.group(1), m.group(2)
-        bold1, bold2 = m.group(3), m.group(4)
-        italic1, italic2 = m.group(5), m.group(6)
-        code = m.group(7)
-        link_text, link_url = m.group(8), m.group(9)
+        latex_block  = m.group(1)
+        latex_inline = m.group(2)
+        bold1        = m.group(3)
+        bold2        = m.group(4)
+        italic1      = m.group(5)
+        italic2      = m.group(6)
+        code         = m.group(7)
+        link_text    = m.group(8)
+        link_url     = m.group(9)
 
         if latex_block:
-            result.append(f" [{latex_block}] ", style=f"italic {AMBER}")
+            plain = _latex_to_plain(latex_block)
+            result.append(f" {plain} ", style=f"italic {AMBER}")
         elif latex_inline:
-            result.append(f"[{latex_inline}]", style=f"italic {AMBER}")
+            plain = _latex_to_plain(latex_inline)
+            result.append(plain, style=f"italic {AMBER}")
         elif bold1 or bold2:
             result.append(bold1 or bold2, style="bold white")
         elif italic1 or italic2:
             result.append(italic1 or italic2, style="italic white")
         elif code:
             result.append(code, style="bold #A8D8A8")
-        elif link_text:
+        elif link_text and link_url:
             result.append(link_text, style=f"underline {BLUE}")
             result.append(f" ({link_url})", style=DIM)
+        else:
+            result.append(m.group(0), style=WHITE)
 
         last = m.end()
 
@@ -354,7 +394,7 @@ async def stream_ava(prompt: str, session_id: str,
         "strategy":   "parallel",
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(99999999999999.0)) as client:
             async with client.stream("POST", f"{ORCHESTRATOR_URL}/execute",
                                      json=payload) as resp:
                 resp.raise_for_status()
@@ -530,18 +570,23 @@ class ChatMessage(Widget):
         self.msg_id  = msg_id or str(uuid.uuid4())[:8]
 
     def compose(self) -> ComposeResult:
-        if self.role == "user":
+        role = getattr(self, "role", "assistant")
+        if role == "user":
             header = f"[bold {BLUE}]▶ Você[/]"
-        elif self.role == "system":
+        elif role == "system":
             header = f"[dim {GRAY}]● Sistema[/]"
-        elif self.role == "step":
+        elif role == "step":
             header = f"[dim {AMBER}]⚙ Pipeline[/]"
         else:
             header = f"[bold {GREEN}]◆ ALPHA AI[/]"
 
         yield Static(header, id="msg-header")
-        yield Static(_render_rich(self.content), id="msg-body")
 
+        if role in ("step", "system"):
+            yield Static(self.content, id="msg-body", markup=True)
+        else:
+            yield Static(_render_rich(self.content), id="msg-body")
+            
     def append_delta(self, delta: str):
         """Adiciona delta de streaming ao conteúdo e re-renderiza."""
         self.content += delta
@@ -604,8 +649,8 @@ class AlphaAI(App):
         ("ctrl+n", "new_session", "Nova sessão"),
     ]
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.session_id     = str(uuid.uuid4())
         self._streaming_msg : Optional[ChatMessage] = None
         self._is_streaming  = False
@@ -626,10 +671,10 @@ class AlphaAI(App):
     def on_mount(self) -> None:
         psutil.cpu_percent(interval=None)
         self.call_after_refresh(self._focus)
+
     def _focus(self) -> None:
         self.query_one("#prompt-input", Input).focus()
 
-    # ── helpers ─────────────────────────────────────────────────────────
     def _add_message(self, role: str, content: str) -> ChatMessage:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         msg = ChatMessage(role=role, content=content)
@@ -644,7 +689,6 @@ class AlphaAI(App):
             f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {method} • {via}[/]"
         )
 
-    # ── actions ─────────────────────────────────────────────────────────
     def action_clear_chat(self) -> None:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         scroll.remove_children()
@@ -654,26 +698,20 @@ class AlphaAI(App):
         self.session_id = str(uuid.uuid4())
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         scroll.remove_children()
-        self._add_message("system",
-            f"Nova sessão iniciada: `{self.session_id[:8]}`")
+        self._add_message("system", f"Nova sessão iniciada: `{self.session_id[:8]}`")
 
-    # ── input ────────────────────────────────────────────────────────────
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt-input" or self._is_streaming:
             return
-
         prompt = event.value.strip()
         if not prompt:
             return
-
-        event.input.value = ""
+        event.input.value    = ""
         event.input.disabled = True
         self._is_streaming   = True
-
         self._add_message("user", prompt)
         ai_msg = self._add_message("assistant", "")
         self._streaming_msg = ai_msg
-
         asyncio.create_task(self._run_stream(prompt, ai_msg))
 
     async def _run_stream(self, prompt: str, ai_msg: ChatMessage) -> None:
@@ -698,10 +736,10 @@ class AlphaAI(App):
             lat      = event.get("latency_ms", 0)
             icon     = "✓" if ok else "✗"
             color    = GREEN if ok else RED_C
-            step_text = (f"\n[{GRAY}]  {icon} step {step_n} "
-                         f"[{executor}] {lat:.0f}ms[/]\n")
-            ai_msg.content += step_text
-            ai_msg.query_one("#msg-body", Static).update(_render_rich(ai_msg.content))
+            self._add_message(
+                "step",
+                f"[{color}]{icon}[/] step {step_n} [{executor}] {lat:.0f}ms",
+            )
 
         async def on_result(text: str):
             ai_msg.append_delta(text)
@@ -711,17 +749,17 @@ class AlphaAI(App):
             self._add_message("system", f"**Erro:** {error}")
 
         async def on_done(event: dict):
-            lat  = event.get("total_latency_ms", 0)
-            errs = event.get("errors", [])
-            route = event.get("route", "?")
-            conf  = event.get("route_confidence", 0.0)
-            meth  = event.get("route_method", "?")
+            lat    = event.get("total_latency_ms", 0)
+            errs   = event.get("errors", [])
+            route  = event.get("route", "?")
+            conf   = event.get("route_confidence", 0.0)
+            meth   = event.get("route_method", "?")
             direct = event.get("routed_directly", False)
-            via   = "direto" if direct else "CoT"
-            color = BLUE if direct else AMBER
+            via    = "direto" if direct else "CoT"
+            color  = BLUE if direct else AMBER
             self.query_one("#route-bar").update(
-                f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {meth} "
-                f"• {via} • {lat:.0f}ms[/]"
+                f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {meth}"
+                f" • {via} • {lat:.0f}ms[/]"
                 + (f"  [{RED_C}]{len(errs)} erro(s)[/]" if errs else "")
             )
 
@@ -730,7 +768,7 @@ class AlphaAI(App):
             on_delta, on_meta, on_step, on_result, on_error, on_done,
         )
 
-        self._is_streaming = False
+        self._is_streaming  = False
         self._streaming_msg = None
         inp = self.query_one("#prompt-input", Input)
         inp.disabled = False
@@ -739,3 +777,4 @@ class AlphaAI(App):
 
 if __name__ == "__main__":
     AlphaAI().run()
+

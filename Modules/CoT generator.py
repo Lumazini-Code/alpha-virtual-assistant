@@ -14,7 +14,7 @@ from pydantic import BaseModel
 # ── Configuração ───────────────────────────────────────────────────────────────
 
 LLAMA_SERVER_URL  = "http://localhost:2001"
-LLAMA_TIMEOUT_S   = 60.0
+LLAMA_TIMEOUT_S   = 9999999.0
 MEMORY_API_URL    = "http://localhost:3001"
 MEMORY_TIMEOUT_S  = 5.0
 
@@ -37,7 +37,6 @@ AVA_MODULES: dict[str, str] = {
     "search":         "buscar informações atuais na internet",
     "vision":         "analisar imagens, descrever cenas, ler texto em imagens",
     "tts":            "converter texto em fala, ajustar voz ou velocidade",
-    "stt":            "transcrever áudio para texto",
     "local_scraping": "buscar e ler arquivos locais no computador do usuário, indexar conteúdo de documentos locais",
     "deep_search":    "realizar pesquisas web automáticas avançadas com múltiplas etapas, agregando e resumindo informações de várias fontes online e aprendendo com base nelas",
 }
@@ -63,7 +62,7 @@ Rules:
 8. Mark independent steps with depends_on:null; dependent steps list their dependencies
 9. Use "local_scraping" when the user wants to READ or SEARCH a local file on their computer
 11. When a file is read via local_scraping and the user asks about its content, the next step should use "llm" to analyze result of step N
-12. When is asked to learn or research something, don't use search, instead use deep search to make a deep search on the topic and learn from it
+12. When is needed to search small or simple things, utilize "search". When is asked to learn about complex or broad topics, utilize "deep_search" to gather and summarize information from multiple online sources.
 
 Output format — output ONLY the inner content, starting from the first step object:
 {{"step":1,"action":"...","executor":"llm","depends_on":null}},{{"step":2,"action":"...","executor":"search","depends_on":[1]}}]}}
@@ -71,9 +70,6 @@ Output format — output ONLY the inner content, starting from the first step ob
 Examples:
 Input: "what GPU should I buy for gaming under R$2000"
 Output: {{"step":1,"action":"search RTX 4060 RX 7600 benchmark price Brazil 2024","executor":"search","depends_on":null}},{{"step":2,"action":"retrieve user GPU preferences from memory","executor":"memory","depends_on":null}},{{"step":3,"action":"recommend GPU based on result of step 1 and result of step 2","executor":"llm","depends_on":[1,2]}}]}}
-
-Input: "play some jazz music"
-Output: {{"step":1,"action":"search jazz playlist Spotify","executor":"search","depends_on":null}},{{"step":2,"action":"open music player with result of step 1","executor":"commander","depends_on":[1]}}]}}
 
 Input: "leia o arquivo relatório de vendas e me diga o total"
 Output: {{"step":1,"action":"buscar e ler arquivo relatório de vendas","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"analisar o conteúdo e informar o total de vendas com base em result of step 1","executor":"llm","depends_on":[1]}}]}}
@@ -83,12 +79,6 @@ Output: {{"step":1,"action":"search latest industry report data online","executo
 
 Input: "leia o arquivo notas.txt e grave as informações na memória"
 Output: {{"step":1,"action":"buscar e ler arquivo notas.txt","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"gravar na memória as informações de result of step 1","executor":"memory","depends_on":[1]}}]}}
-
-Input: "traduza o conteúdo do arquivo contrato.docx para inglês"
-Output: {{"step":1,"action":"buscar e ler arquivo contrato.docx","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"traduzir result of step 1 para inglês","executor":"translator","depends_on":[1]}}]}}
-
-Input: "leia o relatório financeiro e calcule a soma das despesas"
-Output: {{"step":1,"action":"buscar e ler arquivo relatório financeiro","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"calcular a soma das despesas em result of step 1","executor":"calculator","depends_on":[1]}}]}}
 
 Input: "aprenda sobre química orgânica avançada"
 Output: {{"step":1,"action":"estudar sobre Química orgânica avançada","executor":"deep_search","depends_on":null}},{{"step":2,"action":"Fazer um resumo dos conhecimentos obtidos para o usuário","executor":"LLM","depends_on":[1]}}]}}
@@ -101,7 +91,7 @@ GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
 steps-cont  ::= step ("," step)*
 step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
 step-num    ::= [1-7]
-executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"stt\"" | "\"translator\"" | "\"local_scraping\"" | "\"deep_search\""
+executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"local_scraping\"" | "\"deep_search\""
 depends     ::= "null" | "[" step-num ("," step-num)* "]"
 string      ::= "\"" ([^"\\] | "\\" .)* "\""
 """
