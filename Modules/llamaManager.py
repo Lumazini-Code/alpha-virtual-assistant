@@ -189,6 +189,7 @@ def build_command(
     model_path: str,
     mmproj_path: Optional[str] = None,
     draft_path: Optional[str] = None,
+    
 ) -> list[str]:
     """Builds the llama-server command based on model type."""
     cmd = [LLAMA_SERVER_PATH, "--model", os.path.abspath(model_path)]
@@ -235,7 +236,7 @@ def build_command(
 # Core Actions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def start_server(model_path: str, draft_path: Optional[str] = None):
+def start_server(model_path: str, draft_path: Optional[str] = None, mmproj_used: Optional[str] = "false"):
     """Starts the llama-server with appropriate parameters."""
     if not os.path.exists(model_path):
         print(f"[Error] Model file not found: {model_path}")
@@ -250,8 +251,12 @@ def start_server(model_path: str, draft_path: Optional[str] = None):
 
     # Find mmproj
     mmproj_path = find_mmproj(model_path)
+    if mmproj_used == "false":
+        mmproj_path = None
+    
     if not mmproj_path:
-        print("[Info] No mmproj file found. Using TEXT-ONLY parameters.")
+        print("[Info] No mmproj file found/used. Using TEXT-ONLY parameters.")
+        
 
     # Use CLI draft path, or fallback to global config
     effective_draft = draft_path or DRAFT_MODEL_PATH
@@ -400,11 +405,17 @@ def main():
         default=None,
         help="Path to a draft GGUF model for speculative decoding (e.g., Qwen3-0.6B-Q4_K_M.gguf)"
     )
+    parser.add_argument(
+        "--mmproj-used",
+        default=None,
+        choices=["true", "false"],
+        help="Selects if the found mmproj file should be used. Set to 'true' to use, anything else to ignore.")
+    
 
     args = parser.parse_args()
 
     if args.action == "start":
-        start_server(args.model_path, draft_path=args.draft)
+        start_server(args.model_path, draft_path=args.draft, mmproj_used=args.mmproj_used)
     elif args.action == "stop":
         stop_server(args.model_path)
     elif args.action == "status":

@@ -9,7 +9,6 @@ import subprocess
 import uuid
 from datetime import datetime
 from typing import Optional
-
 import httpx
 import psutil
 import pyfiglet
@@ -47,7 +46,7 @@ RED_C = "#E45012"
 WHITE = "#CCCCCC"
 DIM   = "#333333"
 
-MODEL   = os.environ.get("AVA_MODEL", "llama-local")
+MODEL   = os.environ.get("AVA_MODEL", "")
 TAGLINE = "Any model. Every tool. Zero limits."
 
 # ─────────────────────────────────────────
@@ -776,5 +775,26 @@ class AlphaAI(App):
 
 
 if __name__ == "__main__":
+    from model_selector import run_model_selector
+
+    chosen = run_model_selector()
+
+    if chosen is None:
+        # Usuário fechou sem selecionar — encerra
+        raise SystemExit(0)
+
+    mmproj_flag = "true" if chosen["mmproj"] else "false"
+    proc = subprocess.Popen([
+        "python3",
+        "./Modules/llamaManager.py",
+        "start",
+        chosen["model"],
+        f"--mmproj-used {mmproj_flag}"
+    ])
+
+    # Atualiza a variável de display que aparece no SplashHeader
+    import pathlib
+    os.environ["AVA_MODEL"] = pathlib.Path(chosen["model"]).stem
+
     AlphaAI().run()
 
