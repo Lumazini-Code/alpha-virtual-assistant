@@ -81,16 +81,19 @@ DEFAULT_TOP_K     = 5
 DEFAULT_MIN_SCORE = 0.30
 
 # Router Configuration
-CONFIDENCE_THRESHOLD = float(os.environ.get("ROUTER_CONFIDENCE", "0.65"))
-HEURISTIC_MIN_SCORE  = 0.35
-ONNX_PROVIDERS = os.environ.get("ONNX_PROVIDERS", "AzureExecutionProvider,CPUExecutionProvider").split(",")
+CONFIDENCE_MIN = 0.45        # Se acima disso e não ambíguo, aceita
+AMBIGUITY_THRESHOLD = 0.08   # Se top2 rotas diferem por menos, considerar ambíguo
+COT_THRESHOLD = 0.30  
+ONNX_PROVIDERS = os.environ.get("ONNX_PROVIDERS", "AzureExecutionProvider, CPUExecutionProvider").split(",")
 
 # Direct Route Mapping
+# Direct Route Mapping (ATUALIZADO)
 ROUTE_TO_EXECUTOR: dict[str, str] = {
     "llm": "llm", "search": "search", "memory_read": "memory", "memory_write": "memory",
     "vision": "vision", "deep_search": "deep_search", "tts": "tts",
-    "local_scraping": "local_scraping",  # ← NEW
+    "local_scraping": "local_scraping",  
 }
+
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: (
@@ -150,7 +153,7 @@ THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     ),
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ava.orchestrator")
 
 
@@ -219,14 +222,13 @@ class LocalScrapingChooseRequest(BaseModel):
     force_reindex: bool = Field(False, description="Forçar reindexação")
     session_id: Optional[str] = None
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL ROUTER — ONNX + Heuristics
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RouteLabel(IntEnum):
-    COT = 0; LLM = 1; SEARCH = 2; MEMORY_READ = 3; MEMORY_WRITE = 4
-    VISION = 5; DEEP_SEARCH = 6; TTS = 10; LOCAL_SCRAPING = 11   # ← NEW
+    COT = 0; LLM = 1; MEMORY_READ = 3; MEMORY_WRITE = 4
+    VISION = 5; DEEP_SEARCH = 6;  # ← NEW
 
 LABEL_NAMES: list[str] = [rl.name.lower() for rl in RouteLabel]
 NUM_LABELS = len(RouteLabel)   # agora 12
@@ -267,24 +269,53 @@ def _encode_for_onnx(tokenizer: Tokenizer, text: str) -> dict[str, np.ndarray]:
     if encoding.type_ids: result["token_type_ids"] = np.array([encoding.type_ids], dtype=np.int64)
     return result
 
+def _sanitize_step_value(val):
+    """Extrai o valor primitivo caso venha como dict do CoT."""
+    if isinstance(val, dict):
+        # Tenta pegar chaves comuns como id, name, step, etc.
+        return val.get("id") or val.get("name") or val.get("step") or val.get("executor") or str(val)
+    return val
 
+def _sanitize_steps(raw_steps: list) -> list:
+    """Garante que os steps do CoT tenham tipos primitivos (int, str, list)."""
+    sanitized = []
+    for s in raw_steps:
+        if not isinstance(s, dict):
+            continue
+        
+        step_num = _sanitize_step_value(s.get("step"))
+        try: step_num = int(step_num)
+        except: step_num = 0
+            
+        executor = _sanitize_step_value(s.get("executor"))
+        if not isinstance(executor, str):
+            executor = str(executor).lower()
+            
+        action = s.get("action") or s.get("task") or ""
+        
+        deps = s.get("depends_on") or []
+        clean_deps = []
+        for d in deps:
+            d_val = _sanitize_step_value(d)
+            try: clean_deps.append(int(d_val))
+            except: pass
+            
+        sanitized.append({
+            "step": step_num,
+            "executor": executor,
+            "action": str(action),
+            "depends_on": clean_deps
+        })
+    return sanitized
 
 class OnnxMiniLMRouter:
     ROUTE_PROTOTYPES: dict[str, list[str]] = {
         "cot": ["search and then translate", "research and summarize", "complex multi step task"],
         "llm": ["hello how are you", "explain what is ai", "tell me a joke", "write a poem"],
-        "search": ["search the web for", "find information about", "look up price", "procure na internet"],
         "memory_read": ["what do you remember", "recall my conversation", "what do you know about me"],
         "memory_write": ["remember my favorite color", "save this info", "grave na memória"],
         "vision": ["describe this image", "analyze photo", "what does picture show"],
         "deep_search": ["deep research about", "learn about", "pesquisa profunda"],
-        "tts": ["speak text aloud", "fale em voz alta"],
-        "local_scraping": [                                       # ← NEW
-            "leia o arquivo", "read the file", "abra o arquivo relatório",
-            "mostre o conteúdo do arquivo", "read file from disk",
-            "leia o documento pdf", "abra o arquivo de texto",
-            "show me the file", "conteúdo do arquivo",
-        ],
     }
     def __init__(self): self.ready = False; self.tokenizer = None; self.session = None; self.input_names = []; self.output_names = []; self.provider = ""; self._prototype_embeddings = None
     def load(self, model_dir: str) -> bool:
@@ -317,89 +348,92 @@ class OnnxMiniLMRouter:
         scores = {LABEL_NAMES[i]: round(float(probs[i]), 4) for i in range(NUM_LABELS)}
         idx = int(probs.argmax()); return LABEL_NAMES[idx], round(float(probs[idx]), 4), scores
 
-# Heuristic Rules — now includes local_scraping
-_HEURISTIC_RULES = [
-    # ── local_scraping must come BEFORE commander "open/abrir" to disambiguate ──
-    ("local_scraping", ["leia o arquivo", "ler arquivo", "read file", "abra o arquivo", "conteúdo do arquivo"],
-     re.compile(
-         r"(leia\s+o?\s*arquivo|ler\s+o?\s*arquivo|read\s+(the\s+)?file|"
-         r"abra\s+o?\s*arquivo|open\s+(the\s+)?file|"
-         r"conte[úu]do\s+do?\s*arquivo|show\s+(me\s+)?(the\s+)?file|"
-         r"mostre\s+o?\s*arquivo|abrir\s+arquivo|"
-         r"leia\s+o?\s*documento|read\s+(the\s+)?document|"
-         r"leia\s+o?\s*(pdf|txt|csv|xlsx|docx|json|md|py|js|ts)|"
-         r"read\s+(the\s+)?(pdf|txt|csv|xlsx|docx|json|md|py|js|ts)|"
-         r"abra\s+o?\s*(pdf|txt|csv|xlsx|docx|json|md)|"
-         r"conte[úu]do\s+do?\s*(pdf|txt|csv|docx|json|md)|"
-         r"index[ae]?\s+(o?\s*)?arquivo|index\s+(the\s+)?file|"
-         r"reindex[ae]?\s+(o?\s*)?arquivo|reindex\s+(the\s+)?file)"
-         , re.I)),
-    ("memory_write", ["lembrar","memorizar","gravar","salvar","remember","save"], re.compile(r"(lembrar|memorizar|gravar|salvar|remember|save|store|memo)\b", re.I)),
-    ("memory_read", ["o que você sabe","recall"], re.compile(r"(o que (você|voce) (sabe|lembra)|recall|what do you (know|remember))", re.I)),
-    ("vision", ["imagem","foto","image"], re.compile(r"(imagem|foto|picture|image|screenshot|descreva a|what is in the)", re.I)),
-    ("deep_search", ["pesquisa profunda","research"], re.compile(r"(pesquisa profunda|investigue|deep.?search|research|estude sobre)", re.I)),
-    ("search", ["procure","busque","search"], re.compile(r"(procure|busque|pesquis|search|look up|find|not[ií]cia|news)", re.I)),
-    ("tts", ["fale","speak"], re.compile(r"^(fale|diga em voz alta|speak|read aloud)\b", re.I)),
-]
-
-def _heuristic_classify(text: str, image_path: Optional[str] = None) -> tuple[str, float, dict[str, float]]:
-    scores: dict[str, float] = {name: 0.0 for name in LABEL_NAMES}
-    if image_path: scores["vision"] += 0.5
-    tl = text.lower().strip()
-    for rn, kws, pat in _HEURISTIC_RULES:
-        if pat.search(tl): scores[rn] += 0.4
-        if any(kw in tl for kw in kws): scores[rn] += 0.15
-    if sum(1 for s in scores.values() if s > 0.2) >= 2: scores["cot"] += 0.5
-    if re.search(r"\b(e\s+(depois|então)|and\s+then|compare|resuma\s+e|primeiro|step by step)\b", tl): scores["cot"] += 0.3
-    wc = len(text.split())
-    if wc > 25: scores["cot"] += 0.15
-    if tl.endswith("?") and max(scores.values()) < 0.15: scores["llm"] += 0.3
-    if re.search(r"^(oi|olá|hello|hi|bom dia)\b", tl): scores["llm"] += 0.5
-    total = sum(scores.values())
-    if total > 0: scores = {k: v/total for k, v in scores.items()}
-    best = max(scores, key=scores.get); bscore = scores[best]
-    if bscore < HEURISTIC_MIN_SCORE: best = "cot" if wc > 15 else "llm"; bscore = 0.35
-    return best, round(bscore, 4), scores
 
 # Global Router State
 minilm_router  = OnnxMiniLMRouter()
-
 def _internal_classify(text: str, image_path: Optional[str] = None) -> dict:
-    route, confidence, method = "cot", 0.0, "default"
+    """
+    Classifica texto utilizando APENAS o modelo ONNX (MiniLM).
+    CoT só é usado quando há real ambiguidade ou confiança muito baixa.
+    """
     all_scores = {n: 0.0 for n in LABEL_NAMES}
-    m_scores = {}
+    method = "default"
+    route = "llm"  # Fallback seguro
+    confidence = 0.0
 
-    # DeBERTa desabilitado — usar apenas MiniLM + Heuristic
+    # ─────────────────────────────────────────
+    # PASSO 1: Tentar MiniLM (ONNX)
+    # ─────────────────────────────────────────
     if minilm_router.ready:
         try:
-            _, _, m_scores = minilm_router.predict(text)
+            # predict retorna (route, confidence, all_scores)
+            route, confidence, all_scores = minilm_router.predict(text)
             method = "onnx_minilm"
-        except Exception:
-            pass
-
-    h_route, h_conf, h_scores = _heuristic_classify(text, image_path)
-    if method == "default":
-        method = "heuristic"
+        except Exception as e:
+            log.warning(f"Erro ao classificar com ONNX: {e}")
+            method = "onnx_error"
+            # Em caso de erro no ONNX, joga pra CoT ou LLM com baixa confiança
+            route = "llm"
+            confidence = 0.0
     else:
-        method += "+heuristic"
+        method = "router_offline"
+        route = "llm"
+        confidence = 0.0
 
-    if m_scores:
-        for n in LABEL_NAMES:
-            all_scores[n] = round(m_scores.get(n, 0.0) * 0.55 + h_scores.get(n, 0.0) * 0.45, 4)
+    # ─────────────────────────────────────────
+    # PASSO 2: Análise de confiança
+    # ─────────────────────────────────────────
+    # Calcula a segunda maior confiança para detectar ambiguidade
+    sorted_scores = sorted(all_scores.values(), reverse=True)
+    second_best = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+    confidence_gap = confidence - second_best
+
+    # ─────────────────────────────────────────
+    # PASSO 3: Decisão sobre CoT
+    # ─────────────────────────────────────────
+    needs_cot = False
+    reason_cot = None
+
+    # Caso 1: Ambíguo — 2+ rotas com scores próximos e sem confiança alta
+    if confidence_gap < AMBIGUITY_THRESHOLD and confidence < 0.70:
+        needs_cot = True
+        reason_cot = "ambiguous_top2"
+
+    # Caso 2: Confiança MUITO baixa (modelo muito incerto)
+    elif confidence < COT_THRESHOLD:
+        needs_cot = True
+        reason_cot = "low_confidence"
+
+    # ─────────────────────────────────────────
+    # PASSO 4: Ajuste Final de Segurança
+    # ─────────────────────────────────────────
+    if needs_cot:
+        # Se decidiu por CoT, força a rota
+        route = "cot"
+        confidence = 0.0
+        method = f"{method}→cot"
     else:
-        all_scores = h_scores
-
-    route = max(all_scores, key=all_scores.get)
-    confidence = all_scores[route]
-    if confidence < HEURISTIC_MIN_SCORE:
-        route, confidence, method = "cot", 0.3, "default_safe"
+        # 🛡️ SEGURANÇA CRÍTICA: Se NÃO precisa de CoT, mas a rota calculada 
+        # foi "cot" (porque o modelo deu um leve pico de ruído nela), 
+        # impedimos que caia no pipeline CoT forçando o fallback para a 
+        # melhor rota DIRETA disponível (geralmente "llm").
+        if route not in ROUTE_TO_EXECUTOR:
+            valid_routes = {k: v for k, v in all_scores.items() if k in ROUTE_TO_EXECUTOR}
+            if valid_routes:
+                route = max(valid_routes, key=valid_routes.get)
+                confidence = valid_routes[route]
+            else:
+                route = "llm"
+                confidence = 0.5
 
     return {
         "route": route,
         "confidence": confidence,
         "method": method,
         "all_scores": all_scores,
-        "needs_cot": route == "cot",
+        "needs_cot": needs_cot,
+        "reason_cot": reason_cot,
+        "confidence_gap": confidence_gap,
     }
 
 
@@ -518,9 +552,44 @@ async def _stream_llm(
     return full_response
 
 
-async def _adapt_llm(action, context, req, stream_tts=False) -> str:
+async def _adapt_llm(action, context, req, stream_tts=False, step_queue=None, step_num=None) -> str:
     ctx = _format_context_for_llm(action, context)
     msg = f"{action}\n\n{ctx}" if ctx else action
+    
+    # Se houver fila (CoT pipeline), faz streaming via fila em tempo real
+    if step_queue and step_num is not None:
+        full_resp = ""
+        try:
+            async for event_type, data in _stream_llm_chunks(
+                msg,
+                voice=req.voice,
+                lang=req.lang,
+                tts=stream_tts,
+                session_id=req.session_id or "default",
+            ):
+                if event_type == "reasoning":
+                    await step_queue.put({
+                        "type": "step_reasoning", 
+                        "step": step_num, 
+                        "data": data
+                    })
+                elif event_type == "delta":
+                    full_resp += data
+                    await step_queue.put({
+                        "type": "step_delta", 
+                        "step": step_num, 
+                        "data": data
+                    })
+            return full_resp
+        except Exception as e:
+            await step_queue.put({
+                "type": "step_error", 
+                "step": step_num, 
+                "data": str(e)
+            })
+            raise
+
+    # Caminho antigo (sem fila, caso seja chamado fora do pipeline)
     return await _stream_llm(
         msg,
         voice=req.voice,
@@ -662,21 +731,36 @@ def _format_context_for_llm(action, context):
     if not keys: return ""
     return "\n\n".join([f"[Step {k.split('_')[1]} result]\n{_result_to_text(context[k])}" for k in sorted(keys)])[:MAX_CONTEXT_CHARS]
 
-async def _run_step_with_retry(step_num, action, executor, context, req, stream_tts=False) -> StepResult:
+async def _run_step_with_retry(step_num, action, executor, context, req, stream_tts=False, step_queue=None) -> StepResult:
+    # Sanitiza executor caso venha como dict
+    if isinstance(step_num, dict):
+        step_num = step_num.get("id") or step_num.get("step") or step_num.get("num") or 0
+    try:
+        step_num = int(step_num)
+    except (TypeError, ValueError):
+        step_num = 0
+
+    # ✅ Sanitizar executor (já existe)
+    if isinstance(executor, dict):
+        executor = executor.get("name") or executor.get("executor") or "llm"
+    executor = str(executor).lower()
+
     adapter = EXECUTOR_ADAPTERS.get(executor)
     max_retries = EXECUTOR_MAX_RETRIES.get(executor, 1)
+    
     if not adapter:
         return StepResult(step=step_num, executor=executor, action=action, success=False, error=f"Unknown executor: {executor}")
+        
     t0 = time.perf_counter()
     retries = 0
     last_err = ""
     res_act = _resolve_action_text(action, context)
+    
     while retries <= max_retries:
         try:
-            # Pass stream_tts only to the LLM adapter
-            if executor == "llm" and stream_tts:
+            if executor == "llm":
                 res = await asyncio.wait_for(
-                    adapter(res_act, context, req, stream_tts=True),
+                    adapter(res_act, context, req, stream_tts=(stream_tts or req.tts), step_queue=step_queue, step_num=step_num),
                     timeout=EXECUTOR_TIMEOUTS.get(executor, 30.0),
                 )
             else:
@@ -684,9 +768,11 @@ async def _run_step_with_retry(step_num, action, executor, context, req, stream_
                     adapter(res_act, context, req),
                     timeout=EXECUTOR_TIMEOUTS.get(executor, 30.0),
                 )
+                
             lat = round((time.perf_counter() - t0) * 1000, 2)
             return StepResult(step=step_num, executor=executor, action=action, success=True,
                               result=res, retries=retries, latency_ms=lat)
+                              
         except (httpx.ConnectError, httpx.TimeoutException, asyncio.TimeoutError) as e:
             last_err = f"{type(e).__name__}: {e}"
             retries += 1
@@ -698,23 +784,43 @@ async def _run_step_with_retry(step_num, action, executor, context, req, stream_
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             break
+            
     lat = round((time.perf_counter() - t0) * 1000, 2)
     return StepResult(step=step_num, executor=executor, action=action, success=False,
                       error=last_err, retries=retries, latency_ms=lat)
     
     
-async def _execute_plan(steps, req, strategy) -> tuple[list[StepResult], dict[str, Any], bool]:
-    step_map = {s["step"]: s for s in steps}
+
+async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue] = None) -> tuple[list[StepResult], dict[str, Any], bool]:
+    # 🚨 LOG DE RASTREAMENTO 1: Onde o unhashable type costuma ocorrer
+    try:
+        step_map = {s["step"]: s for s in steps}
+        pending = set(step_map.keys())
+        
+        dependents = set()
+        for s in steps:
+            for d in (s.get("depends_on") or []):
+                dependents.add(d)
+                
+        output_steps = {s["step"] for s in steps if s["step"] not in dependents}
+    except TypeError as e:
+        log.error("🚨🚨🚨 ERRO UNHASHABLE DETECTADO EM _execute_plan 🚨🚨🚨")
+        log.error(f"Tipo do erro: {e}")
+        # Faz um dump completo da lista de steps para vermos o que o CoT enviou
+        log.error(f"ESTRUTURA DOS STEPS RECEBIDOS: {json.dumps(steps, indent=2, default=str, ensure_ascii=False)}")
+        # Identifica qual step específico tem o problema
+        for idx, s in enumerate(steps):
+            if not isinstance(s.get("step"), int):
+                log.error(f"👉 CULPADO: O step no índice {idx} tem 'step' como {type(s.get('step'))} -> Valor: {s.get('step')}")
+            if s.get("depends_on"):
+                for d in s["depends_on"]:
+                    if not isinstance(d, int):
+                        log.error(f"👉 CULPADO: depends_on contém {type(d)} -> Valor: {d}")
+        raise e  # Relança o erro após logar
+
     results = {}
     context = {}
-    pending = set(step_map.keys())
     tts_fired = False
-
-    dependents = set()
-    for s in steps:
-        for d in (s.get("depends_on") or []):
-            dependents.add(d)
-    output_steps = {s["step"] for s in steps if s["step"] not in dependents}
 
     while pending:
         ready = [
@@ -739,104 +845,40 @@ async def _execute_plan(steps, req, strategy) -> tuple[list[StepResult], dict[st
         if strategy == "sequential":
             ready = [ready[0]]
 
+        # ── NOTIFICAÇÃO DE INÍCIO (Tempo Real) ──
+        if step_queue:
+            for sn in ready:
+                await step_queue.put({
+                    "type": "step_start",
+                    "step": sn,
+                    "executor": step_map[sn]["executor"],
+                    "action": step_map[sn]["action"][:50]
+                })
+
         batch = await asyncio.gather(*[
             _run_step_with_retry(
                 sn, step_map[sn]["action"], step_map[sn]["executor"], context, req,
                 stream_tts=(sn in output_steps and step_map[sn]["executor"] == "llm" and req.tts),
+                step_queue=step_queue,
             )
             for sn in ready
         ])
+        
         for sr in batch:
             results[sr.step] = sr
             pending.discard(sr.step)
             context[f"step_{sr.step}"] = sr.result if sr.success else None
             if sr.success and sr.step in output_steps and sr.executor == "llm" and req.tts:
                 tts_fired = True
+            
+            # ── NOTIFICAÇÃO DE CONCLUSÃO (Tempo Real) ──
+            if step_queue:
+                await step_queue.put({"type": "step_done", "data": sr})
 
+    if step_queue is not None:
+        await step_queue.put(None)  # sentinela
     return [results[sn] for sn in sorted(results.keys())], context, tts_fired
-
-async def _build_final_response(orig, steps, context, req) -> tuple[str, bool]:
-    """
-    Returns (final_text, tts_already_fired).
-    When synthesis calls LLM, streams with tts=True so user hears audio immediately.
-    """
-    succ = [s for s in steps if s.success]
-    if not succ:
-        return f"Erros: {'; '.join(s.error for s in steps if s.error)}", False
-    last = succ[-1]
     
-    # ── Handle local_scraping results specially ──
-    # If any step returned multiple_matches, format a choice message
-    for s in succ:
-        if s.executor == "local_scraping" and isinstance(s.result, dict):
-            if s.result.get("status") == "multiple_matches":
-                matches = s.result.get("matches", [])
-                msg = s.result.get("message", "Múltiplos arquivos encontrados.")
-                lines = [f"  [{i+1}] {m.get('file_path','?')}  ({m.get('size','?')}, modificado: {m.get('modified','?')})" for i, m in enumerate(matches[:10])]
-                return f"{msg}\n\n" + "\n".join(lines), False
-            if s.result.get("status") == "success" and s.result.get("content"):
-                content = s.result["content"]
-                file_path = s.result.get("file_path", "")
-                header = f"📄 Arquivo: {file_path}"
-                reindex_info = ""
-                if s.result.get("was_reindexed"):
-                    reindex_info = " (reindexado — arquivo foi modificado)"
-                elif not s.result.get("hash_match", True):
-                    reindex_info = " (hash diferente — reindexado)"
-                return f"{header}{reindex_info}\n\n{content}", False
-    
-    # If the last step was LLM/deep_search, return its result directly
-    if last.executor in ("llm", "deep_search") and isinstance(last.result, str) and len(last.result) > 20:
-        return last.result, False
-    parts = [f"[{s.executor.upper()} — step {s.step}]\n{_result_to_text(s.result)}"
-             for s in succ if _result_to_text(s.result)]
-    if not parts:
-        return "Tarefa concluída sem resultado textual.", False
-    ctx = "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
-    try:
-        text = await _stream_llm(
-            f"Original: {orig}\nInfo:\n{ctx}\nDirect response in same language:",
-            voice=req.voice,
-            lang=req.lang,
-            tts=True,
-            max_turns=1,
-        )
-        return text or ctx, True
-    except Exception:
-        return ctx, False
-    
-async def _execute_direct(route: str, req: ExecuteRequest) -> tuple[list[StepResult], dict[str, Any], bool]:
-    """
-    Returns (step_results, context, tts_already_fired).
-    For direct LLM routes, streams with TTS for immediate audio.
-    """
-    executor = ROUTE_TO_EXECUTOR.get(route, "llm")
-    action = f"gravar {req.input}" if route == "memory_write" else req.input
-    tts_fired = False
-
-    if executor == "llm":
-        t0 = time.perf_counter()
-        try:
-            text = await _stream_llm(
-                action,
-                voice=req.voice,
-                lang=req.lang,
-                tts=req.tts,
-                session_id=req.session_id or "default",
-            )
-            lat = round((time.perf_counter() - t0) * 1000, 2)
-            sr = StepResult(step=1, executor="llm", action=action, success=True,
-                            result=text, latency_ms=lat)
-            tts_fired = req.tts
-        except Exception as e:
-            lat = round((time.perf_counter() - t0) * 1000, 2)
-            sr = StepResult(step=1, executor="llm", action=action, success=False,
-                            error=str(e), latency_ms=lat)
-    else:
-        sr = await _run_step_with_retry(1, action, executor, {}, req)
-
-    ctx = {"step_1": sr.result} if sr.success else {}
-    return [sr], ctx, tts_fired
 
 async def _fire_tts(text, req):
     try: await state.tts_client.post("/speak", json={"text": text[:2000], "voice": req.voice, "lang": req.lang})
@@ -849,6 +891,63 @@ async def _save_turn(u, a, sid):
 async def _save_lt(text, src="chat"):
     try: await state.memory_client.post("/write", json={"text": text[:500], "source": src, "confidence": 0.8})
     except: pass
+    
+async def _stream_llm_chunks(
+    message: str,
+    voice: str = "M1",
+    lang: str = "pt",
+    tts: bool = False,
+    session_id: str = "default",
+    max_turns: int = 10,
+    stream_reasoning: bool = True,  # ← NOVO PARÂMETRO
+):
+    """
+    Gerador que yielda tuplas (event_type, data):
+      - ("reasoning", texto) → thinking do modelo (se stream_reasoning=True)
+      - ("delta", texto)     → resposta final
+    """
+    try:
+        async with state.llm_client.stream(
+            "POST",
+            "/chat/stream",
+            json={
+                "message": message,
+                "voice": voice,
+                "lang": lang,
+                "tts": tts,
+                "session_id": session_id,
+                "max_turns": max_turns,
+                "stream_reasoning": stream_reasoning,  # ← ENVIAR PARA O LLM
+            },
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                try:
+                    chunk = json.loads(payload)
+                    
+                    # Só processa reasoning se a flag estiver True E o LLM enviou
+                    if "reasoning" in chunk and stream_reasoning:
+                        yield ("reasoning", chunk["reasoning"])
+                    elif "delta" in chunk:
+                        yield ("delta", chunk["delta"])
+                    elif "done" in chunk:
+                        break
+                    elif "error" in chunk:
+                        log.warning(f"LLM stream error: {chunk['error']}")
+                        break
+                except json.JSONDecodeError:
+                    continue
+    except httpx.StreamError as e:
+        log.warning(f"LLM stream interrupted: {e}")
+        raise
+    except Exception as e:
+        log.error(f"LLM stream failed: {e}")
+        raise
+    
+    
 async def _execute_stream_generator(req: ExecuteRequest):
     """
     Gerador assíncrono que emite Server-Sent Events para o /execute.
@@ -908,18 +1007,20 @@ async def _execute_stream_generator(req: ExecuteRequest):
             action = f"gravar {req.input}" if route_name == "memory_write" else req.input
 
             if executor == "llm":
-                # ── Stream LLM tokens diretamente ao cliente ──
                 t0_step = time.perf_counter()
                 try:
-                    async for delta in _stream_llm_chunks(
+                    async for event_type, data in _stream_llm_chunks(
                         action,
                         voice=req.voice,
                         lang=req.lang,
                         tts=req.tts,
                         session_id=sid,
                     ):
-                        final_response += delta
-                        yield _sse("delta", delta)  # TEXTO PURO
+                        if event_type == "reasoning":
+                            yield _sse("reasoning", data)  # ← NOVO
+                        else:
+                            final_response += data
+                            yield _sse("delta", data)
 
                     lat = round((time.perf_counter() - t0_step) * 1000, 2)
                     step_results = [StepResult(
@@ -961,25 +1062,64 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 pd = cr.json()
                 raw = pd.get("steps", [])
                 plan_cache = pd.get("from_cache", False)
+                
+                # 🚨 LOG DE RASTREAMENTO 2: O que o CoT mandou?
+                log.debug(f"🧠 Resposta bruta do CoT: {json.dumps(raw, indent=2, default=str, ensure_ascii=False)}")
+                
             except Exception as e:
                 yield _sse("error", {"error": f"CoT falhou: {e}"})
                 final_response = f"CoT falhou: {e}"
 
             if raw:
-                # Executa todos os steps do plano (acumula internamente)
-                step_results, context, tts_already_fired = await _execute_plan(
-                    raw, req, req.strategy
+                # Log de antes e depois da sanitização
+                log.debug(f"🧠 ANTES do _sanitize_steps: {raw}")
+                raw = _sanitize_steps(raw)
+                log.debug(f"🧠 DEPOIS do _sanitize_steps: {json.dumps(raw, indent=2, default=str, ensure_ascii=False)}")
+                
+                # ... (resto do código continua)
+                # ── Aplica saneamento para evitar erro de unhashable type ──
+                raw = _sanitize_steps(raw)
+
+                # ── Emite o plano completo antes de executar ──────────────────
+                yield _sse("plan", {
+                    "from_cache": plan_cache,
+                    "steps": raw,  # Agora é seguro usar diretamente
+                })
+
+                # ── Executa com notificações em tempo real via Queue ──────────
+                step_queue: asyncio.Queue = asyncio.Queue()
+                plan_task = asyncio.create_task(
+                    _execute_plan(raw, req, req.strategy, step_queue)
                 )
 
-                # Notifica o cliente sobre cada step concluído
-                for sr in step_results:
-                    yield _sse("step", {
-                        "step": sr.step,
-                        "executor": sr.executor,
-                        "success": sr.success,
-                        "latency_ms": sr.latency_ms,
-                        "error": sr.error,
-                    })
+                while True:
+                    item = await step_queue.get()
+                    if item is None:
+                        break
+                    
+                    if item["type"] == "step_start":
+                        yield _sse("step_start", {
+                            "step":     item["step"],
+                            "executor": item["executor"],
+                            "action":   item.get("action", ""),
+                        })
+                    elif item["type"] == "step_delta":
+                        # Manda o token do LLM direto para a UI em tempo real!
+                        yield _sse("delta", item["data"])
+                    elif item["type"] == "step_reasoning":
+                        # Manda o raciocínio do LLM direto para a UI em tempo real!
+                        yield _sse("reasoning", item["data"])
+                    elif item["type"] == "step_done":
+                        sr = item["data"]
+                        yield _sse("step_done", {
+                            "step":       sr.step,
+                            "executor":   sr.executor,
+                            "success":    sr.success,
+                            "latency_ms": sr.latency_ms,
+                            "error":      sr.error,
+                        })
+
+                step_results, context, tts_already_fired = await plan_task
 
                 # ── Monta resposta final ──
                 succ = [s for s in step_results if s.success]
@@ -1052,7 +1192,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                                     f"Direct response in same language:"
                                 )
                                 try:
-                                    async for delta in _stream_llm_chunks(
+                                    async for event_type, data in _stream_llm_chunks(
                                         synthesis_prompt,
                                         voice=req.voice,
                                         lang=req.lang,
@@ -1060,8 +1200,9 @@ async def _execute_stream_generator(req: ExecuteRequest):
                                         session_id=sid,
                                         max_turns=1,
                                     ):
-                                        final_response += delta
-                                        yield _sse("delta", delta)  # TEXTO PURO
+                                        if event_type == "delta":
+                                            final_response += data
+                                            yield _sse("delta", data)
                                     tts_already_fired = req.tts
                                 except Exception:
                                     final_response = ctx_text
@@ -1106,52 +1247,6 @@ async def _execute_stream_generator(req: ExecuteRequest):
         "routed_directly": routed_directly,
     })
 
-async def _stream_llm_chunks(
-    message: str,
-    voice: str = "M1",
-    lang: str = "pt",
-    tts: bool = False,
-    session_id: str = "default",
-    max_turns: int = 10,
-):
-    """
-    Gerador assíncrono que faz yield de cada delta recebido do LLM
-    via /chat/stream.  Usado por _execute_stream_generator para
-    encaminhar tokens ao cliente em tempo real.
-    """
-    try:
-        async with state.llm_client.stream(
-            "POST",
-            "/chat/stream",
-            json={
-                "message":    message,
-                "voice":      voice,
-                "lang":       lang,
-                "tts":        tts,
-                "session_id": session_id,
-                "max_turns":  max_turns,
-            },
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                try:
-                    chunk = json.loads(payload)
-                    if "delta" in chunk:
-                        yield chunk["delta"]
-                    elif "done" in chunk:
-                        break
-                    elif "error" in chunk:
-                        log.warning(f"LLM stream error: {chunk['error']}")
-                        break
-                except json.JSONDecodeError:
-                    continue
-    except httpx.StreamError as e:
-        log.warning(f"LLM stream interrupted: {e}")
-    except Exception as e:
-        log.warning(f"LLM stream failed: {e}")
 
 
 def _sse(event: str, data: Any) -> str:
@@ -1243,13 +1338,19 @@ app = FastAPI(title="AVA Unified Orchestrator", version="3.1.0", description="Ce
 @app.post("/execute")
     
 async def execute(req: ExecuteRequest):
+    async def stream_with_flush():
+        async for chunk in _execute_stream_generator(req):
+            yield chunk
+            # Força o uvicorn a não bufferizar
+    
     return StreamingResponse(
-        _execute_stream_generator(req),
+        stream_with_flush(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked",  # <- adicione este
         },
     )
 
@@ -1482,4 +1583,3 @@ async def list_voices():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("orchestrator:app", host="0.0.0.0", port=9000, log_level="info")
-    

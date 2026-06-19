@@ -471,6 +471,7 @@ class ChatRequest(BaseModel):
     lang:    Optional[str] = Field(default=None, description="Idioma forçado. None = detectado.")
     max_turns: int = Field(default=10,  ge=1, le=40, description="Limite de contexto recuperado")
     tts: bool = Field(default=True, description="Dispara TTS após gerar resposta.")
+    stream_reasoning: bool = Field(default=True, description="Se True e o modelo emitir reasoning_content, envia para a UI. Se False, ignora completamente.")
 
 class ClearRequest(BaseModel):
     confirm: bool = False
@@ -649,20 +650,20 @@ async def chat_stream(req: ChatRequest):
     async def generator():
         nonlocal _tts_buf
         full_response = ""
+        full_reasoning = ""  
         t0 = time.perf_counter()
         cached_tokens = 0
 
         try:
-            # ── OPTIMIZED: Use persistent client for streaming ────────────────
             client = await _get_llama_client()
             async with client.stream(
                 "POST",
                 "/v1/chat/completions",
                 json={
-                    "model":       MODEL_NAME,
-                    "messages":    messages,
+                    "model": MODEL_NAME,
+                    "messages": messages,
                     "temperature": 0.7,
-                    "stream":      True,
+                    "stream": True,
                 },
             ) as r:
                 r.raise_for_status()
@@ -674,25 +675,37 @@ async def chat_stream(req: ChatRequest):
                         break
                     try:
                         chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                        if not delta:
+                        delta_obj = chunk["choices"][0].get("delta", {})
+                        
+                        # ── REASONING: Só captura se a flag for True E a tag existir ──
+                        if req.stream_reasoning:
+                            reasoning = delta_obj.get("reasoning_content", "")
+                            if reasoning:
+                                full_reasoning += reasoning
+                                yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
+                        
+                        # Content normal
+                        content = delta_obj.get("content", "")
+                        
+                        if not content:
+                            # ── CORREÇÃO: Lê os tokens de cache do campo 'timings' do llama.cpp ──
+                            # O llama.cpp envia as estatísticas de prompt/cache no último chunk,
+                            # dentro de "timings": {"cache_n": X, "prompt_n": Y}, e NÃO em "usage".
+                            timings = chunk.get("timings", {})
+                            if timings and "cache_n" in timings:
+                                cached_tokens = timings.get("cache_n", 0)
                             continue
 
-                        full_response += delta
-                        yield f"data: {json.dumps({'delta': delta})}\n\n"
+                        full_response += content
+                        yield f"data: {json.dumps({'delta': content})}\n\n"
 
-                        # Buffer para o TTS
+                        # Buffer para o TTS (só para content, não reasoning)
                         if req.tts and voice:
-                            _tts_buf += delta
+                            _tts_buf += content
                             buf_rstrip = _tts_buf.rstrip()
                             if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
                                or len(_tts_buf) > 150:
                                 _flush_tts_buf()
-
-                        # Track cached tokens from streaming response
-                        usage = chunk.get("usage", {})
-                        if usage and "prompt_tokens_cached" in usage:
-                            cached_tokens = usage["prompt_tokens_cached"]
 
                     except (json.JSONDecodeError, KeyError):
                         continue
@@ -708,6 +721,7 @@ async def chat_stream(req: ChatRequest):
         elapsed = time.perf_counter() - t0
         log.info(
             f"[STREAM] {elapsed:.2f}s | {len(full_response)} chars | "
+            f"reasoning: {len(full_reasoning)} chars | "
             f"cached: {cached_tokens} tokens"
         )
 
@@ -722,7 +736,16 @@ async def chat_stream(req: ChatRequest):
                 memory_write_fact(f"Usuário disse: {user_input[:300]}", "chat", 0.7)
             )
 
-    return StreamingResponse(generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked",
+        }
+    )
+
 
 
 @app.delete("/history")
