@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import logging
+import sys
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -20,15 +21,37 @@ from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.widget import Widget
 from textual.widgets import Footer, Input, Static, RichLog, Markdown
 import traceback
+import requests
+import tkinter.messagebox as messagebox
+from Modules.local_scraping import status 
+
+
+with open("ava_ui.log", "w") as f:
+    f.write("")
+
+global chosen
+API_BASE = "http://localhost:9001"
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] [UI] %(message)s",
     handlers=[
         logging.FileHandler("ava_ui.log"),
     ]
 )
 log = logging.getLogger("ava.ui")
+
+# ─────────────────────────────────────────
+# Redireciona stdout/stderr (nível Python) para o arquivo de log.
+# IMPORTANTE: não usar os.dup2 aqui — isso reescreve o file
+# descriptor 1/2 do processo inteiro e "rouba" o terminal antes do
+# Textual conseguir desenhar a TUI (app.run() fica preso, tela não
+# aparece). Trocar apenas sys.stdout/sys.stderr em nível Python já
+# resolve prints/logging/requests vazando, sem afetar o terminal
+# real que o Textual precisa para entrar em alternate screen.
+# ─────────────────────────────────────────
+sys.stdout = open("ava_ui.log", "a", buffering=1)
+sys.stderr = open("ava_ui.log", "a", buffering=1)
 
 # ─────────────────────────────────────────
 # ORCHESTRATOR
@@ -57,8 +80,18 @@ RED_C = "#E45012"
 WHITE = "#CCCCCC"
 DIM   = "#333333"
 
-MODEL   = os.environ.get("AVA_MODEL", "")
+
 TAGLINE = "Any model. Every tool. Zero limits."
+
+# ─────────────────────────────────────────
+# CORREÇÃO #4: regex para remover sequências ANSI cruas
+# (ex: cores de terminal emitidas pelo container docker) antes de
+# escrever no RichLog. Sem isso, escape codes como \x1b[31m ou
+# \x1b[2J podem ser interpretados pelo terminal real e quebrar o
+# redraw da TUI, fazendo texto "vazar" para posições erradas da tela.
+# ─────────────────────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
 
 # ─────────────────────────────────────────
 # GIT
@@ -383,11 +416,16 @@ class PipelineStep(Widget):
 
     def finish(self, success: bool, latency_ms: float, error: str = None):
         """Chamado quando o passo termina."""
+        if not self.is_mounted:
+            return
         icon = "✅" if success else "❌"
         err_str = f" — {error}" if error else ""
-        self.query_one("#step-text", Static).update(
-            f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}"
-        )
+        try:
+            self.query_one("#step-text", Static).update(
+                f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}"
+            )
+        except Exception:
+            return
         if success:
             self.set_class(True, "-done")
         else:
@@ -433,21 +471,36 @@ class CoTPlanRow(Widget):
         yield Static(preview, classes="cpr-action")
 
     def set_running(self) -> None:
+        # CORREÇÃO #1: blinda contra chamadas antes do widget estar
+        # montado no DOM (ou depois de já ter sido removido). Sem
+        # isso, query(...).first() levanta NoMatches e o Textual
+        # imprime o traceback por cima da TUI no terminal.
+        if not self.is_mounted:
+            return
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
-        self.query(".cpr-header", Static).first().update(
-            f"⏳ Step {self.step_num} [{self.executor}]{dep_str}"
-        )
+        try:
+            self.query(".cpr-header", Static).first().update(
+                f"⏳ Step {self.step_num} [{self.executor}]{dep_str}"
+            )
+        except Exception:
+            return
         self.set_class(False, "-pending")
         self.set_class(True,  "-running")
 
     def set_done(self, success: bool, latency_ms: float, error: str = None) -> None:
+        # CORREÇÃO #1 (mesma lógica para set_done)
+        if not self.is_mounted:
+            return
         icon    = "✓" if success else "✗"
         err_str = f" — {error}" if error else ""
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
-        self.query(".cpr-header", Static).first().update(
-            f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}{dep_str}"
-        )
-        self.query(".cpr-action", Static).first().update("")
+        try:
+            self.query(".cpr-header", Static).first().update(
+                f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}{dep_str}"
+            )
+            self.query(".cpr-action", Static).first().update("")
+        except Exception:
+            return
         self.styles.height = 1
         self.set_class(False, "-running")
         self.set_class(False, "-pending")
@@ -502,12 +555,16 @@ class CoTPlan(Widget):
             yield row
 
     def mark_running(self, step_num: int) -> None:
+        if not self.is_mounted:
+            return
         step_num = _safe_step(step_num) # 👇 Defesa aqui também
         if step_num in self._rows:
             self._rows[step_num].set_running()
 
     def mark_done(self, step_num: int, success: bool,
                   latency_ms: float, error: str = None) -> None:
+        if not self.is_mounted:
+            return
         step_num = _safe_step(step_num) # 👇 E aqui
         if step_num in self._rows:
             self._rows[step_num].set_done(success, latency_ms, error)
@@ -581,7 +638,16 @@ class DockerLog(Widget):
 
     def write(self, line: str) -> None:
         """Escreve uma linha no log."""
-        self.query_one("#docker-body", RichLog).write(line.rstrip())
+        # CORREÇÃO #4: remove sequências ANSI cruas (cores/cursor do
+        # terminal do container) antes de escrever no RichLog, e
+        # protege contra escrever num widget já desmontado.
+        if not self.is_mounted:
+            return
+        clean = _ANSI_RE.sub("", line)
+        try:
+            self.query_one("#docker-body", RichLog).write(clean.rstrip())
+        except Exception:
+            return
 
 
 # ─────────────────────────────────────────
@@ -609,7 +675,7 @@ async def stream_ava(
         "session_id": session_id,
         "voice": DEFAULT_VOICE,
         "lang": DEFAULT_LANG,
-        "tts": False,
+        "tts": True,
         "use_cache": True,
         "stream": True,
         "strategy": "parallel",
@@ -711,6 +777,8 @@ class MetricsBar(Widget):
         self.set_interval(2, self._tick)
 
     def _tick(self) -> None:
+        if not self.is_mounted:
+            return
         m = collect_metrics()
 
         lc = (f" [dim]+{m['llama_cpu']:.1f}%[/]"    if m["llama_pid"] else "")
@@ -731,18 +799,22 @@ class MetricsBar(Widget):
             if m["has_gpu"] else f"[{GRAY}]VRAM ——[/]"
         )
 
-        self.query_one("#m-cpu").update(
-            f"[{GRAY}]CPU [/][{cc}]{_bar(m['total_cpu'])}[/] [{cc}]{m['total_cpu']:.1f}%[/]{lc}")
-        self.query_one("#m-ram").update(
-            f"[{GRAY}]RAM [/][{rc}]{_bar(m['sys_ram_pct'])}[/] "
-            f"[{rc}]{m['sys_ram_gb']:.1f}[/][dim]/{m['sys_ram_tot']:.1f}GB[/]{lr}")
-        self.query_one("#m-gpu").update(gpu_str)
-        self.query_one("#m-vram").update(vram_str)
+        try:
+            self.query_one("#m-cpu").update(
+                f"[{GRAY}]CPU [/][{cc}]{_bar(m['total_cpu'])}[/] [{cc}]{m['total_cpu']:.1f}%[/]{lc}")
+            self.query_one("#m-ram").update(
+                f"[{GRAY}]RAM [/][{rc}]{_bar(m['sys_ram_pct'])}[/] "
+                f"[{rc}]{m['sys_ram_gb']:.1f}[/][dim]/{m['sys_ram_tot']:.1f}GB[/]{lr}")
+            self.query_one("#m-gpu").update(gpu_str)
+            self.query_one("#m-vram").update(vram_str)
+        except Exception:
+            return
 
 
 # ─────────────────────────────────────────
 # WIDGET: SPLASH HEADER
 # ─────────────────────────────────────────
+model = os.environ.get("AVA_MODEL")
 class SplashHeader(Widget):
 
     DEFAULT_CSS = f"""
@@ -766,7 +838,7 @@ class SplashHeader(Widget):
         yield Static(TAGLINE,  id="tagline")
         with Vertical(id="info-panel"):
             yield Static(f"[{GRAY}]OS      [/]  [{BLUE}]{platform.system()} {platform.release()}[/]")
-            yield Static(f"[{GRAY}]Model   [/]  [{WHITE}]{MODEL}[/]")
+            yield Static(f"[{GRAY}]Model   [/]  [{WHITE}]{model}[/]")
             yield Static(f"[{GRAY}]Commit  [/]  [{BLUE}]{GIT_HASH}[/]  [{GRAY}]{GIT_MSG}[/]")
         with Horizontal(id="status-row"):
             yield Static(
@@ -820,11 +892,18 @@ class ChatMessage(Widget):
             yield Static(_render_rich(self.content), id="msg-body")
 
     def append_delta(self, delta: str):
+        if not self.is_mounted:
+            return
         self.content += delta
-        self.query_one("#msg-body", Static).update(_render_rich(self.content))
+        try:
+            self.query_one("#msg-body", Static).update(_render_rich(self.content))
+        except Exception:
+            return
 
     def append_reasoning(self, reasoning: str) -> None:
         """Adiciona reasoning ao ThinkingBox."""
+        if not self.is_mounted:
+            return
         try:
             box = self.query_one("#thinking-box", ThinkingBox)
             box.append_reasoning(reasoning)
@@ -833,6 +912,8 @@ class ChatMessage(Widget):
 
     def finish_thinking(self) -> None:
         """Finaliza o thinking e auto-colapsa."""
+        if not self.is_mounted:
+            return
         try:
             box = self.query_one("#thinking-box", ThinkingBox)
             box.finish_thinking()
@@ -914,34 +995,44 @@ class ThinkingBox(Widget):
 
     def append_reasoning(self, text: str) -> None:
         """Adiciona texto de reasoning e torna a caixa visível."""
+        if not self.is_mounted:
+            return
         # Primeira vez: remove classe hidden
         if self.has_class("-hidden"):
             self.remove_class("-hidden")
 
         self._char_count += len(text)
-        
-        # Atualiza label com contagem
-        self.query_one("#think-label", Static).update(
-            f"💭 thinking... ({self._char_count} chars)"
-        )
-        
-        # Escreve no log (scroll automático)
-        self.query_one("#think-content", RichLog).write(text)
+
+        try:
+            # Atualiza label com contagem
+            self.query_one("#think-label", Static).update(
+                f"💭 thinking... ({self._char_count} chars)"
+            )
+
+            # Escreve no log (scroll automático)
+            self.query_one("#think-content", RichLog).write(text)
+        except Exception:
+            return
 
     def finish_thinking(self) -> None:
         """Chamado quando o reasoning termina — auto-colapsa."""
         if self._char_count == 0:
             return
-        
-        # Atualiza label final
-        self.query_one("#think-label", Static).update(
-            f"💭 thought {self._char_count} chars"
-        )
-        
+        if not self.is_mounted:
+            return
+
+        try:
+            # Atualiza label final
+            self.query_one("#think-label", Static).update(
+                f"💭 thought {self._char_count} chars"
+            )
+            self.query_one("#think-toggle", Static).update("▶")
+        except Exception:
+            return
+
         # Auto-colapsa após terminar
         self._collapsed = True
         self.set_class(True, "-collapsed")
-        self.query_one("#think-toggle", Static).update("▶")
         
 
 
@@ -1072,23 +1163,44 @@ class AlphaAI(App):
         """
         proc = self._proc_docker
         if proc is None or proc.stdout is None:
+            log.warning("DockerLog: proc_docker ou stdout é None")
             return
 
-        docker_log = self.query_one(DockerLog)
+        # CORREÇÃO #3: garante que o widget DockerLog já está no DOM
+        # antes de começar a escrever nele. Se a task disparar antes
+        # do compose() inicial da tela terminar, query_one levanta
+        # NoMatches e o traceback aparece por cima da TUI.
+        try:
+            docker_log = self.query_one(DockerLog)
+        except Exception:
+            log.warning("DockerLog ainda não montado, abortando leitura")
+            return
+
         loop = asyncio.get_event_loop()
 
-        while True:
-            # run_in_executor evita bloquear o event loop do Textual
-            # durante o readline() que pode ficar esperando dados
-            line = await loop.run_in_executor(None, proc.stdout.readline)
-            if not line:
-                # Processo encerrou ou pipe fechou
-                docker_log.write("[processo encerrado]")
-                break
-            docker_log.write(line.decode(errors="replace"))
+        try:
+            while True:
+                line = await loop.run_in_executor(None, proc.stdout.readline)
+                if not line:
+                    if self.is_running:
+                        docker_log.write("[dim]--- processo encerrado ---[/]")
+                    break
+                # ✅ CORRIGIDO: line já é string (text=True), não precisa de .decode()
+                if self.is_running:
+                    docker_log.write(line.rstrip())
+        except Exception as e:
+            log.error(f"Erro na leitura do Docker log: {e}")
+            if self.is_running:
+                try:
+                    docker_log.write(f"[red]Erro: {e}[/]")
+                except Exception:
+                    pass
 
     def _focus(self) -> None:
-        self.query_one("#prompt-input", Input).focus()
+        try:
+            self.query_one("#prompt-input", Input).focus()
+        except Exception:
+            return
 
     def _add_message(self, role: str, content: str) -> ChatMessage:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
@@ -1100,9 +1212,12 @@ class AlphaAI(App):
     def _set_route_bar(self, route: str, conf: float, method: str, direct: bool):
         via = "direto" if direct else "CoT"
         color = BLUE if direct else AMBER
-        self.query_one("#route-bar").update(
-            f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {method} • {via}[/]"
-        )
+        try:
+            self.query_one("#route-bar").update(
+                f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {method} • {via}[/]"
+            )
+        except Exception:
+            return
 
     def action_clear_chat(self) -> None:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
@@ -1118,6 +1233,9 @@ class AlphaAI(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt-input" or self._is_streaming:
             return
+        if chosen:
+            await start_processes(chosen)
+            
         prompt = event.value.strip()
         if not prompt:
             return
@@ -1175,7 +1293,12 @@ class AlphaAI(App):
                     steps      = steps,
                     from_cache = event.get("from_cache", False),
                 )
-                scroll.mount(_cot_plan_widget)
+                # CORREÇÃO #2: await no mount garante que o widget e
+                # seus filhos (CoTPlanRow) já estão de fato no DOM
+                # quando on_plan retorna — eliminando a corrida com
+                # on_step_start/on_step_done que chegam logo em
+                # seguida via SSE.
+                await scroll.mount(_cot_plan_widget)
                 self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
                 log.info(f"Plano CoT recebido com {len(steps)} step(s).")
             except Exception as e:
@@ -1258,10 +1381,70 @@ class AlphaAI(App):
         self.call_after_refresh(self._focus)
 
 
+async def start_processes(info):
+    try:
+        async with httpx.AsyncClient() as client:
+            # Inicia o processo
+            resp = await client.post(
+                f"{API_BASE}/llama/start",
+                json={
+                    "model": info["model"],
+                    "mmproj_used": bool(info.get("mmproj"))
+                },
+                timeout=15.0
+            )
+            resp.raise_for_status()
 
+            # Espera até o processo estar pronto
+
+        while True:
+            try:
+                r = requests.get(f"http://localhost:2001/health")
+            except requests.RequestException as e:
+                log.error(f"Erro ao verificar status do ava_tray: {e}")
+                await asyncio.sleep(0.5)
+                continue
+
+            status = r.json().get("status")
+            if status == "ok":
+                break   
+
+            await asyncio.sleep(0.5)
+
+    except httpx.ConnectError:
+        err_msg = "Falha ao conectar ao ava_tray."
+        log.error(err_msg)
+        messagebox.showerror("Erro de Conexão", err_msg)
+        raise SystemExit(1)
+
+    except Exception as e:
+        err_msg = f"Falha ao iniciar o llama-server: {e}"
+        log.error(err_msg)
+        messagebox.showerror("Erro na API", err_msg)
+        raise SystemExit(1)
+    # ════════════════════════════════════════════════════════════════════
+    # 2. Inicia o Docker via API
+    # ════════════════════════════════════════════════════════════════════
+    try:
+        resp = requests.post(
+            f"{API_BASE}/docker/start",
+            timeout=30.0 
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        log.info(f"Docker: {data.get('message')}")
+    except requests.exceptions.RequestException as e:
+        # Apenas avisa no log, não encerra o programa por causa do Docker
+        log.warning(f"Aviso ao contatar a API do Docker: {e}")
+        
 # ─────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────
+
+
+log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
     from model_selector import run_model_selector
 
@@ -1271,34 +1454,160 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     mmproj_flag = "true" if chosen["mmproj"] else "false"
+    log.info(f"Modelo escolhido: {chosen['model']} (mmproj={mmproj_flag})")
+    
+    # Inicia os processos necessários (Llama e Docker)
+    asyncio.run(start_processes(chosen))
 
-    # Inicia o llama manager
-    subprocess.Popen([
-        "python",
-        "./Modules/llamaManager.py",
-        "start",
-        chosen["model"],
-        f"--mmproj-used {mmproj_flag}",
-    ])
+    # ════════════════════════════════════════════════════════════════════
+    # 3. "Espia" os logs do container Docker
+    # ════════════════════════════════════════════════════════════════════
+    proc_docker = None
+    container_name = "ava-vulkan"
 
-    # Inicia o Docker (redireciona saída para captura)
-    if platform.system() == "Windows":
-        proc_docker = subprocess.Popen(
-            ["./docker-start.bat", "--profile", "vulkan", "up"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # junta stderr no stdout
+    def _try_docker_logs() -> Optional[subprocess.Popen]:
+        """Tenta docker logs com o ambiente atual do Python."""
+        # Debug: mostra qual docker o Python está encontrando
+        try:
+            which = subprocess.run(
+                ["which", "docker"], capture_output=True, text=True, timeout=5
+            )
+            log.info(f"Python vê docker em: {which.stdout.strip()}")
+        except Exception:
+            pass
+
+        # Debug: mostra o context
+        try:
+            ctx = subprocess.run(
+                ["docker", "context", "ls"],
+                capture_output=True, text=True, timeout=5
+            )
+            log.info(f"Docker contexts:\n{ctx.stdout}")
+            if ctx.stderr:
+                log.warning(f"Docker context stderr: {ctx.stderr}")
+        except Exception as e:
+            log.warning(f"Não consegui listar docker context: {e}")
+
+        # Tenta o docker logs
+        try:
+            proc = subprocess.Popen(
+                ["docker", "logs", "-f", container_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,  # ← Captura stderr separado para debug
+                text=True,
+                bufsize=1
+            )
+            
+            # Lê a primeira linha do stderr para detectar erro imediato
+            import select
+            # No Windows não tem select para pipes, usa threading
+            import threading
+            stderr_lines = []
+            
+            def read_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line)
+                    log.warning(f"docker logs stderr: {line.strip()}")
+
+            t = threading.Thread(target=read_stderr, daemon=True)
+            t.start()
+            
+            # Dá 2 segundos para ver se erro aparece
+            t.join(timeout=2)
+            
+            if stderr_lines and "no such container" in stderr_lines[0].lower():
+                log.error(f"docker logs falhou: {stderr_lines[0].strip()}")
+                proc.terminate()
+                return None
+            
+            # Se chegou aqui, parece que funcionou
+            # Continua lendo stderr em background
+            return proc
+            
+        except FileNotFoundError:
+            log.error("Comando 'docker' não encontrado no PATH do Python")
+            return None
+        except Exception as e:
+            log.error(f"Erro ao iniciar docker logs: {e}")
+            return None
+
+    def _try_tail_log_file() -> Optional[subprocess.Popen]:
+        """Fallback: encontra o arquivo de log do container e usa tail."""
+        try:
+            # Pega o container ID
+            result = subprocess.run(
+                ["docker", "ps", "-q", "-f", f"name={container_name}"],
+                capture_output=True, text=True, timeout=5
+            )
+            container_id = result.stdout.strip()
+            
+            if not container_id:
+                log.warning(f"Não encontrou ID do container '{container_name}'")
+                return None
+                
+            log.info(f"Container ID: {container_id}")
+            
+            # Tenta encontrar o arquivo de log
+            # Docker Desktop (Mac/Windows) ou Linux
+            possible_paths = [
+                f"/var/lib/docker/containers/{container_id}/{container_id}-json.log",
+            ]
+            
+            # No Docker Desktop, tenta via docker inspect
+            try:
+                inspect = subprocess.run(
+                    ["docker", "inspect", container_id],
+                    capture_output=True, text=True, timeout=5
+                )
+                import json
+                data = json.loads(inspect.stdout)
+                log_path = data[0].get("LogPath", "")
+                if log_path:
+                    possible_paths.insert(0, log_path)
+                    log.info(f"LogPath do inspect: {log_path}")
+            except Exception as e:
+                log.warning(f"Não consegui fazer docker inspect: {e}")
+
+            for path in possible_paths:
+                if os.path.exists(path):
+                    log.info(f"Usando tail -f {path}")
+                    return subprocess.Popen(
+                        ["tail", "-f", "-n", "50", path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1
+                    )
+            
+            log.warning(f"Nenhum arquivo de log encontrado em: {possible_paths}")
+            return None
+            
+        except Exception as e:
+            log.error(f"Erro no fallback tail: {e}")
+            return None
+
+    # Tenta na ordem: docker logs → tail do arquivo de log
+    proc_docker = _try_docker_logs()
+    
+    if proc_docker is None:
+        log.info("Tentando fallback com tail do arquivo de log...")
+        proc_docker = _try_tail_log_file()
+
+    if proc_docker is None:
+        log.warning(
+            "Nenhum método de leitura de logs funcionou. "
+            "O widget de logs ficará vazio. "
+            "Verifique o arquivo ava_ui.log para detalhes."
         )
-    else:
-        proc_docker = subprocess.Popen(
-            ["bash", "./docker-start.sh", "--profile", "vulkan", "up"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
 
+    # ════════════════════════════════════════════════════════════════════
+    # 4. Inicia a interface principal
+    # ════════════════════════════════════════════════════════════════════
     os.environ["AVA_MODEL"] = pathlib.Path(chosen["model"]).stem
-
-    # Injeta o processo no app ANTES de rodar
-    # (on_mount lê self._proc_docker para iniciar a leitura do log)
+    
     app = AlphaAI()
-    app._proc_docker = proc_docker
+    
+    # ✅ CORRIGIDO: Injeta o processo de tail para a UI poder ler os logs
+    app._proc_docker = proc_docker 
+    
     app.run()

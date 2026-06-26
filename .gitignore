@@ -20,3 +20,9 @@ openclaude
 *.gguf
 
 !.gitkeep
+
+Manager/target/**
+Manager/deps/**
+Manager/build/**
+Manager/incremental/**
+Manager/.fingerprint/**

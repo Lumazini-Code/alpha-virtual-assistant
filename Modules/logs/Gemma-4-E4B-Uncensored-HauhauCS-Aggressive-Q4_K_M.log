@@ -584,3 +584,38 @@ How are you?<turn|>
 19.56.159.106 I slot print_timing: id  0 | task 3890 |    graphs reused =       5324
 19.56.161.004 I slot      release: id  0 | task 3890 | stop processing: n_tokens = 2819, truncated = 0
 19.56.161.018 I srv  update_slots: all slots are idle
+28.20.303.073 W common_chat_try_specialized_template: detected an outdated gemma4 chat template, applying compatibility workarounds. Consider updating to the official template.
+28.20.304.903 I srv  params_from_: Chat format: peg-gemma4
+28.20.305.688 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.961 (> 0.100 thold), f_keep = 0.071
+28.20.305.691 I srv  get_availabl: updating prompt cache
+28.20.305.790 W srv   prompt_save:  - saving prompt with length 2819, total state size = 23.683 MiB (draft: 0.000 MiB)
+28.20.333.183 I srv          load:  - looking for better prompt, base f_keep = 0.071, sim = 0.961
+28.20.333.200 I srv        update:  - cache state: 13 prompts, 348.581 MiB (limits: 8192.000 MiB, 8192 tokens, 412019 est)
+28.20.333.206 I srv        update:    - prompt 0x5e0739d1a230:     249 tokens, checkpoints:  1,     4.628 MiB
+28.20.333.207 I srv        update:    - prompt 0x5e0738472c70:     933 tokens, checkpoints:  2,    23.259 MiB
+28.20.333.208 I srv        update:    - prompt 0x5e07384c1370:    1052 tokens, checkpoints:  3,    29.712 MiB
+28.20.333.209 I srv        update:    - prompt 0x5e0736f350f0:    1059 tokens, checkpoints:  3,    29.853 MiB
+28.20.333.209 I srv        update:    - prompt 0x5e0739e2f040:    1031 tokens, checkpoints:  2,    25.572 MiB
+28.20.333.219 I srv        update:    - prompt 0x5e07358bfc90:    1012 tokens, checkpoints:  2,    25.070 MiB
+28.20.333.220 I srv        update:    - prompt 0x5e073c03f050:     958 tokens, checkpoints:  2,    23.821 MiB
+28.20.333.221 I srv        update:    - prompt 0x5e07387ca780:     954 tokens, checkpoints:  2,    23.286 MiB
+28.20.333.222 I srv        update:    - prompt 0x5e07357f5820:     996 tokens, checkpoints:  2,    24.417 MiB
+28.20.333.222 I srv        update:    - prompt 0x5e072e594e80:    5141 tokens, checkpoints:  3,    58.616 MiB
+28.20.333.223 I srv        update:    - prompt 0x5e072e56d180:     210 tokens, checkpoints:  1,     5.303 MiB
+28.20.333.224 I srv        update:    - prompt 0x5e072e593570:    1118 tokens, checkpoints:  2,    30.420 MiB
+28.20.333.224 I srv        update:    - prompt 0x5e07389d84a0:    2819 tokens, checkpoints:  2,    44.623 MiB
+28.20.333.226 I srv  get_availabl: prompt cache update took 27.54 ms
+28.20.333.340 I slot launch_slot_: id  0 | task 5427 | processing task, is_child = 0
+28.20.333.354 I slot update_slots: id  0 | task 5427 | Checking checkpoint with [259, 1282] against 0...
+28.20.333.355 I slot update_slots: id  0 | task 5427 | Checking checkpoint with [0, 879] against 0...
+28.20.337.854 W slot update_slots: id  0 | task 5427 | restored context checkpoint (pos_min = 0, pos_max = 879, n_tokens = 880, n_past = 199, size = 9.679 MiB)
+28.20.337.863 W slot update_slots: id  0 | task 5427 | erased invalidated context checkpoint (pos_min = 0, pos_max = 879, n_tokens = 880, n_swa = 512, pos_next = 199, size = 9.679 MiB)
+28.20.337.866 W slot update_slots: id  0 | task 5427 | erased invalidated context checkpoint (pos_min = 259, pos_max = 1282, n_tokens = 1283, n_swa = 512, pos_next = 199, size = 11.262 MiB)
+28.20.340.718 I slot create_check: id  0 | task 5427 | created context checkpoint 1 of 32 (pos_min = 0, pos_max = 198, n_tokens = 199, size = 2.189 MiB)
+28.20.666.828 I slot print_timing: id  0 | task 5427 | prompt eval time =     333.46 ms /     8 tokens (   41.68 ms per token,    23.99 tokens per second)
+28.20.666.833 I slot print_timing: id  0 | task 5427 |        eval time =       0.00 ms /     1 tokens (    0.00 ms per token, 1000000.00 tokens per second)
+28.20.666.834 I slot print_timing: id  0 | task 5427 |       total time =     333.46 ms /     9 tokens
+28.20.666.835 I slot print_timing: id  0 | task 5427 |    graphs reused =       5324
+28.20.666.882 I slot      release: id  0 | task 5427 | stop processing: n_tokens = 207, truncated = 0
+28.20.666.907 I srv  update_slots: all slots are idle
+28.48.740.999 I srv    operator(): operator(): cleaning up before exit...

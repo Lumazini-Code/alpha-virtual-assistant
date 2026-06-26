@@ -153,7 +153,7 @@ THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     ),
 }
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ava.orchestrator")
 
 
@@ -792,31 +792,17 @@ async def _run_step_with_retry(step_num, action, executor, context, req, stream_
     
 
 async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue] = None) -> tuple[list[StepResult], dict[str, Any], bool]:
-    # 🚨 LOG DE RASTREAMENTO 1: Onde o unhashable type costuma ocorrer
-    try:
-        step_map = {s["step"]: s for s in steps}
-        pending = set(step_map.keys())
-        
-        dependents = set()
-        for s in steps:
-            for d in (s.get("depends_on") or []):
-                dependents.add(d)
-                
-        output_steps = {s["step"] for s in steps if s["step"] not in dependents}
-    except TypeError as e:
-        log.error("🚨🚨🚨 ERRO UNHASHABLE DETECTADO EM _execute_plan 🚨🚨🚨")
-        log.error(f"Tipo do erro: {e}")
-        # Faz um dump completo da lista de steps para vermos o que o CoT enviou
-        log.error(f"ESTRUTURA DOS STEPS RECEBIDOS: {json.dumps(steps, indent=2, default=str, ensure_ascii=False)}")
-        # Identifica qual step específico tem o problema
-        for idx, s in enumerate(steps):
-            if not isinstance(s.get("step"), int):
-                log.error(f"👉 CULPADO: O step no índice {idx} tem 'step' como {type(s.get('step'))} -> Valor: {s.get('step')}")
-            if s.get("depends_on"):
-                for d in s["depends_on"]:
-                    if not isinstance(d, int):
-                        log.error(f"👉 CULPADO: depends_on contém {type(d)} -> Valor: {d}")
-        raise e  # Relança o erro após logar
+    step_map = {s["step"]: s for s in steps}
+    pending = set(step_map.keys())
+    
+    dependents = set()
+    for s in steps:
+        for d in (s.get("depends_on") or []):
+            dependents.add(d)
+            
+    output_steps = {s["step"] for s in steps if s["step"] not in dependents}
+    # Faz um dump completo da lista de steps para vermos o que o CoT enviou
+    log.info(f"ESTRUTURA DOS STEPS RECEBIDOS: {json.dumps(steps, indent=2, default=str, ensure_ascii=False)}")
 
     results = {}
     context = {}
@@ -1063,8 +1049,6 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 raw = pd.get("steps", [])
                 plan_cache = pd.get("from_cache", False)
                 
-                # 🚨 LOG DE RASTREAMENTO 2: O que o CoT mandou?
-                log.debug(f"🧠 Resposta bruta do CoT: {json.dumps(raw, indent=2, default=str, ensure_ascii=False)}")
                 
             except Exception as e:
                 yield _sse("error", {"error": f"CoT falhou: {e}"})
@@ -1072,9 +1056,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
 
             if raw:
                 # Log de antes e depois da sanitização
-                log.debug(f"🧠 ANTES do _sanitize_steps: {raw}")
                 raw = _sanitize_steps(raw)
-                log.debug(f"🧠 DEPOIS do _sanitize_steps: {json.dumps(raw, indent=2, default=str, ensure_ascii=False)}")
                 
                 # ... (resto do código continua)
                 # ── Aplica saneamento para evitar erro de unhashable type ──
