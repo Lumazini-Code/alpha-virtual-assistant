@@ -26,3 +26,4 @@ Manager/deps/**
 Manager/build/**
 Manager/incremental/**
 Manager/.fingerprint/**
+Manager/ava-tray
