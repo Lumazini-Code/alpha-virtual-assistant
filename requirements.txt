@@ -46,3 +46,9 @@ supertonic>=0.1.0
 supervisor>=4.2.5
 
 bs4
+
+psutil
+
+pyfiglet
+
+textual

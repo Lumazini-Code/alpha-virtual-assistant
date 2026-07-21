@@ -1,0 +1,5 @@
+# rename this arquive from "env" to ".env"
+
+# You can get your API key from https://console.groq.com/keys and set it here
+
+GROQ_API_KEY=YOUR KEY HERE 

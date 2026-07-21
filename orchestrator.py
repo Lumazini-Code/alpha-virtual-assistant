@@ -552,7 +552,18 @@ async def _stream_llm(
     return full_response
 
 
-async def _adapt_llm(action, context, req, stream_tts=False, step_queue=None, step_num=None) -> str:
+async def _adapt_llm(action, context, req, stream_tts=False, step_queue=None, step_num=None, thinking_depth=0, is_final_llm: bool = False) -> str:
+    """
+    Executa um step LLM.
+
+    is_final_llm=True  → step é o último LLM do plano CoT: streama
+                         delta + reasoning para a UI em tempo real
+                         (via step_queue) e dispara TTS.
+    is_final_llm=False → step LLM intermediário: NÃO streama para a
+                         UI (apenas acumula full_resp internamente).
+                         É puro processamento interno — o usuário não
+                         deve ver a resposta parcial.
+    """
     ctx = _format_context_for_llm(action, context)
     msg = f"{action}\n\n{ctx}" if ctx else action
     
@@ -565,21 +576,31 @@ async def _adapt_llm(action, context, req, stream_tts=False, step_queue=None, st
                 voice=req.voice,
                 lang=req.lang,
                 tts=stream_tts,
+                thinking_depth=thinking_depth,
                 session_id=req.session_id or "default",
             ):
                 if event_type == "reasoning":
-                    await step_queue.put({
-                        "type": "step_reasoning", 
-                        "step": step_num, 
-                        "data": data
-                    })
+                    # Só repassa raciocínio para a UI se for o último LLM.
+                    # Raciocínio de step intermediário é interno.
+                    if is_final_llm:
+                        await step_queue.put({
+                            "type": "step_reasoning", 
+                            "step": step_num, 
+                            "data": data
+                        })
                 elif event_type == "delta":
                     full_resp += data
-                    await step_queue.put({
-                        "type": "step_delta", 
-                        "step": step_num, 
-                        "data": data
-                    })
+                    # Só streama token a token para a UI se for o
+                    # último LLM do plano. Caso contrário, apenas
+                    # acumula internamente — o resultado completo vai
+                    # para o contexto (context[f"step_{N}"]) e poderá
+                    # ser usado pelos steps seguintes.
+                    if is_final_llm:
+                        await step_queue.put({
+                            "type": "step_delta", 
+                            "step": step_num, 
+                            "data": data
+                        })
             return full_resp
         except Exception as e:
             await step_queue.put({
@@ -731,7 +752,7 @@ def _format_context_for_llm(action, context):
     if not keys: return ""
     return "\n\n".join([f"[Step {k.split('_')[1]} result]\n{_result_to_text(context[k])}" for k in sorted(keys)])[:MAX_CONTEXT_CHARS]
 
-async def _run_step_with_retry(step_num, action, executor, context, req, stream_tts=False, step_queue=None) -> StepResult:
+async def _run_step_with_retry(step_num, action, executor, context, req, stream_tts=False, step_queue=None, thinking_depth=0, is_final_llm: bool = False) -> StepResult:
     # Sanitiza executor caso venha como dict
     if isinstance(step_num, dict):
         step_num = step_num.get("id") or step_num.get("step") or step_num.get("num") or 0
@@ -760,7 +781,7 @@ async def _run_step_with_retry(step_num, action, executor, context, req, stream_
         try:
             if executor == "llm":
                 res = await asyncio.wait_for(
-                    adapter(res_act, context, req, stream_tts=(stream_tts or req.tts), step_queue=step_queue, step_num=step_num),
+                    adapter(res_act, context, req, stream_tts=(stream_tts or req.tts), step_queue=step_queue, step_num=step_num, thinking_depth=thinking_depth, is_final_llm=is_final_llm),
                     timeout=EXECUTOR_TIMEOUTS.get(executor, 30.0),
                 )
             else:
@@ -791,7 +812,7 @@ async def _run_step_with_retry(step_num, action, executor, context, req, stream_
     
     
 
-async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue] = None) -> tuple[list[StepResult], dict[str, Any], bool]:
+async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue] = None, thinking_depth: int = 0) -> tuple[list[StepResult], dict[str, Any], bool, Optional[int]]:
     step_map = {s["step"]: s for s in steps}
     pending = set(step_map.keys())
     
@@ -803,6 +824,22 @@ async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue
     output_steps = {s["step"] for s in steps if s["step"] not in dependents}
     # Faz um dump completo da lista de steps para vermos o que o CoT enviou
     log.info(f"ESTRUTURA DOS STEPS RECEBIDOS: {json.dumps(steps, indent=2, default=str, ensure_ascii=False)}")
+
+    # ── NOVO: identifica o ÚLTIMO step LLM do plano ──────────────────
+    # Apenas esse step faz stream de delta/reasoning para a UI e
+    # dispara TTS. Os demais LLM steps são processamento interno
+    # (sumarização, geração de sub-queries, etc.) e não devem
+    # aparecer para o usuário.
+    final_llm_step: Optional[int] = None
+    for s in steps:
+        sn = s["step"]
+        ex = s.get("executor")
+        if isinstance(ex, dict):
+            ex = ex.get("name") or ex.get("executor") or "llm"
+        ex = str(ex).lower() if ex else "llm"
+        if ex == "llm" and (final_llm_step is None or sn > final_llm_step):
+            final_llm_step = sn
+    log.info(f"Final LLM step (delta+TTS para UI): {final_llm_step}")
 
     results = {}
     context = {}
@@ -844,8 +881,10 @@ async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue
         batch = await asyncio.gather(*[
             _run_step_with_retry(
                 sn, step_map[sn]["action"], step_map[sn]["executor"], context, req,
-                stream_tts=(sn in output_steps and step_map[sn]["executor"] == "llm" and req.tts),
+                stream_tts= (sn == final_llm_step and step_map[sn]["executor"] == "llm" and req.tts),
                 step_queue=step_queue,
+                thinking_depth=thinking_depth,
+                is_final_llm=(sn == final_llm_step),
             )
             for sn in ready
         ])
@@ -854,7 +893,8 @@ async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue
             results[sr.step] = sr
             pending.discard(sr.step)
             context[f"step_{sr.step}"] = sr.result if sr.success else None
-            if sr.success and sr.step in output_steps and sr.executor == "llm" and req.tts:
+            # TTS só dispara no último LLM (mesma condição de stream_tts)
+            if sr.success and sr.step == final_llm_step and sr.executor == "llm" and req.tts:
                 tts_fired = True
             
             # ── NOTIFICAÇÃO DE CONCLUSÃO (Tempo Real) ──
@@ -863,7 +903,7 @@ async def _execute_plan(steps, req, strategy, step_queue: Optional[asyncio.Queue
 
     if step_queue is not None:
         await step_queue.put(None)  # sentinela
-    return [results[sn] for sn in sorted(results.keys())], context, tts_fired
+    return [results[sn] for sn in sorted(results.keys())], context, tts_fired, final_llm_step
     
 
 async def _fire_tts(text, req):
@@ -885,7 +925,8 @@ async def _stream_llm_chunks(
     tts: bool = False,
     session_id: str = "default",
     max_turns: int = 10,
-    stream_reasoning: bool = True,  # ← NOVO PARÂMETRO
+    stream_reasoning: bool = True, 
+    thinking_depth: int = 0,
 ):
     """
     Gerador que yielda tuplas (event_type, data):
@@ -903,7 +944,8 @@ async def _stream_llm_chunks(
                 "tts": tts,
                 "session_id": session_id,
                 "max_turns": max_turns,
-                "stream_reasoning": stream_reasoning,  # ← ENVIAR PARA O LLM
+                "stream_reasoning": stream_reasoning, 
+                "thinking_depth": thinking_depth
             },
         ) as resp:
             resp.raise_for_status()
@@ -951,7 +993,8 @@ async def _execute_stream_generator(req: ExecuteRequest):
     sid = req.session_id or str(uuid.uuid4())
     log.info(f"[{eid[:8]}] Executando (stream): '{req.input[:80]}'")
     try:
-        req.input = await _add_think_instruction(req)
+        depth, think_instruction = await _add_think_instruction(req)
+        req.input = f"[Reasoning depth: {depth}/10]\n{think_instruction}\n\n{req.input}"
         log.info(f"[{eid[:8]}] Think depth aplicado")
     except Exception as e:
         log.warning(f"[{eid[:8]}] _verify_think falhou, usando input original: {e}")
@@ -998,6 +1041,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                     async for event_type, data in _stream_llm_chunks(
                         action,
                         voice=req.voice,
+                        thinking_depth=depth,
                         lang=req.lang,
                         tts=req.tts,
                         session_id=sid,
@@ -1071,7 +1115,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 # ── Executa com notificações em tempo real via Queue ──────────
                 step_queue: asyncio.Queue = asyncio.Queue()
                 plan_task = asyncio.create_task(
-                    _execute_plan(raw, req, req.strategy, step_queue)
+                    _execute_plan(raw, req, req.strategy, step_queue, depth)
                 )
 
                 while True:
@@ -1101,7 +1145,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                             "error":      sr.error,
                         })
 
-                step_results, context, tts_already_fired = await plan_task
+                step_results, context, tts_already_fired, final_llm_step = await plan_task
 
                 # ── Monta resposta final ──
                 succ = [s for s in step_results if s.success]
@@ -1142,7 +1186,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                                 elif not s.result.get("hash_match", True):
                                     reindex_info = " (hash diferente — reindexado)"
                                 final_response = (
-                                    f"📄 Arquivo: {file_path}{reindex_info}"
+                                    f"\U0001F4C4 Arquivo: {file_path}{reindex_info}"
                                     f"\n\n{content}"
                                 )
                                 yield _sse("result", final_response)  # TEXTO PURO
@@ -1150,15 +1194,37 @@ async def _execute_stream_generator(req: ExecuteRequest):
                                 break
 
                     if not local_scraping_handled:
-                        last = succ[-1]
-                        # Último step é LLM/deep_search com texto útil → enviar direto
+                        # ── NOVO: procura o último LLM bem-sucedido ──
+                        # Em vez de olhar apenas succ[-1] (que pode não
+                        # ser LLM), identificamos explicitamente o
+                        # último step LLM que completou com sucesso.
+                        # Esse é o step cujos deltas já foram (ou deveriam
+                        # ter sido) streamados para a UI — quando
+                        # final_llm_step coincide, NÃO emitimos `result`
+                        # novamente, evitando duplicação de texto na UI.
+                        last_llm_succ = None
+                        for s in succ:
+                            if s.executor == "llm":
+                                last_llm_succ = s
+
                         if (
-                            last.executor in ("llm", "deep_search")
-                            and isinstance(last.result, str)
-                            and len(last.result) > 20
+                            last_llm_succ is not None
+                            and isinstance(last_llm_succ.result, str)
+                            and len(last_llm_succ.result) > 20
                         ):
-                            final_response = last.result
-                            yield _sse("result", final_response)  # TEXTO PURO
+                            # Último LLM tem texto útil — usar como resposta final.
+                            final_response = last_llm_succ.result
+                            # Se esse step já foi streamado via deltas
+                            # (is_final_llm=True), NÃO reemitir como `result`.
+                            # Apenas o `done` event carregará o final_response
+                            # para fins de persistência/auditoria.
+                            if last_llm_succ.step != final_llm_step:
+                                # Caso raro: o último LLM bem-sucedido não
+                                # é o final_llm_step esperado (ex.: final
+                                # falhou mas outro LLM depois dele completou).
+                                # Garante que a UI receba o texto.
+                                yield _sse("result", final_response)
+                            # else: deltas já foram enviados; nada a emitir.
                         else:
                             # ── Síntese via LLM em streaming ──
                             parts = [
@@ -1176,6 +1242,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                                 try:
                                     async for event_type, data in _stream_llm_chunks(
                                         synthesis_prompt,
+                                        thinking_depth=depth,
                                         voice=req.voice,
                                         lang=req.lang,
                                         tts=req.tts,
@@ -1271,7 +1338,7 @@ single-digit ::= [0-9]
                     "Given a user input, respond with a single integer from 0 to 10 "
                     "representing how much deep reasoning or complex thinking is required. "
                     "0 = trivial (greetings, simple facts). "
-                    "10 = very complex (multi-step reasoning, math proofs, deep research). "
+                    "10 = very complex (multi-step reasoning, math proofs, deep research, complex coding). "
                     "Respond with the number only. No explanation, no punctuation."
                 ),
             },
@@ -1284,6 +1351,8 @@ single-digit ::= [0-9]
             {"role": "assistant", "content": "4"},
             {"role": "user",      "content": "Pesquise sobre os impactos econômicos da IA e resuma em tópicos."},
             {"role": "assistant", "content": "7"},
+            {"role": "user",      "content": "Gere um código pra mim que resolva o problema do caixeiro viajante usando programação dinâmica."},
+            {"role": "assistant", "content": "10"},
             {"role": "user",      "content": "Prove que existem infinitos números primos e explique cada passo."},
             {"role": "assistant", "content": "10"},
             # Actual user input
@@ -1308,9 +1377,8 @@ single-digit ::= [0-9]
 async def _add_think_instruction(req: ExecuteRequest) -> str:
     depth = await _verify_think(req)
     think_instruction = THINK_DEPTH_INSTRUCTIONS[depth]
+    return depth, think_instruction
 
-    # Injeta como system message adicional ou prefixo do contexto
-    return f"[Reasoning depth: {depth}/10]\n{think_instruction}\n\n{req.input}"
 # ══════════════════════════════════════════════════════════════════════════════
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════

@@ -8,6 +8,7 @@ import re
 import subprocess
 import logging
 import sys
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -28,6 +29,14 @@ from Modules.local_scraping import status
 
 with open("ava_ui.log", "w") as f:
     f.write("")
+
+# CORREÇÃO #6: arquivo dedicado para o log bruto do container Docker
+# (stdout+stderr unificados). Usado por _read_docker_log() para que o
+# usuário sempre tenha uma cópia completa e fácil de selecionar/copiar
+# fora dos limites de renderização do widget RichLog da TUI.
+with open("ava_docker.log", "w", encoding="utf-8") as f:
+    f.write("")
+_docker_log_file = open("ava_docker.log", "a", encoding="utf-8", buffering=1)
 
 global chosen
 API_BASE = "http://localhost:9001"
@@ -84,13 +93,10 @@ DIM   = "#333333"
 TAGLINE = "Any model. Every tool. Zero limits."
 
 # ─────────────────────────────────────────
-# CORREÇÃO #4: regex para remover sequências ANSI cruas
-# (ex: cores de terminal emitidas pelo container docker) antes de
-# escrever no RichLog. Sem isso, escape codes como \x1b[31m ou
-# \x1b[2J podem ser interpretados pelo terminal real e quebrar o
-# redraw da TUI, fazendo texto "vazar" para posições erradas da tela.
+# NOTA: a remoção de sequências ANSI cruas do log do Docker agora é
+# feita por Text.from_ansi() (ver DockerLog.write), que faz o parsing
+# completo em vez de um regex parcial. Ver histórico da CORREÇÃO #4.
 # ─────────────────────────────────────────
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 # ─────────────────────────────────────────
@@ -441,15 +447,21 @@ class CoTPlanRow(Widget):
 
     DEFAULT_CSS = f"""
     CoTPlanRow {{
-        height: 2;
+        height: auto;
+        min-height: 2;
         padding: 0 0 0 6;
         border-bottom: solid #111111;
     }}
-    .cpr-header {{ color: #555555; }}
-    .cpr-action  {{ color: #333333;  padding: 0 0 0 2; }}
-    CoTPlanRow.-running  .cpr-header {{ color: #E4A012; }}
-    CoTPlanRow.-done     .cpr-header {{ color: #4CAF7D; }}
-    CoTPlanRow.-error    .cpr-header {{ color: #E45012; }}
+    .cpr-header {{ color: #888888; }}
+    .cpr-action  {{ color: #BBBBBB;  padding: 0 0 0 2; }}
+    CoTPlanRow.-pending .cpr-header {{ color: #777777; }}
+    CoTPlanRow.-pending .cpr-action  {{ color: #666666; }}
+    CoTPlanRow.-running .cpr-header {{ color: #E4A012; text-style: bold; }}
+    CoTPlanRow.-running .cpr-action  {{ color: #FFD080; }}
+    CoTPlanRow.-done    .cpr-header {{ color: #4CAF7D; }}
+    CoTPlanRow.-done    .cpr-action  {{ color: #88BBAA; }}
+    CoTPlanRow.-error   .cpr-header {{ color: #E45012; }}
+    CoTPlanRow.-error   .cpr-action  {{ color: #FF8866; }}
     """
 
     def __init__(self, step_num: int, executor: str, action: str,
@@ -464,11 +476,15 @@ class CoTPlanRow(Widget):
     def compose(self) -> ComposeResult:
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         yield Static(
-            f"○ Step {self.step_num} [{self.executor}]{dep_str}",
-            classes="cpr-header"
+            f"\u25cb Step {self.step_num} [{self.executor}]{dep_str}",
+            classes="cpr-header",
+            markup=False,
         )
-        preview = self.action[:90] + ("…" if len(self.action) > 90 else "")
-        yield Static(preview, classes="cpr-action")
+        # Sem truncamento: deixa o Static envolver (wrap) naturalmente.
+        # Antes era self.action[:90] + "\u2026" — cortava descrições
+        # comuns de 95-130 chars no meio, dando a impressão de que
+        # o widget "não mostrava o que o step vai executar".
+        yield Static(self.action, classes="cpr-action", markup=False)
 
     def set_running(self) -> None:
         # CORREÇÃO #1: blinda contra chamadas antes do widget estar
@@ -480,7 +496,7 @@ class CoTPlanRow(Widget):
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         try:
             self.query(".cpr-header", Static).first().update(
-                f"⏳ Step {self.step_num} [{self.executor}]{dep_str}"
+                f"\u23f3 Step {self.step_num} [{self.executor}]{dep_str}"
             )
         except Exception:
             return
@@ -488,20 +504,29 @@ class CoTPlanRow(Widget):
         self.set_class(True,  "-running")
 
     def set_done(self, success: bool, latency_ms: float, error: str = None) -> None:
-        # CORREÇÃO #1 (mesma lógica para set_done)
+        # CORREÇÃO: antes este método limpava a action (update("")) e
+        # colapsava height=1. Isso apagava a descrição do step assim
+        # que ele terminava — dando a impressão de que o widget "não
+        # mostra se já foi concluído". Agora a action continua visível
+        # (em verde/vermelho) e a altura é preservada.
         if not self.is_mounted:
             return
-        icon    = "✓" if success else "✗"
-        err_str = f" — {error}" if error else ""
+        icon    = "\u2713" if success else "\u2717"
+        err_str = f"  \u2014 {error}" if error else ""
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         try:
             self.query(".cpr-header", Static).first().update(
-                f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}{dep_str}"
+                f"{icon} Step {self.step_num} [{self.executor}] "
+                f"{latency_ms:.0f}ms{err_str}{dep_str}",
+                markup=False,
             )
-            self.query(".cpr-action", Static).first().update("")
+            # Mantém a action visível — só reescreve para garantir refresh
+            self.query(".cpr-action", Static).first().update(
+                self.action, markup=False
+            )
         except Exception:
             return
-        self.styles.height = 1
+        # NÃO mexer em self.styles.height — preserva a altura
         self.set_class(False, "-running")
         self.set_class(False, "-pending")
         self.set_class(True,  "-done" if success else "-error")
@@ -622,12 +647,20 @@ class DockerLog(Widget):
         super().__init__(**kwargs)
         self._collapsed = False
         self._toggle_icon = "▶"  # ▶ = colapsado (lateral), ◀ = expandido
+        self._body: Optional[RichLog] = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="docker-header"):
             yield Static("● Docker", id="docker-title")
             yield Static(self._toggle_icon, id="docker-toggle")
         yield RichLog(id="docker-body", highlight=False, markup=False, max_lines=500)
+
+    def on_mount(self) -> None:
+        # CORREÇÃO #5: cacheia a referência do RichLog uma única vez.
+        # Antes, cada linha de log disparava um query_one() novo no DOM
+        # (custo desnecessário quando o container despeja dezenas de
+        # linhas por segundo).
+        self._body = self.query_one("#docker-body", RichLog)
 
     def on_click(self) -> None:
         """Toggle entre expandido e colapsado."""
@@ -636,16 +669,33 @@ class DockerLog(Widget):
         self._toggle_icon = "◀" if self._collapsed else "▶"
         self.query_one("#docker-toggle", Static).update(self._toggle_icon)
 
-    def write(self, line: str) -> None:
-        """Escreve uma linha no log."""
-        # CORREÇÃO #4: remove sequências ANSI cruas (cores/cursor do
-        # terminal do container) antes de escrever no RichLog, e
-        # protege contra escrever num widget já desmontado.
-        if not self.is_mounted:
+    def write(self, content) -> None:
+        """Escreve uma linha no log.
+
+        Aceita tanto `str` cru (saída do container, possivelmente com
+        ANSI) quanto um `rich.text.Text` já estilizado (usado para
+        mensagens de status internas, como "processo encerrado").
+        """
+        if not self.is_mounted or self._body is None:
             return
-        clean = _ANSI_RE.sub("", line)
+        # CORREÇÃO #4 (revisada): a versão anterior usava um regex que só
+        # cobria sequências CSI simples (\x1b[...letra). Sequências que
+        # ela NÃO pegava (OSC de título, save/restore de cursor, etc.,
+        # comuns em saída de container Docker/build) passavam intactas
+        # para o RichLog. Como esses bytes de escape sobreviviam até o
+        # terminal real e eram interpretados por ELE, o texto "pulava"
+        # para o meio da tela e sobrescrevia linhas já desenhadas
+        # (o efeito de "partes do log somem").
+        #
+        # Text.from_ansi() faz o parsing correto: converte códigos de
+        # cor/estilo (SGR) em spans de Style do Rich e descarta
+        # sequências de controle não suportadas, sem nunca deixar um
+        # \x1b cru dentro do texto final.
         try:
-            self.query_one("#docker-body", RichLog).write(clean.rstrip())
+            if isinstance(content, Text):
+                self._body.write(content)
+            else:
+                self._body.write(Text.from_ansi(str(content).rstrip("\n\r")))
         except Exception:
             return
 
@@ -675,7 +725,7 @@ async def stream_ava(
         "session_id": session_id,
         "voice": DEFAULT_VOICE,
         "lang": DEFAULT_LANG,
-        "tts": True,
+        "tts": False,
         "use_cache": True,
         "stream": True,
         "strategy": "parallel",
@@ -867,6 +917,13 @@ class ChatMessage(Widget):
         self.role    = role
         self.content = content
         self.msg_id  = msg_id or str(uuid.uuid4())[:8]
+        # ── Throttle de render ───────────────────────────────────
+        # Evita re-render O(n²): só reprocessa o Markdown/LaTeX no
+        # máximo a cada 80 ms durante o streaming, e força um flush
+        # final quando o stream termina (on_done / on_result).
+        self._last_render       = 0.0
+        self._dirty             = False
+        self._render_scheduled  = False
 
     def compose(self) -> ComposeResult:
         role = getattr(self, "role", "assistant")
@@ -892,13 +949,53 @@ class ChatMessage(Widget):
             yield Static(_render_rich(self.content), id="msg-body")
 
     def append_delta(self, delta: str):
+        """
+        Adiciona um chunk ao conteúdo e re-renderiza com throttle.
+
+        Antes: cada delta reprocessava TODO o conteúdo acumulado via
+        _render_rich (regex com DOTALL sobre a string inteira), gerando
+        um padrão O(n²). A partir de ~300-500 linhas o tempo de cada
+        render ultrapassava o intervalo entre deltas, a fila de
+        call_after_refresh crescia sem parar e a UI aparentava
+        'congelar' — mesmo o stream ainda chegando pelo httpx.
+
+        Agora: só re-renderiza no máximo a cada 80 ms. Um timer cuida
+        do flush do último chunk pendente. Render final forçado via
+        force_flush() no on_done / on_result.
+        """
         if not self.is_mounted:
             return
         self.content += delta
+        self._dirty  = True
+        now = time.monotonic()
+        elapsed = now - self._last_render
+        if elapsed < 0.08:  # 80 ms throttle
+            if not self._render_scheduled:
+                self._render_scheduled = True
+                self.set_timer(0.08 - elapsed, self._flush_render)
+            return
+        self._flush_render()
+
+    def _flush_render(self):
+        """Executa o render pendente (chamado direto ou via set_timer)."""
+        self._render_scheduled = False
+        if not self._dirty or not self.is_mounted:
+            return
+        self._dirty       = False
+        self._last_render = time.monotonic()
         try:
             self.query_one("#msg-body", Static).update(_render_rich(self.content))
         except Exception:
             return
+
+    def force_flush(self):
+        """Força um render completo — chamar no on_done / on_result."""
+        self._render_scheduled = False
+        self._dirty            = True
+        self._flush_render()
+        # Força o Textual a recalcular o layout e altura do widget
+        if self.is_mounted:
+            self.refresh(layout=True)
 
     def append_reasoning(self, reasoning: str) -> None:
         """Adiciona reasoning ao ThinkingBox."""
@@ -1176,6 +1273,14 @@ class AlphaAI(App):
             log.warning("DockerLog ainda não montado, abortando leitura")
             return
 
+        # CORREÇÃO #6: além de mostrar no widget (que não suporta
+        # seleção de texto nativa do Textual — só a do terminal, com
+        # tecla modificadora), grava cada linha também em
+        # ava_docker.log. Isso dá um jeito confiável de copiar o log
+        # inteiro: basta abrir o arquivo em qualquer editor de texto
+        # e selecionar tudo. Sem isso, o conteúdo do container fica
+        # preso só dentro do widget da TUI.
+        global _docker_log_file
         loop = asyncio.get_event_loop()
 
         try:
@@ -1183,16 +1288,20 @@ class AlphaAI(App):
                 line = await loop.run_in_executor(None, proc.stdout.readline)
                 if not line:
                     if self.is_running:
-                        docker_log.write("[dim]--- processo encerrado ---[/]")
+                        docker_log.write(Text("--- processo encerrado ---", style="dim"))
                     break
                 # ✅ CORRIGIDO: line já é string (text=True), não precisa de .decode()
+                try:
+                    _docker_log_file.write(line if line.endswith("\n") else line + "\n")
+                except Exception:
+                    pass
                 if self.is_running:
-                    docker_log.write(line.rstrip())
+                    docker_log.write(line)
         except Exception as e:
             log.error(f"Erro na leitura do Docker log: {e}")
             if self.is_running:
                 try:
-                    docker_log.write(f"[red]Erro: {e}[/]")
+                    docker_log.write(Text(f"Erro: {e}", style="red"))
                 except Exception:
                     pass
 
@@ -1251,9 +1360,12 @@ class AlphaAI(App):
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         
         async def on_delta(delta: str):
+            # CORREÇÃO: NÃO chamar finish_thinking() aqui — era redundante
+            # (chamado a cada chunk) e somava trabalho ao render O(n²).
+            # finish_thinking() é delegado ao on_done / on_result.
             try:
-                ai_msg.finish_thinking()
                 ai_msg.append_delta(delta)
+                
                 self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
             except Exception as e:
                 log.error(f"Erro em on_delta: {e}\n{traceback.format_exc()}")
@@ -1332,6 +1444,7 @@ class AlphaAI(App):
             try:
                 ai_msg.finish_thinking()
                 ai_msg.append_delta(text)
+                ai_msg.force_flush()  # render final completo
                 self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
             except Exception as e:
                 log.error(f"Erro em on_result: {e}\n{traceback.format_exc()}")
@@ -1347,6 +1460,7 @@ class AlphaAI(App):
         async def on_done(event: dict):
             try:
                 ai_msg.finish_thinking()
+                ai_msg.force_flush()  # garante texto 100% renderizado
                 lat    = event.get("total_latency_ms", 0)
                 errs   = event.get("errors", [])
                 route  = event.get("route", "?")
@@ -1465,6 +1579,33 @@ if __name__ == "__main__":
     proc_docker = None
     container_name = "ava-vulkan"
 
+    def _wait_for_container(timeout: float = 30.0, interval: float = 1.0) -> bool:
+        """
+        Espera o container aparecer no `docker ps` antes de tentar ler
+        os logs dele.
+
+        CORREÇÃO: antes, se o container ainda não tivesse subido no
+        momento em que a UI chamava _try_docker_logs() (ex: o endpoint
+        /docker/start já respondeu 200, mas o container ainda está
+        sendo criado), a leitura de logs falhava uma única vez com
+        "no such container" e NUNCA mais era tentada — o painel de
+        logs ficava vazio pelo resto da sessão. Agora esperamos até
+        `timeout` segundos, checando a cada `interval`.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                result = subprocess.run(
+                    ["docker", "ps", "-q", "-f", f"name={container_name}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.stdout.strip():
+                    return True
+            except Exception as e:
+                log.warning(f"Erro ao checar se o container subiu: {e}")
+            time.sleep(interval)
+        return False
+
     def _try_docker_logs() -> Optional[subprocess.Popen]:
         """Tenta docker logs com o ambiente atual do Python."""
         # Debug: mostra qual docker o Python está encontrando
@@ -1488,42 +1629,33 @@ if __name__ == "__main__":
         except Exception as e:
             log.warning(f"Não consegui listar docker context: {e}")
 
+        # CORREÇÃO: espera o container existir antes de tentar ler
+        # logs, em vez de tentar uma única vez e desistir de vez.
+        log.info(f"Aguardando container '{container_name}' subir...")
+        if not _wait_for_container():
+            log.error(f"Container '{container_name}' não apareceu em 30s.")
+            return None
+
         # Tenta o docker logs
         try:
             proc = subprocess.Popen(
                 ["docker", "logs", "-f", container_name],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,  # ← Captura stderr separado para debug
+                # CORREÇÃO: stderr=STDOUT em vez de PIPE separado.
+                # A maior parte da saída dos serviços (logging/uvicorn
+                # em Python vai para stderr por padrão) — com um pipe
+                # separado que só era drenado para o arquivo de log
+                # (nunca para o widget da UI), o painel de logs
+                # mostrava só uma fração mínima do que `docker logs`
+                # realmente exibe. Unificando os streams,
+                # _read_docker_log() (que já lê stdout) passa a
+                # receber TUDO.
+                stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1
             )
-            
-            # Lê a primeira linha do stderr para detectar erro imediato
-            import select
-            # No Windows não tem select para pipes, usa threading
-            import threading
-            stderr_lines = []
-            
-            def read_stderr():
-                for line in proc.stderr:
-                    stderr_lines.append(line)
-                    log.warning(f"docker logs stderr: {line.strip()}")
-
-            t = threading.Thread(target=read_stderr, daemon=True)
-            t.start()
-            
-            # Dá 2 segundos para ver se erro aparece
-            t.join(timeout=2)
-            
-            if stderr_lines and "no such container" in stderr_lines[0].lower():
-                log.error(f"docker logs falhou: {stderr_lines[0].strip()}")
-                proc.terminate()
-                return None
-            
-            # Se chegou aqui, parece que funcionou
-            # Continua lendo stderr em background
             return proc
-            
+
         except FileNotFoundError:
             log.error("Comando 'docker' não encontrado no PATH do Python")
             return None

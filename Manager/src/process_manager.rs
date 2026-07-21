@@ -6,15 +6,114 @@
 
 use crate::state::{ProcStatus, SharedState};
 use anyhow::{bail, Context, Result};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 use tokio::net::TcpStream;
-
+use tokio::process::Command;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::fs::OpenOptions;
 /// Porta fixa do llama-server, igual ao script Python original.
 const LLAMA_PORT: u16 = 2001;
 const LLAMA_HOST: &str = "127.0.0.1";
+
+// ════════════════════════════════════════════════════════════════════════
+// Ringbuffer de log do llama-server
+// ════════════════════════════════════════════════════════════════════════
+
+/// Ringbuffer em memória para as últimas N linhas do log do llama-server.
+/// Acessível via API ou GUI sem precisar ler arquivos.
+#[derive(Debug)]
+pub struct LlamaLog {
+    /// Capacidade máxima do ringbuffer.
+    capacity: usize,
+    /// Linhas armazenadas (ordem de inserção).
+    lines: VecDeque<String>,
+}
+
+impl Default for LlamaLog {
+    fn default() -> Self {
+        Self::new(2000)
+    }
+}
+
+impl LlamaLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            lines: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Insere uma linha, descartando a mais antiga se necessário.
+    pub fn push(&mut self, line: String) {
+        if self.lines.len() >= self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+
+}
+
+/// Handle compartilhado do log — adicione ao `SharedState`.
+pub type SharedLlamaLog = Arc<TokioMutex<LlamaLog>>;
+
+/// Cria um novo handle de log com capacidade padrão de 2000 linhas.
+pub fn new_llama_log() -> SharedLlamaLog {
+    Arc::new(TokioMutex::new(LlamaLog::new(2000)))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Tarefa interna: drena um pipe linha a linha e loga via tracing
+// ════════════════════════════════════════════════════════════════════════
+
+/// Drena `reader` linha a linha, emitindo cada linha via `tracing` e
+/// acumulando no ringbuffer `log`.
+///
+/// `stream_label` diferencia stdout de stderr no log:
+///   - `"llama-server[out]"` para stdout
+///   - `"llama-server[err]"` para stderr
+async fn drain_pipe<R>(
+    mut reader: BufReader<R>,
+    stream_label: &'static str,
+    log: SharedLlamaLog,
+    file_writer: Option<Arc<TokioMutex<tokio::fs::File>>>,
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+                tracing::debug!(target: "llama-server", "[{}] {}", stream_label, trimmed);
+
+                // Escreve no arquivo de log, se disponível
+                if let Some(ref fw) = file_writer {
+                    let log_line = format!("[{stream_label}] {trimmed}\n");
+                    let _ = fw.lock().await.write_all(log_line.as_bytes()).await;
+                }
+
+                log.lock().await.push(trimmed);
+            }
+            Err(e) => {
+                tracing::warn!(target: "llama-server", "[{}] Erro ao ler pipe: {e}", stream_label);
+                break;
+            }
+        }
+    }
+    tracing::debug!(target: "llama-server", "[{}] <pipe fechado>", stream_label);
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // Parâmetros do llama-server (equivalentes a TEXT_PARAMS / VISION_PARAMS)
@@ -45,8 +144,8 @@ fn build_llama_args(model_path: &str, mmproj_path: Option<&str>) -> Vec<String> 
         ("--fit", "off"),
         ("--gpu-layers", "999"),
         ("--split-mode", "layer"),
-        ("--cache-type-k", "q4_0"),
-        ("--cache-type-v", "q4_0"),
+        ("--cache-type-k", "iq4_nl"),
+        ("--cache-type-v", "iq4_nl"),
         ("--threads", "4"),
         ("--threads-batch", "4"),
         ("--threads-http", threads_http),
@@ -60,6 +159,8 @@ fn build_llama_args(model_path: &str, mmproj_path: Option<&str>) -> Vec<String> 
         ("--repeat-penalty", "1.05"),
         ("--host", "0.0.0.0"),
         ("--port", &LLAMA_PORT.to_string()),
+        ("--spec-type", "draft-mtp"),
+        ("--spec-draft-n-max", "3"),
     ]));
 
     args.push("--flash-attn".into());
@@ -97,7 +198,7 @@ async fn is_port_listening(host: &str, port: u16) -> bool {
 /// Retorna o caminho do modelo se conseguir, ou None se falhar.
 async fn query_llama_model_info() -> Option<String> {
     let url = format!("http://{LLAMA_HOST}:{LLAMA_PORT}/props");
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -109,13 +210,16 @@ async fn query_llama_model_info() -> Option<String> {
     }
 
     let body: serde_json::Value = resp.json().await.ok()?;
-    
+
     // A API do llama-server retorna algo como:
     // { "model": "/path/to/model.gguf", "mmproj": "/path/to/mmproj.gguf", ... }
     let model_path = body.get("model")?.as_str()?.to_string();
-    
+
     // Tenta pegar mmproj também (pode não existir)
-    let _mmproj = body.get("mmproj").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let _mmproj = body
+        .get("mmproj")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Some(model_path)
 }
@@ -142,16 +246,13 @@ async fn find_pid_by_name(name: &str) -> Option<u32> {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     if cfg!(target_os = "windows") {
         // Formato CSV: "nome.exe","PID","..."
-        stdout
-            .lines()
-            .next()
-            .and_then(|line| {
-                let parts: Vec<&str> = line.split(',').collect();
-                parts.get(1)?.trim_matches('"').parse().ok()
-            })
+        stdout.lines().next().and_then(|line| {
+            let parts: Vec<&str> = line.split(',').collect();
+            parts.get(1)?.trim_matches('"').parse().ok()
+        })
     } else {
         // pgrep retorna apenas o PID (um por linha)
         stdout.lines().next()?.trim().parse().ok()
@@ -159,21 +260,26 @@ async fn find_pid_by_name(name: &str) -> Option<u32> {
 }
 
 /// Descobre se o llama-server já está rodando e atualiza o estado.
-/// Descobre se o llama-server já está rodando e atualiza o estado.
 async fn discover_llama_server(state: &SharedState) {
     tracing::info!("Verificando se llama-server já está em execução...");
 
     if !is_port_listening(LLAMA_HOST, LLAMA_PORT).await {
-        tracing::info!("Porta {} não está em uso, llama-server não está rodando.", LLAMA_PORT);
+        tracing::info!(
+            "Porta {} não está em uso, llama-server não está rodando.",
+            LLAMA_PORT
+        );
         return;
     }
 
-    tracing::info!("Porta {} está em uso, tentando identificar o modelo...", LLAMA_PORT);
+    tracing::info!(
+        "Porta {} está em uso, tentando identificar o modelo...",
+        LLAMA_PORT
+    );
 
     // Tenta obter info do modelo via API
     let model_path = query_llama_model_info().await;
-    
-    // ✅ CORRIGIDO: evita closure assíncrono usando um `if` direto
+
+    // Evita closure assíncrono usando um `if` direto
     let pid = find_pid_by_name("llama-server").await;
     let pid = if pid.is_some() {
         pid
@@ -209,9 +315,11 @@ async fn discover_docker(state: &SharedState) {
     tracing::info!("Verificando se Docker já está em execução...");
 
     // Procura o docker-compose.yml perto do script docker-start
-    let compose_file = state.docker_start_script.parent()
+    let compose_file = state
+        .docker_start_script
+        .parent()
         .map(|p| p.join("docker-compose.yml"));
-    
+
     let compose_file = match compose_file {
         Some(f) if f.exists() => f,
         _ => {
@@ -224,11 +332,15 @@ async fn discover_docker(state: &SharedState) {
     let output = Command::new("docker")
         .args([
             "compose",
-            "-f", compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile", "vulkan",
+            "-f",
+            compose_file.to_str().unwrap_or("docker-compose.yml"),
+            "--profile",
+            "vulkan",
             "ps",
-            "--status", "running",
-            "--format", "{{.Name}}",
+            "--status",
+            "running",
+            "--format",
+            "{{.Name}}",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -238,11 +350,14 @@ async fn discover_docker(state: &SharedState) {
     match output {
         Ok(out) if out.status.success() => {
             let running_containers = String::from_utf8_lossy(&out.stdout);
-            let count = running_containers.lines().filter(|l| !l.trim().is_empty()).count();
-            
+            let count = running_containers
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+
             if count > 0 {
                 tracing::info!("Docker detectado! {} container(s) rodando.", count);
-                
+
                 let mut docker = state.docker.lock().await;
                 docker.status = ProcStatus::Running;
                 docker.pid = None; // Não temos um PID único para o compose
@@ -263,20 +378,20 @@ async fn discover_docker(state: &SharedState) {
     }
 }
 
-/// ✅ PONTO DE ENTRADA: Descobre todos os processos que já estão rodando.
-/// 
+/// Ponto de entrada: descobre todos os processos que já estão rodando.
+///
 /// Chame isso na inicialização da aplicação, antes de iniciar a GUI ou API.
 /// Isso permite que o gerenciador "se conecte" a instâncias existentes,
 /// útil quando a aplicação é reiniciada sem derrubar os processos.
 pub async fn discover_running_processes(state: &SharedState) {
     tracing::info!("═══ Descobrindo processos em execução... ═══");
-    
+
     discover_llama_server(state).await;
     discover_docker(state).await;
-    
+
     let llama = state.llama.lock().await;
     let docker = state.docker.lock().await;
-    
+
     tracing::info!(
         "═══ Estado descoberto: llama-server={}, docker={} ═══",
         llama.status.label(),
@@ -289,7 +404,15 @@ pub async fn discover_running_processes(state: &SharedState) {
 // ════════════════════════════════════════════════════════════════════════
 
 /// Inicia o llama-server para o modelo informado.
-pub async fn start_llama(state: &SharedState, model_path: &str, mmproj_path: Option<&str>) -> Result<()> {
+///
+/// `log` é o ringbuffer compartilhado onde stdout/stderr do processo serão
+/// acumulados linha a linha. Passe `state.llama_log.clone()` no call-site.
+pub async fn start_llama(
+    state: &SharedState,
+    model_path: &str,
+    mmproj_path: Option<&str>,
+    log: SharedLlamaLog,
+) -> Result<()> {
     {
         let llama = state.llama.lock().await;
         if llama.status == ProcStatus::Running {
@@ -311,6 +434,9 @@ pub async fn start_llama(state: &SharedState, model_path: &str, mmproj_path: Opt
         llama.status = ProcStatus::Starting;
     }
 
+    // Limpa o log anterior antes de iniciar nova instância.
+    log.lock().await.clear();
+
     let args = build_llama_args(model_path, mmproj_path);
 
     tracing::info!(
@@ -319,15 +445,68 @@ pub async fn start_llama(state: &SharedState, model_path: &str, mmproj_path: Opt
         args.join(" ")
     );
 
-    let child = Command::new(&state.llama_server_bin)
+    // Cria o comando
+    let mut cmd = Command::new(&state.llama_server_bin);
+
+    // Faz o spawn com os pipes e argumentos
+    let mut child = cmd
         .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(false)
         .spawn()
         .context("Falha ao iniciar llama-server. Verifique o caminho do binário.")?;
 
     let pid = child.id();
+
+    // Drena stdout em task independente.
+    let log_file_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("llama-server.log");
+
+    let file_writer: Option<Arc<TokioMutex<tokio::fs::File>>> =
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_file_path)
+            .await
+        {
+            Ok(f) => {
+                tracing::info!("Log do llama-server será gravado em: {}", log_file_path.display());
+                Some(Arc::new(TokioMutex::new(f)))
+            }
+            Err(e) => {
+                tracing::warn!("Não foi possível criar arquivo de log '{}': {e}", log_file_path.display());
+                None
+            }
+        };
+
+    // Drena stdout em task independente.
+    if let Some(stdout) = child.stdout.take() {
+        let log_clone = log.clone();
+        let fw = file_writer.clone();
+        tokio::spawn(drain_pipe(
+            BufReader::new(stdout),
+            "llama-server[out]",
+            log_clone,
+            fw,
+        ));
+    }
+
+    // Drena stderr em task independente.
+    if let Some(stderr) = child.stderr.take() {
+        let log_clone = log.clone();
+        let fw = file_writer.clone();
+        tokio::spawn(drain_pipe(
+            BufReader::new(stderr),
+            "llama-server[err]",
+            log_clone,
+            fw,
+        ));
+    }
+
+    // Abandona o child sem derrubá-lo ao fazer drop — igual ao original.
     std::mem::forget(child);
 
     let mut llama = state.llama.lock().await;
@@ -338,6 +517,7 @@ pub async fn start_llama(state: &SharedState, model_path: &str, mmproj_path: Opt
     llama.port = LLAMA_PORT;
     llama.last_activity = Some(Instant::now());
 
+    tracing::info!("llama-server iniciado (PID: {:?}), log ativo.", pid);
     Ok(())
 }
 
@@ -355,8 +535,8 @@ pub async fn stop_llama(state: &SharedState) -> Result<()> {
     if let Some(pid) = pid {
         kill_process(pid).await?;
     } else {
-        // ✅ Se não temos PID (processo descoberto, não iniciado por nós),
-        // tentamos matar pelo nome
+        // Se não temos PID (processo descoberto, não iniciado por nós),
+        // tentamos matar pelo nome.
         kill_process_by_name("llama-server").await;
         #[cfg(windows)]
         kill_process_by_name("llama-server.exe").await;
@@ -453,11 +633,10 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
         docker.status = ProcStatus::Stopping;
     }
 
-    // Usa o caminho do estado para o down (funciona mesmo se não fomos nós quem iniciou)
     let script = &state.docker_start_script;
     let script_dir = script.parent().unwrap_or(script);
 
-    // Se o script não existe, tenta usar docker compose diretamente
+    // Se o script não existe, tenta usar docker compose diretamente.
     let result = if script.exists() {
         if cfg!(target_os = "windows") {
             Command::new(script)
@@ -478,14 +657,10 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
                 .await
         }
     } else {
-        // ✅ Fallback: chama docker compose diretamente
+        // Fallback: chama docker compose diretamente.
         tracing::warn!("Script não encontrado, usando docker compose diretamente...");
         Command::new("docker")
-            .args([
-                "compose",
-                "--profile", "vulkan",
-                "down",
-            ])
+            .args(["compose", "--profile", "vulkan", "down"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -613,9 +788,11 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
     }
 
     // Reusa a lógica de descoberta
-    let compose_file = state.docker_start_script.parent()
+    let compose_file = state
+        .docker_start_script
+        .parent()
         .map(|p| p.join("docker-compose.yml"));
-    
+
     let compose_file = match compose_file {
         Some(f) if f.exists() => f,
         _ => return true, // Não conseguimos verificar, assume que está ok
@@ -624,10 +801,13 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
     let output = Command::new("docker")
         .args([
             "compose",
-            "-f", compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile", "vulkan",
+            "-f",
+            compose_file.to_str().unwrap_or("docker-compose.yml"),
+            "--profile",
+            "vulkan",
             "ps",
-            "--status", "running",
+            "--status",
+            "running",
             "--quiet",
         ])
         .stdout(Stdio::piped())

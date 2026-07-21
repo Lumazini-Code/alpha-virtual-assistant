@@ -77,6 +77,24 @@ ST_CLEANUP_INTERVAL_S = 1800
 
 PC_HIT_THRESHOLD = 0.92
 
+# ── Otimização de tokens (reduzir payload enviado ao LLM) ─────────────────────
+# Evita erros 413 Payload Too Large no Groq quando o /read é chamado múltiplas
+# vezes pelo pipeline CoT → LLM (5 passos × N entradas × ~1KB cada).
+#
+# Estratégia em 3 camadas:
+#   1. Thresholds mais seletivos para o /read (combinação de 4 fontes)
+#   2. Teto de caracteres por entrada individual (trunca preservando palavra)
+#   3. Teto global de caracteres no resultado final (corta entradas de menor score)
+READ_TOP_K_FINAL        = 3        # era TOP_K_READ (5) — menos entradas no /read
+READ_TOTAL_MAX_CHARS    = 2400     # teto global de chars retornados pelo /read
+READ_LT_MAX_CHARS       = 600      # teto por entrada de memória de longo prazo
+READ_ST_MAX_CHARS       = 350      # teto menor para curto prazo (texto denso)
+READ_VS_MAX_CHARS       = 500      # teto para chunks de conhecimento (KG-RAG)
+READ_IF_MAX_CHARS       = 500      # teto para chunks de arquivos indexados
+READ_MIN_SCORE_STRICT   = 0.85     # mais seletivo que READ_MIN_SCORE (0.83)
+IF_MIN_SCORE_READ       = 0.82     # threshold p/ /read (era min(0.83,0.75)=0.75)
+                                   # corrige bug que retornava chunks demais de IF
+
 # ── Parâmetros de busca contextual ─────────────────────────────────────────────
 QUERY_SHORT_WORDS     = 6
 QUERY_AMBIGUOUS_RATIO = 0.55
@@ -951,6 +969,44 @@ app = FastAPI(title="AVA Memory API", lifespan=lifespan)
 
 # ── Helpers de busca contextual ────────────────────────────────────────────────
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    """
+    Trunca texto preservando o início e quebrando em fronteira de palavra.
+    Adiciona '...' quando truncado. Usado para reduzir tokens no /read.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    # Reserva 3 chars para '...'
+    cut = text[:max(max_chars - 3, 1)]
+    # Tenta cortar em fronteira de palavra para não cortar no meio de token
+    last_space = cut.rfind(' ')
+    if last_space > max_chars // 2:
+        cut = cut[:last_space]
+    return cut.rstrip() + "..."
+
+
+def _apply_token_budget(
+    entries: list[MemoryEntry],
+    total_max_chars: int,
+    top_k: int,
+) -> list[MemoryEntry]:
+    """
+    Aplica orçamento global de caracteres no resultado final do /read.
+    Corta entradas de menor score primeiro quando o total excede o teto.
+    """
+    if not entries:
+        return entries
+    # Primeiro garante o top_k
+    selected = entries[:top_k]
+    # Depois corta de trás pra frente (menor score) enquanto exceder o teto
+    while len(selected) > 1:
+        total = sum(len(e.text or "") for e in selected)
+        if total <= total_max_chars:
+            break
+        selected.pop()  # remove o último (menor score, já ordenado)
+    return selected
+
+
 def _classify_query(query: str) -> str:
     tokens = re.findall(r"\w+", query.lower())
     if not tokens:
@@ -1028,6 +1084,7 @@ def _build_lt_entries(
     lt_raw: list[tuple[int, float]],
     min_score: float,
     loop: asyncio.AbstractEventLoop,
+    max_chars: int = READ_LT_MAX_CHARS,
 ) -> list[MemoryEntry]:
     ids_filtered = [mid for mid, score in lt_raw if score >= min_score]
     score_map    = {mid: score for mid, score in lt_raw}
@@ -1037,7 +1094,7 @@ def _build_lt_entries(
     for row in state.lt_db.get_by_ids(ids_filtered):
         entries.append(MemoryEntry(
             id           = row["id"],
-            text         = row["text"],
+            text         = _truncate_text(row["text"], max_chars),
             score        = round(score_map[row["id"]], 4),
             confidence   = round(row["confidence"], 4),
             created_at   = row["created_at"],
@@ -1053,6 +1110,7 @@ def _build_st_entries(
     st_raw: list[tuple[int, float]],
     min_score: float,
     loop: asyncio.AbstractEventLoop,
+    max_chars: int = READ_ST_MAX_CHARS,
 ) -> list[MemoryEntry]:
     ids_filtered = [mid for mid, score in st_raw if score >= min_score]
     score_map    = {mid: score for mid, score in st_raw}
@@ -1063,10 +1121,23 @@ def _build_st_entries(
         score      = score_map[row["id"]]
         turns_data = json.loads(row["turns_json"])
         turns      = [Turn(**t) for t in turns_data]
-        text_repr  = " | ".join(f"[{t.role}] {t.content[:120]}" for t in turns)
+        # Representação compacta: prioriza último user turn, depois assistant
+        # Antes: " | ".join(f"[role] content[:120]" for t in turns) — acumulava
+        # Agora: apenas primeiro e último turn, cada um com 80 chars no máx
+        if len(turns) <= 2:
+            parts = [f"[{t.role}] {t.content[:100]}" for t in turns]
+        else:
+            first = turns[0]
+            last  = turns[-1]
+            parts = [
+                f"[{first.role}] {first.content[:80]}",
+                f"...(+{len(turns)-2} turns)...",
+                f"[{last.role}] {last.content[:100]}",
+            ]
+        text_repr = " | ".join(parts)
         entries.append(MemoryEntry(
             id           = row["id"],
-            text         = text_repr,
+            text         = _truncate_text(text_repr, max_chars),
             score        = round(score, 4),
             confidence   = 1.0,
             created_at   = row["created_at"],
@@ -1081,6 +1152,7 @@ def _build_st_entries(
 def _build_vs_entries(
     vs_results: list,
     min_score: float,
+    max_chars: int = READ_VS_MAX_CHARS,
 ) -> list[MemoryEntry]:
     if not vs_results:
         return []
@@ -1090,7 +1162,7 @@ def _build_vs_entries(
             continue
         entries.append(MemoryEntry(
             id           = ventry.id,
-            text         = ventry.text,
+            text         = _truncate_text(ventry.text, max_chars),
             score        = round(score, 4),
             confidence   = 1.0,
             created_at   = 0.0,
@@ -1108,6 +1180,7 @@ def _build_if_entries(
     min_score: float,
     loop: asyncio.AbstractEventLoop,
     return_full_content: bool = False,
+    max_chars: int = READ_IF_MAX_CHARS,
 ) -> list[MemoryEntry]:
     """
     Converte resultados de busca FAISS de chunks em MemoryEntry.
@@ -1156,7 +1229,12 @@ def _build_if_entries(
         if file_row is None:
             continue
 
-        text = file_row["content"] if return_full_content else chunk_row["chunk_text"]
+        # No modo /read (return_full_content=False), sempre trunca o chunk
+        # No modo full content (indexed-file/read), não trunca — preserva o original
+        if return_full_content:
+            text = file_row["content"]
+        else:
+            text = _truncate_text(chunk_row["chunk_text"], max_chars)
 
         entries.append(MemoryEntry(
             id           = fid,
@@ -1309,14 +1387,38 @@ async def read_memory(req: ReadRequest):
             log.error(f"Indexed files search failed: {e}")
             if_raw = []
 
+    # ── Otimização de tokens ───────────────────────────────────────────────────
+    # 1. Threshold mais seletivo para /read (combinação de 4 fontes gera ruído)
+    #    Usa max(req.min_score, READ_MIN_SCORE_STRICT) — sempre >= 0.85
+    # 2. Corrige bug do IF_MIN_SCORE: usar max (mais seletivo) não min
+    #    Antes: min(req.min_score, IF_MIN_SCORE) → retornava chunks com score 0.75
+    #    Agora: max(req.min_score, IF_MIN_SCORE_READ) → >= 0.82
+    strict_min_score = max(req.min_score, READ_MIN_SCORE_STRICT)
+    if_strict_min_score = max(strict_min_score, IF_MIN_SCORE_READ)
+
     results: list[MemoryEntry] = (
-        _build_lt_entries(lt_raw, req.min_score, loop) +
-        _build_st_entries(st_raw, req.min_score, loop) +
-        _build_vs_entries(vs_results, req.min_score) +
-        _build_if_entries(if_raw, min(req.min_score, IF_MIN_SCORE), loop)  # NEW
+        _build_lt_entries(lt_raw, strict_min_score, loop) +
+        _build_st_entries(st_raw, strict_min_score, loop) +
+        _build_vs_entries(vs_results, strict_min_score) +
+        _build_if_entries(if_raw, if_strict_min_score, loop)  # NEW
     )
     results.sort(key=lambda r: r.score * r.confidence, reverse=True)
-    return ReadResponse(results=results[:req.top_k], query=query, strategy=effective_strategy)
+
+    # ── Orçamento global de tokens ─────────────────────────────────────────────
+    # Limita o total de caracteres retornados, cortando entradas de menor score.
+    # Sempre retorna pelo menos 1 entrada se existir.
+    final_top_k = min(req.top_k, READ_TOP_K_FINAL) if req.top_k > 0 else READ_TOP_K_FINAL
+    results = _apply_token_budget(results, READ_TOTAL_MAX_CHARS, final_top_k)
+
+    # Log de diagnóstico (nível INFO para acompanhar redução no pipeline)
+    total_chars = sum(len(r.text or "") for r in results)
+    log.info(
+        f"/read query='{query[:50]}' strategy={effective_strategy} "
+        f"results={len(results)} total_chars={total_chars} "
+        f"budget={READ_TOTAL_MAX_CHARS} strict_score={strict_min_score:.2f}"
+    )
+
+    return ReadResponse(results=results, query=query, strategy=effective_strategy)
 
 
 # ── DELETE /session/{session_id} ───────────────────────────────────────────────
@@ -1721,6 +1823,17 @@ async def status():
             "context_max_chars":     CONTEXT_MAX_CHARS,
             "context_turns_fetch":   CONTEXT_TURNS_FETCH,
             "dual_context_weight":   DUAL_CONTEXT_WEIGHT,
+        },
+        # ── Otimização de tokens (anti 413 Payload Too Large) ──
+        "token_optimization": {
+            "read_top_k_final":       READ_TOP_K_FINAL,
+            "read_total_max_chars":   READ_TOTAL_MAX_CHARS,
+            "read_lt_max_chars":      READ_LT_MAX_CHARS,
+            "read_st_max_chars":      READ_ST_MAX_CHARS,
+            "read_vs_max_chars":      READ_VS_MAX_CHARS,
+            "read_if_max_chars":      READ_IF_MAX_CHARS,
+            "read_min_score_strict":  READ_MIN_SCORE_STRICT,
+            "if_min_score_read":      IF_MIN_SCORE_READ,
         },
         "onnx_serving": {
             "url": ONNX_SERVING_URL,

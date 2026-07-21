@@ -2,6 +2,23 @@
 # Remove o set -e — não queremos que um serviço derrube os outros
 # set -e  ← REMOVIDO
 
+# ─────────────────────────────────────────
+# CORREÇÃO: propaga SIGTERM/SIGINT do Docker para todo o grupo de
+# processos. Sem isso, este script (PID 1) morre e deixa os filhos
+# órfãos até o Docker mandar SIGKILL — o que costuma deixar sockets
+# em TIME_WAIT/portas presas, causando falhas em cascata no boot
+# seguinte (visto no log: vários serviços reiniciando juntos).
+# ─────────────────────────────────────────
+_shutting_down=0
+_cleanup() {
+    if [ "$_shutting_down" -eq 1 ]; then return; fi
+    _shutting_down=1
+    echo "🛑 Sinal de parada recebido — encerrando processos filhos..."
+    kill -TERM -- -$$ 2>/dev/null
+    wait
+    exit 0
+}
+trap _cleanup SIGTERM SIGINT
 
 # Baixa Supertonic se não estiver em cache
 python3 -c "
@@ -11,12 +28,6 @@ try:
 except Exception as e: print(f'⚠ Supertonic: {e}')
 "
 echo "🚀 Iniciando AVA..."
-
-echo "  • Orchestrator..."
-python3 /app/orchestrator.py &
-sleep 1
-
-cd /app/Modules
 
 # Função que reinicia serviços que caem
 restart_on_fail() {
@@ -29,6 +40,14 @@ restart_on_fail() {
         sleep 5
     done
 }
+
+echo "  • Orchestrator..."
+# CORREÇÃO: agora protegido por restart_on_fail como todo o resto —
+# antes, se caísse uma vez, nunca mais voltava.
+restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
+sleep 1
+
+cd /app/Modules
 
 echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
@@ -61,6 +80,6 @@ echo "✓ Todos os serviços iniciados"
 echo ""
 echo "Aguardando processos..."
 
-wait -n  # Aguarda qualquer processo — sem set -e não derruba os outros
+wait -n
 echo "⚠️  Um serviço saiu (normal se foi reiniciado pelo restart_on_fail)"
-wait     # Aguarda os demais
+wait

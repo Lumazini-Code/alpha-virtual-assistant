@@ -142,7 +142,7 @@ async fn post_llama_start(
         None
     };
 
-    match process_manager::start_llama(&state, &req.model, mmproj.as_deref()).await {
+    match process_manager::start_llama(&state, &req.model, mmproj.as_deref(), state.llama_log.clone()).await {
         Ok(()) => (
             StatusCode::OK,
             Json(SimpleResponse {

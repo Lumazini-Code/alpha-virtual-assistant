@@ -5,10 +5,12 @@
 //! Como GUI e servidor rodam em threads/tasks diferentes, tudo é protegido
 //! por `Mutex` dentro de um `Arc` para podermos clonar referências livremente.
 
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
+use crate::process_manager::{SharedLlamaLog, new_llama_log};
+
 
 /// Status de um processo gerenciado (llama-server ou docker).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,15 +90,17 @@ pub struct ModelInfo {
 
 /// Estado raiz da aplicação. Uma única instância, compartilhada via `Arc`.
 pub struct AppState {
-    pub llama: Mutex<LlamaState>,
-    pub docker: Mutex<DockerState>,
-    /// Pasta onde os .gguf ficam (./Models por padrão, relativa ao executável).
+    pub llama: Arc<TokioMutex<LlamaState>>,
+    pub docker: Arc<TokioMutex<DockerState>>,
     pub models_dir: PathBuf,
-    /// Caminho do llama-server (binário), equivalente ao LLAMA_SERVER_PATH do script Python.
     pub llama_server_bin: PathBuf,
-    /// ✅ Caminho absoluto para o script docker-start (.sh ou .bat)
     pub docker_start_script: PathBuf,
+    
+    /// Ringbuffer de log do llama-server (adicionar este campo!)
+    pub llama_log: SharedLlamaLog,
 }
+
+
 
 pub type SharedState = Arc<AppState>;
 
@@ -155,10 +159,11 @@ pub fn new_shared_state() -> SharedState {
     tracing::info!("Diretório do executável: {}", exe_dir.display());
 
     Arc::new(AppState {
-        llama: Mutex::new(LlamaState::default()),
-        docker: Mutex::new(DockerState::default()),
+        llama: Arc::new(TokioMutex::new(LlamaState::default())),
+        docker: Arc::new(TokioMutex::new(DockerState::default())),
         models_dir: resolve_path("../Modules/Models"),
         llama_server_bin: resolve_path("../Modules/llama-cpp/llama-server"),
         docker_start_script: find_docker_start_script(),
+        llama_log: new_llama_log(),
     })
 }
