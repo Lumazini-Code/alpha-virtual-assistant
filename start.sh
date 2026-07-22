@@ -10,6 +10,7 @@
 # seguinte (visto no log: vários serviços reiniciando juntos).
 # ─────────────────────────────────────────
 _shutting_down=0
+export ALPHA_ENABLE_GIT=0
 _cleanup() {
     if [ "$_shutting_down" -eq 1 ]; then return; fi
     _shutting_down=1
@@ -75,6 +76,12 @@ restart_on_fail "VQA" "python3 VQA.py" &
 
 echo "  • Local Scraping & Client..."
 restart_on_fail "Local Scraping" "python3 local_scraping.py" &
+
+echo "  • Alpha-code Agent..."
+# Alpha-code roda na porta 4006. Precisa ser invocado como módulo (python -m)
+# a partir de /app/Modules para que os imports relativos (alpha_code.tools.*)
+# funcionem. ALPHA_PROJECT_ROOT aponta para o diretório alvo do agente.
+restart_on_fail "Alpha-code" "ALPHA_PROJECT_ROOT=/app python3 -m alpha_code.alpha_code" &
 
 echo "✓ Todos os serviços iniciados"
 echo ""

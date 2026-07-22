@@ -11,6 +11,8 @@ RUN chmod +x /app/start.sh
 
 RUN apt update
 
-RUN apt install -y pulseaudio-utils alsa-utils
+RUN apt install -y pulseaudio-utils alsa-utils 
+
+RUN apt-get install -y ripgrep
 
 CMD ["/bin/bash", "/app/start.sh"]

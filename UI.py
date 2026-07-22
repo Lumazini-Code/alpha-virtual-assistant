@@ -447,21 +447,15 @@ class CoTPlanRow(Widget):
 
     DEFAULT_CSS = f"""
     CoTPlanRow {{
-        height: auto;
-        min-height: 2;
+        height: 2;
         padding: 0 0 0 6;
         border-bottom: solid #111111;
     }}
-    .cpr-header {{ color: #888888; }}
-    .cpr-action  {{ color: #BBBBBB;  padding: 0 0 0 2; }}
-    CoTPlanRow.-pending .cpr-header {{ color: #777777; }}
-    CoTPlanRow.-pending .cpr-action  {{ color: #666666; }}
-    CoTPlanRow.-running .cpr-header {{ color: #E4A012; text-style: bold; }}
-    CoTPlanRow.-running .cpr-action  {{ color: #FFD080; }}
-    CoTPlanRow.-done    .cpr-header {{ color: #4CAF7D; }}
-    CoTPlanRow.-done    .cpr-action  {{ color: #88BBAA; }}
-    CoTPlanRow.-error   .cpr-header {{ color: #E45012; }}
-    CoTPlanRow.-error   .cpr-action  {{ color: #FF8866; }}
+    .cpr-header {{ color: #555555; }}
+    .cpr-action  {{ color: #333333;  padding: 0 0 0 2; }}
+    CoTPlanRow.-running  .cpr-header {{ color: #E4A012; }}
+    CoTPlanRow.-done     .cpr-header {{ color: #4CAF7D; }}
+    CoTPlanRow.-error    .cpr-header {{ color: #E45012; }}
     """
 
     def __init__(self, step_num: int, executor: str, action: str,
@@ -476,15 +470,11 @@ class CoTPlanRow(Widget):
     def compose(self) -> ComposeResult:
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         yield Static(
-            f"\u25cb Step {self.step_num} [{self.executor}]{dep_str}",
-            classes="cpr-header",
-            markup=False,
+            f"○ Step {self.step_num} [{self.executor}]{dep_str}",
+            classes="cpr-header"
         )
-        # Sem truncamento: deixa o Static envolver (wrap) naturalmente.
-        # Antes era self.action[:90] + "\u2026" — cortava descrições
-        # comuns de 95-130 chars no meio, dando a impressão de que
-        # o widget "não mostrava o que o step vai executar".
-        yield Static(self.action, classes="cpr-action", markup=False)
+        preview = self.action[:90] + ("…" if len(self.action) > 90 else "")
+        yield Static(preview, classes="cpr-action")
 
     def set_running(self) -> None:
         # CORREÇÃO #1: blinda contra chamadas antes do widget estar
@@ -496,7 +486,7 @@ class CoTPlanRow(Widget):
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         try:
             self.query(".cpr-header", Static).first().update(
-                f"\u23f3 Step {self.step_num} [{self.executor}]{dep_str}"
+                f"⏳ Step {self.step_num} [{self.executor}]{dep_str}"
             )
         except Exception:
             return
@@ -504,29 +494,20 @@ class CoTPlanRow(Widget):
         self.set_class(True,  "-running")
 
     def set_done(self, success: bool, latency_ms: float, error: str = None) -> None:
-        # CORREÇÃO: antes este método limpava a action (update("")) e
-        # colapsava height=1. Isso apagava a descrição do step assim
-        # que ele terminava — dando a impressão de que o widget "não
-        # mostra se já foi concluído". Agora a action continua visível
-        # (em verde/vermelho) e a altura é preservada.
+        # CORREÇÃO #1 (mesma lógica para set_done)
         if not self.is_mounted:
             return
-        icon    = "\u2713" if success else "\u2717"
-        err_str = f"  \u2014 {error}" if error else ""
+        icon    = "✓" if success else "✗"
+        err_str = f" — {error}" if error else ""
         dep_str = f"  deps:{self.depends_on}" if self.depends_on else ""
         try:
             self.query(".cpr-header", Static).first().update(
-                f"{icon} Step {self.step_num} [{self.executor}] "
-                f"{latency_ms:.0f}ms{err_str}{dep_str}",
-                markup=False,
+                f"{icon} Step {self.step_num} [{self.executor}] {latency_ms:.0f}ms{err_str}{dep_str}"
             )
-            # Mantém a action visível — só reescreve para garantir refresh
-            self.query(".cpr-action", Static).first().update(
-                self.action, markup=False
-            )
+            self.query(".cpr-action", Static).first().update("")
         except Exception:
             return
-        # NÃO mexer em self.styles.height — preserva a altura
+        self.styles.height = 1
         self.set_class(False, "-running")
         self.set_class(False, "-pending")
         self.set_class(True,  "-done" if success else "-error")
@@ -715,28 +696,47 @@ async def stream_ava(
     on_error,
     on_done,
     on_reasoning=None,
+    code_mode: bool = False,
 ):
     
     """
-    POST /execute com stream=true e consome os SSE.
+    POST /execute (modo conversa) ou /code (modo código) com stream=true e
+    consome os SSE.
+
+    code_mode=True:
+      - Usa endpoint /code do orchestrator
+      - Repassa eventos do agente alpha_code (plan, tool_call, tool_result,
+        model_choice, context_budget, delta, error, done)
+      - Não dispara TTS (resposta é técnica, não para ser falada)
     """
-    payload = {
-        "input": prompt,
-        "session_id": session_id,
-        "voice": DEFAULT_VOICE,
-        "lang": DEFAULT_LANG,
-        "tts": False,
-        "use_cache": True,
-        "stream": True,
-        "strategy": "parallel",
-    }
+    if code_mode:
+        endpoint = "/code"
+        payload = {
+            "task": prompt,
+            "session_id": session_id,
+            "max_steps": 25,
+            "temperature": 0.3,
+            "stream": True,
+        }
+    else:
+        endpoint = "/execute"
+        payload = {
+            "input": prompt,
+            "session_id": session_id,
+            "voice": DEFAULT_VOICE,
+            "lang": DEFAULT_LANG,
+            "tts": True,
+            "use_cache": True,
+            "stream": True,
+            "strategy": "parallel",
+        }
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
         ) as client:
             async with client.stream(
                 "POST",
-                f"{ORCHESTRATOR_URL}/execute",
+                f"{ORCHESTRATOR_URL}{endpoint}",
                 json=payload,
             ) as resp:
                 resp.raise_for_status()
@@ -909,7 +909,16 @@ class ChatMessage(Widget):
     }}
     #msg-header {{ height: 1; padding: 0 0 0 2; }}
     #thinking-box {{ margin: 0 2 0 2; }}
-    #msg-body   {{ height: auto; padding: 0 0 0 4; }}
+    #msg-body   {{
+        height: auto;
+        min-height: 1;
+        padding: 0 0 0 4;
+    }}
+    /* ← FIX: Static dentro de ScrollableContainer pode truncar
+       silenciosamente quando o texto é grande. Forçamos auto-height. */
+    #msg-body Static {{
+        height: auto;
+    }}
     """
 
     def __init__(self, role: str, content: str = "", msg_id: str = "", **kwargs):
@@ -917,13 +926,6 @@ class ChatMessage(Widget):
         self.role    = role
         self.content = content
         self.msg_id  = msg_id or str(uuid.uuid4())[:8]
-        # ── Throttle de render ───────────────────────────────────
-        # Evita re-render O(n²): só reprocessa o Markdown/LaTeX no
-        # máximo a cada 80 ms durante o streaming, e força um flush
-        # final quando o stream termina (on_done / on_result).
-        self._last_render       = 0.0
-        self._dirty             = False
-        self._render_scheduled  = False
 
     def compose(self) -> ComposeResult:
         role = getattr(self, "role", "assistant")
@@ -949,53 +951,26 @@ class ChatMessage(Widget):
             yield Static(_render_rich(self.content), id="msg-body")
 
     def append_delta(self, delta: str):
-        """
-        Adiciona um chunk ao conteúdo e re-renderiza com throttle.
-
-        Antes: cada delta reprocessava TODO o conteúdo acumulado via
-        _render_rich (regex com DOTALL sobre a string inteira), gerando
-        um padrão O(n²). A partir de ~300-500 linhas o tempo de cada
-        render ultrapassava o intervalo entre deltas, a fila de
-        call_after_refresh crescia sem parar e a UI aparentava
-        'congelar' — mesmo o stream ainda chegando pelo httpx.
-
-        Agora: só re-renderiza no máximo a cada 80 ms. Um timer cuida
-        do flush do último chunk pendente. Render final forçado via
-        force_flush() no on_done / on_result.
-        """
         if not self.is_mounted:
             return
         self.content += delta
-        self._dirty  = True
-        now = time.monotonic()
-        elapsed = now - self._last_render
-        if elapsed < 0.08:  # 80 ms throttle
-            if not self._render_scheduled:
-                self._render_scheduled = True
-                self.set_timer(0.08 - elapsed, self._flush_render)
-            return
-        self._flush_render()
-
-    def _flush_render(self):
-        """Executa o render pendente (chamado direto ou via set_timer)."""
-        self._render_scheduled = False
-        if not self._dirty or not self.is_mounted:
-            return
-        self._dirty       = False
-        self._last_render = time.monotonic()
         try:
-            self.query_one("#msg-body", Static).update(_render_rich(self.content))
-        except Exception:
-            return
-
-    def force_flush(self):
-        """Força um render completo — chamar no on_done / on_result."""
-        self._render_scheduled = False
-        self._dirty            = True
-        self._flush_render()
-        # Força o Textual a recalcular o layout e altura do widget
-        if self.is_mounted:
-            self.refresh(layout=True)
+            body = self.query_one("#msg-body", Static)
+            # ← FIX: em vez de re-renderizar tudo a cada delta (caro p/ textos
+            # longos), só faz update se o conteúdo for curto OU se o delta
+            # incluir uma quebra de linha (provável mudança de parágrafo).
+            # Para textos muito longos, o update a cada char pode causar
+            # truncamento silencioso no Static. Usamos refresh() como fallback.
+            if len(self.content) > 8000:
+                # Para conteúdo grande: só atualiza periodicamente (a cada
+                # 50 chars ou quebra de linha) para evitar re-render dispendioso
+                if len(delta) > 1 or "\n" in delta or self.content.endswith((".", "!", "?", "\n")):
+                    body.update(_render_rich(self.content))
+                    body.refresh()
+            else:
+                body.update(_render_rich(self.content))
+        except Exception as e:
+            log.debug(f"append_delta render error: {e}")
 
     def append_reasoning(self, reasoning: str) -> None:
         """Adiciona reasoning ao ThinkingBox."""
@@ -1209,6 +1184,9 @@ class AlphaAI(App):
         ("ctrl+l", "clear_chat",  "Limpar"),
         ("ctrl+n", "new_session", "Nova sessão"),
         ("ctrl+d", "toggle_docker", "Docker Log"),
+        ("ctrl+e", "toggle_code_mode", "Code Mode"),  # ← NEW
+        ("ctrl+shift+c", "copy_last_message", "Copiar"),  # ← NEW: copia última msg do assistant
+        ("ctrl+shift+f", "save_full_log", "Salvar Log"),  # ← NEW: salva conversa em arquivo
     ]
 
     def __init__(self, **kwargs):
@@ -1217,6 +1195,23 @@ class AlphaAI(App):
         self._streaming_msg : Optional[ChatMessage] = None
         self._is_streaming  = False
         self._proc_docker: Optional[subprocess.Popen] = None
+        self.code_mode: bool = False  # ← NEW: quando True, usa endpoint /code do orchestrator
+        # ← NEW: buffer de mensagens em texto puro para exportar/copiar
+        self._plain_messages: list[dict] = []  # [{"role": "user", "content": "..."}, ...]
+
+    def action_toggle_code_mode(self) -> None:
+        """ Alterna entre modo conversa (POST /execute) e modo código (POST /code)."""
+        self.code_mode = not self.code_mode
+        try:
+            route_bar = self.query_one("#route-bar", Static)
+            if self.code_mode:
+                route_bar.update(f"  [{BLUE}]⬢ CODE MODE ON[/] [{GRAY}]— próx. mensagem vai para o agente alpha_code (porta 4006)[/]")
+                self._add_message("system", "**Modo código ativado.** Mensagens serão tratadas pelo agente alpha_code — ele pode editar arquivos, rodar testes e fazer commits. TTS desativado.")
+            else:
+                route_bar.update(f"  [{GRAY}]Modo conversa normal[/]")
+                self._add_message("system", "**Modo conversa** restaurado.")
+        except Exception:
+            pass
 
     def compose(self) -> ComposeResult:
         # Header no topo (largura total)
@@ -1316,6 +1311,9 @@ class AlphaAI(App):
         msg = ChatMessage(role=role, content=content)
         scroll.mount(msg)
         self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+        # ← NEW: registra no buffer de texto puro (para cópia/exportação)
+        if role in ("user", "assistant", "system"):
+            self._plain_messages.append({"role": role, "content": content})
         return msg
 
     def _set_route_bar(self, route: str, conf: float, method: str, direct: bool):
@@ -1328,15 +1326,199 @@ class AlphaAI(App):
         except Exception:
             return
 
+    # ── NEW: Cópia e exportação de mensagens ────────────────────────────────────
+    # O Textual não suporta seleção de texto com mouse nativamente.
+    # Estas actions resolvem o problema copiando para o clipboard do sistema
+    # (via xclip/xsel/pbcopy/clip.exe) ou salvando em arquivo.
+
+    def _get_last_assistant_message(self) -> Optional[str]:
+        """
+        Retorna o conteúdo da última mensagem do assistant (texto puro).
+        Percorre os widgets ChatMessage do scroll em ordem reversa, pegando o
+        conteúdo atualizado (inclui deltas adicionados durante streaming).
+        """
+        try:
+            scroll = self.query_one("#chat-scroll", ScrollableContainer)
+            for widget in reversed(list(scroll.children)):
+                if isinstance(widget, ChatMessage) and widget.role == "assistant":
+                    content = widget.content.strip()
+                    if content:
+                        return content
+        except Exception as e:
+            log.warning(f"Erro ao buscar última mensagem: {e}")
+        # Fallback: usa o buffer de texto puro
+        for msg in reversed(self._plain_messages):
+            if msg["role"] == "assistant" and msg["content"].strip():
+                return msg["content"]
+        return None
+
+    def action_copy_last_message(self) -> None:
+        """
+        Copia a última mensagem do assistant para o clipboard do sistema.
+        Suporta: Linux (xclip/xsel), macOS (pbcopy), Windows (clip.exe).
+        Fallback: salva em arquivo temporário e mostra o caminho.
+        """
+        text = self._get_last_assistant_message()
+        if not text:
+            self._add_message("system", "⚠ Nenhuma mensagem do assistant para copiar.")
+            return
+
+        # Tenta copiar via comandos do sistema
+        import shutil
+        success = False
+        method = ""
+
+        # Linux: xclip
+        if shutil.which("xclip"):
+            try:
+                proc = subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text.encode("utf-8"),
+                    capture_output=True,
+                    timeout=5.0,
+                )
+                if proc.returncode == 0:
+                    success = True
+                    method = "xclip"
+            except Exception as e:
+                log.warning(f"xclip falhou: {e}")
+
+        # Linux: xsel (fallback do xclip)
+        if not success and shutil.which("xsel"):
+            try:
+                proc = subprocess.run(
+                    ["xsel", "--clipboard", "--input"],
+                    input=text.encode("utf-8"),
+                    capture_output=True,
+                    timeout=5.0,
+                )
+                if proc.returncode == 0:
+                    success = True
+                    method = "xsel"
+            except Exception as e:
+                log.warning(f"xsel falhou: {e}")
+
+        # macOS: pbcopy
+        if not success and shutil.which("pbcopy"):
+            try:
+                proc = subprocess.run(
+                    ["pbcopy"],
+                    input=text.encode("utf-8"),
+                    capture_output=True,
+                    timeout=5.0,
+                )
+                if proc.returncode == 0:
+                    success = True
+                    method = "pbcopy"
+            except Exception as e:
+                log.warning(f"pbcopy falhou: {e}")
+
+        # Windows: clip.exe
+        if not success and shutil.which("clip"):
+            try:
+                proc = subprocess.run(
+                    ["clip"],
+                    input=text.encode("utf-16-le"),
+                    capture_output=True,
+                    timeout=5.0,
+                )
+                if proc.returncode == 0:
+                    success = True
+                    method = "clip.exe"
+            except Exception as e:
+                log.warning(f"clip falhou: {e}")
+
+        if success:
+            self._add_message(
+                "system",
+                f"✓ Última resposta copiada para o clipboard ({method}). {len(text)} chars."
+            )
+        else:
+            # Fallback: salva em arquivo
+            try:
+                from datetime import datetime
+                tmp = Path(f"/tmp/ava_clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                tmp.write_text(text, encoding="utf-8")
+                self._add_message(
+                    "system",
+                    f"⚠ Clipboard não disponível (instale xclip). Texto salvo em: {tmp}"
+                )
+            except Exception as e:
+                self._add_message("system", f"✗ Falha ao copiar: {e}")
+
+    def action_save_full_log(self) -> None:
+        """
+        Salva a conversa completa (todas as mensagens) em um arquivo .md.
+        Útil para auditoria, sharing, ou copiar trechos depois.
+        Percorre os widgets ChatMessage para pegar o conteúdo atualizado
+        (inclui texto adicionado via append_delta durante streaming).
+        """
+        # Coleta mensagens dos widgets (não do buffer estático)
+        messages: list[dict] = []
+        try:
+            scroll = self.query_one("#chat-scroll", ScrollableContainer)
+            for widget in scroll.children:
+                if isinstance(widget, ChatMessage) and widget.content.strip():
+                    messages.append({"role": widget.role, "content": widget.content})
+        except Exception as e:
+            log.warning(f"Erro ao coletar mensagens dos widgets: {e}")
+            messages = self._plain_messages  # fallback
+
+        if not messages:
+            self._add_message("system", "⚠ Nenhuma mensagem para salvar.")
+            return
+
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"ava_session_{self.session_id[:8]}_{timestamp}.md"
+            filepath = Path(filename)
+
+            lines = [
+                f"# AVA Session Log",
+                f"",
+                f"- **Session ID:** `{self.session_id}`",
+                f"- **Data:** {datetime.now().isoformat()}",
+                f"- **Mensagens:** {len(messages)}",
+                f"",
+                f"---",
+                f"",
+            ]
+
+            for msg in messages:
+                role = msg["role"]
+                content = msg["content"]
+                if role == "user":
+                    lines.append(f"## ▶ Você\n\n{content}\n")
+                elif role == "assistant":
+                    lines.append(f"## ◆ ALPHA AI\n\n{content}\n")
+                else:
+                    lines.append(f"### ● Sistema\n\n{content}\n")
+                lines.append("---")
+                lines.append("")
+
+            filepath.write_text("\n".join(lines), encoding="utf-8")
+            abs_path = filepath.resolve()
+            self._add_message(
+                "system",
+                f"✓ Conversa salva em: `{abs_path}` ({len(messages)} mensagens)"
+            )
+            log.info(f"Session log saved to: {abs_path}")
+        except Exception as e:
+            self._add_message("system", f"✗ Falha ao salvar log: {e}")
+            log.error(f"Failed to save session log: {e}")
+
     def action_clear_chat(self) -> None:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         scroll.remove_children()
+        self._plain_messages = []  # ← NEW: limpa buffer de texto puro também
         self._add_message("system", "Chat limpo.")
 
     def action_new_session(self) -> None:
         self.session_id = str(uuid.uuid4())
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
         scroll.remove_children()
+        self._plain_messages = []  # ← NEW: limpa buffer
         self._add_message("system", f"Nova sessão iniciada: `{self.session_id[:8]}`")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1358,22 +1540,40 @@ class AlphaAI(App):
 
     async def _run_stream(self, prompt: str, ai_msg: ChatMessage) -> None:
         scroll = self.query_one("#chat-scroll", ScrollableContainer)
-        
+        # ← FIX: throttling do scroll para evitar truncamento visual
+        # quando muitos deltas chegam rapidamente. Sem isso, o scroll
+        # dispara scroll_end a cada char, fazendo o Textual "perder"
+        # renderizações intermediárias e aparentar truncamento.
+        self._last_scroll_update = 0.0
+        self._pending_scroll = False
+
+        async def _maybe_scroll():
+            """Throttle: máximo 1 scroll a cada 100ms."""
+            import time as _time
+            now = _time.time()
+            elapsed = now - self._last_scroll_update
+            if elapsed >= 0.1:
+                self._last_scroll_update = now
+                self._pending_scroll = False
+                try:
+                    scroll.scroll_end(animate=False)
+                except Exception:
+                    pass
+            else:
+                self._pending_scroll = True
+
         async def on_delta(delta: str):
-            # CORREÇÃO: NÃO chamar finish_thinking() aqui — era redundante
-            # (chamado a cada chunk) e somava trabalho ao render O(n²).
-            # finish_thinking() é delegado ao on_done / on_result.
             try:
+                ai_msg.finish_thinking()
                 ai_msg.append_delta(delta)
-                
-                self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+                await _maybe_scroll()
             except Exception as e:
                 log.error(f"Erro em on_delta: {e}\n{traceback.format_exc()}")
 
         async def on_reasoning(reasoning: str):
             try:
                 ai_msg.append_reasoning(reasoning)
-                self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+                await _maybe_scroll()
             except Exception as e:
                 log.error(f"Erro em on_reasoning: {e}\n{traceback.format_exc()}")
 
@@ -1444,8 +1644,11 @@ class AlphaAI(App):
             try:
                 ai_msg.finish_thinking()
                 ai_msg.append_delta(text)
-                ai_msg.force_flush()  # render final completo
-                self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+                # ← FIX: scroll forçado após resultado final de step
+                # (garante que texto longo seja visível)
+                import time as _time
+                self._last_scroll_update = 0.0  # força próximo scroll
+                await _maybe_scroll()
             except Exception as e:
                 log.error(f"Erro em on_result: {e}\n{traceback.format_exc()}")
 
@@ -1460,7 +1663,16 @@ class AlphaAI(App):
         async def on_done(event: dict):
             try:
                 ai_msg.finish_thinking()
-                ai_msg.force_flush()  # garante texto 100% renderizado
+                # ← FIX: após done, força renderização final + scroll
+                # para garantir que TODO o conteúdo acumulado esteja visível.
+                # Sem isso, o último delta pode não ter sido renderizado ainda.
+                try:
+                    body = ai_msg.query_one("#msg-body", Static)
+                    body.update(_render_rich(ai_msg.content))
+                    body.refresh()
+                except Exception:
+                    pass
+
                 lat    = event.get("total_latency_ms", 0)
                 errs   = event.get("errors", [])
                 route  = event.get("route", "?")
@@ -1474,6 +1686,10 @@ class AlphaAI(App):
                     f" • {via} • {lat:.0f}ms[/]"
                     + (f"  [{RED_C}]{len(errs)} erro(s)[/]" if errs else "")
                 )
+                # Scroll final garantido
+                self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+                # Segundo scroll após 200ms (caso o layout ainda esteja se ajustando)
+                self.set_timer(0.2, lambda: scroll.scroll_end(animate=False))
                 log.info("Execução finalizada (evento 'done' recebido).")
             except Exception as e:
                 log.error(f"Erro em on_done: {e}\n{traceback.format_exc()}")
@@ -1484,6 +1700,7 @@ class AlphaAI(App):
                 on_delta, on_meta, on_plan, on_step_start, on_step_done,
                 on_result, on_error, on_done,
                 on_reasoning=on_reasoning,
+                code_mode=self.code_mode,  # ← NEW
             )
         except Exception as e:
             log.error(f"Erro fatal no stream_ava: {e}\n{traceback.format_exc()}")

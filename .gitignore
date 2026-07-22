@@ -32,3 +32,5 @@ Manager/ava-tray
 .venv/**
 
 .env
+
+*.pyc

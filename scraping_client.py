@@ -28,7 +28,6 @@ from pydantic import BaseModel, Field
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-CLIENT_PORT  = "3005"
 CLIENT_TOKEN = os.environ.get("CLIENT_TOKEN", "")
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_CMD_TIME  = 30.0
@@ -143,6 +142,55 @@ class StatResponse(BaseModel):
     modified:  Optional[str]  = None
     file_hash: Optional[str]  = None
     extension: Optional[str]  = None
+
+
+# ── NOVOS: write / list / str_replace (para alpha_code) ──────────────────────
+
+class WriteFileRequest(BaseModel):
+    file_path:      str
+    content:        str
+    encoding:       str   = "utf-8"
+    create_parents: bool  = True
+    overwrite:      bool  = True
+
+class WriteFileResponse(BaseModel):
+    file_path: str
+    bytes_written: int
+    created:   bool
+    modified:  str
+
+class ListFilesRequest(BaseModel):
+    path:         str   = "."
+    pattern:      str   = "*"
+    recursive:    bool  = True
+    max_entries:  int   = 500
+    include_hidden: bool = False
+
+class FileEntry(BaseModel):
+    path:      str
+    name:      str
+    is_file:   bool
+    is_dir:    bool
+    size:      Optional[int]  = None
+    modified:  Optional[str]  = None
+
+class ListFilesResponse(BaseModel):
+    path:    str
+    entries: list[FileEntry]
+    total:   int
+    truncated: bool = False
+
+class StrReplaceRequest(BaseModel):
+    file_path:   str
+    old_str:     str
+    new_str:     str
+    replace_all: bool = False
+
+class StrReplaceResponse(BaseModel):
+    file_path:     str
+    replacements:   int
+    new_hash:       str
+    modified:       str
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -294,13 +342,177 @@ async def stat_path(req: StatRequest):
     return result
 
 
+# ── NOVOS endpoints: write / list / str_replace ───────────────────────────────
+
+@app.post("/write-file", response_model=WriteFileResponse, dependencies=[Depends(_auth_check)])
+async def write_file(req: WriteFileRequest):
+    """
+    Escreve conteúdo em arquivo dentro do BASE_DIR.
+    Cria diretórios pais se create_parents=True.
+    """
+    host_path = _resolve(req.file_path)
+    log.info(f"/write-file: container='{req.file_path}' → host='{host_path}'")
+    _validate(host_path)
+
+    existed = host_path.exists() and host_path.is_file()
+
+    if host_path.exists() and not host_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Não é arquivo: {host_path}")
+
+    if host_path.exists() and not req.overwrite:
+        raise HTTPException(status_code=409, detail=f"Arquivo já existe (overwrite=False): {host_path}")
+
+    if req.create_parents:
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        data = req.content.encode(req.encoding)
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"Conteúdo muito grande: {len(data)} bytes")
+        with open(host_path, "wb") as f:
+            f.write(data)
+        sha = hashlib.sha256(data).hexdigest()
+        mtime = datetime.fromtimestamp(host_path.stat().st_mtime).isoformat()
+        return WriteFileResponse(
+            file_path=req.file_path,
+            bytes_written=len(data),
+            created=not existed,
+            modified=mtime,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"Sem permissão: {host_path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/list-files", response_model=ListFilesResponse, dependencies=[Depends(_auth_check)])
+async def list_files(req: ListFilesRequest):
+    """
+    Lista arquivos/dirs dentro de um path do BASE_DIR.
+    Usa glob pattern (default: *).
+    """
+    base = _resolve(req.path)
+    log.info(f"/list-files: container='{req.path}' → host='{base}'")
+    _validate(base)
+
+    if not base.exists():
+        raise HTTPException(status_code=404, detail=f"Path não existe: {req.path}")
+    if not base.is_dir():
+        raise HTTPException(status_code=400, detail=f"Não é diretório: {req.path}")
+
+    if req.recursive:
+        iterator = base.rglob(req.pattern)
+    else:
+        iterator = base.glob(req.pattern)
+
+    entries: list[FileEntry] = []
+    truncated = False
+    for p in iterator:
+        # skip hidden if not requested
+        try:
+            rel = p.relative_to(base)
+        except ValueError:
+            continue
+        if not req.include_hidden and any(part.startswith(".") for part in rel.parts if part):
+            continue
+
+        if len(entries) >= req.max_entries:
+            truncated = True
+            break
+
+        try:
+            st = p.stat()
+            entries.append(FileEntry(
+                path=str(rel),
+                name=p.name,
+                is_file=p.is_file(),
+                is_dir=p.is_dir(),
+                size=st.st_size if p.is_file() else None,
+                modified=datetime.fromtimestamp(st.st_mtime).isoformat(),
+            ))
+        except (PermissionError, OSError):
+            continue
+
+    return ListFilesResponse(
+        path=req.path,
+        entries=entries,
+        total=len(entries),
+        truncated=truncated,
+    )
+
+
+@app.post("/str-replace", response_model=StrReplaceResponse, dependencies=[Depends(_auth_check)])
+async def str_replace(req: StrReplaceRequest):
+    """
+    Substitui old_str por new_str em arquivo do BASE_DIR.
+    Falha se old_str não existir, ou se replace_all=False e houver >1 ocorrência.
+    """
+    if not req.old_str:
+        raise HTTPException(status_code=400, detail="old_str não pode ser vazio")
+    if req.old_str == req.new_str:
+        raise HTTPException(status_code=400, detail="old_str == new_str")
+
+    host_path = _resolve(req.file_path)
+    log.info(f"/str-replace: container='{req.file_path}' → host='{host_path}'")
+    _validate(host_path)
+
+    if not host_path.exists():
+        raise HTTPException(status_code=404, detail=f"Não encontrado: {host_path}")
+    if not host_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Não é arquivo: {host_path}")
+
+    try:
+        raw = host_path.read_bytes()
+        # tenta utf-8 primeiro, fallback latin-1
+        for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                content = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            content = raw.decode("utf-8", errors="replace")
+
+        count = content.count(req.old_str)
+        if count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"old_str não encontrado no arquivo. Verifique indentação/whitespace."
+            )
+        if count > 1 and not req.replace_all:
+            raise HTTPException(
+                status_code=409,
+                detail=f"old_str aparece {count} vezes. Use replace_all=true ou torne old_str mais específico."
+            )
+
+        new_content = content.replace(req.old_str, req.new_str) if req.replace_all else content.replace(req.old_str, req.new_str, 1)
+        new_bytes = new_content.encode("utf-8")
+        host_path.write_bytes(new_bytes)
+        sha = hashlib.sha256(new_bytes).hexdigest()
+        mtime = datetime.fromtimestamp(host_path.stat().st_mtime).isoformat()
+
+        replacements = count if req.replace_all else 1
+        return StrReplaceResponse(
+            file_path=req.file_path,
+            replacements=replacements,
+            new_hash=sha,
+            modified=mtime,
+        )
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"Sem permissão: {host_path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
     log.info(f"═══════════════════════════════════════════")
     log.info(f"  Alpha Host Client v3.0")
-    log.info(f"  Porta:    {CLIENT_PORT}")
+    log.info(f"  Porta:    {3005}")
     log.info(f"  BASE_DIR: {BASE_DIR}")
     log.info(f"═══════════════════════════════════════════")
-    uvicorn.run(app, host="0.0.0.0", port=CLIENT_PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=3005, log_level="info")

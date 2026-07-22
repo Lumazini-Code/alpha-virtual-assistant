@@ -16,7 +16,6 @@ Integrates ALL AVA microservices:
   - Vision / VQA    (port 4002)  — image understanding (Qwen3VL)
   - Deep Search     (port 4005)  — KG-RAG with automatic web research
 """
-
 from __future__ import annotations
 
 import json 
@@ -57,21 +56,25 @@ TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
 DEEP_SEARCH_URL      = "http://localhost:4005"
+ALPHA_CODE_URL       = "http://localhost:4006"   # ← NEW: alpha_code agent
 
 HEALTH_PATHS: dict[str, str] = {
     "cot": "/status", "memory": "/status", "search": "/status",
     "local_scraping": "/status", "tts": "/status",          # ← NEW
     "llm": "/health", "vision": "/health", "deep_search": "/health",
+    "alpha_code": "/health",                                 # ← NEW: alpha_code agent
 }
 
 EXECUTOR_TIMEOUTS: dict[str, float] = {
     "llm": 9999999.0, "memory": 9999999.0, "search": 9999999.0, "deep_search": 9999999.0,
     "vision": 9999999.0, "tts": 9999999.0, "local_scraping": 9999999.0,  # ← NEW
+    "alpha_code": 9999999.0,  # ← NEW: agente pode rodar muitos steps
 }
 
 EXECUTOR_MAX_RETRIES: dict[str, int] = {
     "llm": 2, "memory": 3, "search": 2, "deep_search": 1, "vision": 1,
     "tts": 2,"local_scraping": 2,  # ← NEW
+    "alpha_code": 1,  # ← NEW: agente faz retries internos
 }
 
 RETRY_BACKOFF_S   = 0.15
@@ -92,6 +95,7 @@ ROUTE_TO_EXECUTOR: dict[str, str] = {
     "llm": "llm", "search": "search", "memory_read": "memory", "memory_write": "memory",
     "vision": "vision", "deep_search": "deep_search", "tts": "tts",
     "local_scraping": "local_scraping",  
+    "alpha_code": "alpha_code",  # ← NEW: agente de código
 }
 
 
@@ -222,6 +226,21 @@ class LocalScrapingChooseRequest(BaseModel):
     force_reindex: bool = Field(False, description="Forçar reindexação")
     session_id: Optional[str] = None
 
+# ── NEW: Alpha-code (agente de código) ────────────────────────────────────────
+
+class AlphaCodeRequest(BaseModel):
+    """Request para o agente de código (alpha_code)."""
+    task: str = Field(..., description="Descrição da tarefa em linguagem natural")
+    session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
+    project_dir: Optional[str] = Field(None, description="Diretório alvo. None = BASE_DIR do scraping_client.")
+    max_steps: int = Field(25, ge=1, le=100, description="Limite de iterações ReAct")
+    temperature: float = Field(0.3, ge=0.0, le=2.0)
+    model_override: Optional[str] = Field(
+        None,
+        description="Força modelo Groq para TODOS os steps. None = roteamento adaptativo."
+    )
+    stream: bool = Field(True, description="True = SSE streaming, False = síncrono")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL ROUTER — ONNX + Heuristics
 # ══════════════════════════════════════════════════════════════════════════════
@@ -229,6 +248,7 @@ class LocalScrapingChooseRequest(BaseModel):
 class RouteLabel(IntEnum):
     COT = 0; LLM = 1; MEMORY_READ = 3; MEMORY_WRITE = 4
     VISION = 5; DEEP_SEARCH = 6;  # ← NEW
+    ALPHA_CODE = 7  # ← NEW: agente de edição/geração de código
 
 LABEL_NAMES: list[str] = [rl.name.lower() for rl in RouteLabel]
 NUM_LABELS = len(RouteLabel)   # agora 12
@@ -316,6 +336,19 @@ class OnnxMiniLMRouter:
         "memory_write": ["remember my favorite color", "save this info", "grave na memória"],
         "vision": ["describe this image", "analyze photo", "what does picture show"],
         "deep_search": ["deep research about", "learn about", "pesquisa profunda"],
+        # ← NEW: protótipos para edição/geração de código
+        "alpha_code": [
+            "fix the bug in auth.py",
+            "adicione autenticação jwt",
+            "refatore essa função",
+            "implemente o endpoint de login",
+            " corrija o teste que está falhando",
+            "adicione testes para a função validate",
+            "explique o que essa classe faz",
+            "gere um readme para o projeto",
+            "migra esse projeto de flask para fastapi",
+            "add error handling to this function",
+        ],
     }
     def __init__(self): self.ready = False; self.tokenizer = None; self.session = None; self.input_names = []; self.output_names = []; self.provider = ""; self._prototype_embeddings = None
     def load(self, model_dir: str) -> bool:
@@ -448,6 +481,7 @@ class AppState:
     llm_client: httpx.AsyncClient = field(default=None); vision_client: httpx.AsyncClient = field(default=None)
     deep_search_client: httpx.AsyncClient = field(default=None)
     local_scraping_client: httpx.AsyncClient = field(default=None)  # ← NEW
+    alpha_code_client: httpx.AsyncClient = field(default=None)  # ← NEW: agente de código
 
 state = AppState()
 
@@ -464,6 +498,7 @@ async def lifespan(app: FastAPI):
         "cot": COT_URL, "memory": MEMORY_URL, "search": SEARCH_URL,
         "local_scraping": LOCAL_SCRAPING_URL, "tts": TTS_URL,          # ← NEW
         "llm": LLM_URL, "vision": VISION_URL, "deep_search": DEEP_SEARCH_URL,
+        "alpha_code": ALPHA_CODE_URL,  # ← NEW
     }
     async with httpx.AsyncClient(timeout=5.0) as probe:
         for name, url in service_urls.items():
@@ -480,12 +515,14 @@ async def lifespan(app: FastAPI):
     state.llm_client = _make_client(LLM_URL, EXECUTOR_TIMEOUTS["llm"]); state.vision_client = _make_client(VISION_URL, EXECUTOR_TIMEOUTS["vision"])
     state.deep_search_client = _make_client(DEEP_SEARCH_URL, EXECUTOR_TIMEOUTS["deep_search"])
     state.local_scraping_client = _make_client(LOCAL_SCRAPING_URL, EXECUTOR_TIMEOUTS["local_scraping"])  # ← NEW
+    state.alpha_code_client = _make_client(ALPHA_CODE_URL, EXECUTOR_TIMEOUTS["alpha_code"])  # ← NEW
     
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
     for c in (state.cot_client, state.memory_client, state.search_client, state.tts_client,
               state.llm_client, state.vision_client, state.deep_search_client,
-              state.local_scraping_client):                             # ← NEW
+              state.local_scraping_client,                             # ← NEW
+              state.alpha_code_client):                               # ← NEW
         await c.aclose()
     log.info("AVA Orchestrator encerrado")
 
@@ -722,10 +759,212 @@ async def _adapt_local_scraping(action, context, req) -> dict:
     }
 
 
+# ── NEW: Alpha-code adapter ────────────────────────────────────────────────────
+
+async def _adapt_alpha_code(action, context, req) -> dict:
+    """
+    Adapter síncrono (não-streaming) para o agente alpha_code.
+    
+    Usado quando o executor cai no pipeline CoT (não-direto).
+    Para streaming em tempo real via SSE, use o endpoint POST /code que
+    chama diretamente o _alpha_code_stream_generator (sem passar pelo CoT).
+    """
+    task = _resolve_action_text(action, context) or action
+    payload = {
+        "task":           task,
+        "session_id":     req.session_id,
+        "project_dir":    None,  # usa BASE_DIR do scraping_client
+        "max_steps":      25,
+        "temperature":    req.lang and 0.3 or 0.3,
+        "streaming":      False,  # síncrono p/ uso dentro do CoT
+    }
+    r = await state.alpha_code_client.post("/run", json=payload)
+    r.raise_for_status()
+    data = r.json()
+    return {
+        "status":      "success" if data.get("success") else "failed",
+        "answer":      data.get("answer", ""),
+        "files_changed": data.get("files_changed", []),
+        "steps_executed": data.get("steps_executed", 0),
+        "tools_called":  data.get("tools_called", 0),
+        "session_id":    data.get("session_id", ""),
+    }
+
+
+async def _alpha_code_stream_generator(req: AlphaCodeRequest):
+    """
+    Gerador SSE que consome o /run/stream do alpha_code e REPASSA os eventos
+    para o cliente do orchestrator, em tempo real.
+
+    Tipos de evento repassados (compatíveis com UI.py):
+      plan           – plano de execução (lista de steps)
+      thinking       – pensamento intermediário do agente (texto)
+      tool_call      – chamada de tool (name + args)
+      tool_result    – resultado de tool (output + success)
+      model_choice   – modelo escolhido para o step (policy function)
+      context_budget – uso de tokens (após summarization opcional)
+      step           – número do step atual (compat UI)
+      delta          – texto da resposta final (streaming)
+      error          – erro (fatal ou não)
+      done           – evento final com resposta completa + estatísticas
+    """
+    t0 = time.perf_counter()
+    eid = str(uuid.uuid4())
+    sid = req.session_id or str(uuid.uuid4())
+
+    log.info(f"[alpha_code:{eid[:8]}] Iniciando tarefa: '{req.task[:80]}'")
+
+    # ── Meta inicial ──────────────────────────────────────────────────────────
+    yield _sse("meta", {
+        "execution_id": eid,
+        "session_id":   sid,
+        "route":        "alpha_code",
+        "route_confidence": 1.0,
+        "route_method": "direct",
+        "routed_directly": True,
+    })
+
+    payload = {
+        "task":              req.task,
+        "session_id":        sid,
+        "project_dir":       req.project_dir,
+        "max_steps":         req.max_steps,
+        "temperature":       req.temperature,
+        "model_override":    req.model_override,
+        "streaming":         True,
+    }
+
+    final_answer = ""
+    files_changed: list[str] = []
+    tools_called = 0
+    steps_executed = 0
+    tokens_used = 0
+    error_msg: Optional[str] = None
+
+    try:
+        async with state.alpha_code_client.stream(
+            "POST", "/run/stream", json=payload, timeout=EXECUTOR_TIMEOUTS["alpha_code"]
+        ) as resp:
+            if resp.status_code != 200:
+                body = ""
+                async for chunk in resp.aiter_text():
+                    body += chunk
+                error_msg = f"alpha_code HTTP {resp.status_code}: {body[:300]}"
+                yield _sse("error", {"error": error_msg})
+            else:
+                # alpha_code emite: data: {"event": "...", "data": {...}, "step": N, "ts": "..."}
+                buffer = ""
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        payload_str = line[5:].strip()
+                        try:
+                            evt = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        ev_type = evt.get("event", "")
+                        ev_data = evt.get("data", {}) or {}
+                        ev_step = evt.get("step")
+
+                        # Repassa eventos, traduzindo para o formato esperado pela UI
+                        if ev_type == "plan":
+                            yield _sse("plan", ev_data)
+                        elif ev_type == "thinking":
+                            # thinking → reasoning (compat UI)
+                            yield _sse("reasoning", ev_data.get("text", ""))
+                        elif ev_type == "tool_call":
+                            tools_called += 1
+                            yield _sse("tool_call", {
+                                "step": ev_step,
+                                "tool": ev_data.get("name", ""),
+                                "arguments": ev_data.get("arguments", {}),
+                            })
+                            # Emite também step_start para compat UI
+                            yield _sse("step_start", {
+                                "step": ev_step or tools_called,
+                                "executor": "alpha_code",
+                                "action": f"{ev_data.get('name', '')}({json.dumps(ev_data.get('arguments', {}), ensure_ascii=False)[:120]})",
+                            })
+                        elif ev_type == "tool_result":
+                            success = ev_data.get("success", False)
+                            out = ev_data.get("output", "")
+                            err = ev_data.get("error", "")
+                            yield _sse("step_done", {
+                                "step": ev_step or tools_called,
+                                "executor": "alpha_code",
+                                "success": success,
+                                "latency_ms": ev_data.get("elapsed_ms", 0),
+                                "error": err,
+                            })
+                            # result em texto puro para UI exibir
+                            if not success and err:
+                                yield _sse("result", f"❌ {err[:500]}")
+                            else:
+                                yield _sse("result", out[:2000] if out else "(no output)")
+                        elif ev_type == "model_choice":
+                            yield _sse("model_choice", {
+                                "step": ev_step,
+                                "model": ev_data.get("model", ""),
+                                "reasoning_effort": ev_data.get("reasoning_effort"),
+                                "temperature": ev_data.get("temperature", 0.3),
+                                "step_kind": ev_data.get("step_kind", ""),
+                            })
+                        elif ev_type == "context_budget":
+                            tokens_used = ev_data.get("tokens_used", tokens_used)
+                            yield _sse("context_budget", ev_data)
+                        elif ev_type == "error":
+                            fatal = ev_data.get("fatal", False)
+                            error_msg = ev_data.get("error", "unknown error")
+                            yield _sse("error", {"error": error_msg, "fatal": fatal})
+                            if fatal:
+                                break
+                        elif ev_type == "final":
+                            final_answer = ev_data.get("answer", "")
+                            files_changed = ev_data.get("files_changed", []) or []
+                            tools_called = ev_data.get("tools_called", tools_called)
+                            steps_executed = ev_data.get("steps_executed", steps_executed)
+                            tokens_used = ev_data.get("tokens_used", tokens_used)
+                            # Emite deltas do texto final (quebra em chunks p/ compat UI)
+                            if final_answer:
+                                yield _sse("delta", final_answer)
+                            break
+
+    except httpx.ConnectError as e:
+        error_msg = f"alpha_code offline: {e}"
+        yield _sse("error", {"error": error_msg, "fatal": True})
+    except httpx.ReadTimeout as e:
+        error_msg = f"alpha_code timeout: {e}"
+        yield _sse("error", {"error": error_msg, "fatal": True})
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        log.exception("[alpha_code] erro inesperado")
+        yield _sse("error", {"error": error_msg, "fatal": True})
+
+    # ── Evento final ──────────────────────────────────────────────────────────
+    lat = round((time.perf_counter() - t0) * 1000, 2)
+    yield _sse("done", {
+        "execution_id":   eid,
+        "session_id":     sid,
+        "final_response": final_answer or (f"Erro: {error_msg}" if error_msg else "(no answer)"),
+        "steps_executed": steps_executed,
+        "tools_called":   tools_called,
+        "tokens_used":    tokens_used,
+        "files_changed":  files_changed,
+        "total_latency_ms": lat,
+        "errors":         [error_msg] if error_msg else [],
+        "route":          "alpha_code",
+        "route_confidence": 1.0,
+        "routed_directly": True,
+    })
+
+
 EXECUTOR_ADAPTERS = {
     "llm": _adapt_llm, "memory": _adapt_memory, "search": _adapt_search,
     "deep_search": _adapt_deep_search, "vision": _adapt_vision, "tts": _adapt_tts,
     "stt": _adapt_stt, "local_scraping": _adapt_local_scraping,  # ← NEW
+    "alpha_code": _adapt_alpha_code,  # ← NEW: agente de código
 }
 
 def _resolve_action_text(action, context):
@@ -1383,7 +1622,7 @@ async def _add_think_instruction(req: ExecuteRequest) -> str:
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AVA Unified Orchestrator", version="3.1.0", description="Central Execution + Internal ONNX Routing Engine + Local Scraping", lifespan=lifespan)
+app = FastAPI(title="AVA Unified Orchestrator", version="3.2.0", description="Central Execution + Internal ONNX Routing Engine + Local Scraping + Alpha-code Agent", lifespan=lifespan)
 
 @app.post("/execute")
     
@@ -1403,6 +1642,72 @@ async def execute(req: ExecuteRequest):
             "Transfer-Encoding": "chunked",  # <- adicione este
         },
     )
+
+
+# ── NEW: Alpha-code endpoint (streaming direto, sem passar pelo CoT/router) ───
+# Permite chamar o agente de código diretamente, com SSE em tempo real.
+# Útil quando o usuário sabe que a tarefa é de edição/geração de código e
+# quer ver o raciocínio do agente em vez de tratar como query genérica.
+
+@app.post("/code")
+async def code_endpoint(req: AlphaCodeRequest):
+    """
+    Executa tarefa no agente alpha_code com streaming SSE em tempo real.
+
+    Repassa eventos do agente (plan, tool_call, tool_result, model_choice,
+    context_budget, error, done) para o cliente, traduzindo para o formato
+    esperado pela UI do AVA (reasoning, step_start, step_done, delta, etc).
+
+    Não passa pelo roteador ONNX nem pelo CoT — é uma rota direta para o agente.
+    """
+    if not req.task.strip():
+        raise HTTPException(400, "task vazio")
+
+    async def stream_alpha_code():
+        async for chunk in _alpha_code_stream_generator(req):
+            yield chunk
+
+    return StreamingResponse(
+        stream_alpha_code(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+@app.post("/code/sync")
+async def code_sync_endpoint(req: AlphaCodeRequest):
+    """
+    Versão síncrona do /code — bloqueia até o agente terminar e retorna
+    JSON com resultado final. Útil para scripts que não querem SSE.
+    """
+    if not req.task.strip():
+        raise HTTPException(400, "task vazio")
+
+    # Reusa o payload do /run do alpha_code (não-streaming)
+    payload = {
+        "task":              req.task,
+        "session_id":        req.session_id,
+        "project_dir":       req.project_dir,
+        "max_steps":         req.max_steps,
+        "temperature":       req.temperature,
+        "model_override":    req.model_override,
+        "streaming":         False,
+    }
+    try:
+        r = await state.alpha_code_client.post("/run", json=payload, timeout=EXECUTOR_TIMEOUTS["alpha_code"])
+        r.raise_for_status()
+        return r.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(502, f"alpha_code offline: {e}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, f"alpha_code: {e.response.text[:500]}")
+    except Exception as e:
+        raise HTTPException(500, f"alpha_code falhou: {e}")
 
 
 @app.post("/classify", response_model=ClassifyResponse)
@@ -1604,6 +1909,7 @@ async def status():
         "llm": (state.llm_client, HEALTH_PATHS["llm"]),
         "vision": (state.vision_client, HEALTH_PATHS["vision"]),
         "deep_search": (state.deep_search_client, HEALTH_PATHS["deep_search"]),
+        "alpha_code": (state.alpha_code_client, HEALTH_PATHS["alpha_code"]),  # ← NEW
     }
     for n, (c, p) in cfg.items():
         try: r = await c.get(p, timeout=2.0); checks[n] = {"healthy": r.status_code == 200, "status_code": r.status_code}

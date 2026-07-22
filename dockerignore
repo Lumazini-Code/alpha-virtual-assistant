@@ -4,10 +4,10 @@
 # ==============================================================================
 
 # Modelos GGUF e ONNX (montados como volume)
-Modules/Models/
+*.gguf
 
 # Python
-__pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -16,15 +16,15 @@ dist
 build
 .eggs/
 *.egg
-test
+test/*
 logs/*
 Modules/logs/**
 compiler/
 Modules/memory/**
-
+.venv/*
 # IDE
-.vscode/
-.idea/
+.vscode/*
+.idea/*
 *.swp
 *.swo
 *~
@@ -60,4 +60,4 @@ Thumbs.db
 docker-start.sh
 docker-start.bat
 
-manager/
+Manager/*
