@@ -475,9 +475,19 @@ async def str_replace(req: StrReplaceRequest):
 
         count = content.count(req.old_str)
         if count == 0:
+            # 422, não 404: o arquivo existe (já passou pelo check de
+            # existência acima) — o que não existe é o old_str dentro dele.
+            # Antes usava 404 aqui também, o que deixava indistinguível no
+            # access log de um 404 real de "path não existe" (mesmo código,
+            # mesmo formato de linha, debug muito mais lento).
             raise HTTPException(
-                status_code=404,
-                detail=f"old_str não encontrado no arquivo. Verifique indentação/whitespace."
+                status_code=422,
+                detail=(
+                    "old_str não encontrado no arquivo. Isso normalmente "
+                    "significa que o conteúdo mudou desde a última leitura, ou "
+                    "há diferença de indentação/whitespace/quebra de linha. "
+                    "Releia o arquivo (read-file) antes de tentar de novo."
+                )
             )
         if count > 1 and not req.replace_all:
             raise HTTPException(

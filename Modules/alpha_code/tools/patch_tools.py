@@ -82,18 +82,44 @@ SEARCH_REPLACEMENT_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# Parser tolerante (fallback quando os dois formatos rígidos acima não batem).
+# Aceita variações comuns que modelos geram na prática:
+#   - CRLF (\r\n) em vez de \n
+#   - Número variável de caracteres nos marcadores (3 a 10x '<'/'='/'>')
+#   - Label "SEARCH"/"REPLACE" opcional, com espaços variáveis ao redor
+#   - Espaço/tab sobrando no fim da linha do marcador
+#   - Texto extra depois de "REPLACE" na mesma linha (ex: crase de code fence)
+LENIENT_PATTERN = re.compile(
+    r"^[ \t]*<{3,}[ \t]*(?:SEARCH)?[ \t]*\r?\n"
+    r"(.*?)\r?\n"
+    r"^[ \t]*={3,}[ \t]*\r?\n"
+    r"(.*?)\r?\n"
+    r"^[ \t]*>{3,}[ \t]*(?:REPLACE)?.*$",
+    re.DOTALL | re.MULTILINE,
+)
+
 
 def _parse_patch(patch_text: str) -> list[tuple[str, str]]:
     """
-    Aceita dois formatos:
+    Aceita três formatos, do mais estrito ao mais tolerante:
       1. Padrão Aider com <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
       2. Padrão curto com <<<SEARCH ... === ... >>>
+      3. Fallback tolerante: qualquer variação razoável dos marcadores acima
+         (CRLF, labels/espaços opcionais, nº variável de </=/>). Isso existe
+         porque já vimos o modelo gerar um patch que nenhum dos dois formatos
+         rígidos reconhecia e o apply_patch falhava inteiro (0 blocos) sem
+         nenhuma pista de por quê — o log agora mostra o patch bruto nesse
+         caso pra dar pra diagnosticar de vez.
     Retorna lista de (search, replace).
     """
     blocks: list[tuple[str, str]] = []
 
+    # Normaliza CRLF cedo — ajuda até os formatos 1 e 2 abaixo, que já
+    # assumem \n puro.
+    normalized = patch_text.replace("\r\n", "\n")
+
     # Formato 1 (Aider)
-    matches = list(SEARCH_REPLACEMENT_PATTERN.finditer(patch_text))
+    matches = list(SEARCH_REPLACEMENT_PATTERN.finditer(normalized))
     if matches:
         for m in matches:
             search = m.group(1)
@@ -106,12 +132,23 @@ def _parse_patch(patch_text: str) -> list[tuple[str, str]]:
         r"<<<SEARCH\n(.*?)\n===\n(.*?)\n>>>",
         re.DOTALL,
     )
-    matches = list(pattern2.finditer(patch_text))
+    matches = list(pattern2.finditer(normalized))
     if matches:
         for m in matches:
             blocks.append((m.group(1), m.group(2)))
         return blocks
 
+    # Formato 3 (tolerante) — último recurso antes de desistir
+    matches = list(LENIENT_PATTERN.finditer(normalized))
+    if matches:
+        for m in matches:
+            blocks.append((m.group(1), m.group(2)))
+        return blocks
+
+    # Nada bateu em nenhum dos 3 formatos — loga o patch bruto (truncado)
+    # pra dar pra ver na próxima falha exatamente o que o modelo gerou,
+    # em vez de só saber que "0 blocos" foram encontrados.
+    log.warning(f"apply_patch: nenhum formato reconhecido. patch_text={patch_text[:1000]!r}")
     return []
 
 
@@ -154,13 +191,15 @@ def _apply_blocks(content: str, blocks: list[tuple[str, str]]) -> tuple[str, int
 
 class ApplyPatchTool(Tool):
     name = "apply_patch"
+    # ATENÇÃO: mantenha esta description <= 160 chars (incluindo os literais
+    # "\n" e "```"). agent.py::_compress_schema corta em max_desc_chars=160
+    # antes de enviar ao Groq — uma description mais longa é truncada no meio
+    # (já aconteceu: cortava bem no meio do bloco de exemplo, sem nunca chegar
+    # a mostrar 'file_path' sendo usado, o que contribuía para o modelo gerar
+    # tool calls só com 'patch' e esquecer o 'file_path' obrigatório).
     description = (
-        "Aplica um patch no formato SEARCH/REPLACE a um arquivo. "
-        "Mais robusto que str_replace para múltiplas edições. "
-        "Formato (use exatamente):\\n"
-        "```\\n<<<<<<< SEARCH\\n<código atual>\\n=======\\n<novo código>\\n>>>>>>> REPLACE\\n```\\n"
-        "Pode incluir múltiplos blocos. Cada SEARCH deve ser único no arquivo. "
-        "Atenção ao whitespace — copie exatamente o conteúdo atual."
+        "Edita um arquivo via SEARCH/REPLACE. SEMPRE informe file_path + patch juntos. "
+        "patch: <<<<<<< SEARCH\\n<atual>\\n=======\\n<novo>\\n>>>>>>> REPLACE"
     )
 
     def schema(self) -> dict:
@@ -168,10 +207,13 @@ class ApplyPatchTool(Tool):
             name=self.name,
             description=self.description,
             properties={
-                "file_path": param("string", "Caminho do arquivo relativo ao BASE_DIR"),
+                "file_path": param(
+                    "string",
+                    "Caminho do arquivo relativo ao BASE_DIR. Obrigatório em toda chamada.",
+                ),
                 "patch": param(
                     "string",
-                    "Patch no formato SEARCH/REPLACE (veja description para formato exato).",
+                    "Blocos SEARCH/REPLACE. Cada SEARCH deve ser único no arquivo (inclua contexto).",
                 ),
             },
             required=["file_path", "patch"],

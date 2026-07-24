@@ -1181,11 +1181,12 @@ class AlphaAI(App):
 
     BINDINGS = [
         ("ctrl+q", "quit",        "Sair"),
+        ("ctrl+c", "copy_selection",  "Copiar"),        # ← Copia texto selecionado (ou última msg)
+        ("ctrl+shift+c", "copy_selection", "Copiar"),   # ← Copia texto selecionado (ou última msg)
         ("ctrl+l", "clear_chat",  "Limpar"),
         ("ctrl+n", "new_session", "Nova sessão"),
         ("ctrl+d", "toggle_docker", "Docker Log"),
         ("ctrl+e", "toggle_code_mode", "Code Mode"),  # ← NEW
-        ("ctrl+shift+c", "copy_last_message", "Copiar"),  # ← NEW: copia última msg do assistant
         ("ctrl+shift+f", "save_full_log", "Salvar Log"),  # ← NEW: salva conversa em arquivo
     ]
 
@@ -1326,47 +1327,133 @@ class AlphaAI(App):
         except Exception:
             return
 
-    # ── NEW: Cópia e exportação de mensagens ────────────────────────────────────
-    # O Textual não suporta seleção de texto com mouse nativamente.
-    # Estas actions resolvem o problema copiando para o clipboard do sistema
-    # (via xclip/xsel/pbcopy/clip.exe) ou salvando em arquivo.
+    # ── NEW: Cópia de texto selecionado e exportação de mensagens ──────────────
+    # O Textual suporta seleção de texto com mouse (clique e arraste) em
+    # widgets como Static, RichLog, Input e TextArea. Estas actions extraem
+    # o texto selecionado e copiam para o clipboard do sistema via:
+    #   1. OSC52 (Textual nativo) — funciona em terminais modernos
+    #   2. xclip/xsel (Linux), pbcopy (macOS), clip.exe (Windows)
+    #   3. Fallback: salva em arquivo temporário
 
-    def _get_last_assistant_message(self) -> Optional[str]:
+    def _extract_selection_from_widget(self, widget) -> Optional[str]:
         """
-        Retorna o conteúdo da última mensagem do assistant (texto puro).
-        Percorre os widgets ChatMessage do scroll em ordem reversa, pegando o
-        conteúdo atualizado (inclui deltas adicionados durante streaming).
+        Extrai o texto selecionado de um widget, suportando múltiplas
+        APIs do Textual (diferentes versões e tipos de widget).
+        Retorna None se não houver seleção.
         """
+        if widget is None:
+            return None
+
+        # Método 1: atributo `selected_text` (TextArea e alguns widgets custom)
         try:
-            scroll = self.query_one("#chat-scroll", ScrollableContainer)
-            for widget in reversed(list(scroll.children)):
-                if isinstance(widget, ChatMessage) and widget.role == "assistant":
-                    content = widget.content.strip()
-                    if content:
-                        return content
-        except Exception as e:
-            log.warning(f"Erro ao buscar última mensagem: {e}")
-        # Fallback: usa o buffer de texto puro
-        for msg in reversed(self._plain_messages):
-            if msg["role"] == "assistant" and msg["content"].strip():
-                return msg["content"]
+            selected = getattr(widget, "selected_text", None)
+            if selected and isinstance(selected, str) and selected.strip():
+                return selected
+        except Exception:
+            pass
+
+        # Método 2: atributo `_selected_text` (Static, RichLog em algumas versões)
+        try:
+            selected = getattr(widget, "_selected_text", None)
+            if selected and isinstance(selected, str) and selected.strip():
+                return selected
+        except Exception:
+            pass
+
+        # Método 3: `widget.selection` (Selection namedtuple) para Input/TextArea
+        try:
+            selection = getattr(widget, "selection", None)
+            if selection is not None:
+                start = getattr(selection, "start", None)
+                end   = getattr(selection, "end",   None)
+                if start is not None and end is not None and start != end:
+                    # Input: seleção linear com inteiros
+                    if hasattr(widget, "value") and isinstance(start, int) and isinstance(end, int):
+                        s, e = min(start, end), max(start, end)
+                        return widget.value[s:e]
+                    # TextArea: seleção bidimensional (row, col)
+                    if hasattr(widget, "document"):
+                        try:
+                            if start > end:
+                                start, end = end, start
+                            return widget.document.get_text_range(start, end)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Método 4: `_selection` (privado, versões mais antigas do Static)
+        try:
+            selection = getattr(widget, "_selection", None)
+            if selection is not None:
+                start = getattr(selection, "start", None)
+                end   = getattr(selection, "end",   None)
+                if start is not None and end is not None and start != end:
+                    # Tenta método privado de extração
+                    if hasattr(widget, "_get_selection_text"):
+                        text = widget._get_selection_text()
+                        if text and text.strip():
+                            return text
+        except Exception:
+            pass
+
         return None
 
-    def action_copy_last_message(self) -> None:
+    def _get_selected_text(self) -> Optional[str]:
         """
-        Copia a última mensagem do assistant para o clipboard do sistema.
-        Suporta: Linux (xclip/xsel), macOS (pbcopy), Windows (clip.exe).
-        Fallback: salva em arquivo temporário e mostra o caminho.
+        Percorre widgets para encontrar texto selecionado.
+        Ordem de busca:
+          1. Widget focado (onde o usuário está interagindo)
+          2. Todos os widgets visíveis da tela (caso a seleção
+             tenha sido feita em um widget que perdeu o foco)
         """
-        text = self._get_last_assistant_message()
-        if not text:
-            self._add_message("system", "⚠ Nenhuma mensagem do assistant para copiar.")
-            return
+        # 1. Widget focado
+        try:
+            if self.focused is not None:
+                text = self._extract_selection_from_widget(self.focused)
+                if text:
+                    return text
+        except Exception:
+            pass
 
-        # Tenta copiar via comandos do sistema
+        # 2. Todos os widgets visíveis (procura seleção em qualquer widget)
+        try:
+            for widget in self.screen.query():
+                text = self._extract_selection_from_widget(widget)
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        return None
+
+    def _copy_to_clipboard(self, text: str, source: str = "") -> bool:
+        """
+        Copia texto para o clipboard usando múltiplos métodos:
+          1. OSC52 via Textual nativo (funciona em terminais modernos)
+          2. xclip/xsel (Linux)
+          3. pbcopy (macOS)
+          4. clip.exe (Windows)
+          5. Fallback: salva em arquivo temporário
+        Retorna True se copiou com sucesso.
+        """
+        if not text:
+            return False
+
         import shutil
+        osc_ok  = False
         success = False
-        method = ""
+        method  = ""
+
+        # Método 1: OSC52 via Textual (sempre tenta — funciona em muitos terminais)
+        try:
+            self.copy_to_clipboard(text)
+            osc_ok = True
+            log.info(f"OSC52 copy enviado ({len(text)} chars, source={source})")
+        except Exception as e:
+            log.debug(f"OSC52 falhou: {e}")
+
+        # Métodos 2-4: comandos do SO (reforço — mais confiável que OSC52 em alguns terminais)
 
         # Linux: xclip
         if shutil.which("xclip"):
@@ -1383,7 +1470,7 @@ class AlphaAI(App):
             except Exception as e:
                 log.warning(f"xclip falhou: {e}")
 
-        # Linux: xsel (fallback do xclip)
+        # Linux: xsel
         if not success and shutil.which("xsel"):
             try:
                 proc = subprocess.run(
@@ -1431,12 +1518,19 @@ class AlphaAI(App):
         if success:
             self._add_message(
                 "system",
-                f"✓ Última resposta copiada para o clipboard ({method}). {len(text)} chars."
+                f"✓ Texto copiado para o clipboard ({method}). {len(text)} chars. ({source})"
             )
+            return True
+        elif osc_ok:
+            # OSC52 já enviou — assume sucesso silencioso
+            self._add_message(
+                "system",
+                f"✓ Texto copiado via OSC52. {len(text)} chars. ({source})"
+            )
+            return True
         else:
-            # Fallback: salva em arquivo
+            # Fallback final: salva em arquivo
             try:
-                from datetime import datetime
                 tmp = Path(f"/tmp/ava_clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
                 tmp.write_text(text, encoding="utf-8")
                 self._add_message(
@@ -1445,6 +1539,69 @@ class AlphaAI(App):
                 )
             except Exception as e:
                 self._add_message("system", f"✗ Falha ao copiar: {e}")
+            return False
+
+    def action_copy_selection(self) -> None:
+        """
+        Copia o texto selecionado na tela para o clipboard.
+        Ativado por Ctrl+C e Ctrl+Shift+C.
+
+        Ordem de precedência:
+          1. Texto selecionado em qualquer widget (mouse selection do Textual)
+          2. Última mensagem do assistant (fallback)
+          3. Aviso de "nada para copiar"
+        """
+        # 1. Tenta texto selecionado
+        selected = self._get_selected_text()
+        if selected:
+            self._copy_to_clipboard(selected, source="seleção")
+            return
+
+        # 2. Fallback: última mensagem do assistant
+        last = self._get_last_assistant_message()
+        if last:
+            self._copy_to_clipboard(last, source="última mensagem")
+            return
+
+        # 3. Nada para copiar
+        self._add_message(
+            "system",
+            "⚠ Nada para copiar. Selecione texto com o mouse (clique e arraste) "
+            "ou tenha uma mensagem do assistant no chat."
+        )
+
+    def _get_last_assistant_message(self) -> Optional[str]:
+        """
+        Retorna o conteúdo da última mensagem do assistant (texto puro).
+        Percorre os widgets ChatMessage do scroll em ordem reversa, pegando o
+        conteúdo atualizado (inclui deltas adicionados durante streaming).
+        """
+        try:
+            scroll = self.query_one("#chat-scroll", ScrollableContainer)
+            for widget in reversed(list(scroll.children)):
+                if isinstance(widget, ChatMessage) and widget.role == "assistant":
+                    content = widget.content.strip()
+                    if content:
+                        return content
+        except Exception as e:
+            log.warning(f"Erro ao buscar última mensagem: {e}")
+        # Fallback: usa o buffer de texto puro
+        for msg in reversed(self._plain_messages):
+            if msg["role"] == "assistant" and msg["content"].strip():
+                return msg["content"]
+        return None
+
+    def action_copy_last_message(self) -> None:
+        """
+        Copia a última mensagem do assistant para o clipboard do sistema.
+        Mantida como action separada para compatibilidade.
+        Use action_copy_selection() para copiar texto selecionado (Ctrl+C / Ctrl+Shift+C).
+        """
+        text = self._get_last_assistant_message()
+        if not text:
+            self._add_message("system", "⚠ Nenhuma mensagem do assistant para copiar.")
+            return
+        self._copy_to_clipboard(text, source="última mensagem")
 
     def action_save_full_log(self) -> None:
         """

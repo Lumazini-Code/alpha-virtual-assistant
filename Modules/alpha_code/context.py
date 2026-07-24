@@ -61,6 +61,16 @@ COMPACT_MARKER = (
     "ver /session/{id}/log para o conteúdo completo]"
 )
 
+# Tools cujo resultado NUNCA deve ser compactado/colapsado, mesmo fora da
+# janela de "últimos N" — são o mapa estrutural do projeto (o que existe e
+# onde), tipicamente pequeno (list_files aqui: ~850 chars), e o agente
+# precisa continuar reconsultando o caminho REAL dos arquivos em qualquer
+# step, não só nos primeiros. Compactar isso foi a causa real de um
+# incidente (2026-07-22): list_files sumiu do contexto após poucos steps,
+# e o agente passou ~20 steps alucinando paths de outro projeto em vez de
+# usar a listagem real que já tinha visto.
+STRUCTURAL_TOOL_NAMES = {"list_files", "stat"}
+
 # LLM endpoint (LLM.py:4003) — para summarization
 LLM_URL = os.environ.get("ALPHA_LLM_URL", "http://localhost:4003")
 
@@ -298,6 +308,13 @@ class ContextManager:
         for i in tool_indices:
             m = msgs[i]
             content = m.get("content") or ""
+            tool_name = m.get("name", "")
+
+            # Tools estruturais (list_files/stat) nunca são compactadas —
+            # ver STRUCTURAL_TOOL_NAMES acima.
+            if tool_name in STRUCTURAL_TOOL_NAMES:
+                seen_content.setdefault(content, i)
+                continue
 
             if i in keep_full:
                 seen_content.setdefault(content, i)
@@ -331,6 +348,87 @@ class ContextManager:
 
         return changed
 
+    async def compact_for_budget(self, target_tokens: int) -> bool:
+        """
+        Compactação agressiva que visa trazer o total de tokens de MENSAGENS
+        abaixo de target_tokens. Usada quando o contexto + tool schemas
+        excedem o TPM do modelo e a compactação normal + summarization
+        não foram suficientes.
+
+        Diferente de compact_history() (que preserva os últimos N tool
+        results intactos), este método também trunca tool results
+        recentes e conteúdo de assistant se necessário para atingir o
+        orçamento.
+
+        Nunca toca mensagens de system nem tools estruturais
+        (list_files/stat) — o agente precisa do mapa real do projeto.
+        """
+        msgs = self.session.state.messages
+        changed = False
+
+        # 1. Roda compactação normal primeiro (dedup + encolhe antigos)
+        changed = await self.compact_history() or changed
+
+        if self.tokens_used() <= target_tokens:
+            return changed
+
+        # 2. Trunca tool results que estavam na janela "keep full"
+        #    (do mais antigo pro mais recente, exceto estruturais)
+        tool_indices = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+        for i in tool_indices:
+            if self.tokens_used() <= target_tokens:
+                break
+            m = msgs[i]
+            content = m.get("content") or ""
+            tool_name = m.get("name", "")
+
+            # Nunca compacta tools estruturais
+            if tool_name in STRUCTURAL_TOOL_NAMES:
+                continue
+
+            if len(content) > COMPACT_TOOL_RESULT_MAX_CHARS:
+                m["content"] = content[:COMPACT_TOOL_RESULT_MAX_CHARS] + "\n" + COMPACT_MARKER
+                changed = True
+                # Recalcula a cada iteração para parar cedo
+                self.session.state.tokens_used = self.tokens_used()
+
+        if self.tokens_used() <= target_tokens:
+            if changed:
+                await self.session._save_state()
+            return changed
+
+        # 3. Trunca mensagens de assistant com thinking (conteúdo longo
+        #    que não é tool_call — geralmente raciocínio/explicação)
+        for m in msgs:
+            if self.tokens_used() <= target_tokens:
+                break
+            if m.get("role") == "assistant" and not m.get("tool_calls"):
+                content = m.get("content") or ""
+                if len(content) > 300:
+                    m["content"] = (
+                        content[:300]
+                        + "\n[...compactado para cabir no orçamento de TPM...]"
+                    )
+                    changed = True
+                    self.session.state.tokens_used = self.tokens_used()
+
+        self.session.state.tokens_used = self.tokens_used()
+        if changed:
+            await self.session._save_state()
+            await self.session.append_event({
+                "ts": datetime.utcnow().isoformat(),
+                "type": "budget_compaction",
+                "tokens_after": self.tokens_used(),
+                "target": target_tokens,
+            })
+            log.info(
+                f"Sessão {self.session.session_id}: compactação por orçamento de TPM. "
+                f"Tokens: {self.tokens_used()} (alvo: {target_tokens})"
+            )
+
+        return changed
+
+
     async def emergency_summarize(self) -> bool:
         """
         Versão agressiva de maybe_summarize, usada como último recurso
@@ -349,8 +447,22 @@ class ContextManager:
         if len(non_system) < 3:
             return False
 
-        keep = non_system[-1:]
-        to_summarize = non_system[:-1]
+        # Preserva a última ocorrência de tools estruturais (list_files/
+        # stat), além da última mensagem — sem isso o agente perde de vez
+        # o mapa real do projeto bem na hora mais crítica (contexto já no
+        # limite), e passa a alucinar paths (ver STRUCTURAL_TOOL_NAMES).
+        last_structural_idx: Optional[int] = None
+        for idx, m in enumerate(non_system):
+            if m.get("role") == "tool" and m.get("name") in STRUCTURAL_TOOL_NAMES:
+                last_structural_idx = idx
+
+        keep_idxs = {len(non_system) - 1}
+        if last_structural_idx is not None:
+            keep_idxs.add(last_structural_idx)
+        keep_idxs = _ensure_tool_pairing(non_system, keep_idxs)
+
+        keep = [m for i, m in enumerate(non_system) if i in keep_idxs]
+        to_summarize = [m for i, m in enumerate(non_system) if i not in keep_idxs]
 
         log.warning(
             f"Sessão {self.session.session_id}: emergency_summarize de "
@@ -358,10 +470,15 @@ class ContextManager:
         )
 
         try:
-            summary = await self._call_llm_summarize(to_summarize)
+            summary = await self._call_llm_summarize(to_summarize, model="groq/compound-mini")
         except Exception as e:
-            log.warning(f"Emergency summarization falhou: {e}")
-            return False
+            log.warning(
+                f"Emergency summarization via LLM falhou: {e}. "
+                f"Aplicando truncamento forçado (sem LLM) como último recurso "
+                f"para a sessão não morrer por causa de uma falha do provider "
+                f"bem no passo que deveria salvá-la."
+            )
+            return await self._force_truncate(system_msgs, keep, to_summarize)
 
         summary_msg = {
             "role": "user",
@@ -382,6 +499,47 @@ class ContextManager:
         log.warning(f"Emergency summarization concluída. Tokens agora: {self.tokens_used()}")
         return True
 
+    async def _force_truncate(
+        self, system_msgs: list[dict], keep: list[dict], dropped: list[dict]
+    ) -> bool:
+        """
+        Último recurso dos últimos recursos: descarta mensagens antigas SEM
+        chamar o LLM. Só é usado quando a própria chamada de summarization
+        emergencial falha (ex: Groq 400/503) — ou seja, quando confiar de
+        novo no LLM para se recuperar de um problema causado pelo LLM não é
+        uma boa aposta. Não produz um resumo de qualidade nenhum, só garante
+        que a sessão consiga continuar em vez de morrer com
+        "Context too large... Reduce task complexity or start new session."
+        """
+        if not dropped:
+            return False
+
+        marker_msg = {
+            "role": "user",
+            "content": (
+                "[CONTEXT TRUNCADO À FORÇA — a summarization emergencial via "
+                "LLM falhou (erro do provider), então "
+                f"{len(dropped)} mensagem(ns) antiga(s) foram descartadas SEM "
+                "resumo para a sessão poder continuar. O histórico completo "
+                f"ainda está em /session/{self.session.session_id}/log se "
+                "precisar consultar o que foi feito antes.]"
+            ),
+        }
+        self.session.state.messages = system_msgs + [marker_msg] + keep
+        self.session.state.tokens_used = self.tokens_used()
+        await self.session._save_state()
+        await self.session.append_event({
+            "ts": datetime.utcnow().isoformat(),
+            "type": "forced_truncation",
+            "dropped_count": len(dropped),
+            "tokens_after": self.tokens_used(),
+        })
+        log.warning(
+            f"Sessão {self.session.session_id}: truncamento forçado (sem LLM) "
+            f"aplicado. Tokens agora: {self.tokens_used()}"
+        )
+        return True
+
     async def maybe_summarize(self) -> bool:
         """
         Se preciso, sumariza. Retorna True se sumarizou.
@@ -396,8 +554,10 @@ class ContextManager:
         # System message fica; intermediárias viram summary; últimas KEEP_RECENT ficam
         system_msgs = [m for m in msgs if m.get("role") == "system"]
         non_system = [m for m in msgs if m.get("role") != "system"]
-        keep = non_system[-KEEP_RECENT_AFTER_SUMMARY:]
-        to_summarize = non_system[:-KEEP_RECENT_AFTER_SUMMARY]
+        keep_from = max(0, len(non_system) - KEEP_RECENT_AFTER_SUMMARY)
+        keep_idxs = _ensure_tool_pairing(non_system, set(range(keep_from, len(non_system))))
+        keep = [m for i, m in enumerate(non_system) if i in keep_idxs]
+        to_summarize = [m for i, m in enumerate(non_system) if i not in keep_idxs]
 
         if len(to_summarize) < 3:
             return False
@@ -436,8 +596,21 @@ class ContextManager:
         log.info(f"Summarization concluída. Tokens agora: {self.tokens_used()}")
         return True
 
-    async def _call_llm_summarize(self, messages: list[dict]) -> str:
-        """Chama LLM.py:4003 /chat/tools para sumarizar mensagens antigas."""
+    async def _call_llm_summarize(
+        self, messages: list[dict], model: str = "openai/gpt-oss-20b"
+    ) -> str:
+        """Chama LLM.py:4003 /chat/tools para sumarizar mensagens antigas.
+
+        model: por padrão o mesmo modelo barato de sempre (usado pela
+        summarization rotineira via maybe_summarize). emergency_summarize
+        passa "groq/compound-mini" — TPM de 70K (vs ~6800-10200 dos modelos
+        de chain normais) praticamente elimina o "too_large" bem no passo
+        que é o último recurso antes de matar a sessão. O trade-off é RPD
+        baixo (250/dia) nesse tier, por isso NÃO é o default: usar isso
+        também no caminho rotineiro (maybe_summarize, que dispara toda vez
+        que a sessão passa de 55% do contexto — pode ser várias vezes por
+        sessão) esgotaria a cota diária rápido demais.
+        """
         # Monta prompt de summarization
         formatted = []
         for m in messages:
@@ -464,12 +637,28 @@ class ContextManager:
 
         payload = {
             "messages": [{"role": "user", "content": prompt}],
-            "tools": [],
-            "tool_choice": "auto",
-            "model": "openai/gpt-oss-20b",  # modelo barato para summarization
+            # Sem tools/tool_choice: isto é geração de texto puro (um resumo),
+            # não precisa de function calling. Antes mandava tools=[] junto
+            # com tool_choice="auto" — combinação instável que é candidata
+            # direta a gerar o erro do Groq "400 - Failed to call a
+            # function. Please adjust your prompt" bem na chamada que é o
+            # último recurso antes de desistir da sessão inteira. Além
+            # disso, os sistemas groq/compound* NEM suportam tools
+            # customizadas — mandar isso quebraria a chamada de vez.
+            "model": model,
             "temperature": 0.2,
             "max_tokens": 1024,
         }
+
+        if model.startswith("groq/compound"):
+            # Desliga TODAS as built-in tools (web_search, code_interpreter,
+            # visit_website, browser_automation, wolfram_alpha). Sem isso o
+            # compound pode decidir sozinho pesquisar na web ou rodar código
+            # com o conteúdo do resumo (que inclui trechos de arquivos do
+            # projeto do usuário) — imprevisível e desnecessário pra uma
+            # tarefa que é só "resuma esse texto".
+            payload["compound_custom"] = {"tools": {"enabled_tools": []}}
+
         r = await self._client.post("/chat/tools", json=payload)
         r.raise_for_status()
         data = r.json()
@@ -482,3 +671,27 @@ class ContextManager:
 
 def _estimate_tokens_summary(messages: list[dict]) -> int:
     return estimate_messages_tokens(messages)
+
+
+def _ensure_tool_pairing(non_system: list[dict], idxs: set[int]) -> set[int]:
+    """
+    Garante que, para toda mensagem role=tool mantida em idxs, a mensagem
+    assistant (com tool_calls) que a originou também fique em idxs.
+
+    Sem isso, cortar o histórico "a partir do índice X" pode manter um
+    resultado de tool ÓRFÃO — sem o tool_call correspondente antes dele.
+    Isso quebra o protocolo de mensagens OpenAI/Groq (um `tool` role sem o
+    `assistant.tool_calls` que o originou é inválido) e pode fazer o Groq
+    recusar o request inteiro. Suspeita forte de ser a causa real de um
+    incidente em produção: um Groq 400 "Failed to call a function" logo
+    depois de um emergency_summarize() que alterou o histórico.
+    """
+    result = set(idxs)
+    for i in list(idxs):
+        j = i
+        while j >= 0 and non_system[j].get("role") == "tool":
+            result.add(j)
+            j -= 1
+        if j >= 0:
+            result.add(j)  # a mensagem assistant que originou os tool_calls
+    return result

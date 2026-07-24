@@ -69,9 +69,8 @@ def _check_rg() -> str:
 class SearchCodeTool(Tool):
     name = "search_code"
     description = (
-        "Busca por padrão (regex ou literal) em arquivos do projeto usando ripgrep. "
-        "Retorna matches com arquivo:linha:conteúdo. "
-        "Ex: search_code({\"pattern\": \"def authenticate\", \"file_type\": \"py\"})"
+        "Busca por padrão (regex/literal) em arquivos via ripgrep. 'pattern' é "
+        "OBRIGATÓRIO. Retorna arquivo:linha:conteúdo. Ex: {\"pattern\": \"def foo\"}"
     )
 
     def schema(self) -> dict:
@@ -216,9 +215,9 @@ class SearchCodeTool(Tool):
 class SemanticSearchTool(Tool):
     name = "semantic_search"
     description = (
-        "Busca semântica em código: encontra arquivos/símbolos por significado, não por string exata. "
-        "Ex: semantic_search({\"query\": \"onde é implementada a autenticação JWT\"}). "
-        "Usa embeddings multilingual-e5-small + cross-encoder rerank via onnx_serving:2002."
+        "Busca semântica em código por significado, não string exata. "
+        "Ex: {\"query\": \"onde é implementada autenticação JWT\"}. "
+        "Usa embeddings + rerank via onnx_serving."
     )
 
     def schema(self) -> dict:
@@ -284,7 +283,11 @@ class SemanticSearchTool(Tool):
             )
 
         # 2. Lê conteúdo (limita tamanho por arquivo p/ não estourar embedding)
-        docs: list[tuple[str, str]] = []
+        # NOTA: path e chunk_idx ficam separados (não mais "path#i" concatenado).
+        # Concatenar já causou o modelo tentar ler_file("orchestrator.py#49")
+        # literalmente, que sempre dá 404 — "#N" é só controle interno pra
+        # saber qual pedaço do arquivo, não faz parte do path de verdade.
+        docs: list[tuple[str, int, str]] = []
         for f in files:
             try:
                 content = f.read_text(encoding="utf-8", errors="replace")
@@ -297,7 +300,7 @@ class SemanticSearchTool(Tool):
             except Exception:
                 rel = str(f)
             for i, chunk in enumerate(chunks):
-                docs.append((f"{rel}#{i}", chunk))
+                docs.append((rel, i, chunk))
 
         if not docs:
             return ToolResult(
@@ -314,7 +317,7 @@ class SemanticSearchTool(Tool):
                 query_emb = r_q.json()["embeddings"][0]
 
                 # 4. Embed passages (batch 64)
-                passages = [f"passage: {d[1]}" for d in docs]
+                passages = [f"passage: {d[2]}" for d in docs]
                 all_embs = []
                 for i in range(0, len(passages), 64):
                     batch = passages[i:i+64]
@@ -335,22 +338,65 @@ class SemanticSearchTool(Tool):
                 top_idx = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:25]
 
                 # 6. Rerank com cross-encoder
-                candidates = [docs[i][1] for i in top_idx]
-                r_r = await client.post("/v1/rerank", json={"query": query, "candidates": candidates, "top_k": max_results})
-                if r_r.status_code == 200:
-                    ranked = r_r.json().get("ranked", [])
-                else:
-                    # sem reranker → usa só sims
-                    ranked = [{"index": i, "score": sims[i], "text": candidates[i]} for i in top_idx[:max_results]]
+                candidates = [docs[i][2] for i in top_idx]
+                ranked: list[dict] = []
+                if candidates:
+                    # onnx_serving espera o campo "passages", não "candidates" —
+                    # confirmado pelo 422 anterior: {"detail":[{"loc":["body",
+                    # "passages"],"msg":"Field required"}]}. Antes disso caía
+                    # sempre no fallback por sims, nunca rerankeava de verdade.
+                    r_r = await client.post("/v1/rerank", json={"query": query, "passages": candidates, "top_k": max_results})
+                    if r_r.status_code == 200:
+                        resp_json = r_r.json()
+                        # Tenta as chaves mais prováveis pro array de resultados —
+                        # já vimos um 200 OK com "ranked" ausente (a chave certa
+                        # do onnx_serving ainda não foi confirmada). Loga as
+                        # chaves reais quando nada bate, pra descobrir de vez.
+                        ranked = (
+                            resp_json.get("ranked")
+                            or resp_json.get("results")
+                            or resp_json.get("reranked")
+                            or resp_json.get("data")
+                            or []
+                        )
+                        if not ranked and resp_json:
+                            log.warning(
+                                f"/v1/rerank 200 OK mas nenhuma chave conhecida "
+                                f"(ranked/results/reranked/data) tinha itens. "
+                                f"keys={list(resp_json.keys())!r} body={r_r.text[:500]!r}"
+                            )
+                    else:
+                        # Ainda assim trata qualquer outro erro sem crashar —
+                        # loga o corpo pra diagnosticar e cai pro fallback.
+                        log.warning(
+                            f"/v1/rerank retornou {r_r.status_code}, usando fallback por sims. "
+                            f"body={r_r.text[:500]!r}"
+                        )
+                        # IMPORTANTE: "index" aqui precisa ser a POSIÇÃO dentro de
+                        # top_idx/candidates (0..len(top_idx)-1), não o índice
+                        # original em docs — é o mesmo formato que o bloco de
+                        # montagem de resultado abaixo espera via
+                        # `top_idx[r["index"]]`. Usar o índice original de docs
+                        # aqui causava IndexError em candidates[i] (candidates só
+                        # tem len(top_idx) itens, tipicamente 25).
+                        ranked = [
+                            {"index": pos, "score": sims[orig_i], "text": candidates[pos]}
+                            for pos, orig_i in enumerate(top_idx[:max_results])
+                        ]
 
                 # 7. Monta resultado
+                # Formato explícito "arquivo=" pra deixar claro pro modelo qual
+                # é o path de verdade a usar em read_file — sem o "#N" do chunk
+                # colado (isso já causou tentativas de read_file("foo.py#3")).
                 out_lines = []
                 for r in ranked[:max_results]:
                     orig_idx = top_idx[r["index"]] if "index" in r else r.get("orig_idx", 0)
-                    doc_path, doc_text = docs[orig_idx]
+                    doc_path, chunk_idx, doc_text = docs[orig_idx]
                     snippet = doc_text[:400].replace("\n", " ")
-                    out_lines.append(f"[score={r.get('score', 0):.3f}] {doc_path}\n  {snippet}")
-                out = "\n\n".join(out_lines)
+                    out_lines.append(
+                        f"[score={r.get('score', 0):.3f}] arquivo={doc_path} (trecho {chunk_idx})\n  {snippet}"
+                    )
+                out = "\n\n".join(out_lines) or "Nenhum resultado relevante encontrado."
                 return ToolResult(
                     tool_call_id="",
                     tool_name=self.name,

@@ -49,8 +49,25 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+class ScrapeClientError(Exception):
+    """Erro do scraping_client que preserva o status_code original.
+
+    Antes tudo virava RuntimeError genérico, e quem chamava _post não tinha
+    como distinguir "old_str não bateu" (422, recuperável, o modelo só
+    precisa reler o arquivo e tentar de novo) de um erro de verdade (500,
+    403, etc). Isso fazia o registry.py logar até esses casos esperados
+    como "Tool crashed" (log.exception), o que é ruidoso e enganoso.
+    """
+
+    def __init__(self, path: str, status_code: int, detail: str):
+        self.path = path
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"scraping_client {path} → {status_code}: {detail}")
+
+
 async def _post(path: str, payload: dict) -> dict:
-    """POST helper que levanta exceção em status não-2xx."""
+    """POST helper que levanta ScrapeClientError em status não-2xx."""
     client = await _get_client()
     r = await client.post(path, json=payload)
     if r.status_code >= 400:
@@ -58,7 +75,7 @@ async def _post(path: str, payload: dict) -> dict:
             detail = r.json().get("detail", r.text[:500])
         except Exception:
             detail = r.text[:500]
-        raise RuntimeError(f"scraping_client {path} → {r.status_code}: {detail}")
+        raise ScrapeClientError(path, r.status_code, detail)
     return r.json()
 
 
@@ -76,9 +93,8 @@ async def close_client() -> None:
 class ListFilesTool(Tool):
     name = "list_files"
     description = (
-        "Lista arquivos e diretórios em um path do projeto. "
-        "Retorna nome, tipo (arquivo/dir), tamanho e mtime. "
-        "Use para descobrir a estrutura do projeto antes de buscar símbolos específicos."
+        "Lista arquivos/dirs de um path do projeto: nome, tipo, tamanho, mtime. "
+        "Use antes de buscar símbolos específicos."
     )
 
     def schema(self) -> dict:
@@ -151,7 +167,22 @@ class ReadFileTool(Tool):
                 tool_call_id="", tool_name=self.name, success=False,
                 error="file_path é obrigatório",
             )
-        data = await _post("/read-file", {"file_path": file_path})
+        try:
+            data = await _post("/read-file", {"file_path": file_path})
+        except ScrapeClientError as e:
+            if e.status_code == 404:
+                # Path não existe — comum quando o modelo erra o path (ex:
+                # usou um path chutado ou um identificador interno de outra
+                # tool, como o "arquivo#chunk" do semantic_search). É
+                # recuperável: o loop ReAct deve rodar list_files e tentar de
+                # novo, não é um crash de verdade. Sem isso, todo 404 virava
+                # log.exception("crashed") no registry.py — ruidoso e
+                # enganoso pro mesmo motivo já documentado em StrReplaceTool.
+                return ToolResult(
+                    tool_call_id="", tool_name=self.name, success=False,
+                    error=f"Arquivo não encontrado: {file_path}. Use list_files para confirmar o path exato.",
+                )
+            raise
         content = data.get("content", "")
         truncated = data.get("truncated", False)
         out = content
@@ -174,10 +205,8 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     name = "write_file"
     description = (
-        "Cria ou sobrescreve um arquivo com o conteúdo dado. "
-        "CUIDADO: sobrescreve conteúdo existente sem perguntar. "
-        "Para criar arquivo novo, use create_parents=true. "
-        "Para evitar perdas, prefira str_replace para edições."
+        "Cria/sobrescreve um arquivo com o conteúdo dado. CUIDADO: sobrescreve "
+        "sem perguntar. Prefira apply_patch pra editar sem perder conteúdo."
     )
 
     def schema(self) -> dict:
@@ -212,9 +241,8 @@ class WriteFileTool(Tool):
 class StrReplaceTool(Tool):
     name = "str_replace"
     description = (
-        "Substitui uma string por outra em um arquivo. "
-        "FALHA se old_str não existir, ou se aparecer >1 vez e replace_all=false. "
-        "Inclua contexto suficiente (linhas ao redor) para garantir match único."
+        "Substitui uma string por outra em um arquivo. FALHA se old_str não "
+        "existir ou aparecer >1x (replace_all=false). Inclua contexto pro match único."
     )
 
     def schema(self) -> dict:
@@ -231,12 +259,31 @@ class StrReplaceTool(Tool):
         )
 
     async def execute(self, args: dict, ctx: StepContext) -> ToolResult:
-        data = await _post("/str-replace", {
-            "file_path": args["file_path"],
-            "old_str": args["old_str"],
-            "new_str": args["new_str"],
-            "replace_all": args.get("replace_all", False),
-        })
+        try:
+            data = await _post("/str-replace", {
+                "file_path": args["file_path"],
+                "old_str": args["old_str"],
+                "new_str": args["new_str"],
+                "replace_all": args.get("replace_all", False),
+            })
+        except ScrapeClientError as e:
+            if e.status_code == 422:
+                # old_str não bateu com o conteúdo atual — esperado e
+                # recuperável, não é um crash. Devolve ToolResult normal
+                # (success=False) pro loop ReAct decidir reler o arquivo,
+                # em vez de propagar e virar log.exception("crashed").
+                return ToolResult(
+                    tool_call_id="", tool_name=self.name, success=False,
+                    error=e.detail,
+                )
+            if e.status_code == 409:
+                return ToolResult(
+                    tool_call_id="", tool_name=self.name, success=False,
+                    error=e.detail,
+                )
+            # Demais status codes (403, 404 de path real, 500...) seguem
+            # sendo tratados como erro genérico pelo registry.py.
+            raise
         return ToolResult(
             tool_call_id="",
             tool_name=self.name,
@@ -249,10 +296,8 @@ class StrReplaceTool(Tool):
 class RunCommandTool(Tool):
     name = "run_command"
     description = (
-        "Executa um comando shell no diretório do projeto (BASE_DIR do scraping_client). "
-        "Use para: build, lint, formatador, install de deps, git. "
-        "EVITE: rm -rf, mkfs, format (bloqueado). "
-        "Timeout padrão 30s."
+        "Roda comando shell no BASE_DIR do projeto. Use pra build/lint/deps/git. "
+        "EVITE rm -rf/mkfs/format (bloqueado). Timeout 30s."
     )
 
     def schema(self) -> dict:
@@ -334,10 +379,19 @@ class StatTool(Tool):
 # ── Registry helper ──────────────────────────────────────────────────────────
 
 def register_all(registry) -> None:
-    """Registra todas as file tools no registry dado."""
+    """Registra todas as file tools no registry dado.
+
+    NOTA: StrReplaceTool NÃO é registrada de propósito. apply_patch
+    (patch_tools.py) cobre o mesmo caso de uso com múltiplos blocos por
+    chamada e erro detalhado por bloco (qual bloco falhou, 0x vs Nx
+    ocorrências) — é um superconjunto estrito. Manter as duas registradas
+    dava ao modelo duas ferramentas sobrepostas para "editar arquivo", o
+    que piora a escolha de tool e não trouxe benefício real em troca. A
+    classe StrReplaceTool continua definida (e com o tratamento de erro
+    422/409 corrigido) caso algum outro fluxo precise dela diretamente.
+    """
     registry.register(ListFilesTool())
     registry.register(ReadFileTool())
     registry.register(WriteFileTool())
-    registry.register(StrReplaceTool())
     registry.register(RunCommandTool())
     registry.register(StatTool())
