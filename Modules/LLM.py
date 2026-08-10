@@ -44,9 +44,6 @@ log = logging.getLogger("ava.llm")
 
 
 load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-
-log.info(f"[LLM] GROQ_API_KEY loaded: {'set' if GROQ_KEY else 'not set'}")
 
 # ─────────────────────────────────────────────────────────────
 #                          CONFIG
@@ -63,7 +60,6 @@ LLAMA_SERVER_PATH = r".\llama-cpp\llama-server"
 LLAMA_HOST        = "localhost"
 LLAMA_PORT        = 2001
 LLAMA_URL         = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
-GROQ_URL          = "https://api.groq.com/openai"    
 
 # ─────────────────────────────────────────────────────────────
 #          OPTIMIZATION 1: PERSISTENT HTTP CLIENTS
@@ -74,7 +70,6 @@ GROQ_URL          = "https://api.groq.com/openai"
 # This is the SINGLE BIGGEST latency win for TTFT.
 
 _llama_client: httpx.AsyncClient | None = None
-_groq_client: httpx.AsyncClient | None = None
 _memory_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
 
@@ -98,28 +93,6 @@ async def _get_llama_client() -> httpx.AsyncClient:
 
 
 
-async def _get_groq_client() -> httpx.AsyncClient:
-    """Persistent client to Groq API — connection pooling + keep-alive."""
-    global _groq_client
-    if _groq_client is None or _groq_client.is_closed:
-        _groq_client = httpx.AsyncClient(
-            base_url=GROQ_URL,
-            timeout=httpx.Timeout(9999999.0, connect=5.0),
-            limits=httpx.Limits(
-                max_connections=10,
-                max_keepalive_connections=6,
-                keepalive_expiry=60.0,       # Keep connections warm for 60s
-            ),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}"},
-        )
-    return _groq_client
-
-
-
-
-
-    
-    
 async def _get_memory_client() -> httpx.AsyncClient:
     """Persistent client to memory API — connection pooling + keep-alive."""
     global _memory_client
@@ -196,7 +169,6 @@ model_raw = _read(BASEFOLDER / r"resource/Aiconfig.dll")
 model_path = re.split(r"[\\/]", model_raw)
 MODEL_PATH = model_path[-1]
 MODEL_NAME = model_raw
-MODEL_GROQ_NAME = "openai/gpt-oss-120b"
 
 try:
     with open(BASEFOLDER / f"CfgModels/{model_raw}.json", "r", encoding="utf-8") as f:
@@ -213,523 +185,110 @@ import httpx
 log = logging.getLogger("ava.llm")
 
 # ════════════════════════════════════════════════════════════════════════════
-# Rate limits reais por modelo (console Groq, tier on_demand desta org,
-# checado em 2026-07-22). Usados como valor inicial de "remaining" antes do
-# primeiro response chegar com headers reais, e como fallback pra modelos
-# não listados aqui (ex: futuro modelo novo ainda não catalogado).
+# Inferência 100% local via llama-server — um único modelo, sem rate-limit
+# tracking por modelo e sem estado de "esgotado".
 # ════════════════════════════════════════════════════════════════════════════
-MODEL_RATE_LIMITS: dict[str, dict[str, int]] = {
-    "llama-3.1-8b-instant":    {"rpm": 30, "rpd": 14_400, "tpm": 6_000,  "tpd": 500_000},
-    "llama-3.3-70b-versatile": {"rpm": 30, "rpd": 1_000,  "tpm": 12_000, "tpd": 100_000},
-    "openai/gpt-oss-120b":     {"rpm": 30, "rpd": 1_000,  "tpm": 8_000,  "tpd": 200_000},
-    "openai/gpt-oss-20b":      {"rpm": 30, "rpd": 1_000,  "tpm": 8_000,  "tpd": 200_000},
-}
-_DEFAULT_MODEL_RATE_LIMITS = {"rpm": 30, "rpd": 1_000, "tpm": 8_000, "tpd": 200_000}
 
-# Teto de espera "razoável" pra um 429 de TPM por minuto. Na prática o Groq
-# já mandou retry-after de 2376s (~40min) num 429 — isso não é mais um
-# rate-limit de minuto, é algo mais parecido com quota horária/diária. Sem
-# teto, _wait_for_groq_tpm ficava com asyncio.sleep(2376) e travava a
-# request (e a task inteira do alpha_code, que espera essa resposta) por
-# quase 40 minutos numa única chamada. Acima desse teto, tratamos como
-# "esgotado" (mesmo caminho do RPD diário) e caímos em fallback/erro
-# IMEDIATO em vez de bloquear a thread.
-GROQ_MAX_REASONABLE_WAIT_SECONDS = float(os.getenv("GROQ_MAX_REASONABLE_WAIT_SECONDS", "90"))
-
-
-def _model_limits(model_name: str) -> dict:
-    return MODEL_RATE_LIMITS.get(model_name, _DEFAULT_MODEL_RATE_LIMITS)
-
-
-def _new_model_state(model_name: str) -> dict:
-    limits = _model_limits(model_name)
-    return {
-        "blocked_until": 0.0,          # timestamp em que TPM libera
-        "daily_exhausted": False,      # RPD esgotado?
-        "daily_reset_at": 0.0,         # timestamp em que RPD reseta
-        "last_remaining_tokens": limits["tpm"],
-        "last_remaining_requests": limits["rpd"],
-    }
-
-
-# ANTES: um único dict global compartilhado por TODOS os modelos Groq. Isso
-# quebrava qualquer tentativa de usar mais de um modelo: se o modelo A
-# batesse RPD, `daily_exhausted` virava True globalmente e TODO request
-# subsequente — mesmo pra modelo B/C/D, que nunca chegaram perto do limite
-# deles — era tratado como esgotado (e como alpha_code chama /chat/tools
-# com allow_llama_fallback=False, isso derrubava a task inteira em vez de
-# só cair pro llama-server). Agora é um dict POR MODELO, indexado pelo
-# nome exato usado na Groq API (ex: "openai/gpt-oss-120b").
-groq_state: dict[str, dict] = {}
-
-
-def _get_model_state(model_name: str) -> dict:
-    if model_name not in groq_state:
-        groq_state[model_name] = _new_model_state(model_name)
-    return groq_state[model_name]
-
-
-
-def _estimate_prompt_tokens(messages: list) -> int:
-    """Estima tokens do prompt (heurística: 4 chars ≈ 1 token)."""
-    total_chars = 0
-    for m in messages:
-        content = m.get("content", "") if isinstance(m, dict) else str(m)
-        total_chars += len(str(content))
-        # overhead por mensagem (~4 tokens)
-        total_chars += 16
-    return total_chars // 4
-
-
-def _calc_max_tokens(messages: list, model_name: str, requested: int = 4096) -> int:
+def _calc_max_tokens(messages: list, requested: int = 4096) -> int:
     """
-    Calcula max_tokens dinamicamente baseado no modelo e tamanho do prompt.
-
-    Limites TPM por modelo (tier on_demand do Groq):
-      - gpt-oss-20b:  8000 TPM
-      - gpt-oss-120b: 30000 TPM
-      - llama-3.3-70b: 15000 TPM
-      - llama-server (local): sem limite prático
-
-    Estratégia:
-      - Reserva 500 tokens de margem
-      - max_tokens = min(requested, tpm_limit - prompt_tokens - 500)
-      - Se sobrar menos de 1024 tokens, usa 1024 (mínimo para resposta útil)
+    Calcula max_tokens para a resposta. O llama-server local não impõe
+    limite prático de tokens por minuto, então isso só evita pedir um
+    max_tokens absurdamente alto por engano.
     """
-    if not _is_groq_model_name(model_name):
-        # llama-server local: usa o solicitado (sem limite TPM)
-        return min(requested, 8000)
-
-    prompt_tokens = _estimate_prompt_tokens(messages)
-
-    # TPM limits por modelo
-    tpm_limits = {
-        "openai/gpt-oss-20b": 8000,
-        "openai/gpt-oss-120b": 30000,
-        "llama-3.3-70b-versatile": 15000,
-    }
-    tpm = tpm_limits.get(model_name, 8000)  # conservador: 8000 default
-
-    available = tpm - prompt_tokens - 500  # 500 tokens de margem
-    max_tok = min(requested, available)
-    return max(max_tok, 1024)  # mínimo 1024 tokens para resposta útil
+    return min(requested, 8000)
 
 
-def _is_groq_model_name(model_name: str) -> bool:
-    """Verifica se o modelo é do Groq (não llama-server local)."""
-    return model_name.startswith("openai/") or model_name.startswith("llama-3") or "/" in model_name
-
-
-async def _execute_inference(json_payload: dict, thinking_depth: int, stream: bool = False):
+def _reasoning_payload_extra(thinking_depth: int) -> dict:
     """
-    Executa a inferência respeitando as regras estritas:
-    - Se for usar Groq e der erro 429 (TPM), espera e tenta de novo (loop infinito).
-    - Só faz fallback para llama-server se for RPD ou erro 5xx de servidor.
+    Traduz `thinking_depth` (0-10) em parâmetros de reasoning para o
+    llama-server. LFM2.5-8B-A1B é um reasoning model — a decisão do time
+    (2026-08-05) é priorizar QUALIDADE por padrão, então depth=0 não manda
+    nenhum override e deixa o comportamento nativo do template agir
+    (raciocínio sem teto).
+
+    Para depth > 0, tentamos limitar via `reasoning_budget_tokens` — mas o
+    nome desse campo mudou entre versões recentes do llama.cpp (havia
+    `think_budget` via CLI, `thinking_budget_tokens` numa proposta anterior,
+    e `reasoning_budget_tokens` é o confirmado como funcional per-request na
+    build mais recente checada). Se o seu build não reconhecer o campo, ele
+    é ignorado silenciosamente pelo llama-server — sem quebrar o request,
+    só sem efeito. Vale conferir contra `--help`/`/props` do seu binário.
     """
-    while True:
-        client = await choose_client(thinking_depth)
-        model_name = await get_model_name(thinking_depth)
-        messages = json_payload.get("messages", [])
-        # ← FIX: calcula max_tokens dinamicamente para não estourar TPM do Groq
-        # (antes era fixo em 8000, fazendo o LLM desistir de tarefas longas)
-        max_tok = _calc_max_tokens(messages, model_name, requested=4096)
-
-        # Se escolheu llama-server, executa e retorna
-        if not _is_groq_client(client):
-            payload = {**json_payload, "model": model_name, "stream": stream, "max_tokens": max_tok}
-            if stream:
-                ctx = client.stream("POST", "/v1/chat/completions", json=payload)
-                return client, model_name, ctx
-            else:
-                r = await client.post("/v1/chat/completions", json=payload)
-                return client, model_name, r
-
-        # Escolheu Groq. Tenta executar
-        try:
-            payload = {**json_payload, "model": model_name, "stream": stream, "max_tokens": max_tok}
-            if stream:
-                # No stream, retornamos o contexto. O 429 será tratado por quem chamar.
-                ctx = client.stream("POST", "/v1/chat/completions", json=payload)
-                return client, model_name, ctx
-            else:
-                r = await client.post("/v1/chat/completions", json=payload)
-                await update_groq_limits(r, model_name)
-
-                if r.status_code == 429:
-                    log.warning("Groq: 429 (TPM). Vou esperar e tentar de novo...")
-                    continue # Volta para o while True, vai chamar choose_client que vai esperar
-                
-                if r.status_code >= 500:
-                    log.warning(f"Groq: Erro servidor {r.status_code}. Fallback para llama-server.")
-                    fb = await _get_llama_client()
-                    rfb = await fb.post("/v1/chat/completions", json={**json_payload, "model": MODEL_NAME, "stream": False, "max_tokens": max_tok})
-                    return fb, MODEL_NAME, rfb
-
-                return client, model_name, r
-
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            log.warning(f"Groq: erro de rede ({type(e).__name__}). Fallback para llama-server.")
-            fb = await _get_llama_client()
-            payload = {**json_payload, "model": MODEL_NAME, "stream": stream, "max_tokens": max_tok}
-            if stream:
-                return fb, MODEL_NAME, fb.stream("POST", "/v1/chat/completions", json=payload)
-            else:
-                rfb = await fb.post("/v1/chat/completions", json=payload)
-                return fb, MODEL_NAME, rfb
+    if thinking_depth <= 0:
+        return {}
+    return {"reasoning_budget_tokens": thinking_depth * 300}
 
 
-def _parse_duration_to_seconds(value: str) -> float:
-    if not value:
-        return 2.0
-    value = value.strip().lower()
-    pattern = re.compile(r'(\d+(?:\.\d+)?)([hms])')
-    matches = pattern.findall(value)
-    total = 0.0
-    for num, unit in matches:
-        n = float(num)
-        if unit == 'h': total += n * 3600
-        elif unit == 'm': total += n * 60
-        elif unit == 's': total += n
-    return total if total > 0 else 2.0
-
-
-def _extract_retry_seconds_from_body(body_text: str) -> Optional[float]:
+async def _execute_inference(json_payload: dict, stream: bool = False):
     """
-    Extrai tempo de retry do corpo do erro do Groq.
-    Formato: "Please try again in 9.18s" ou "Please try again in 9.18 seconds"
-    Retorna None se não encontrar.
+    Executa a inferência contra o llama-server local (único backend).
     """
-    if not body_text:
-        return None
-    m = re.search(r"try again in\s+(\d+(?:\.\d+)?)\s*(?:s|seconds?)", body_text, re.IGNORECASE)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
+    client = await _get_llama_client()
+    messages = json_payload.get("messages", [])
+    max_tok = _calc_max_tokens(messages, requested=4096)
+    payload = {**json_payload, "model": MODEL_NAME, "stream": stream, "max_tokens": max_tok}
+
+    if stream:
+        ctx = client.stream("POST", "/v1/chat/completions", json=payload)
+        return client, MODEL_NAME, ctx
+    else:
+        r = await client.post("/v1/chat/completions", json=payload)
+        return client, MODEL_NAME, r
 
 
-def _is_request_too_large_error(body_text: str) -> bool:
-    """
-    Detecta erro do Groq onde o REQUEST individual é maior que o limite TPM do modelo.
-    Diferente de "rate limit reached" — esse NÃO resolve esperando.
+# ─────────────────────────────────────────────────────────────
+#          INFERÊNCIA SÍNCRONA COM RETRY (falhas transitórias)
+# ─────────────────────────────────────────────────────────────
+# Único backend: llama-server local. Apenas um pequeno retry para
+# 5xx/erro de rede transitório.
 
-    Mensagens típicas:
-      - "Request too large for model X on tokens per minute (TPM)"
-      - "please reduce your message size and try again"
-    """
-    if not body_text:
-        return False
-    bt = body_text.lower()
-    return ("request too large" in bt and "tokens per minute" in bt) or \
-           ("reduce your message size" in bt) or \
-           ("request_too_large" in bt)
+LLAMA_MAX_RETRIES = 2
+LLAMA_RETRY_BACKOFF_S = 1.0
 
 
-def _check_daily_reset(model_name: str):
-    st = _get_model_state(model_name)
-    if st["daily_exhausted"] and time.time() >= st["daily_reset_at"]:
-        limits = _model_limits(model_name)
-        st["daily_exhausted"] = False
-        st["last_remaining_requests"] = limits["rpd"]
-        st["last_remaining_tokens"] = limits["tpm"]
-        st["blocked_until"] = 0.0
-        log.info(f"Groq: janela diária (RPD) resetada pra {model_name} — voltando a usar.")
-
-
-
-
-async def update_groq_limits(response, model_name: str):
-    st = _get_model_state(model_name)
-    headers = response.headers
-    if "x-ratelimit-remaining-tokens" not in headers and "retry-after" not in headers:
-        return
-
-    limits = _model_limits(model_name)
-    try:
-        remaining_tokens = int(headers.get("x-ratelimit-remaining-tokens", limits["tpm"]))
-    except (ValueError, TypeError):
-        remaining_tokens = limits["tpm"]
-    try:
-        remaining_requests = int(headers.get("x-ratelimit-remaining-requests", limits["rpd"]))
-    except (ValueError, TypeError):
-        remaining_requests = limits["rpd"]
-
-    st["last_remaining_tokens"] = remaining_tokens
-    st["last_remaining_requests"] = remaining_requests
-
-    # Limite DIÁRIO (RPD) esgotado PARA ESTE MODELO → só ele cai pro
-    # llama-server (ou é rejeitado, se allow_llama_fallback=False); os
-    # outros 3 modelos continuam disponíveis normalmente.
-    if remaining_requests <= 0:
-        reset_requests_str = headers.get("x-ratelimit-reset-requests", "")
-        reset_seconds = _parse_duration_to_seconds(reset_requests_str)
-        reset_seconds = max(reset_seconds, 60.0)
-        st["daily_exhausted"] = True
-        st["daily_reset_at"] = time.time() + reset_seconds
-        log.warning(f"Groq: RPD diário esgotado para {model_name}. Bloqueado por {reset_seconds:.1f}s.")
-        return
-
-    # Limite POR MINUTO (TPM) esgotado → bloqueia e espera (só este modelo)
-    if remaining_tokens <= 0:
-        reset_tokens_str = headers.get("x-ratelimit-reset-tokens", "")
-        reset_seconds = _parse_duration_to_seconds(reset_tokens_str)
-        if reset_seconds > GROQ_MAX_REASONABLE_WAIT_SECONDS:
-            st["daily_exhausted"] = True
-            st["daily_reset_at"] = time.time() + reset_seconds
-            st["blocked_until"] = time.time() + reset_seconds
-            log.warning(
-                f"Groq: TPM esgotado para {model_name} com reset de {reset_seconds:.1f}s — "
-                f"acima do teto razoável ({GROQ_MAX_REASONABLE_WAIT_SECONDS:.0f}s). "
-                f"Tratando como quota esgotada (fallback/erro imediato em vez de bloquear)."
-            )
-            return
-        wait_seconds = reset_seconds + 0.5
-        st["blocked_until"] = time.time() + wait_seconds
-        log.warning(f"Groq: TPM por minuto esgotado para {model_name}. Esperando {wait_seconds:.2f}s para tentar de novo.")
-        return
-
-    # 429 com remaining_tokens > 0 (request excede quota disponível no bucket)
-    # Ex: "Limit 8000, Used 6467, Requested 2757" → remaining=1533, mas request=2757
-    # Aqui precisamos distinguir:
-    #   - "try again in X seconds" → rate limit normal, espera
-    #   - "Request too large" → request é maior que o limite TPM inteiro, NÃO espera
-    if response.status_code == 429 and "retry-after" in headers:
-        # Tenta ler o body para detectar tipo do erro
-        try:
-            body_text = response.text if hasattr(response, 'text') else ""
-        except Exception:
-            body_text = ""
-
-        if _is_request_too_large_error(body_text):
-            # Request é grande demais para o modelo — NÃO bloqueia globalmente
-            # (esperar não adianta: request size não muda)
-            # Deixa o caller decidir: trocar de modelo ou reduzir contexto
-            log.warning(
-                f"Groq: Request too large para {model_name} (TPM={remaining_tokens} restantes, mas request individual excede limite do modelo)."
-            )
-            # Seta blocked_until curto (5s) só pra evitar spam imediato, mas caller
-            # precisa trocar de modelo ou reduzir contexto.
-            st["blocked_until"] = time.time() + 5.0
-            return
-
-        retry_after_str = headers.get("retry-after", "5").strip()
-        try:
-            retry_seconds = float(retry_after_str)
-        except (ValueError, TypeError):
-            retry_seconds = _parse_duration_to_seconds(retry_after_str)
-
-        if retry_seconds > GROQ_MAX_REASONABLE_WAIT_SECONDS:
-            # Retry-after de minutos não é mais "rate limit por minuto" — é
-            # algo mais parecido com quota horária/diária. Esperar isso
-            # bloquearia a task inteira (foi exatamente o que aconteceu:
-            # retry-after=2376s travou uma execução do alpha_code por quase
-            # 40min numa chamada só). Trata como esgotado, igual ao RPD
-            # diário: fallback/erro imediato, sem sleep algum.
-            st["daily_exhausted"] = True
-            st["daily_reset_at"] = time.time() + retry_seconds
-            st["blocked_until"] = time.time() + retry_seconds
-            log.warning(
-                f"Groq: 429 para {model_name} com retry-after={retry_seconds}s "
-                f"(remaining_tokens={remaining_tokens}) — acima do teto razoável "
-                f"({GROQ_MAX_REASONABLE_WAIT_SECONDS:.0f}s). Tratando como quota "
-                f"esgotada (fallback/erro imediato em vez de bloquear a thread)."
-            )
-            return
-
-        wait_seconds = retry_seconds + 0.5
-        st["blocked_until"] = time.time() + wait_seconds
-        log.warning(
-            f"Groq: 429 para {model_name} com retry-after={retry_seconds}s "
-            f"(remaining_tokens={remaining_tokens}, request excede bucket). "
-            f"Esperando {wait_seconds:.2f}s."
-        )
-        return
-
-    # Prevenção (quando tá chegando perto do limite)
-    if remaining_tokens < 500:
-        reset_tokens_str = headers.get("x-ratelimit-reset-tokens", "5s")
-        reset_seconds = _parse_duration_to_seconds(reset_tokens_str)
-        st["blocked_until"] = time.time() + reset_seconds
-        log.info(f"Groq: TPM baixo para {model_name} ({remaining_tokens}). Pre-blocked por {reset_seconds:.2f}s.")
-
-
-
-
-async def _wait_for_groq_tpm(model_name: str):
-    st = _get_model_state(model_name)
-
-    # Se já foi marcado como esgotado (RPD real ou 429 com retry-after
-    # gigante tratado como esgotado — ver update_groq_limits), NÃO dorme
-    # aqui. O caller (_groq_tool_call) checa `daily_exhausted` logo depois
-    # dessa chamada e já faz fallback/erro imediato — sem isso, o loop de
-    # retry chamava _wait_for_groq_tpm ANTES de checar o flag na iteração
-    # seguinte, e dormia a espera inteira (ex: 2376s) mesmo já sabendo que
-    # ia cair em fallback de qualquer forma.
-    _check_daily_reset(model_name)
-    if st["daily_exhausted"]:
-        return
-
-    now = time.time()
-    if now < st["blocked_until"]:
-        wait = st["blocked_until"] - now
-        # Defesa extra: nunca dorme além do teto razoável, mesmo que
-        # blocked_until tenha sido setado em algum outro caminho sem passar
-        # por daily_exhausted. Evita qualquer nova forma de travar a thread
-        # por dezenas de minutos numa única chamada.
-        wait = min(wait, GROQ_MAX_REASONABLE_WAIT_SECONDS)
-        log.info(f"Groq: aguardando {wait:.2f}s para liberação do TPM de {model_name}...")
-        await asyncio.sleep(wait)
-
-
-async def choose_client(thinking_depth: int = 0):
-    # Este caminho (endpoint /chat legado) sempre usou 1 único modelo Groq
-    # (MODEL_GROQ_NAME) — mantido assim aqui. A rotação entre os 4 modelos
-    # vive no /chat/tools (_groq_tool_call), usado pelo alpha_code.
-    _check_daily_reset(MODEL_GROQ_NAME)
-
-    # Regra 1: Dificuldade baixa → sempre llama-server
-    if thinking_depth <= 5:
-        return await _get_llama_client()
-
-    # Regra 2: Dificuldade alta (>5), mas limite diário estourado → llama-server
-    if _get_model_state(MODEL_GROQ_NAME)["daily_exhausted"]:
-        log.info("Groq: RPD diário esgotado, usando llama-server.")
-        return await _get_llama_client()
-
-    # Regra 3: Dificuldade alta, mas limite por minuto estourado → ESPERA e usa Groq
-    await _wait_for_groq_tpm(MODEL_GROQ_NAME)
-    return await _get_groq_client()
-
-
-
-async def get_model_name(thinking_depth: int = 0) -> str:
-    if thinking_depth <= 5:
-        return MODEL_NAME
-    if _get_model_state(MODEL_GROQ_NAME)["daily_exhausted"]:
-        return MODEL_NAME
-    return MODEL_GROQ_NAME
-
-
-def _is_groq_client(client: httpx.AsyncClient) -> bool:
-    try:
-        return "groq.com" in str(client.base_url)
-    except Exception:
-        return False
-    
-    
-async def _groq_post_with_fallback(
+async def _llama_post_with_retry(
     json_payload: dict,
-    thinking_depth: int,
     stream: bool = False,
 ):
     """
-    Executa POST no /v1/chat/completions com:
-      - Retry em 429 (espera TPM liberar)
-      - Fallback automático para llama-server se:
-          * RPD esgotado
-          * 429 persistente
-          * Erro 5xx do Groq
-          * Exceção de rede
+    Executa POST no /v1/chat/completions do llama-server local, com um
+    pequeno retry em caso de 5xx ou erro de rede transitório.
 
-    Retorna tuplo: (client_usado, model_name_usado, response_obj)
+    Retorna tupla: (client, model_name, response_obj).
     """
-    # 1) Determina cliente inicial
-    client = await choose_client(thinking_depth)
-    model_name = await get_model_name(thinking_depth)
+    client = await _get_llama_client()
+    messages = json_payload.get("messages", [])
+    max_tok = _calc_max_tokens(messages, requested=4096)
+    payload = {**json_payload, "model": MODEL_NAME, "stream": stream, "max_tokens": max_tok}
 
-    # 2) Se já caiu em llama-server (RPD), segue direto
-    if not _is_groq_client(client):
-        if stream:
-            ctx = client.stream("POST", "/v1/chat/completions",
-                                json={**json_payload, "model": model_name, "stream": True})
-            return client, model_name, ctx
-        else:
-            r = await client.post("/v1/chat/completions",
-                                  json={**json_payload, "model": model_name, "stream": False})
-            return client, model_name, r
+    if stream:
+        # No streaming, devolvemos o context manager — 5xx/erro de rede
+        # dentro do stream é tratado por quem consome (ver /chat/stream).
+        ctx = client.stream("POST", "/v1/chat/completions", json=payload)
+        return client, MODEL_NAME, ctx
 
-    # 3) Tentativa Groq com retry
-    MAX_RETRIES = 2
-    for attempt in range(MAX_RETRIES + 1):
-        # Antes de cada tentativa, garante que TPM está liberado
-        await _wait_for_groq_tpm(model_name)
-
-        # Checa se RPD virou durante a espera
-        _check_daily_reset(model_name)
-        if _get_model_state(model_name)["daily_exhausted"]:
-            log.warning("Groq: RPD detectado, fallback para llama-server.")
-            client = await _get_llama_client()
-            model_name = MODEL_NAME
-            if stream:
-                ctx = client.stream("POST", "/v1/chat/completions",
-                                    json={**json_payload, "model": model_name, "stream": True})
-                return client, model_name, ctx
-            else:
-                r = await client.post("/v1/chat/completions",
-                                      json={**json_payload, "model": model_name, "stream": False})
-                return client, model_name, r
-
+    last_error: Optional[Exception] = None
+    for attempt in range(LLAMA_MAX_RETRIES + 1):
         try:
-            if stream:
-                # Para streaming, abrimos o context manager e retornamos
-                ctx = client.stream(
-                    "POST", "/v1/chat/completions",
-                    json={**json_payload, "model": model_name, "stream": True},
-                )
-                # Não conseguimos ler headers sem entrar no ctx.
-                # O caller vai lidar com 429 dentro do streaming.
-                return client, model_name, ctx
-            else:
-                r = await client.post(
-                    "/v1/chat/completions",
-                    json={**json_payload, "model": model_name, "stream": False},
-                )
-                await update_groq_limits(r, model_name)
-
-                if r.status_code == 429:
-                    log.warning(f"Groq: 429 (tentativa {attempt+1}/{MAX_RETRIES+1}).")
-                    if attempt < MAX_RETRIES:
-                        # update_groq_limits já setou blocked_until ou daily_exhausted
-                        continue
-                    # esgotou tentativas → fallback
-                    log.warning("Groq: 429 persistente. Fallback para llama-server.")
-                    fb = await _get_llama_client()
-                    rfb = await fb.post("/v1/chat/completions",
-                                        json={**json_payload, "model": MODEL_NAME, "stream": False})
-                    return fb, MODEL_NAME, rfb
-
-                if r.status_code >= 500:
-                    log.warning(f"Groq: {r.status_code} (tentativa {attempt+1}).")
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(1.0)
-                        continue
-                    fb = await _get_llama_client()
-                    rfb = await fb.post("/v1/chat/completions",
-                                        json={**json_payload, "model": MODEL_NAME, "stream": False})
-                    return fb, MODEL_NAME, rfb
-
-                # Sucesso
-                return client, model_name, r
-
+            r = await client.post("/v1/chat/completions", json=payload)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            log.warning(f"Groq: erro de rede ({type(e).__name__}). Fallback para llama-server.")
-            fb = await _get_llama_client()
-            if stream:
-                ctx = fb.stream("POST", "/v1/chat/completions",
-                                json={**json_payload, "model": MODEL_NAME, "stream": True})
-                return fb, MODEL_NAME, ctx
-            else:
-                rfb = await fb.post("/v1/chat/completions",
-                                    json={**json_payload, "model": MODEL_NAME, "stream": False})
-                return fb, MODEL_NAME, rfb
+            last_error = e
+            log.warning(f"llama-server: erro de rede ({type(e).__name__}), tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}.")
+            if attempt < LLAMA_MAX_RETRIES:
+                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                continue
+            raise RuntimeError(f"llama-server inacessível em {LLAMA_URL}: {e}") from e
 
-    # Fallback final de segurança
-    fb = await _get_llama_client()
-    rfb = await fb.post("/v1/chat/completions",
-                        json={**json_payload, "model": MODEL_NAME, "stream": False})
-    return fb, MODEL_NAME, rfb
+        if r.status_code >= 500 and attempt < LLAMA_MAX_RETRIES:
+            log.warning(f"llama-server: {r.status_code} (tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}).")
+            await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+            continue
+
+        return client, MODEL_NAME, r
+
+    raise RuntimeError(f"llama-server: falhou após {LLAMA_MAX_RETRIES + 1} tentativa(s): {last_error}")
+
+
 # ─────────────────────────────────────────────────────────────
 #          OPTIMIZATION 2: STABLE SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────
@@ -1035,9 +594,21 @@ class ChatRequest(BaseModel):
     lang:    Optional[str] = Field(default=None, description="Idioma forçado. None = detectado.")
     max_turns: int = Field(default=10,  ge=1, le=40, description="Limite de contexto recuperado")
     tts: bool = Field(default=True, description="Dispara TTS após gerar resposta.")
-    thinking_depth: int = Field(default=0, ge=0, le=10, description="Profundidade do pensamento.")
+    thinking_depth: int = Field(
+        default=0, ge=0, le=10,
+        description=(
+            "Orçamento de raciocínio (best-effort). LFM2.5-8B-A1B é um reasoning "
+            "model — por padrão (0) usamos o comportamento nativo do template "
+            "(raciocina livremente, sem teto), priorizando qualidade sobre "
+            "latência. Valores 1-10 tentam limitar o raciocínio via "
+            "`reasoning_budget_tokens` do llama-server (depth * 300 tokens) "
+            "para reduzir latência quando isso importar mais — mas esse campo "
+            "do servidor mudou de nome recentemente entre builds do llama.cpp, "
+            "então trate como melhor-esforço, não garantia."
+        ),
+    )
     stream_reasoning: bool = Field(default=True, description="Se True e o modelo emitir reasoning_content, envia para a UI. Se False, ignora completamente.")
-    model: Optional[str] = Field(default=None, description="Força modelo Groq específico. None = usa roteamento padrão por thinking_depth.")
+    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o único modelo servido pelo llama-server local.")
 
 class ClearRequest(BaseModel):
     confirm: bool = False
@@ -1057,17 +628,29 @@ class ToolCallMessage(BaseModel):
 
 class ToolUseRequest(BaseModel):
     messages: list[ToolCallMessage]
-    tools: list[dict] = Field(default_factory=list, description="Lista de tool schemas no formato OpenAI function-calling")
-    tool_choice: Optional[str] = Field(default="auto", description="auto | required | none | {type:function,function:{name:...}}")
-    model: Optional[str] = Field(default=None, description="Força modelo Groq. None = gpt-oss-120b padrão.")
+    tools: list[dict] = Field(default_factory=list, description="Lista de tool schemas no formato OpenAI function-calling. IGNORADO quando `grammar` está presente — nesse caso o llama-server usa a grammar para restringir o output e o caller deve parsear `message.content` em vez de `message.tool_calls`.")
+    tool_choice: Optional[str] = Field(default="auto", description="auto | required | none | {type:function,function:{name:...}}. IGNORADO quando `grammar` está presente.")
+    grammar: Optional[str] = Field(default=None, description="Gramática GBNF (llama.cpp) para restringir o output do modelo. Quando presente, o payload enviado ao llama-server NÃO inclui `tools`/`tool_choice` (desabilita function-calling nativo) e a resposta deve ser lida de `message.content`. O caller é responsável por parsear o content segundo a grammar — garantidamente válido pelo servidor.")
+    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o único modelo servido pelo llama-server local.")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=32000)
-    reasoning_effort: Optional[str] = Field(default=None, description="low | medium | high. None = default do modelo.")
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description=(
+            "Passado direto para o llama-server. Padrão (None) = comportamento "
+            "nativo do template (LFM2.5-8B-A1B raciocina antes de responder — "
+            "prioriza qualidade). Envie \"none\" para desligar reasoning nesta "
+            "chamada específica (único valor com efeito documentado no "
+            "tools/server/README.md do llama.cpp; use quando latência por "
+            "passo importar mais que qualidade — ex.: loops rápidos do "
+            "alpha_code)."
+        ),
+    )
     allow_llama_fallback: bool = Field(
         default=True,
-        description="Se True, faz fallback para llama-server em RPD/5xx/rede. Se False, só usa Groq."
+        description="Ignorado — mantido por compatibilidade. O llama-server local já é o único backend."
     )
-    max_retries: int = Field(default=3, ge=0, le=10, description="Máximo de retries em 429 antes de fallback/desistir.")
+    max_retries: int = Field(default=3, ge=0, le=10, description="Máximo de retries em falha transitória (5xx/rede) do llama-server local antes de desistir.")
 
 class ToolUseResponse(BaseModel):
     message: dict
@@ -1146,16 +729,16 @@ async def chat(req: ChatRequest):
     # 3. Montar prompt (with stable system prompt for caching)
     messages = _build_messages(user_input, lang, memories)
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
-    # 4. Inferência com fallback automático
+    # 4. Inferência (llama-server local, com retry para falhas transitórias)
     t0 = time.perf_counter()
     log.info(messages)
     try:
-        client_used, model_used, r = await _groq_post_with_fallback(
+        client_used, model_used, r = await _llama_post_with_retry(
             json_payload={
                 "messages":    messages,
                 "temperature": 0.7,
+                **_reasoning_payload_extra(req.thinking_depth),
             },
-            thinking_depth=req.thinking_depth,
             stream=False,
         )
         r.raise_for_status()
@@ -1164,6 +747,8 @@ async def chat(req: ChatRequest):
 
     resp_data = r.json()
     response_text = resp_data["choices"][0]["message"]["content"]
+    reasoning_text = resp_data["choices"][0]["message"].get("reasoning_content", "") or \
+                      resp_data["choices"][0]["message"].get("reasoning", "")
     elapsed = time.perf_counter() - t0
 
     # Log cache stats
@@ -1172,6 +757,7 @@ async def chat(req: ChatRequest):
     total_prompt = usage.get("prompt_tokens", 0)
     log.info(
         f"[CHAT] {elapsed:.2f}s | {len(response_text)} chars | "
+        f"reasoning: {len(reasoning_text)} chars | "
         f"prompt: {total_prompt} tokens (cached: {cached})"
     )
 
@@ -1199,7 +785,6 @@ async def chat(req: ChatRequest):
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    await asyncio.sleep(2)
     """
     Inferência com streaming — retorna Server-Sent Events (SSE).
     OPTIMIZED:
@@ -1254,38 +839,23 @@ async def chat_stream(req: ChatRequest):
         t0 = time.perf_counter()
         cached_tokens = 0
 
-        # Loop para lidar com 429 (TPM) no Groq: espera e reinicia o stream
-        while True:
+        # Retry simples para falhas transitórias (5xx/erro de rede) do llama-server local
+        for attempt in range(LLAMA_MAX_RETRIES + 1):
             client_used, model_used, r_ctx = await _execute_inference(
                 json_payload={
                     "messages":    messages,
                     "temperature": 0.7,
+                    **_reasoning_payload_extra(req.thinking_depth),
                 },
-                thinking_depth=req.thinking_depth,
                 stream=True,
             )
 
             try:
                 async with r_ctx as r:
-                    if _is_groq_client(client_used):
-                        await update_groq_limits(r, model_used)
-
-                    # Se Groq bloqueou por minuto (TPM), espera e reinicia o loop
-                    if r.status_code == 429 and _is_groq_client(client_used):
-                        log.warning("Groq: 429 no stream. Esperando para tentar de novo...")
-                        await _wait_for_groq_tpm(model_used)
-                        continue # Volta para o while True
-
-                    # Se for erro grave no Groq, desvia pro llama-server
-                    if r.status_code >= 500 and _is_groq_client(client_used):
-                        log.warning(f"Groq: {r.status_code} no stream. Fallback para llama-server.")
-                        client_used = await _get_llama_client()
-                        model_used = MODEL_NAME
-                        # ← FIX: max_tokens dinâmico (era 8000 fixo)
-                        _mt = _calc_max_tokens(messages, MODEL_NAME, requested=4096)
-                        r_ctx = client_used.stream("POST", "/v1/chat/completions",
-                            json={"model": MODEL_NAME, "messages": messages, "temperature": 0.7, "stream": True, "max_tokens": _mt})
-                        continue # Reinicia o loop para entrar no contexto do llama-server
+                    if r.status_code >= 500 and attempt < LLAMA_MAX_RETRIES:
+                        log.warning(f"llama-server: {r.status_code} no stream (tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}).")
+                        await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                        continue
 
                     r.raise_for_status()
 
@@ -1325,7 +895,7 @@ async def chat_stream(req: ChatRequest):
                         except (json.JSONDecodeError, KeyError):
                             continue
                     
-                    # Se o stream terminou com sucesso, quebra o loop while True
+                    # Se o stream terminou com sucesso, quebra o loop de retry
                     break 
 
             except Exception as e:
@@ -1438,212 +1008,168 @@ async def cache_stats():
 # ─────────────────────────────────────────────────────────────
 
 def _safe_detect(text: str) -> str:
-    return "pt"
+    """
+    Detecta o idioma do texto para escolher a pronúncia do TTS.
+
+    Estava hardcoded para sempre retornar "pt" (langdetect importado mas
+    nunca usado) — provavelmente um atalho de debug que ficou. Isso não
+    afeta a RESPOSTA do modelo (o system prompt já instrui a responder no
+    idioma do usuário, e o LFM2.5 segue isso bem por conta própria), mas
+    afeta o TTS: `lang` é passado para o serviço de voz, então uma
+    conversa em qualquer idioma diferente de português seria falada com
+    pronúncia errada. Restaurado com fallback seguro para "pt" se a
+    detecção falhar (texto curto demais, erro do langdetect, etc.).
+    """
+    try:
+        return detect(text) if len(text.strip()) >= 3 else "pt"
+    except Exception:
+        return "pt"
 
 
 # ─────────────────────────────────────────────────────────────
-#                   TOOL USE NATIVO (Groq)
+#                   TOOL USE NATIVO (llama-server local)
 # ─────────────────────────────────────────────────────────────
 # Endpoint para o módulo alpha_code (agente ReAct). Não compartilha
 # memória/TTS do /chat — mensagens e tools são controlados pelo caller.
 
 class RequestTooLargeError(RuntimeError):
-    """Sinaliza que o request excedeu o limite TPM do modelo — NÃO é rate limit normal."""
+    """Sinaliza que o request excedeu o contexto máximo do llama-server local."""
     pass
 
 
-async def _groq_tool_call(
+def _is_request_too_large_error(msg: str) -> bool:
+    """Detecta mensagens de erro indicando que o prompt excede o contexto do modelo."""
+    if not msg:
+        return False
+    msg_l = msg.lower()
+    return any(s in msg_l for s in ("context", "too large", "exceeds", "n_ctx", "exceed"))
+
+
+async def _llama_tool_call(
     messages: list[dict],
     tools: list[dict],
     tool_choice,
-    model: Optional[str],
     temperature: float,
-    max_tokens: int,
-    reasoning_effort: Optional[str],
-    allow_llama_fallback: bool = True,
     max_retries: int = 3,
+    grammar: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[dict, str, bool]:
     """
-    Executa tool call no Groq com retry respeitando rate limit.
+    Executa tool call no llama-server local, com retry em falhas transitórias.
 
     Estratégia:
-      - Antes de cada tentativa: chama _wait_for_groq_tpm() (respeita blocked_until)
-      - Em 429 "try again in Xs": espera e tenta de novo (rate limit normal)
-      - Em 429 "Request too large": NÃO tenta de novo — levanta RequestTooLargeError
-        (esperar não adianta, request size não muda)
-      - Em RPD diário esgotado: fallback direto (ou erro se allow_llama_fallback=False)
-      - Em 5xx: 1 retry com sleep 1s, depois fallback/erro
-      - Em erro de rede: fallback/erro direto
+      - Em erro de rede (ConnectError/ReadTimeout/RemoteProtocolError): retry
+        com backoff, até esgotar max_retries.
+      - Em 5xx: retry com backoff, até esgotar max_retries.
+      - Em erro indicando contexto grande demais: NÃO retenta — levanta
+        RequestTooLargeError (esperar não adianta, o tamanho não muda).
+      - Outros erros (4xx): não retry.
 
-    Retorna (message_dict, model_used, fallback_used).
+    MODO GRAMMAR (otimização extrema):
+      Quando `grammar` (string GBNF) é fornecida, o payload NÃO inclui
+      `tools`/`tool_choice` — isso desabilita o function-calling nativo do
+      OpenAI, que consome ~500-1000 tokens de schemas por request e é a fonte
+      #1 de JSON malformado em modelos locais. Em vez disso, a grammar força
+      o output a seguir um formato JSON compacto (definido pelo caller), e a
+      resposta vem em `message.content` — não em `message.tool_calls`.
+      O caller é responsável por parsear o content. Como a grammar garante
+      validade estrutural, o parse só falha se o caller cometer erro na
+      definição da grammar — nunca por output malformado do modelo.
+
+    Retorna (message_dict, model_used, fallback_used=False sempre — não há
+    mais fallback entre provedores, só o llama-server local).
     """
+    client = await _get_llama_client()
     payload: dict = {
+        "model": MODEL_NAME,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
     }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice or "auto"
+    # `reasoning_effort` é passado direto — o único valor com efeito
+    # documentado no llama-server é "none" (desliga reasoning nesta
+    # chamada). Padrão (None) = não manda o campo, deixa o comportamento
+    # nativo do template agir (prioriza qualidade). Ver ToolUseRequest.
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
+    # ── Modo grammar vs. modo tool-calling nativo ─────────────────────────
+    # São mutuamente exclusivos no llama-server: se `grammar` está presente,
+    # não enviamos `tools` — o output vem em `content` e a grammar garante o
+    # formato. Isso economiza tokens de prompt (schemas) e elimina retries
+    # por JSON malformado.
+    if grammar:
+        payload["grammar"] = grammar
+    elif tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice or "auto"
 
-    forced_model = model or MODEL_GROQ_NAME
-    llama_payload = {**payload, "model": MODEL_NAME}
-    st = _get_model_state(forced_model)
-
-    # Caso 1: RPD diário já esgotado PARA ESTE MODELO (não afeta os outros 3)
-    _check_daily_reset(forced_model)
-    if st["daily_exhausted"]:
-        if not allow_llama_fallback:
-            raise RuntimeError(
-                f"Groq RPD diário esgotado para {forced_model} e allow_llama_fallback=False. "
-                f"Tente novamente em {st['daily_reset_at'] - time.time():.1f}s "
-                f"(ou use outro modelo — os demais têm cota própria)."
-            )
-        log.warning(f"Groq /chat/tools: RPD diário esgotado para {forced_model}, usando llama-server.")
-        r = await (await _get_llama_client()).post("/v1/chat/completions", json=llama_payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"], MODEL_NAME, True
-
-    # Caso 2: loop de tentativas com retry em 429
-    client = await _get_groq_client()
-
+    last_error: Optional[Exception] = None
     for attempt in range(max_retries + 1):
-        await _wait_for_groq_tpm(forced_model)
-
-        _check_daily_reset(forced_model)
-        if st["daily_exhausted"]:
-            if not allow_llama_fallback:
-                raise RuntimeError(f"Groq RPD diário esgotado para {forced_model} durante retry.")
-            log.warning(f"Groq /chat/tools: RPD detectado durante retry para {forced_model}, fallback llama-server.")
-            r = await (await _get_llama_client()).post("/v1/chat/completions", json=llama_payload)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"], MODEL_NAME, True
-
         try:
-            r = await client.post(
-                "/v1/chat/completions",
-                json={**payload, "model": forced_model},
-            )
+            r = await client.post("/v1/chat/completions", json=payload)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            if not allow_llama_fallback:
-                raise RuntimeError(f"Groq erro de rede: {e}")
-            log.warning(f"Groq /chat/tools: erro rede ({type(e).__name__}). Fallback llama-server.")
-            r = await (await _get_llama_client()).post("/v1/chat/completions", json=llama_payload)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"], MODEL_NAME, True
+            last_error = e
+            log.warning(
+                f"llama-server /chat/tools: erro de rede ({type(e).__name__}), "
+                f"tentativa {attempt + 1}/{max_retries + 1}."
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                continue
+            raise RuntimeError(f"llama-server inacessível em {LLAMA_URL}: {e}") from e
 
-        await update_groq_limits(r, forced_model)
-
-        # 200: sucesso
         if r.status_code == 200:
             data = r.json()
-            return data["choices"][0]["message"], forced_model, False
+            return data["choices"][0]["message"], MODEL_NAME, False
 
-        # 429: distinguir rate-limit-normal vs request-too-large
-        if r.status_code == 429:
-            # Lê body para detectar tipo do erro
-            try:
-                body = r.json()
-                err_msg = body.get("error", {}).get("message", "") or r.text
-            except Exception:
-                err_msg = r.text
-
-            # ── Request too large: NÃO retenta, sinaliza caller ──
-            if _is_request_too_large_error(err_msg):
-                log.warning(
-                    f"Groq /chat/tools: REQUEST TOO LARGE para {forced_model}. "
-                    f"Caller deve trocar modelo ou reduzir contexto. "
-                    f"Erro: {err_msg[:200]}"
-                )
-                raise RequestTooLargeError(
-                    f"Request too large for {forced_model} (TPM limit): {err_msg[:300]}"
-                )
-
-            # ── Rate limit normal: espera e tenta de novo ──
-            if time.time() >= st["blocked_until"]:
-                wait_from_body = _extract_retry_seconds_from_body(err_msg)
-                if wait_from_body:
-                    wait_seconds = wait_from_body + 0.5
-                    st["blocked_until"] = time.time() + wait_seconds
-                    log.warning(
-                        f"Groq /chat/tools: 429 para {forced_model} (tentativa {attempt+1}/{max_retries+1}). "
-                        f"Body indica retry em {wait_from_body}s. Esperando {wait_seconds:.2f}s."
-                    )
-                else:
-                    st["blocked_until"] = time.time() + 10.0
-                    log.warning(
-                        f"Groq /chat/tools: 429 para {forced_model} (tentativa {attempt+1}/{max_retries+1}). "
-                        f"Sem retry-after. Esperando 10s."
-                    )
-            else:
-                log.warning(
-                    f"Groq /chat/tools: 429 para {forced_model} (tentativa {attempt+1}/{max_retries+1}). "
-                    f"Wait já setado: {st['blocked_until'] - time.time():.2f}s restantes."
-                )
-
-            if attempt < max_retries:
-                continue
-
-            # Esgotou retries
-            if not allow_llama_fallback:
-                raise RuntimeError(
-                    f"Groq /chat/tools: 429 persistente para {forced_model} após {max_retries+1} "
-                    f"tentativas e allow_llama_fallback=False."
-                )
-            log.warning(f"Groq /chat/tools: 429 persistente para {forced_model} após {max_retries+1} tentativas. Fallback llama-server.")
-            r = await (await _get_llama_client()).post("/v1/chat/completions", json=llama_payload)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"], MODEL_NAME, True
-
-        # 5xx: 1 retry com sleep, depois fallback
-        if r.status_code >= 500:
-            log.warning(f"Groq /chat/tools: {r.status_code} (tentativa {attempt+1}/{max_retries+1}).")
-            if attempt < max_retries:
-                await asyncio.sleep(1.0)
-                continue
-            if not allow_llama_fallback:
-                raise RuntimeError(f"Groq /chat/tools: {r.status_code} persistente.")
-            log.warning(f"Groq /chat/tools: {r.status_code} persistente. Fallback llama-server.")
-            r = await (await _get_llama_client()).post("/v1/chat/completions", json=llama_payload)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"], MODEL_NAME, True
-
-        # Outros erros (4xx exceto 429): não retry
+        # Erro de contexto grande demais: não faz sentido retentar
         try:
             body = r.json()
-            err_detail = body.get("error", {}).get("message", r.text[:300])
+            err_msg = body.get("error", {}).get("message", "") or r.text
         except Exception:
-            err_detail = r.text[:300]
-        raise RuntimeError(f"Groq /chat/tools: {r.status_code} - {err_detail}")
+            err_msg = r.text
 
-    raise RuntimeError(f"Groq /chat/tools: excedeu tentativas sem resolução.")
+        if _is_request_too_large_error(err_msg):
+            log.warning(f"llama-server /chat/tools: contexto excede o limite. Erro: {err_msg[:200]}")
+            raise RequestTooLargeError(f"Contexto excede o limite do llama-server: {err_msg[:300]}")
+
+        # 5xx: retry com backoff
+        if r.status_code >= 500:
+            log.warning(f"llama-server /chat/tools: {r.status_code} (tentativa {attempt + 1}/{max_retries + 1}).")
+            if attempt < max_retries:
+                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                continue
+            raise RuntimeError(f"llama-server /chat/tools: {r.status_code} persistente. Erro: {err_msg[:300]}")
+
+        # Outros erros (4xx): não retry
+        raise RuntimeError(f"llama-server /chat/tools: {r.status_code} - {err_msg[:300]}")
+
+    raise RuntimeError(f"llama-server /chat/tools: falhou após {max_retries + 1} tentativa(s): {last_error}")
 
 
 @app.post("/chat/tools", response_model=ToolUseResponse)
 async def chat_tools(req: ToolUseRequest):
     """
-    Tool use nativo Groq — para o módulo alpha_code.
+    Tool use nativo (llama-server local) — para o módulo alpha_code.
 
     Recebe messages + tools (formato OpenAI function-calling) e retorna
     a mensagem do assistant (pode conter tool_calls ou content).
+
+    MODO GRAMMAR (otimizado):
+      Se `req.grammar` estiver presente, o payload enviado ao llama-server
+      NÃO inclui `tools`/`tool_choice`. A grammar GBNF restringe o output
+      do modelo a um formato JSON compacto definido pelo caller, e a
+      resposta é devolvida em `message.content` (não em `message.tool_calls`).
+      O caller faz o parse do content — garantidamente válido pelo servidor.
+      Economiza ~500-1000 tokens de prompt por request (schemas) e elimina
+      retries por JSON malformado.
 
     Diferenças vs /chat:
       - Sem memória persistida (caller gerencia)
       - Sem TTS, sem detecção de idioma
       - Sem streaming (síncrono — alpha_code faz seu próprio streaming de steps)
-      - Modelo forçável via `model`
-      - Distingue 429 "rate limit" (espera e retenta) de "request too large"
-        (retorna 422 com too_large=true para caller trocar modelo ou reduzir contexto)
+      - too_large=true quando o contexto excede o limite do llama-server
+        local (caller deve reduzir o contexto)
     """
-    if not GROQ_KEY:
-        raise HTTPException(status_code=503, detail="GROQ_API_KEY não configurada.")
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages vazio.")
 
@@ -1651,23 +1177,21 @@ async def chat_tools(req: ToolUseRequest):
 
     t0 = time.perf_counter()
     try:
-        message, model_used, fallback = await _groq_tool_call(
+        message, model_used, fallback = await _llama_tool_call(
             messages=messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
-            model=req.model,
             temperature=req.temperature,
-            max_tokens=req.max_tokens,
-            reasoning_effort=req.reasoning_effort,
-            allow_llama_fallback=req.allow_llama_fallback,
             max_retries=req.max_retries,
+            grammar=req.grammar,
+            reasoning_effort=req.reasoning_effort,
         )
     except RequestTooLargeError as e:
-        # Request excede TPM do modelo — caller precisa agir
+        # Contexto excede o limite do llama-server local — caller precisa agir
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return ToolUseResponse(
             message={"role": "assistant", "content": "", "tool_calls": None},
-            model=req.model or MODEL_GROQ_NAME,
+            model=MODEL_NAME,
             usage={"error": "request_too_large", "detail": str(e)[:500]},
             elapsed_ms=round(elapsed_ms, 1),
             fallback_used=False,
@@ -1676,10 +1200,7 @@ async def chat_tools(req: ToolUseRequest):
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"upstream error: {e.response.text[:500]}")
     except RuntimeError as e:
-        msg = str(e)
-        if "429" in msg or "RPD" in msg or "rate" in msg.lower():
-            raise HTTPException(status_code=429, detail=msg)
-        raise HTTPException(status_code=503, detail=f"inference error: {msg}")
+        raise HTTPException(status_code=503, detail=f"inference error: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"inference error: {e}")
 
@@ -1699,38 +1220,6 @@ async def chat_tools(req: ToolUseRequest):
         fallback_used=fallback,
         too_large=False,
     )
-
-
-# ─────────────────────────────────────────────────────────────
-#                         ENTRY POINT
-# ─────────────────────────────────────────────────────────────
-
-@app.get("/rate-limit-status")
-async def rate_limit_status():
-    """
-    Estado atual de rate limit por modelo Groq — usado pelo alpha_code
-    para escolher fallback consciente (evitar martelar modelo bloqueado).
-
-    Retorna dict indexado por model_name com:
-      - blocked: bool          — True se blocked_until > agora
-      - blocked_until: float   — timestamp absoluto de quando libera
-      - remaining_tokens: int  — último valor visto nos headers
-      - remaining_requests: int — último RPD remaining visto
-      - daily_exhausted: bool  — RPD esgotou?
-      - daily_reset_at: float  — quando o RPD reseta
-    """
-    now = time.time()
-    return {
-        model: {
-            "blocked": now < st["blocked_until"],
-            "blocked_until": st["blocked_until"],
-            "remaining_tokens": st["last_remaining_tokens"],
-            "remaining_requests": st["last_remaining_requests"],
-            "daily_exhausted": st["daily_exhausted"],
-            "daily_reset_at": st["daily_reset_at"],
-        }
-        for model, st in groq_state.items()
-    }
 
 
 # ─────────────────────────────────────────────────────────────

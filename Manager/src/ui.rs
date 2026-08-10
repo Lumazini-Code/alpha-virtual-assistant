@@ -255,7 +255,8 @@ impl TrayApp {
         let state = self.state.clone();
         self.rt.spawn(async move {
             let mmproj = model.mmproj_path.as_deref();
-            if let Err(e) = process_manager::start_llama(&state, &model.path, mmproj, state.llama_log.clone()).await {
+            let mtp_draft = model.mtp_draft_path.as_deref();
+            if let Err(e) = process_manager::start_llama(&state, &model.path, mmproj, mtp_draft, state.llama_log.clone()).await {
                 tracing::error!("Erro ao iniciar llama-server: {e}");
             }
         });

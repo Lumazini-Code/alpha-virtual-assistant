@@ -18,7 +18,7 @@ LLAMA_TIMEOUT_S   = 9999999.0
 MEMORY_API_URL    = "http://localhost:3001"
 MEMORY_TIMEOUT_S  = 5.0
 
-MAX_TOKENS     = 220   # margem para 7 steps com "local_scraping" (~14 chars)
+MAX_TOKENS     = 900   # margem para reasoning + até 7 steps com "local_scraping"
 TEMPERATURE    = 0.1
 TOP_P          = 0.9
 REPEAT_PENALTY = 1.1
@@ -81,19 +81,13 @@ Input: "leia o arquivo notas.txt e grave as informações na memória"
 Output: {{"step":1,"action":"buscar e ler arquivo notas.txt","executor":"local_scraping","depends_on":null}},{{"step":2,"action":"gravar na memória as informações de result of step 1","executor":"memory","depends_on":[1]}}]}}
 
 Input: "aprenda sobre química orgânica avançada"
-Output: {{"step":1,"action":"estudar sobre Química orgânica avançada","executor":"deep_search","depends_on":null}},{{"step":2,"action":"Fazer um resumo dos conhecimentos obtidos para o usuário","executor":"LLM","depends_on":[1]}}]}}
+Output: {{"step":1,"action":"estudar sobre Química orgânica avançada","executor":"deep_search","depends_on":null}},{{"step":2,"action":"Fazer um resumo dos conhecimentos obtidos para o usuário","executor":"llm","depends_on":[1]}}]}}
 
 """
 
 # ── Grammar GBNF otimizada ─────────────────────────────────────────────────────
 
-GRAMMAR_GBNF = r"""root        ::= steps-cont "]}"
-steps-cont  ::= step ("," step)*
-step        ::= "{\"step\":" step-num ",\"action\":" string ",\"executor\":" executor ",\"depends_on\":" depends "}"
-step-num    ::= [1-7]
-executor    ::= "\"llm\"" | "\"memory\"" | "\"search\"" | "\"vision\"" | "\"tts\"" | "\"local_scraping\"" | "\"deep_search\""
-depends     ::= "null" | "[" step-num ("," step-num)* "]"
-string      ::= "\"" ([^"\\] | "\\" .)* "\""
+GRAMMAR_GBNF = r"""
 """
 
 JSON_PREFIX = '{"steps":['
@@ -177,22 +171,41 @@ app = FastAPI(title="AVA CoT API", lifespan=lifespan)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _build_prompt(user_input: str, context: Optional[str], max_steps: Optional[int]) -> str:
+def _build_messages(user_input: str, context: Optional[str], max_steps: Optional[int]) -> list[dict]:
+    """
+    Monta a lista de mensagens no formato OpenAI (system/user) em vez de um
+    prompt de texto cru.
+
+    Por que a mudança: a versão anterior montava o prompt manualmente com
+    " />" e "<|end|>" como marcadores de role — isso NÃO é o chat template
+    do LFM2.5. O template real (ChatML-like) é:
+        <|startoftext|><|im_start|>system
+        ...<|im_end|>
+        <|im_start|>user
+        ...<|im_end|>
+        <|im_start|>assistant
+    Um marcador de role que o modelo nunca viu no fine-tuning não organiza
+    nada para ele — o texto vira ruído dentro do contexto, e o modelo tem
+    que adivinhar a estrutura do zero a cada chamada. Em vez de tentar
+    reconstruir esse template à mão (frágil e desatualiza sozinho a cada
+    nova versão do modelo), delegamos para o llama-server: enviamos
+    messages para /v1/chat/completions e deixamos o `--jinja` do servidor
+    aplicar o chat_template.jinja oficial do LFM2.5.
+    """
     steps_hint   = f" Use no máximo {max_steps} passos." if max_steps else ""
     user_content = f"Plan the following request:{steps_hint}\n\n{user_input}"
     if context:
         user_content += f"\n\nRelevant context:\n{context}"
 
-    return (
-        f" />\n{SYSTEM_PROMPT}<|end|>\n"
-        f" />\n{user_content}<|end|>\n"
-        f" />\n{JSON_PREFIX}"
-    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
 
-async def _call_llama(prompt: str) -> tuple[str, int]:
+async def _call_llama(messages: list[dict]) -> tuple[str, int]:
     payload = {
-        "prompt":         prompt,
+        "messages":       messages,
         "grammar":        GRAMMAR_GBNF,
         "max_tokens":     MAX_TOKENS,
         "temperature":    TEMPERATURE,
@@ -200,9 +213,22 @@ async def _call_llama(prompt: str) -> tuple[str, int]:
         "repeat_penalty": REPEAT_PENALTY,
         "stream":         False,
         "cache_prompt":   True,
+        # LFM2.5-8B-A1B é um reasoning model — decisão do time (2026-08-05):
+        # priorizar QUALIDADE, não latência mínima, para o planner também.
+        # Por isso não desligamos reasoning aqui — deixamos o comportamento
+        # padrão do template (raciocina antes de montar o plano). MAX_TOKENS
+        # foi ajustado de 220 para 900 para dar espaço ao bloco de raciocínio
+        # sem truncar o JSON do plano.
+        #
+        # Se algum dia latência voltar a ser prioridade para este endpoint
+        # específico, o campo documentado pelo llama-server para desligar é
+        # `reasoning_effort: "none"` (não `"reasoning": "off"` — esse nome
+        # de campo não é o que o servidor espera; conferido no README atual
+        # do tools/server). Fica comentado aqui de propósito, não ativo:
+        # "reasoning_effort": "none",
     }
     try:
-        response = await state.llama_client.post("/completion", json=payload)
+        response = await state.llama_client.post("/v1/chat/completions", json=payload)
         response.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"llama-server erro {e.response.status_code}")
@@ -211,9 +237,14 @@ async def _call_llama(prompt: str) -> tuple[str, int]:
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="llama-server não acessível")
 
-    data        = response.json()
-    raw         = data.get("content", "").strip()
-    tokens_used = data.get("tokens_predicted", 0)
+    data    = response.json()
+    choices = data.get("choices", [])
+    if not choices:
+        return "", 0
+
+    message     = choices[0].get("message", {})
+    raw         = (message.get("content") or "").strip()
+    tokens_used = data.get("usage", {}).get("completion_tokens", 0)
     return raw, tokens_used
 
 
@@ -288,13 +319,13 @@ async def plan(req: PlanRequest):
 
     t0 = time.perf_counter()
 
-    prompt      = _build_prompt(user_input, req.context, req.max_steps)
-    raw, tokens = await _call_llama(prompt)
+    messages    = _build_messages(user_input, req.context, req.max_steps)
+    raw, tokens = await _call_llama(messages)
     steps       = _parse_steps(raw)
 
     latency = round((time.perf_counter() - t0) * 1000, 2)
     log.info(f"Plano em {latency}ms — {len(steps)} steps | {tokens} tokens: {user_input[:60]}")
-
+    log.info(f"Steps: {steps}")
     return PlanResponse(
         steps=steps, input=user_input, from_cache=False,
         tokens_used=tokens, latency_ms=latency,

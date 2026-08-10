@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import logging
 import os
@@ -32,9 +33,36 @@ CLIENT_TOKEN = os.environ.get("CLIENT_TOKEN", "")
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_CMD_TIME  = 30.0
 
-# O ÚNICO caminho que importa — onde o script está rodando
-BASE_DIR = os.path.abspath(os.environ.get("BASE_DIR", os.getcwd()))
+# ── Configuração do repo-sombra de versionamento (auto-commit de cada edição) ──
+# NÃO usa o .git real do usuário (se existir) — GIT_DIR aponta pra uma pasta
+# separada dentro de BASE_DIR/.ava, com GIT_WORK_TREE = BASE_DIR. Isso dá
+# histórico/rollback de tudo que o agente faz, sem sujar (ou depender d)o
+# repositório de trabalho do próprio usuário.
+AVA_GIT_DIR      = None  # setado após BASE_DIR ser resolvido, ver abaixo
+GIT_AUTHOR_NAME  = os.environ.get("AVA_GIT_NAME",  "AVA Alpha Code")
+GIT_AUTHOR_EMAIL = os.environ.get("AVA_GIT_EMAIL", "alpha-code@ava.local")
+GIT_TIMEOUT      = 10.0
 
+# ── Configuração do fuzzy match no str-replace ──
+FUZZY_THRESHOLD_DEFAULT = 0.85
+# Acima disso, pula a etapa de fuzzy (custo O(linhas × tamanho do old_str))
+# e vai direto pra normalized/exact — protege contra arquivos gigantes.
+FUZZY_MAX_CONTENT_LINES = 20_000
+
+# O ÚNICO caminho que importa — onde o script está rodando
+BASE_DIR = os.path.abspath(os.getcwd())
+ALPHA_DIR = os.path.dirname(os.path.abspath(__file__))
+# NOTA: o nome "scraping_cwd.dll" é enganoso — é um arquivo de TEXTO puro
+# (só contém o BASE_DIR), não uma DLL de verdade. Mantido como estava para
+# não quebrar quem já lê esse caminho (ex.: orchestrator.py), mas o
+# makedirs abaixo evita um crash no boot se "resource/" ainda não existir —
+# antes isso derrubava o processo inteiro com FileNotFoundError antes mesmo
+# do logging ser configurado.
+_resource_dir = os.path.join(ALPHA_DIR, "resource")
+os.makedirs(_resource_dir, exist_ok=True)
+with open(os.path.join(_resource_dir, "scraping_cwd.dll"), "w") as f:
+    f.write(BASE_DIR)
+    
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [ALPHA-CLIENT] %(message)s",
@@ -45,6 +73,95 @@ log.info(f"BASE_DIR:  {BASE_DIR}")
 log.info(f"Platform:  {platform.system()} {platform.release()}")
 log.info(f"Home:      {Path.home()}")
 log.info(f"CWD:       {os.getcwd()}")
+
+AVA_GIT_DIR = os.path.join(BASE_DIR, ".ava", "git")
+
+
+def _git_env() -> dict:
+    env = os.environ.copy()
+    env["GIT_DIR"] = AVA_GIT_DIR
+    env["GIT_WORK_TREE"] = BASE_DIR
+    # commits automáticos não devem depender de GPG configurado na máquina
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
+
+
+def _git_run(*args: str, timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=BASE_DIR,
+        env=_git_env(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _ensure_git_shadow_repo() -> None:
+    """
+    Garante que existe um repositório git dedicado ao AVA em BASE_DIR/.ava/git,
+    com work-tree = BASE_DIR. Independente de existir (ou não) um .git real do
+    usuário na mesma pasta — os dois nunca se tocam.
+    """
+    try:
+        if not os.path.isdir(AVA_GIT_DIR):
+            os.makedirs(os.path.dirname(AVA_GIT_DIR), exist_ok=True)
+            r = _git_run("init", "--quiet")
+            if r.returncode != 0:
+                log.warning(f"git init (shadow) falhou: {r.stderr.strip()}")
+                return
+            # identidade local, isolada — não usa/mexe no git config global do usuário
+            _git_run("config", "user.name", GIT_AUTHOR_NAME)
+            _git_run("config", "user.email", GIT_AUTHOR_EMAIL)
+            _git_run("config", "commit.gpgsign", "false")
+            _git_run("config", "tag.gpgsign", "false")
+            # autocrlf: normaliza CRLF->LF no repo mas mantém o arquivo do jeito
+            # que o SO grava — evita diffs gigantes só por causa de line-ending
+            autocrlf = "true" if platform.system() == "Windows" else "input"
+            _git_run("config", "core.autocrlf", autocrlf)
+            # nunca deixa um hook do usuário (ou de outro repo) travar um commit automático
+            _git_run("config", "core.hooksPath", os.devnull)
+            log.info(f"Shadow git repo inicializado em {AVA_GIT_DIR}")
+
+            gitignore = Path(BASE_DIR) / ".gitignore"
+            if not gitignore.exists():
+                gitignore.write_text(
+                    "__pycache__/\n*.pyc\n.venv/\nvenv/\nnode_modules/\n"
+                    ".env\n*.log\n.DS_Store\n.ava/\n",
+                    encoding="utf-8",
+                )
+            # garante que o próprio .ava/ nunca é rastreado dentro do work-tree
+            elif ".ava/" not in gitignore.read_text(encoding="utf-8"):
+                with open(gitignore, "a", encoding="utf-8") as f:
+                    f.write("\n.ava/\n")
+        else:
+            # repo já existe — só confirma que não há hook interferindo
+            _git_run("config", "core.hooksPath", os.devnull)
+    except Exception as e:
+        log.warning(f"Falha ao inicializar shadow git repo: {e}")
+
+
+def _git_commit(rel_path: str, action: str) -> None:
+    """
+    Faz `git add` + `git commit` do arquivo alterado no repo-sombra.
+    Nunca levanta exceção — falha de git não deve derrubar write_file/str_replace.
+    """
+    try:
+        add = _git_run("add", "--", rel_path)
+        if add.returncode != 0:
+            log.warning(f"git add falhou para {rel_path}: {add.stderr.strip()}")
+            return
+        commit = _git_run(
+            "commit", "--quiet", "--no-verify", "-m", f"{action}: {rel_path}"
+        )
+        # exit code 1 sem stderr relevante == "nothing to commit" (conteúdo idêntico)
+        if commit.returncode not in (0, 1):
+            log.warning(f"git commit falhou para {rel_path}: {commit.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"Erro ao commitar {rel_path} no shadow repo: {e}")
+
+
+_ensure_git_shadow_repo()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -152,6 +269,12 @@ class WriteFileRequest(BaseModel):
     encoding:       str   = "utf-8"
     create_parents: bool  = True
     overwrite:      bool  = True
+    # alpha_code.py manda `force=True` nas 3 estratégias de revert
+    # pós-syntax-error (_validate_edit_and_revert). Sem este campo o
+    # pydantic descartava silenciosamente o valor — funcionava por
+    # acidente (overwrite já é True por padrão), mas "force" documentado
+    # aqui deixa explícito que ele existe e, se enviado, tem precedência.
+    force:          Optional[bool] = None
 
 class WriteFileResponse(BaseModel):
     file_path: str
@@ -181,18 +304,37 @@ class ListFilesResponse(BaseModel):
     truncated: bool = False
 
 class StrReplaceRequest(BaseModel):
-    file_path:   str
-    old_str:     str
-    new_str:     str
-    replace_all: bool = False
+    file_path:       str
+    old_str:         str
+    new_str:         str
+    replace_all:     bool            = False
+    expected_hash:   Optional[str]   = None   # sha256 devolvido pelo último read_file — protege contra edição concorrente
+    # ge=0.5 é intencional, não só validação de faixa: abaixo disso o fuzzy
+    # vira "aceita qualquer trecho parecido", o que é perigoso porque o
+    # match errado ainda é aplicado silenciosamente (sem erro) — só o
+    # `strategy_used="fuzzy"` na resposta denuncia que não foi exato.
+    fuzzy_threshold: float = Field(FUZZY_THRESHOLD_DEFAULT, ge=0.5, le=1.0)
 
 class StrReplaceResponse(BaseModel):
     file_path:     str
     replacements:   int
     new_hash:       str
     modified:       str
+    strategy_used:  str    # "exact" | "normalized" | "fuzzy" — qual camada resolveu o match
 
+class ReplaceLinesRequest(BaseModel):
+    file_path:     str
+    start_line:    int   # 1-indexed (inclusive)
+    end_line:      int   # 1-indexed (inclusive)
+    new_content:   str
+    expected_hash: Optional[str] = None   # sha256 devolvido pelo último read_file — protege contra edição concorrente
 
+class ReplaceLinesResponse(BaseModel):
+    file_path:      str
+    lines_replaced: int
+    new_hash:       str
+    modified:       str
+    
 # ── App ────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Alpha Host Client", version="3.0.0")
@@ -214,6 +356,15 @@ async def status():
         "home":      str(Path.home()),
         "contents":  contents,
     }
+
+
+@app.get("/health")
+async def health():
+    # alpha_code.py's /health handler faz GET /health neste serviço para
+    # decidir "scraping_client: ok/unreachable" — sem esta rota, o
+    # alpha_code SEMPRE reporta status degradado mesmo com tudo funcionando,
+    # porque só existia /status aqui (404 != 200). Alias simples e barato.
+    return {"status": "ok", "service": "alpha_host_client", "base_dir": BASE_DIR}
 
 
 @app.post("/execute", response_model=ExecuteResponse, dependencies=[Depends(_auth_check)])
@@ -344,14 +495,23 @@ async def stat_path(req: StatRequest):
 
 # ── NOVOS endpoints: write / list / str_replace ───────────────────────────────
 
+@app.post("/create-file", response_model=WriteFileResponse, dependencies=[Depends(_auth_check)])
 @app.post("/write-file", response_model=WriteFileResponse, dependencies=[Depends(_auth_check)])
-async def write_file(req: WriteFileRequest):
+async def create_file(req: WriteFileRequest):
     """
-    Escreve conteúdo em arquivo dentro do BASE_DIR.
+    Cria/sobrescreve arquivo dentro do BASE_DIR.
     Cria diretórios pais se create_parents=True.
+
+    Registrada em DOIS paths: alpha_code.py (agente ReAct) chama
+    POST /write-file para todo write_file e para as 3 estratégias de
+    revert pós-syntax-error — nenhuma delas chamava /create-file. Sem
+    este alias, toda escrita e todo revert automático retornava 404 e
+    o agente via isso como falha de rede/permissão, não como "rota
+    errada". /create-file continua registrada por compatibilidade com
+    quem já chamava esse nome.
     """
     host_path = _resolve(req.file_path)
-    log.info(f"/write-file: container='{req.file_path}' → host='{host_path}'")
+    log.info(f"/create-file: container='{req.file_path}' → host='{host_path}'")
     _validate(host_path)
 
     existed = host_path.exists() and host_path.is_file()
@@ -359,7 +519,8 @@ async def write_file(req: WriteFileRequest):
     if host_path.exists() and not host_path.is_file():
         raise HTTPException(status_code=400, detail=f"Não é arquivo: {host_path}")
 
-    if host_path.exists() and not req.overwrite:
+    effective_overwrite = req.force if req.force is not None else req.overwrite
+    if host_path.exists() and not effective_overwrite:
         raise HTTPException(status_code=409, detail=f"Arquivo já existe (overwrite=False): {host_path}")
 
     if req.create_parents:
@@ -373,6 +534,9 @@ async def write_file(req: WriteFileRequest):
             f.write(data)
         sha = hashlib.sha256(data).hexdigest()
         mtime = datetime.fromtimestamp(host_path.stat().st_mtime).isoformat()
+
+        _git_commit(req.file_path, "write_file (novo)" if not existed else "write_file")
+
         return WriteFileResponse(
             file_path=req.file_path,
             bytes_written=len(data),
@@ -410,7 +574,10 @@ async def list_files(req: ListFilesRequest):
     for p in iterator:
         # skip hidden if not requested
         try:
-            rel = p.relative_to(base)
+            # SEMPRE retorna o caminho relativo à raiz do projeto (BASE_DIR).
+            # Se listar a pasta "Modules", retorna "Modules/engine.py" em vez
+            # de só "engine.py". Isso impede que o agente se perca na hierarquia.
+            rel = p.relative_to(Path(BASE_DIR))
         except ValueError:
             continue
         if not req.include_hidden and any(part.startswith(".") for part in rel.parts if part):
@@ -441,11 +608,142 @@ async def list_files(req: ListFilesRequest):
     )
 
 
+class AmbiguousMatch(Exception):
+    def __init__(self, count: int, hint: str = ""):
+        self.count = count
+        self.hint = hint
+
+
+class NoMatch(Exception):
+    def __init__(self, closest: str = ""):
+        self.closest = closest
+
+
+def _normalize_line(line: str) -> str:
+    # colapsa espaços/tabs internos e remove espaço nas pontas — não mexe em maiúsculas
+    return re.sub(r"[ \t]+", " ", line.strip())
+
+
+def _split_lines(text: str) -> list[str]:
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _line_offsets(content: str) -> list[int]:
+    """Offset (em caracteres) de início de cada linha de `content`."""
+    offsets = [0]
+    for line in content.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def _windows(content_lines: list[str], n: int):
+    for start in range(len(content_lines) - n + 1):
+        yield start, start + n
+
+
+def _find_normalized(content: str, old_str: str) -> list[tuple[int, int]]:
+    """Match exato após normalizar espaços/quebras de linha. Retorna spans (linha_ini, linha_fim)."""
+    content_lines = _split_lines(content)
+    old_lines = [_normalize_line(l) for l in _split_lines(old_str)]
+    n = len(old_lines)
+    if n == 0 or n > len(content_lines):
+        return []
+    norm_content = [_normalize_line(l) for l in content_lines]
+    matches = []
+    for start, end in _windows(norm_content, n):
+        if norm_content[start:end] == old_lines:
+            matches.append((start, end))
+    return matches
+
+
+def _find_fuzzy(content: str, old_str: str, threshold: float) -> tuple[list[tuple[int, int]], float]:
+    """Janela deslizante (mesmo nº de linhas do old_str) com maior similaridade via difflib."""
+    content_lines_raw = content.splitlines(keepends=True)
+    n = len(old_str.splitlines(keepends=True)) or 1
+    if n > len(content_lines_raw):
+        return [], 0.0
+    best_ratio = 0.0
+    best_spans: list[tuple[int, int]] = []
+    for start, end in _windows(content_lines_raw, n):
+        window = "".join(content_lines_raw[start:end])
+        ratio = difflib.SequenceMatcher(None, window, old_str).ratio()
+        if ratio > best_ratio + 1e-9:
+            best_ratio = ratio
+            best_spans = [(start, end)]
+        elif abs(ratio - best_ratio) <= 1e-9 and ratio >= threshold:
+            best_spans.append((start, end))
+    if best_ratio < threshold:
+        return [], best_ratio
+    return best_spans, best_ratio
+
+
+def _apply_line_span(content: str, span: tuple[int, int], new_str: str) -> str:
+    lines = content.splitlines(keepends=True)
+    start, end = span
+    return "".join(lines[:start]) + new_str + "".join(lines[end:])
+
+
+def _resolve_replacement(content: str, old_str: str, new_str: str, replace_all: bool, threshold: float):
+    """
+    Cadeia de fallback (nesta ordem, por pedido explícito): fuzzy -> normalizado -> exato.
+    Retorna (novo_conteudo, nº_de_substituicoes, estrategia_usada).
+    """
+    content_lines = _split_lines(content)
+
+    # 1) FUZZY — só roda em arquivos de tamanho razoável (custo O(linhas × old_str))
+    if len(content_lines) <= FUZZY_MAX_CONTENT_LINES:
+        spans, ratio = _find_fuzzy(content, old_str, threshold)
+        if len(spans) == 1:
+            return _apply_line_span(content, spans[0], new_str), 1, "fuzzy"
+        if len(spans) > 1 and not replace_all:
+            raise AmbiguousMatch(len(spans), hint=f"fuzzy ratio={ratio:.2f}")
+        if len(spans) > 1 and replace_all:
+            new_content = content
+            for span in sorted(spans, reverse=True):
+                new_content = _apply_line_span(new_content, span, new_str)
+            return new_content, len(spans), "fuzzy"
+
+    # 2) NORMALIZADO — mesmo texto ignorando diferenças de espaço/indentação/EOL
+    spans = _find_normalized(content, old_str)
+    if len(spans) == 1:
+        return _apply_line_span(content, spans[0], new_str), 1, "normalized"
+    if len(spans) > 1:
+        if not replace_all:
+            raise AmbiguousMatch(len(spans))
+        new_content = content
+        for span in sorted(spans, reverse=True):
+            new_content = _apply_line_span(new_content, span, new_str)
+        return new_content, len(spans), "normalized"
+
+    # 3) EXATO — comportamento original, agora como último recurso
+    count = content.count(old_str)
+    if count == 0:
+        raise NoMatch(closest=_closest_snippet(content, old_str))
+    if count > 1 and not replace_all:
+        raise AmbiguousMatch(count)
+    new_content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
+    return new_content, (count if replace_all else 1), "exact"
+
+
+def _closest_snippet(content: str, old_str: str, context_lines: int = 2) -> str:
+    """Pra mensagem de erro: mostra o trecho mais parecido, ajuda o LLM a se corrigir no retry."""
+    spans, ratio = _find_fuzzy(content, old_str, threshold=0.0)
+    if not spans:
+        return ""
+    start, end = spans[0]
+    lines = content.splitlines(keepends=True)
+    lo = max(0, start - context_lines)
+    hi = min(len(lines), end + context_lines)
+    snippet = "".join(lines[lo:hi])
+    return f"(similaridade {ratio:.0%}) {snippet[:500]}"
+
+
 @app.post("/str-replace", response_model=StrReplaceResponse, dependencies=[Depends(_auth_check)])
 async def str_replace(req: StrReplaceRequest):
     """
     Substitui old_str por new_str em arquivo do BASE_DIR.
-    Falha se old_str não existir, ou se replace_all=False e houver >1 ocorrência.
+    Tenta, nesta ordem: fuzzy match -> match normalizado (espaços/EOL) -> match exato.
+    Falha se nenhuma camada achar exatamente 1 ocorrência (ou >1 sem replace_all=True).
     """
     if not req.old_str:
         raise HTTPException(status_code=400, detail="old_str não pode ser vazio")
@@ -473,38 +771,150 @@ async def str_replace(req: StrReplaceRequest):
         else:
             content = raw.decode("utf-8", errors="replace")
 
-        count = content.count(req.old_str)
-        if count == 0:
-            # 422, não 404: o arquivo existe (já passou pelo check de
-            # existência acima) — o que não existe é o old_str dentro dele.
-            # Antes usava 404 aqui também, o que deixava indistinguível no
-            # access log de um 404 real de "path não existe" (mesmo código,
-            # mesmo formato de linha, debug muito mais lento).
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "old_str não encontrado no arquivo. Isso normalmente "
-                    "significa que o conteúdo mudou desde a última leitura, ou "
-                    "há diferença de indentação/whitespace/quebra de linha. "
-                    "Releia o arquivo (read-file) antes de tentar de novo."
+        # ── Proteção contra edição concorrente/arquivo desatualizado ──
+        # Se o agente mandar o hash que recebeu no último read_file, confere
+        # antes de tentar qualquer match — evita aplicar um replace "que só
+        # por acidente" bate em cima de um arquivo que já mudou.
+        if req.expected_hash:
+            current_hash = hashlib.sha256(raw).hexdigest()
+            if current_hash != req.expected_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Arquivo mudou desde a última leitura (hash esperado="
+                        f"{req.expected_hash[:12]}…, atual={current_hash[:12]}…). "
+                        "Releia o arquivo (read-file) antes de tentar de novo."
+                    ),
                 )
+
+        try:
+            new_content, replacements, strategy = _resolve_replacement(
+                content, req.old_str, req.new_str, req.replace_all, req.fuzzy_threshold,
             )
-        if count > 1 and not req.replace_all:
+        except NoMatch as e:
+            detail = (
+                "old_str não encontrado no arquivo (nem por match exato, "
+                "normalizado ou fuzzy). Isso normalmente significa que o "
+                "conteúdo mudou desde a última leitura. Releia o arquivo "
+                "(read-file) antes de tentar de novo."
+            )
+            if e.closest:
+                detail += f" Trecho mais parecido encontrado: {e.closest}"
+            raise HTTPException(status_code=422, detail=detail)
+        except AmbiguousMatch as e:
             raise HTTPException(
                 status_code=409,
-                detail=f"old_str aparece {count} vezes. Use replace_all=true ou torne old_str mais específico."
+                detail=(
+                    f"old_str corresponde a {e.count} trechos diferentes"
+                    f"{' (' + e.hint + ')' if e.hint else ''}. "
+                    "Use replace_all=true ou torne old_str mais específico "
+                    "(inclua mais linhas de contexto ao redor)."
+                ),
             )
 
-        new_content = content.replace(req.old_str, req.new_str) if req.replace_all else content.replace(req.old_str, req.new_str, 1)
         new_bytes = new_content.encode("utf-8")
         host_path.write_bytes(new_bytes)
         sha = hashlib.sha256(new_bytes).hexdigest()
         mtime = datetime.fromtimestamp(host_path.stat().st_mtime).isoformat()
 
-        replacements = count if req.replace_all else 1
+        _git_commit(req.file_path, f"str_replace ({strategy})")
+
         return StrReplaceResponse(
             file_path=req.file_path,
             replacements=replacements,
+            new_hash=sha,
+            modified=mtime,
+            strategy_used=strategy,
+        )
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"Sem permissão: {host_path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@app.post("/replace-lines", response_model=ReplaceLinesResponse, dependencies=[Depends(_auth_check)])
+async def replace_lines(req: ReplaceLinesRequest):
+    """
+    Substitui um intervalo de linhas (1-indexed, inclusivo) por um novo conteúdo.
+    Útil para o agente não precisar reproduzir old_str exato via str-replace,
+    apenas referenciando os números de linha que viu no output do read_file.
+    """
+    if req.start_line < 1 or req.end_line < req.start_line:
+        raise HTTPException(status_code=400, detail="Intervalo de linhas inválido (start_line deve ser >= 1 e <= end_line)")
+
+    host_path = _resolve(req.file_path)
+    log.info(f"/replace-lines: container='{req.file_path}' → host='{host_path}' (lines {req.start_line}-{req.end_line})")
+    _validate(host_path)
+
+    if not host_path.exists():
+        raise HTTPException(status_code=404, detail=f"Não encontrado: {host_path}")
+    if not host_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Não é arquivo: {host_path}")
+
+    try:
+        raw = host_path.read_bytes()
+        # tenta utf-8 primeiro, fallback latin-1
+        for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                content = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            content = raw.decode("utf-8", errors="replace")
+
+        # ── Proteção contra edição concorrente/arquivo desatualizado ──
+        if req.expected_hash:
+            current_hash = hashlib.sha256(raw).hexdigest()
+            if current_hash != req.expected_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Arquivo mudou desde a última leitura (hash esperado="
+                        f"{req.expected_hash[:12]}…, atual={current_hash[:12]}…). "
+                        "Releia o arquivo (read-file) antes de tentar de novo."
+                    ),
+                )
+
+        lines = content.splitlines(keepends=True)
+        
+        # Validar limites do arquivo
+        if req.start_line > len(lines) + 1:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"start_line ({req.start_line}) fora do limite (arquivo tem {len(lines)} linhas)"
+            )
+
+        # Ajustar para índice 0 do Python
+        start_idx = req.start_line - 1
+        end_idx = min(req.end_line, len(lines))
+
+        # Construir o novo conteúdo do arquivo
+        new_str = req.new_content
+        
+        # Se o novo conteúdo não for vazio e não terminar com quebra de linha,
+        # mas houver linhas após a substituição, precisamos adicionar \n
+        # para não mesclar com a próxima linha
+        if new_str and not new_str.endswith(("\n", "\r")) and end_idx < len(lines):
+            new_str += "\n"
+
+        new_lines_list = lines[:start_idx] + [new_str] + lines[end_idx:]
+        new_content = "".join(new_lines_list)
+
+        new_bytes = new_content.encode("utf-8")
+        host_path.write_bytes(new_bytes)
+        sha = hashlib.sha256(new_bytes).hexdigest()
+        mtime = datetime.fromtimestamp(host_path.stat().st_mtime).isoformat()
+
+        _git_commit(req.file_path, f"replace_lines ({req.start_line}-{req.end_line})")
+
+        return ReplaceLinesResponse(
+            file_path=req.file_path,
+            lines_replaced=end_idx - start_idx,
             new_hash=sha,
             modified=mtime,
         )
@@ -516,7 +926,9 @@ async def str_replace(req: StrReplaceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
+# ── Entrypoint ───────────────────────────────────────────────────────────────
+
+
 
 if __name__ == "__main__":
     import uvicorn

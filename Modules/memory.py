@@ -65,6 +65,19 @@ CHUNK_SIZE           = 500        # chars por chunk
 CHUNK_OVERLAP        = 100        # chars de sobreposição entre chunks
 IF_EMBED_BATCH_SIZE  = 64         # chunks por batch de embedding
 
+# ── NEW: Dicionário Visual (módulo vision.py — "Tradução de Objetos") ─────────
+# Armazena, por conceito visual, N embeddings de exemplo (DINOv3) + a
+# descrição textual ("significado") do objeto. A descrição também é gravada
+# na memória de longo prazo (mesma tabela `memories`), então ela é
+# recuperável pela leitura normal (/read) igual a qualquer outra memória.
+VD_DB_PATH           = "./memory/ava_visual_dict.db"
+VD_FAISS_INDEX_PATH  = "./memory/ava_visual_dict.index"
+VD_FAISS_ID_MAP_PATH = "./memory/ava_visual_dict_id_map.npy"
+VD_EMBED_DIM         = 384     # DINOv3 ViT-S/16 (ajustar se trocar de encoder)
+VD_MIN_SCORE         = 0.55    # similaridade mínima p/ considerar candidato válido
+VD_TOP_K             = 5
+VD_AMBIGUOUS_MARGIN  = 0.05    # se score#1 - score#2 < margem → resposta ambígua
+
 EMBED_DIM            = 384
 READ_MIN_SCORE       = 0.83
 DEDUP_THRESHOLD      = 0.92
@@ -208,9 +221,22 @@ class IndexedFileWriteResponse(BaseModel):
     hash_match:     bool = True
 
 class IndexedFileReadRequest(BaseModel):
-    query:     str
+    # ── NEW: leitura exata por caminho absoluto ──
+    # Quando `file_path` é enviado, a busca semântica (via `query`) é
+    # ignorada — o lookup é feito diretamente por igualdade de caminho
+    # (mesma chave usada em `/indexed-file/write`), garantindo que dois
+    # arquivos com o mesmo nome em pastas diferentes nunca se confundam.
+    # `query` continua obrigatório apenas quando `file_path` não é enviado.
+    file_path: Optional[str] = None
+    query:     Optional[str] = None
     top_k:     int   = 5
     min_score: float = IF_MIN_SCORE
+    # ── NEW: quando False, as entradas retornadas vêm com `content=""` —
+    # útil no modo "file_path + query" para arquivos grandes, onde o
+    # chamador só quer as chunks e não o payload inteiro do arquivo.
+    # Não afeta o modo "file_path" sozinho (arquivo inteiro), que sempre
+    # devolve `content` preenchido — é o próprio propósito desse modo.
+    include_full_content: bool = True
 
 class IndexedFileEntry(BaseModel):
     file_id:      int
@@ -228,10 +254,19 @@ class IndexedFileEntry(BaseModel):
     access_count: int
     source:       str = "local_scraping"
     chunk_text:   Optional[str] = None  # chunk específico que deu match
+    # ── NEW: posição da chunk dentro do arquivo — ajuda o chamador a se
+    # orientar sem precisar do arquivo inteiro (útil pra arquivos grandes) ──
+    chunk_index:  Optional[int] = None
+    char_start:   Optional[int] = None
+    char_end:     Optional[int] = None
+    chunk_id: Optional[int] = None 
+    # ── NEW: "exact_path" (lookup direto por file_path) ou "semantic" (busca vetorial) ──
+    match_type:   str = "semantic"
 
 class IndexedFileReadResponse(BaseModel):
-    results: list[IndexedFileEntry]
-    query:   str
+    results:   list[IndexedFileEntry]
+    query:     Optional[str] = None
+    file_path: Optional[str] = None
 
 class IndexedFileCheckResponse(BaseModel):
     indexed:          bool
@@ -241,6 +276,69 @@ class IndexedFileCheckResponse(BaseModel):
     stored_content_hash: Optional[str] = None
     stored_modified:  Optional[str]    = None
     chunks_count:     Optional[int]    = None
+
+
+# ── NEW: Modelos de request/response — Dicionário Visual (vision.py) ──────────
+#
+# O módulo vision.py (pipeline de "Tradução de Objetos") faz a segmentação,
+# extração de crops e geração de embeddings (DINOv3) de cada objeto detectado
+# numa imagem. Ele NÃO guarda nenhum estado — apenas manda o embedding (+ meta)
+# pra cá via HTTP, e este arquivo é o único responsável por persistir o
+# "dicionário" (embeddings no FAISS + texto/significado no SQLite).
+#
+# A descrição textual de cada conceito também é replicada na tabela
+# `memories` (longo prazo), então ela aparece normalmente em qualquer
+# chamada de /read — não é preciso um endpoint de leitura separado pra isso.
+
+class VisualDictWriteRequest(BaseModel):
+    concept_name:   str                 # nome curto do objeto/conceito, ex.: "caneca azul"
+    description:    str                 # "significado" textual — o que é, contexto, uso etc.
+    embedding:      list[float]         # embedding do crop (DINOv3), normalizado ou não
+    source:         str   = "vision_pipeline"
+    confidence:     float = 1.0
+    # quando True (padrão), a descrição também é gravada como memória de
+    # longo prazo normal (pesquisável via /read). Só é feito na primeira vez
+    # que o conceito é criado — exemplos adicionais do mesmo conceito não
+    # duplicam a entrada de texto, só adicionam mais um vetor de embedding.
+    link_to_memory: bool  = True
+
+class VisualDictWriteResponse(BaseModel):
+    stored:       bool
+    reason:       str
+    concept_id:   Optional[int] = None
+    embedding_id: Optional[int] = None
+    memory_id:    Optional[int] = None   # id em `memories`, se link_to_memory=True
+    new_concept:  bool = False           # True se um conceito novo foi criado agora
+
+class VisualDictReadRequest(BaseModel):
+    embedding: list[float]        # embedding do crop consultado (DINOv3)
+    top_k:     int   = VD_TOP_K
+    min_score: float = VD_MIN_SCORE
+
+class VisualDictCandidate(BaseModel):
+    concept_id:   int
+    concept_name: str
+    description:  str
+    score:        float
+    confidence:   float
+    access_count: int
+    memory_id:    Optional[int] = None
+
+class VisualDictReadResponse(BaseModel):
+    results:   list[VisualDictCandidate]
+    ambiguous: bool     # True → nenhum candidato confiável / candidatos muito próximos;
+                         # quem chama (vision.py / orquestrador) deve perguntar ao usuário
+
+class VisualDictEntry(BaseModel):
+    concept_id:    int
+    concept_name:  str
+    description:   str
+    source:        str
+    confidence:    float
+    memory_id:     Optional[int] = None
+    examples_count: int
+    created_at:    float
+    access_count:  int
 
 
 # ── MODIFIED: EmbeddingEngine now delegates to EmbeddingClient ────────────────
@@ -665,6 +763,139 @@ class IndexedFilesDB:
         return self._conn.execute("SELECT COUNT(*) FROM indexed_file_chunks").fetchone()[0]
 
 
+# ── NEW: Banco de dados do Dicionário Visual ───────────────────────────────────
+
+class VisualDictDB:
+    """
+    Persiste os "conceitos visuais" do módulo vision.py: um conceito é um
+    objeto/tipo de objeto (ex.: "caneca azul", "controle remoto da TV"),
+    com uma descrição textual e N embeddings de exemplo (um por crop
+    registrado — permite reconhecer o mesmo conceito em ângulos/condições
+    de luz diferentes).
+
+    Os embeddings em si moram no FAISS (`vd_index`); aqui só ficam o texto
+    e o mapeamento embedding_id → concept_id.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS visual_concepts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_name  TEXT    NOT NULL,
+                concept_key   TEXT    NOT NULL UNIQUE,   -- nome normalizado (lower/strip)
+                description   TEXT    NOT NULL,
+                source        TEXT    NOT NULL DEFAULT 'vision_pipeline',
+                confidence    REAL    NOT NULL DEFAULT 1.0,
+                memory_id     INTEGER,                    -- FK lógica p/ memories.id
+                created_at    REAL    NOT NULL,
+                last_accessed REAL    NOT NULL,
+                access_count  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_vc_key ON visual_concepts(concept_key);
+
+            CREATE TABLE IF NOT EXISTS visual_concept_embeddings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_id INTEGER NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (concept_id) REFERENCES visual_concepts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_vce_concept ON visual_concept_embeddings(concept_id);
+        """)
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    # ── Concept operations ──
+
+    def insert_concept(
+        self, concept_name: str, description: str, source: str,
+        confidence: float, memory_id: Optional[int],
+    ) -> int:
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO visual_concepts "
+            "(concept_name, concept_key, description, source, confidence, memory_id, "
+            "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (concept_name, self._normalize_key(concept_name), description, source,
+             confidence, memory_id, now, now),
+        )
+        return cur.lastrowid
+
+    def get_by_name(self, concept_name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM visual_concepts WHERE concept_key = ?",
+            (self._normalize_key(concept_name),),
+        ).fetchone()
+
+    def get_concept_by_id(self, concept_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM visual_concepts WHERE id = ?", (concept_id,)
+        ).fetchone()
+
+    def update_access(self, concept_id: int):
+        try:
+            self._conn.execute(
+                "UPDATE visual_concepts SET access_count = access_count + 1, "
+                "last_accessed = ? WHERE id = ?",
+                (time.time(), concept_id),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def delete_concept(self, concept_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM visual_concepts WHERE id = ?", (concept_id,))
+        return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM visual_concepts").fetchone()[0]
+
+    def list_concepts(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT c.*, "
+            "(SELECT COUNT(*) FROM visual_concept_embeddings e WHERE e.concept_id = c.id) "
+            "AS examples_count "
+            "FROM visual_concepts c ORDER BY c.last_accessed DESC"
+        ).fetchall()
+
+    # ── Embedding-row operations (mapeamento embedding_id → concept_id) ──
+
+    def insert_embedding(self, concept_id: int) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO visual_concept_embeddings (concept_id, created_at) VALUES (?, ?)",
+            (concept_id, time.time()),
+        )
+        return cur.lastrowid
+
+    def get_concept_id_by_embedding(self, embedding_id: int) -> Optional[int]:
+        row = self._conn.execute(
+            "SELECT concept_id FROM visual_concept_embeddings WHERE id = ?",
+            (embedding_id,),
+        ).fetchone()
+        return row["concept_id"] if row else None
+
+    def get_embedding_ids_by_concept(self, concept_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM visual_concept_embeddings WHERE concept_id = ?", (concept_id,)
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def count_examples(self, concept_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM visual_concept_embeddings WHERE concept_id = ?",
+            (concept_id,),
+        ).fetchone()[0]
+
+
 # ── NEW: Chunking de texto ─────────────────────────────────────────────────────
 
 def _chunk_text(
@@ -752,10 +983,17 @@ def _chunk_text(
 class MemoryIndex:
     """FAISS IndexFlatIP — inner product em vetores L2-normalizados = cosine similarity."""
 
-    def __init__(self, index_path: str, id_map_path: str, persist: bool = True):
+    def __init__(
+        self,
+        index_path: str,
+        id_map_path: str,
+        persist: bool = True,
+        embed_dim: int = EMBED_DIM,
+    ):
         self._index_path  = index_path
         self._id_map_path = id_map_path
         self._persist     = persist
+        self._embed_dim   = embed_dim
         Path(index_path).parent.mkdir(parents=True, exist_ok=True)
 
         if persist and Path(index_path).exists() and Path(id_map_path).exists():
@@ -763,9 +1001,9 @@ class MemoryIndex:
             self._id_map = list(np.load(id_map_path).tolist())
             log.info(f"Índice FAISS carregado [{index_path}] — {self._index.ntotal} vetores")
         else:
-            self._index  = faiss.IndexFlatIP(EMBED_DIM)
+            self._index  = faiss.IndexFlatIP(embed_dim)
             self._id_map = []
-            log.info(f"Novo índice FAISS criado [{index_path}]")
+            log.info(f"Novo índice FAISS criado [{index_path}] (dim={embed_dim})")
 
     def add(self, embedding: np.ndarray, record_id: int):
         self._index.add(embedding.reshape(1, -1))
@@ -796,7 +1034,7 @@ class MemoryIndex:
             if rid not in record_ids:
                 new_vecs.append(vec)
                 new_map.append(rid)
-        self._index = faiss.IndexFlatIP(EMBED_DIM)
+        self._index = faiss.IndexFlatIP(self._embed_dim)
         if new_vecs:
             self._index.add(np.array(new_vecs, dtype=np.float32))
         self._id_map = new_map
@@ -805,7 +1043,7 @@ class MemoryIndex:
         log.info(f"FAISS: {len(record_ids)} vetores removidos [{self._index_path}]")
 
     def reset(self):
-        self._index  = faiss.IndexFlatIP(EMBED_DIM)
+        self._index  = faiss.IndexFlatIP(self._embed_dim)
         self._id_map = []
         if self._persist:
             self._save()
@@ -824,6 +1062,29 @@ class MemoryIndex:
     def search_similar(self, embedding: np.ndarray) -> float:
         results = self.search(embedding, top_k=1)
         return results[0][1] if results else 0.0
+
+    def search_subset(
+        self, query_embedding: np.ndarray, record_ids: list[int], top_k: int
+    ) -> list[tuple[int, float]]:
+        """Ranqueia `record_ids` por similaridade com `query_embedding`, SEM
+        comparar com o restante do índice. Usado para restringir a busca às
+        chunks de um único arquivo (ex.: leitura de um arquivo específico
+        com top_k de chunks) em vez do índice inteiro.
+        """
+        if not record_ids or self._index.ntotal == 0:
+            return []
+        pos_by_id = {rid: i for i, rid in enumerate(self._id_map)}
+        q = query_embedding.reshape(-1)
+        scored: list[tuple[int, float]] = []
+        for rid in record_ids:
+            pos = pos_by_id.get(rid)
+            if pos is None:
+                continue
+            vec = self._index.reconstruct(pos)
+            score = float(np.dot(vec, q))
+            scored.append((rid, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
 
     def _save(self):
         faiss.write_index(self._index, self._index_path)
@@ -849,6 +1110,9 @@ class AppState:
     # ── NEW: Indexed files ──
     if_db:        IndexedFilesDB  = field(default=None)
     if_index:     MemoryIndex     = field(default=None)
+    # ── NEW: Dicionário Visual ──
+    vd_db:        VisualDictDB    = field(default=None)
+    vd_index:     MemoryIndex     = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
 
@@ -926,6 +1190,10 @@ async def lifespan(app: FastAPI):
     state.if_db    = IndexedFilesDB(IF_DB_PATH)
     state.if_index = MemoryIndex(IF_FAISS_INDEX_PATH, IF_FAISS_ID_MAP_PATH)
 
+    # ── NEW: Dicionário Visual ──
+    state.vd_db    = VisualDictDB(VD_DB_PATH)
+    state.vd_index = MemoryIndex(VD_FAISS_INDEX_PATH, VD_FAISS_ID_MAP_PATH, embed_dim=VD_EMBED_DIM)
+
     if _VS_AVAILABLE:
         try:
             vs_idx, vs_db, vs_idmap = _resolve_vs_paths()
@@ -951,7 +1219,8 @@ async def lifespan(app: FastAPI):
         f"{state.st_db.count()} grupos ST | "
         f"{state.pc_db.count()} planos em cache | "
         f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
-        f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks)"
+        f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks) | "
+        f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings)"
     )
     yield
 
@@ -1258,24 +1527,37 @@ def _build_if_entries(
 
 # ── POST /write ────────────────────────────────────────────────────────────────
 
-@app.post("/write", response_model=WriteResponse)
-async def write_memory(req: WriteRequest):
-    text = req.text.strip()
+async def _store_long_term_text(
+    text: str, source: str, confidence: float,
+) -> tuple[bool, str, Optional[int]]:
+    """
+    Lógica compartilhada de gravação em memória de longo prazo — usada tanto
+    pelo endpoint /write quanto pelo /visual-dict/write (para persistir a
+    descrição textual de um conceito visual como memória normal).
+    Retorna (stored, reason, memory_id).
+    """
+    text = text.strip()
     if len(text) < 10:
-        return WriteResponse(stored=False, reason="too_short")
+        return False, "too_short", None
     if state.lt_db.exists_exact(text):
-        return WriteResponse(stored=False, reason="duplicate_exact")
+        return False, "duplicate_exact", None
 
     embedding = await state.embed_engine.embed_one(text)
 
     max_sim = state.lt_index.search_similar(embedding)
     if max_sim >= DEDUP_THRESHOLD:
-        return WriteResponse(stored=False, reason=f"duplicate_semantic:{max_sim:.3f}")
+        return False, f"duplicate_semantic:{max_sim:.3f}", None
 
-    memory_id = state.lt_db.insert(text, req.source, req.confidence)
+    memory_id = state.lt_db.insert(text, source, confidence)
     state.lt_index.add(embedding, memory_id)
     log.info(f"LT #{memory_id} gravada: {text[:60]}")
-    return WriteResponse(stored=True, reason="ok", memory_id=memory_id)
+    return True, "ok", memory_id
+
+
+@app.post("/write", response_model=WriteResponse)
+async def write_memory(req: WriteRequest):
+    stored, reason, memory_id = await _store_long_term_text(req.text, req.source, req.confidence)
+    return WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
 
 
 # ── POST /write_st ─────────────────────────────────────────────────────────────
@@ -1597,15 +1879,106 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
 @app.post("/indexed-file/read", response_model=IndexedFileReadResponse)
 async def indexed_file_read(req: IndexedFileReadRequest):
     """
-    Busca semântica nos arquivos indexados.
+    Lê arquivos indexados. Três modos, mutuamente exclusivos:
 
-    Retorna o conteúdo COMPLETO de cada arquivo que teve um chunk
-    com similaridade acima do threshold, junto com o chunk que
-    deu match para contexto.
+      1. `file_path` sozinho → lookup EXATO por caminho absoluto (mesma
+         chave usada em `/indexed-file/write`). Não passa pelo FAISS —
+         é uma busca direta no SQLite por igualdade de `file_path`, o que
+         garante que dois arquivos com o mesmo nome em pastas diferentes
+         nunca sejam confundidos. Retorna o arquivo INTEIRO (1 resultado).
+
+      2. `file_path` + `query` → mesmo lookup exato por caminho, mas em vez
+         de devolver o arquivo inteiro de uma vez, ranqueia as chunks DESSE
+         MESMO ARQUIVO (e só dele — não compara com outros arquivos do
+         índice) contra `query` e devolve até `top_k` chunks mais
+         relevantes, cada uma com seu `chunk_text` e `score`.
+
+      3. Nem um nem outro, só `query` → busca semântica original entre
+         TODOS os arquivos indexados, retornando até `top_k` arquivos
+         cujos chunks tiveram similaridade acima do threshold.
     """
-    query = req.query.strip()
+    file_path = (req.file_path or "").strip()
+    query     = (req.query or "").strip()
+
+    # ── Modo 1/2: caminho absoluto informado ──
+    if file_path:
+        row = state.if_db.get_by_path(file_path)
+        if row is None:
+            return IndexedFileReadResponse(results=[], file_path=file_path, query=query or None)
+
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, state.if_db.update_access, row["id"])
+
+        # ── Modo 2: sem query → devolve o arquivo inteiro (comportamento original) ──
+        if not query:
+            entry = IndexedFileEntry(
+                file_id      = row["id"],
+                file_path    = row["file_path"],
+                file_name    = row["file_name"],
+                extension    = row["extension"],
+                content      = row["content"],           # conteúdo COMPLETO
+                file_hash    = row["file_hash"],
+                content_hash = row["content_hash"],
+                size         = row["size"],
+                modified     = row["modified"],
+                score        = 1.0,                       # lookup exato — sem score de similaridade
+                confidence   = round(row["confidence"], 4),
+                created_at   = row["created_at"],
+                access_count = row["access_count"],
+                source       = row["source"],
+                chunk_text   = None,
+                match_type   = "exact_path",
+            )
+            return IndexedFileReadResponse(results=[entry], file_path=file_path)
+
+        # ── Modo 2b: com query → top_k chunks ranqueadas, restritas a este arquivo ──
+        chunk_rows = state.if_db.get_chunks_by_file(row["id"])
+        chunk_ids  = [c["id"] for c in chunk_rows]
+        if not chunk_ids:
+            return IndexedFileReadResponse(results=[], file_path=file_path, query=query)
+
+        query_emb = await state.embed_engine.embed_one(query)
+        ranked = await loop.run_in_executor(
+            None, state.if_index.search_subset, query_emb, chunk_ids, req.top_k
+        )
+        ranked = [(cid, score) for cid, score in ranked if score >= req.min_score]
+        if not ranked:
+            return IndexedFileReadResponse(results=[], file_path=file_path, query=query)
+
+        chunk_by_id = {c["id"]: c for c in chunk_rows}
+        full_content = row["content"] if req.include_full_content else ""
+        results = []
+        for cid, score in ranked:
+            chunk_row = chunk_by_id.get(cid)
+            if chunk_row is None:
+                continue
+            results.append(IndexedFileEntry(
+                file_id      = row["id"],
+                file_path    = row["file_path"],
+                file_name    = row["file_name"],
+                extension    = row["extension"],
+                content      = full_content,              # arquivo completo — vazio se include_full_content=False
+                file_hash    = row["file_hash"],
+                content_hash = row["content_hash"],
+                size         = row["size"],
+                modified     = row["modified"],
+                score        = round(score, 4),
+                confidence   = round(row["confidence"], 4),
+                created_at   = row["created_at"],
+                access_count = row["access_count"],
+                source       = row["source"],
+                chunk_text   = chunk_row["chunk_text"],   # a chunk específica ranqueada
+                chunk_index  = chunk_row["chunk_index"],
+                char_start   = chunk_row["char_start"],
+                char_end     = chunk_row["char_end"],
+                chunk_id = chunk_row["id"],
+                match_type   = "exact_path_chunks",
+            ))
+        return IndexedFileReadResponse(results=results, file_path=file_path, query=query)
+
+    # ── Modo 3: busca semântica entre todos os arquivos ──
     if not query:
-        raise HTTPException(status_code=400, detail="query vazia")
+        raise HTTPException(status_code=400, detail="informe 'file_path' (leitura exata) ou 'query' (busca semântica)")
 
     if state.if_index.total == 0:
         return IndexedFileReadResponse(results=[], query=query)
@@ -1670,6 +2043,9 @@ async def indexed_file_read(req: IndexedFileReadRequest):
             access_count = file_row["access_count"],
             source       = file_row["source"],
             chunk_text   = chunk_row["chunk_text"],       # chunk que deu match
+            chunk_index  = chunk_row["chunk_index"],
+            char_start   = chunk_row["char_start"],
+            char_end     = chunk_row["char_end"],
         ))
         loop.run_in_executor(None, state.if_db.update_access, fid)
 
@@ -1735,6 +2111,28 @@ async def indexed_file_get(file_id: int):
     }
 
 
+
+@app.get("/indexed-file/chunk/{chunk_id}")
+async def get_chunk_by_id(chunk_id: int):
+    row = state.if_db._conn.execute(
+        "SELECT c.*, f.file_path, f.file_hash, f.content "
+        "FROM indexed_file_chunks c "
+        "JOIN indexed_files f ON c.file_id = f.id "
+        "WHERE c.id = ?", (chunk_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"Chunk #{chunk_id} não encontrado")
+    return {
+        "chunk_id": row["id"],
+        "file_path": row["file_path"],
+        "file_hash": row["file_hash"],
+        "char_start": row["char_start"],
+        "char_end": row["char_end"],
+        "chunk_text": row["chunk_text"],
+        "file_content": row["content"],  # conteúdo completo para validação
+    }
+
+
 @app.delete("/indexed-file/{file_id}")
 async def indexed_file_delete(file_id: int):
     """
@@ -1795,6 +2193,171 @@ async def indexed_file_list():
     return {"total": len(files), "files": files}
 
 
+# ── NEW: Dicionário Visual — endpoints usados pelo vision.py ──────────────────
+#
+# vision.py NÃO persiste nada localmente: ele roda o pipeline (depth →
+# clustering → segmentação → embeddings) e manda cada embedding de crop pra
+# cá. Este arquivo decide se é um conceito novo ou um exemplo a mais de um
+# conceito já existente, e é quem guarda tudo (FAISS + SQLite + memória de
+# longo prazo).
+
+@app.post("/visual-dict/write", response_model=VisualDictWriteResponse)
+async def visual_dict_write(req: VisualDictWriteRequest):
+    concept_name = req.concept_name.strip()
+    description  = req.description.strip()
+    if not concept_name:
+        return VisualDictWriteResponse(stored=False, reason="empty_concept_name")
+    if len(req.embedding) != VD_EMBED_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}",
+        )
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    existing = state.vd_db.get_by_name(concept_name)
+    new_concept = existing is None
+
+    if existing is not None:
+        concept_id = existing["id"]
+        memory_id  = existing["memory_id"]
+    else:
+        memory_id = None
+        if req.link_to_memory and description:
+            _, _, memory_id = await _store_long_term_text(
+                f"{concept_name}: {description}", "visual_dict", req.confidence,
+            )
+        concept_id = state.vd_db.insert_concept(
+            concept_name, description, req.source, req.confidence, memory_id,
+        )
+        log.info(f"Visual-dict: novo conceito #{concept_id} criado — '{concept_name}'")
+
+    embedding_id = state.vd_db.insert_embedding(concept_id)
+    state.vd_index.add(vec, embedding_id)
+    log.info(
+        f"Visual-dict: embedding #{embedding_id} gravado p/ conceito #{concept_id} "
+        f"({'novo' if new_concept else 'exemplo adicional'})"
+    )
+
+    return VisualDictWriteResponse(
+        stored=True, reason="ok", concept_id=concept_id,
+        embedding_id=embedding_id, memory_id=memory_id, new_concept=new_concept,
+    )
+
+
+@app.post("/visual-dict/read", response_model=VisualDictReadResponse)
+async def visual_dict_read(req: VisualDictReadRequest):
+    if len(req.embedding) != VD_EMBED_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}",
+        )
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    # sobre-amostra o kNN porque vários embeddings podem apontar pro mesmo
+    # conceito (múltiplos exemplos) — precisamos deduplicar por concept_id
+    hits = state.vd_index.search(vec, max(req.top_k * 4, 20))
+
+    best_score_by_concept: dict[int, float] = {}
+    for embedding_id, score in hits:
+        concept_id = state.vd_db.get_concept_id_by_embedding(embedding_id)
+        if concept_id is None:
+            continue
+        if concept_id not in best_score_by_concept or score > best_score_by_concept[concept_id]:
+            best_score_by_concept[concept_id] = score
+
+    ranked = sorted(best_score_by_concept.items(), key=lambda kv: kv[1], reverse=True)[:req.top_k]
+
+    results: list[VisualDictCandidate] = []
+    for concept_id, score in ranked:
+        if score < req.min_score:
+            continue
+        row = state.vd_db.get_concept_by_id(concept_id)
+        if row is None:
+            continue
+        state.vd_db.update_access(concept_id)
+        results.append(VisualDictCandidate(
+            concept_id=row["id"],
+            concept_name=row["concept_name"],
+            description=row["description"],
+            score=score,
+            confidence=row["confidence"],
+            access_count=row["access_count"] + 1,
+            memory_id=row["memory_id"],
+        ))
+
+    # ambíguo quando: nenhum resultado confiável, OU os dois melhores
+    # candidatos estão muito próximos (o objeto pode ser qualquer um dos dois)
+    ambiguous = (
+        len(results) == 0
+        or (len(results) > 1 and (results[0].score - results[1].score) < VD_AMBIGUOUS_MARGIN)
+    )
+
+    return VisualDictReadResponse(results=results, ambiguous=ambiguous)
+
+
+@app.get("/visual-dict", response_model=dict)
+async def visual_dict_list():
+    rows = state.vd_db.list_concepts()
+    concepts = [
+        VisualDictEntry(
+            concept_id=row["id"],
+            concept_name=row["concept_name"],
+            description=row["description"],
+            source=row["source"],
+            confidence=row["confidence"],
+            memory_id=row["memory_id"],
+            examples_count=row["examples_count"],
+            created_at=row["created_at"],
+            access_count=row["access_count"],
+        ).model_dump()
+        for row in rows
+    ]
+    return {"total": len(concepts), "concepts": concepts}
+
+
+@app.get("/visual-dict/{concept_id}", response_model=VisualDictEntry)
+async def visual_dict_get(concept_id: int):
+    row = state.vd_db.get_concept_by_id(concept_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Conceito visual #{concept_id} não encontrado")
+    return VisualDictEntry(
+        concept_id=row["id"],
+        concept_name=row["concept_name"],
+        description=row["description"],
+        source=row["source"],
+        confidence=row["confidence"],
+        memory_id=row["memory_id"],
+        examples_count=state.vd_db.count_examples(concept_id),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+@app.delete("/visual-dict/{concept_id}")
+async def visual_dict_delete(concept_id: int):
+    """Remove um conceito visual e todos os seus embeddings (DB + FAISS)."""
+    row = state.vd_db.get_concept_by_id(concept_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Conceito visual #{concept_id} não encontrado")
+
+    embedding_ids = state.vd_db.get_embedding_ids_by_concept(concept_id)
+    if embedding_ids:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, state.vd_index.remove_ids, set(embedding_ids))
+
+    deleted = state.vd_db.delete_concept(concept_id)
+    log.info(f"Visual-dict: conceito #{concept_id} removido ({len(embedding_ids)} embeddings)")
+    return {"deleted": deleted, "concept_id": concept_id, "embeddings_removed": len(embedding_ids)}
+
+
 # ── GET /status ────────────────────────────────────────────────────────────────
 
 @app.get("/status")
@@ -1849,6 +2412,15 @@ async def status():
             "chunk_overlap":  CHUNK_OVERLAP,
             "max_content":    IF_MAX_CONTENT_SIZE,
             "max_chunks":     IF_MAX_CHUNKS,
+        },
+        # ── NEW: Visual dictionary status ──
+        "visual_dict": {
+            "concepts_total":  state.vd_db.count(),
+            "embeddings_total": state.vd_index.total,
+            "embed_dim":       VD_EMBED_DIM,
+            "min_score":       VD_MIN_SCORE,
+            "top_k":           VD_TOP_K,
+            "ambiguous_margin": VD_AMBIGUOUS_MARGIN,
         },
     }
     if state.vs is not None:

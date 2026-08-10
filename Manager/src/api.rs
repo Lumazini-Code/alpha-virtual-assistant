@@ -74,6 +74,10 @@ struct LlamaStartRequest {
     /// Se true, tenta usar o mmproj encontrado junto ao modelo.
     #[serde(default)]
     mmproj_used: bool,
+    /// Caminho do modelo draft MTP a usar. Se None, start_llama tenta
+    /// descobrir automaticamente na pasta do modelo (find_mtp_draft_model).
+    #[serde(default)]
+    mtp_draft_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,7 +146,15 @@ async fn post_llama_start(
         None
     };
 
-    match process_manager::start_llama(&state, &req.model, mmproj.as_deref(), state.llama_log.clone()).await {
+    match process_manager::start_llama(
+        &state,
+        &req.model,
+        mmproj.as_deref(),
+        req.mtp_draft_path.as_deref(),
+        state.llama_log.clone(),
+    )
+    .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(SimpleResponse {

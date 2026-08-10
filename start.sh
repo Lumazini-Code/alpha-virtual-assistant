@@ -78,10 +78,9 @@ echo "  • Local Scraping & Client..."
 restart_on_fail "Local Scraping" "python3 local_scraping.py" &
 
 echo "  • Alpha-code Agent..."
-# Alpha-code roda na porta 4006. Precisa ser invocado como módulo (python -m)
-# a partir de /app/Modules para que os imports relativos (alpha_code.tools.*)
-# funcionem. ALPHA_PROJECT_ROOT aponta para o diretório alvo do agente.
-restart_on_fail "Alpha-code" "ALPHA_PROJECT_ROOT=/app python3 -m alpha_code.alpha_code" &
+# Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports
+# relativos), então roda igual aos outros serviços em /app/Modules.
+restart_on_fail "alpha_code" "python3 alpha_code.py" &
 
 echo "✓ Todos os serviços iniciados"
 echo ""

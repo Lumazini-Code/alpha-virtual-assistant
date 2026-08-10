@@ -24,7 +24,6 @@ from textual.widgets import Footer, Input, Static, RichLog, Markdown
 import traceback
 import requests
 import tkinter.messagebox as messagebox
-from Modules.local_scraping import status 
 
 
 with open("ava_ui.log", "w") as f:

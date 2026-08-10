@@ -121,7 +121,105 @@ where
 
 /// Monta a lista de argumentos de linha de comando para o llama-server,
 /// espelhando TEXT_PARAMS / VISION_PARAMS do script Python.
-fn build_llama_args(model_path: &str, mmproj_path: Option<&str>) -> Vec<String> {
+
+/// Procura um modelo draft MTP na mesma pasta do modelo principal.
+/// Convenção: arquivos .gguf cujo nome contenha "mtp" ou "draft"
+/// (case-insensitive), excluindo o próprio modelo e arquivos de mmproj.
+async fn find_mtp_draft_model(model_path: &str) -> Option<String> {
+    let model_path = Path::new(model_path);
+    let dir = model_path.parent()?;
+    let model_file_name = model_path.file_name()?.to_string_lossy().to_lowercase();
+
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            continue;
+        }
+
+        let file_name = path.file_name()?.to_string_lossy().to_lowercase();
+
+        // Ignora o próprio modelo e arquivos de mmproj
+        if file_name == model_file_name || file_name.contains("mmproj") {
+            continue;
+        }
+
+        if file_name.contains("mtp") || file_name.contains("draft") {
+            candidates.push(path.to_string_lossy().to_string());
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prioriza candidatos cujo nome compartilha prefixo com o modelo principal
+    let base_stem = model_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    candidates.sort_by_key(|c| {
+        let c_lower = c.to_lowercase();
+        // menor valor = melhor: nomes que compartilham o stem do modelo vêm primeiro
+        if !base_stem.is_empty() && c_lower.contains(&base_stem) {
+            0
+        } else {
+            1
+        }
+    });
+
+    tracing::info!("Draft MTP encontrado automaticamente: {}", candidates[0]);
+    Some(candidates.remove(0))
+}
+
+
+
+/// Monta os argumentos do llama-server.
+///
+/// REESCRITO (2026-08-05) com base no comando manual que o usuário confirmou
+/// rodar a ~35t/s, contra o máximo de ~12t/s da config antiga abaixo. O
+/// comando de referência era essencialmente minimalista:
+///
+///   llama-server -m <modelo> --cache-type-k q8_0 --cache-type-v q8_0
+///                -c 32000 -ngl 99 --top-k 80 --repeat-penalty 1.05 --jinja
+///
+/// A config antiga divergia dele em vários pontos ao mesmo tempo, então não
+/// dá pra apontar com 100% de certeza QUAL flag isolada causava a queda de
+/// ~3x — mas as suspeitas fortes, por ordem de probabilidade, são:
+///
+///   1. `--spec-type draft-mtp` + `--spec-draft-*` eram enviados SEMPRE,
+///      mesmo sem um modelo draft (`-md`) de fato presente — e mesmo quando
+///      presente, um draft mal casado com LFM2.5-8B-A1B (que já é um MoE de
+///      ~1B de parâmetros ativos, ou seja, muito barato de rodar sozinho)
+///      tende a gerar mais overhead de verificação/rejeição do que ganho.
+///      Especulação decoding ajuda modelos "densos e caros"; com um modelo
+///      já ultraleve o custo do draft pode superar o benefício.
+///   2. `--fit off` — em builds recentes do llama.cpp isso pode mudar como
+///      o servidor decide quantas camadas cabem na VRAM; combinado com
+///      `--gpu-layers 999` pode ter empurrado parte do modelo pra CPU sem
+///      isso ficar óbvio no log. O comando validado usa `-ngl 99` sem
+///      `--fit`.
+///   3. `--prio 2` + `--poll 50` fazem a thread de rede fazer busy-wait —
+///      combinado com `--threads`/`--threads-batch` = todos os núcleos da
+///      CPU, isso pode competir por ciclos de CPU com a submissão de
+///      trabalho pra GPU num cenário de offload quase total (`-ngl 99`).
+///   4. DRY sampler (`--dry-*`) adiciona varredura de repetição por token —
+///      overhead pequeno individualmente, mas soma.
+///
+/// Em vez de tentar isolar cada variável, a decisão foi: adotar a config
+/// mínima comprovada como baseline e só reintroduzir o que é claramente
+/// ortogonal ao throughput (cache de prompt, flash-attn, cont-batching —
+/// nenhum desses estava sendo trocado entre as duas versões testadas).
+/// Se quiser isolar a causa exata depois, reintroduza uma flag suspeita
+/// por vez e meça t/s.
+fn build_llama_args(
+    model_path: &str,
+    mmproj_path: Option<&str>,
+    mtp_draft_path: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["--model".into(), model_path.into()];
 
     let is_vision = mmproj_path.is_some();
@@ -130,48 +228,58 @@ fn build_llama_args(model_path: &str, mmproj_path: Option<&str>) -> Vec<String> 
         args.push(mmproj.into());
     }
 
-    let ctx_size = "8192";
-    let (batch_size, ubatch_size, threads_http, parallel) = if is_vision {
-        ("1024", "256", "2", "1")
-    } else {
-        ("2048", "512", "4", "1")
-    };
-
+    // ── Flags do comando validado a ~35t/s (baseline, não mexer sem medir) ──
     args.extend(str_pairs(&[
-        ("--ctx-size", ctx_size),
-        ("--batch-size", batch_size),
-        ("--ubatch-size", ubatch_size),
-        ("--fit", "off"),
-        ("--gpu-layers", "999"),
-        ("--split-mode", "layer"),
-        ("--cache-type-k", "iq4_nl"),
-        ("--cache-type-v", "iq4_nl"),
-        ("--threads", "4"),
-        ("--threads-batch", "4"),
-        ("--threads-http", threads_http),
-        ("--parallel", parallel),
-        ("--prio", "2"),
-        ("--poll", "50"),
-        ("--temp", if is_vision { "0.70" } else { "0.80" }),
-        ("--top-k", "40"),
-        ("--top-p", "0.95"),
-        ("--min-p", "0.05"),
+        ("--ctx-size", "32000"),
+        ("--gpu-layers", "99"),
+        ("--cache-type-k", "q8_0"),
+        ("--cache-type-v", "q8_0"),
+        ("--top-k", "80"),
         ("--repeat-penalty", "1.05"),
         ("--host", "0.0.0.0"),
         ("--port", &LLAMA_PORT.to_string()),
-        ("--spec-type", "draft-mtp"),
-        ("--spec-draft-n-max", "3"),
     ]));
+    args.push("--jinja".into());
 
+    // ── Extras considerados seguros/ortogonais ao throughput medido ────────
+    // Nenhum destes estava sendo alterado entre a config lenta e a rápida,
+    // e --cache-prompt em particular é essencial pro esquema de cache de
+    // prefixo do system prompt usado pelo LLM.py.
     args.push("--flash-attn".into());
     args.push("on".into());
     args.push("--cont-batching".into());
     args.push("--cache-prompt".into());
     args.push("--mmap".into());
+
     if is_vision {
         args.push("--mmproj-offload".into());
         args.push("--image-max-tokens".into());
         args.push("1024".into());
+    }
+
+    // ── Especulação (draft MTP): OFF por padrão ─────────────────────────────
+    // Suspeito #1 da regressão (ver doc da função). Só ativa se um draft
+    // for explicitamente resolvido (auto-descoberta em find_mtp_draft_model
+    // ou passado pelo caller) — e mesmo assim avisa no log, porque não foi
+    // validado que ajuda com este modelo. Se quiser desativar de vez,
+    // remova a chamada a find_mtp_draft_model no call-site de start_llama.
+    if let Some(draft) = mtp_draft_path {
+        tracing::warn!(
+            "Draft MTP '{}' será usado com speculative decoding — isso NÃO \
+             fazia parte do comando validado a ~35t/s e é suspeito de ter \
+             causado a regressão anterior (~12t/s) com LFM2.5-8B-A1B. \
+             Monitore t/s; se piorar, remova o arquivo draft da pasta do \
+             modelo ou passe mtp_draft_path=None.",
+            draft
+        );
+        args.push("-md".into());
+        args.push(draft.into());
+        args.extend(str_pairs(&[
+            ("--spec-type", "draft-mtp"),
+            ("--spec-draft-n-max", "3"),
+            ("--spec-draft-n-min", "1"),
+            ("--spec-draft-p-min", "0.75"),
+        ]));
     }
 
     args
@@ -411,6 +519,7 @@ pub async fn start_llama(
     state: &SharedState,
     model_path: &str,
     mmproj_path: Option<&str>,
+    mtp_draft_path: Option<&str>,
     log: SharedLlamaLog,
 ) -> Result<()> {
     {
@@ -437,7 +546,14 @@ pub async fn start_llama(
     // Limpa o log anterior antes de iniciar nova instância.
     log.lock().await.clear();
 
-    let args = build_llama_args(model_path, mmproj_path);
+        let mtp_draft_owned: Option<String> = match mtp_draft_path {
+        Some(p) => Some(p.to_string()),
+        None => find_mtp_draft_model(model_path).await,
+    };
+    let mtp_draft_ref = mtp_draft_owned.as_deref();
+
+
+    let args = build_llama_args(model_path, mmproj_path, mtp_draft_ref);
 
     tracing::info!(
         "Iniciando llama-server: {} {}",
@@ -514,6 +630,7 @@ pub async fn start_llama(
     llama.pid = pid;
     llama.model_path = Some(model_path.to_string());
     llama.mmproj_path = mmproj_path.map(|s| s.to_string());
+    llama.mtp_draft_path = mtp_draft_owned;
     llama.port = LLAMA_PORT;
     llama.last_activity = Some(Instant::now());
 

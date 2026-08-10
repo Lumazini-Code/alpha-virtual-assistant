@@ -40,6 +40,7 @@ pub struct LlamaState {
     pub pid: Option<u32>,
     pub model_path: Option<String>,
     pub mmproj_path: Option<String>,
+    pub mtp_draft_path: Option<String>, 
     pub port: u16,
     /// Último instante em que houve atividade (requisição na API do llama-server
     /// ou ação manual). Usado pelo watcher de 15 minutos.
@@ -53,6 +54,7 @@ impl Default for LlamaState {
             pid: None,
             model_path: None,
             mmproj_path: None,
+            mtp_draft_path: None, 
             port: 2001,
             last_activity: None,
         }
@@ -83,6 +85,7 @@ impl Default for DockerState {
 pub struct ModelInfo {
     pub name: String,
     pub path: String,
+    pub mtp_draft_path: Option<String>,
     pub mmproj_path: Option<String>,
     pub is_multimodal: bool,
     pub size_mb: u64,

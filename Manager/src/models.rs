@@ -28,15 +28,26 @@ pub fn scan_models(models_dir: &Path) -> anyhow::Result<Vec<ModelInfo>> {
         }
     }
 
-    // 2. Separa os mmproj dos modelos "principais".
+    // 2. Separa os mmproj e os drafts MTP dos modelos "principais".
     let mmproj_files: Vec<&std::path::PathBuf> = all_gguf
         .iter()
         .filter(|p| file_name_lower(p).contains("mmproj"))
         .collect();
 
+    let draft_files: Vec<&std::path::PathBuf> = all_gguf
+        .iter()
+        .filter(|p| {
+            let name = file_name_lower(p);
+            !name.contains("mmproj") && (name.contains("mtp") || name.contains("draft"))
+        })
+        .collect();
+
     let model_files: Vec<&std::path::PathBuf> = all_gguf
         .iter()
-        .filter(|p| !file_name_lower(p).contains("mmproj"))
+        .filter(|p| {
+            let name = file_name_lower(p);
+            !name.contains("mmproj") && !name.contains("mtp") && !name.contains("draft")
+        })
         .collect();
 
     // 3. Para cada modelo principal, tenta achar um mmproj companheiro.
@@ -45,6 +56,7 @@ pub fn scan_models(models_dir: &Path) -> anyhow::Result<Vec<ModelInfo>> {
     let mut result = Vec::new();
     for model_path in model_files {
         let mmproj_path = pick_mmproj(&mmproj_files);
+        let mtp_draft_path = pick_mtp_draft(&draft_files, model_path);
 
         let size_mb = std::fs::metadata(model_path)
             .map(|m| m.len() / (1024 * 1024))
@@ -57,6 +69,7 @@ pub fn scan_models(models_dir: &Path) -> anyhow::Result<Vec<ModelInfo>> {
                 .unwrap_or("desconhecido")
                 .to_string(),
             path: model_path.display().to_string(),
+            mtp_draft_path: mtp_draft_path.map(|p| p.display().to_string()),
             is_multimodal: mmproj_path.is_some(),
             mmproj_path: mmproj_path.map(|p| p.display().to_string()),
             size_mb,
@@ -85,4 +98,34 @@ fn pick_mmproj<'a>(candidates: &[&'a std::path::PathBuf]) -> Option<&'a std::pat
         .find(|p| file_name_lower(p).contains("f16"))
         .copied()
         .or_else(|| candidates.first().copied())
+}
+
+/// Escolhe o draft MTP companheiro de `model_path` dentre `candidates`.
+/// Prioriza o candidato cujo nome compartilha o "stem" do modelo principal
+/// (mesmo critério do find_mtp_draft_model em process_manager.rs); na
+/// ausência de um candidato assim, cai no primeiro disponível.
+fn pick_mtp_draft<'a>(
+    candidates: &[&'a std::path::PathBuf],
+    model_path: &Path,
+) -> Option<&'a std::path::PathBuf> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let base_stem = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if !base_stem.is_empty() {
+        if let Some(matching) = candidates
+            .iter()
+            .find(|p| file_name_lower(p).contains(&base_stem))
+        {
+            return Some(matching);
+        }
+    }
+
+    candidates.first().copied()
 }
