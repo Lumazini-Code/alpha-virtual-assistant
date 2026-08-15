@@ -4,7 +4,7 @@
 //! diretamente em Rust. O docker continua sendo chamado via subprocess,
 //! exatamente como no script original (docker-start.bat / docker-start.sh).
 
-use crate::state::{ProcStatus, SharedState};
+use crate::state::{LlamaMode, ProcStatus, SharedState, VisionConfig};
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -177,44 +177,6 @@ async fn find_mtp_draft_model(model_path: &str) -> Option<String> {
 
 
 
-/// Monta os argumentos do llama-server.
-///
-/// REESCRITO (2026-08-05) com base no comando manual que o usuário confirmou
-/// rodar a ~35t/s, contra o máximo de ~12t/s da config antiga abaixo. O
-/// comando de referência era essencialmente minimalista:
-///
-///   llama-server -m <modelo> --cache-type-k q8_0 --cache-type-v q8_0
-///                -c 32000 -ngl 99 --top-k 80 --repeat-penalty 1.05 --jinja
-///
-/// A config antiga divergia dele em vários pontos ao mesmo tempo, então não
-/// dá pra apontar com 100% de certeza QUAL flag isolada causava a queda de
-/// ~3x — mas as suspeitas fortes, por ordem de probabilidade, são:
-///
-///   1. `--spec-type draft-mtp` + `--spec-draft-*` eram enviados SEMPRE,
-///      mesmo sem um modelo draft (`-md`) de fato presente — e mesmo quando
-///      presente, um draft mal casado com LFM2.5-8B-A1B (que já é um MoE de
-///      ~1B de parâmetros ativos, ou seja, muito barato de rodar sozinho)
-///      tende a gerar mais overhead de verificação/rejeição do que ganho.
-///      Especulação decoding ajuda modelos "densos e caros"; com um modelo
-///      já ultraleve o custo do draft pode superar o benefício.
-///   2. `--fit off` — em builds recentes do llama.cpp isso pode mudar como
-///      o servidor decide quantas camadas cabem na VRAM; combinado com
-///      `--gpu-layers 999` pode ter empurrado parte do modelo pra CPU sem
-///      isso ficar óbvio no log. O comando validado usa `-ngl 99` sem
-///      `--fit`.
-///   3. `--prio 2` + `--poll 50` fazem a thread de rede fazer busy-wait —
-///      combinado com `--threads`/`--threads-batch` = todos os núcleos da
-///      CPU, isso pode competir por ciclos de CPU com a submissão de
-///      trabalho pra GPU num cenário de offload quase total (`-ngl 99`).
-///   4. DRY sampler (`--dry-*`) adiciona varredura de repetição por token —
-///      overhead pequeno individualmente, mas soma.
-///
-/// Em vez de tentar isolar cada variável, a decisão foi: adotar a config
-/// mínima comprovada como baseline e só reintroduzir o que é claramente
-/// ortogonal ao throughput (cache de prompt, flash-attn, cont-batching —
-/// nenhum desses estava sendo trocado entre as duas versões testadas).
-/// Se quiser isolar a causa exata depois, reintroduza uma flag suspeita
-/// por vez e meça t/s.
 fn build_llama_args(
     model_path: &str,
     mmproj_path: Option<&str>,
@@ -230,10 +192,10 @@ fn build_llama_args(
 
     // ── Flags do comando validado a ~35t/s (baseline, não mexer sem medir) ──
     args.extend(str_pairs(&[
-        ("--ctx-size", "32000"),
+        ("--ctx-size", "90000"),
         ("--gpu-layers", "99"),
-        ("--cache-type-k", "q8_0"),
-        ("--cache-type-v", "q8_0"),
+        ("--cache-type-k", "q4_0"),
+        ("--cache-type-v", "q4_0"),
         ("--top-k", "80"),
         ("--repeat-penalty", "1.05"),
         ("--host", "0.0.0.0"),
@@ -255,6 +217,14 @@ fn build_llama_args(
         args.push("--mmproj-offload".into());
         args.push("--image-max-tokens".into());
         args.push("1024".into());
+        args.extend(str_pairs(&[
+            ("--ctx-size", "32000"),
+            ("--cache-type-k", "q4_0"),
+            ("--cache-type-v", "q4_0"),
+            ("--top-k", "50"),
+            ("--repeat-penalty", "1.0"),
+        ]));
+        
     }
 
     // ── Especulação (draft MTP): OFF por padrão ─────────────────────────────
@@ -275,10 +245,11 @@ fn build_llama_args(
         args.push("-md".into());
         args.push(draft.into());
         args.extend(str_pairs(&[
-            ("--spec-type", "draft-mtp"),
-            ("--spec-draft-n-max", "3"),
+            ("--spec-type", "draft-simple"),
+            ("--spec-draft-n-max", "4"),
             ("--spec-draft-n-min", "1"),
-            ("--spec-draft-p-min", "0.75"),
+            ("--spec-draft-p-split", "0.10"),
+            ("--spec-draft-ngl", "all"),
         ]));
     }
 
@@ -303,8 +274,9 @@ async fn is_port_listening(host: &str, port: u16) -> bool {
 }
 
 /// Tenta obter informações do modelo carregado via API do llama-server.
-/// Retorna o caminho do modelo se conseguir, ou None se falhar.
-async fn query_llama_model_info() -> Option<String> {
+/// Retorna (caminho do modelo, caminho do mmproj se multimodal) se
+/// conseguir, ou None se falhar.
+async fn query_llama_model_info() -> Option<(String, Option<String>)> {
     let url = format!("http://{LLAMA_HOST}:{LLAMA_PORT}/props");
 
     let client = reqwest::Client::builder()
@@ -324,12 +296,12 @@ async fn query_llama_model_info() -> Option<String> {
     let model_path = body.get("model")?.as_str()?.to_string();
 
     // Tenta pegar mmproj também (pode não existir)
-    let _mmproj = body
+    let mmproj = body
         .get("mmproj")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    Some(model_path)
+    Some((model_path, mmproj))
 }
 
 /// Tenta descobrir o PID de um processo pelo nome (multiplataforma).
@@ -385,7 +357,11 @@ async fn discover_llama_server(state: &SharedState) {
     );
 
     // Tenta obter info do modelo via API
-    let model_path = query_llama_model_info().await;
+    let info = query_llama_model_info().await;
+    let (model_path, mmproj_path) = match info {
+        Some((m, mp)) => (Some(m), mp),
+        None => (None, None),
+    };
 
     // Evita closure assíncrono usando um `if` direto
     let pid = find_pid_by_name("llama-server").await;
@@ -400,7 +376,17 @@ async fn discover_llama_server(state: &SharedState) {
     let mut llama = state.llama.lock().await;
     llama.status = ProcStatus::Running;
     llama.pid = pid;
-    llama.model_path = model_path;
+    llama.model_path = model_path.clone();
+    llama.mmproj_path = mmproj_path.clone();
+    llama.mode = if mmproj_path.is_some() {
+        LlamaMode::Multimodal
+    } else {
+        LlamaMode::Text
+    };
+    // Também vira o "modelo principal" — não temos como saber qual foi a
+    // intenção original do usuário para um processo já em execução antes
+    // de nós, então tratamos o que está carregado como o principal.
+    llama.main_model_path = model_path.clone();
     llama.port = LLAMA_PORT;
     llama.last_activity = Some(Instant::now());
 
@@ -522,11 +508,134 @@ pub async fn start_llama(
     mtp_draft_path: Option<&str>,
     log: SharedLlamaLog,
 ) -> Result<()> {
+    // `update_main = true`: uma chamada "normal" a start_llama (via
+    // /llama/start ou a tela de seleção de modelo) sempre redefine qual é
+    // o "modelo principal" — usado depois por /llama/switch_mode para
+    // voltar ao texto ou descobrir o mmproj do modelo principal.
+    start_llama_inner(state, model_path, mmproj_path, mtp_draft_path, log, true).await
+}
+
+/// Troca o modo do llama-server (texto <-> multimodal) sem que o usuário
+/// precise reespecificar o modelo manualmente.
+///
+///   - `LlamaMode::Text`: recarrega o modelo principal atual sem mmproj.
+///   - `LlamaMode::Multimodal`: consulta `vision_config` para decidir se
+///     usa o mmproj do próprio modelo principal ou um modelo dedicado
+///     separado (ambos descobertos via `scan_models`, igual à lógica de
+///     `/llama/start`).
+///
+/// Não altera `main_model_path` — trocar para multimodal com um modelo
+/// dedicado não "esquece" o modelo principal original.
+pub async fn switch_llama_mode(state: &SharedState, mode: LlamaMode) -> Result<()> {
+    let main_model_path = {
+        let llama = state.llama.lock().await;
+        llama
+            .main_model_path
+            .clone()
+            .or_else(|| llama.model_path.clone())
+    };
+    let main_model_path = main_model_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Nenhum modelo principal definido ainda. Inicie um modelo com /llama/start primeiro."
+        )
+    })?;
+
+    match mode {
+        LlamaMode::Text => {
+            start_llama_inner(
+                state,
+                &main_model_path,
+                None,
+                None,
+                state.llama_log.clone(),
+                false,
+            )
+            .await
+        }
+        LlamaMode::Multimodal => {
+            let vision_cfg = state.vision_config.lock().await.clone();
+
+            let (target_model, mmproj) = if vision_cfg.use_main_model {
+                let mmproj = find_mmproj_for(state, &main_model_path).await.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "O modelo principal '{main_model_path}' não tem um mmproj \
+                         companheiro na pasta de Models."
+                    )
+                })?;
+                (main_model_path, mmproj)
+            } else {
+                let dedicated = vision_cfg.dedicated_model_path.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Nenhum modelo multimodal dedicado configurado. Defina um em \
+                         /vision/config ou marque use_main_model=true."
+                    )
+                })?;
+                let mmproj = find_mmproj_for(state, &dedicated).await.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "O modelo dedicado '{dedicated}' não tem um mmproj companheiro \
+                         na pasta de Models."
+                    )
+                })?;
+                (dedicated, mmproj)
+            };
+
+            start_llama_inner(
+                state,
+                &target_model,
+                Some(&mmproj),
+                None,
+                state.llama_log.clone(),
+                false,
+            )
+            .await
+        }
+    }
+}
+
+/// Atualiza a configuração de qual modelo usar em modo multimodal.
+/// Faz uma validação leve: se `use_main_model = false`, exige que
+/// `dedicated_model_path` esteja presente e tenha mmproj associado.
+pub async fn set_vision_config(state: &SharedState, cfg: VisionConfig) -> Result<()> {
+    if !cfg.use_main_model {
+        let path = cfg
+            .dedicated_model_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("dedicated_model_path é obrigatório quando use_main_model=false."))?;
+        if find_mmproj_for(state, path).await.is_none() {
+            bail!("O modelo escolhido '{path}' não tem mmproj associado na pasta de Models.");
+        }
+    }
+
+    let mut vision_config = state.vision_config.lock().await;
+    *vision_config = cfg;
+    Ok(())
+}
+
+/// Busca o mmproj companheiro de `model_path` na pasta de Models,
+/// reaproveitando `scan_models` (mesma lógica usada por `/llama/start`).
+async fn find_mmproj_for(state: &SharedState, model_path: &str) -> Option<String> {
+    crate::models::scan_models(&state.models_dir)
+        .ok()?
+        .into_iter()
+        .find(|m| m.path == model_path)
+        .and_then(|m| m.mmproj_path)
+}
+
+async fn start_llama_inner(
+    state: &SharedState,
+    model_path: &str,
+    mmproj_path: Option<&str>,
+    mtp_draft_path: Option<&str>,
+    log: SharedLlamaLog,
+    update_main: bool,
+) -> Result<()> {
     {
         let llama = state.llama.lock().await;
         if llama.status == ProcStatus::Running {
-            if llama.model_path.as_deref() == Some(model_path) {
-                tracing::info!("llama-server já está rodando com este modelo, ignorando pedido.");
+            if llama.model_path.as_deref() == Some(model_path)
+                && llama.mmproj_path.as_deref() == mmproj_path
+            {
+                tracing::info!("llama-server já está rodando com este modelo/modo, ignorando pedido.");
                 return Ok(());
             }
         }
@@ -633,8 +742,20 @@ pub async fn start_llama(
     llama.mtp_draft_path = mtp_draft_owned;
     llama.port = LLAMA_PORT;
     llama.last_activity = Some(Instant::now());
+    llama.mode = if mmproj_path.is_some() {
+        LlamaMode::Multimodal
+    } else {
+        LlamaMode::Text
+    };
+    if update_main {
+        llama.main_model_path = Some(model_path.to_string());
+    }
 
-    tracing::info!("llama-server iniciado (PID: {:?}), log ativo.", pid);
+    tracing::info!(
+        "llama-server iniciado (PID: {:?}, modo: {}), log ativo.",
+        pid,
+        llama.mode.label()
+    );
     Ok(())
 }
 
@@ -665,6 +786,9 @@ pub async fn stop_llama(state: &SharedState) -> Result<()> {
     llama.model_path = None;
     llama.mmproj_path = None;
     llama.last_activity = None;
+    llama.mode = LlamaMode::Text;
+    // main_model_path é preservado de propósito: permite que
+    // /llama/switch_mode saiba qual modelo recarregar depois de um stop.
 
     tracing::info!("llama-server encerrado.");
     Ok(())
@@ -885,6 +1009,8 @@ pub async fn health_check_llama(state: &SharedState) -> bool {
         llama.status = ProcStatus::Stopped;
         llama.pid = None;
         llama.model_path = None;
+        llama.mmproj_path = None;
+        llama.mode = LlamaMode::Text;
         llama.last_activity = None;
         return false;
     }

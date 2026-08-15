@@ -52,3 +52,13 @@ psutil
 pyfiglet
 
 textual
+
+cv2
+
+scikit-learn
+
+pillow
+
+scikit-image
+
+scipy

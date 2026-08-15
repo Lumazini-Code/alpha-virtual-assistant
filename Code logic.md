@@ -14,7 +14,6 @@
 | Porta | Serviço | Modelo | Descrição |
 |-------|---------|--------|-----------|
 | 2001  | LLM llama-server | Text-only (configurável via `Aimodel.dll`) | Inferência conversacional principal |
-| 2004  | VQA llama-server | Qwen3VL-2B-Instruct-Q4_K_M | Inferência multimodal (visão) |
 
 > **Nota:** O `llamaManager.py` gerencia o ciclo de vida desses processos.  
 > Modelos textuais usam o preset `TEXT_PARAMS` (porta 8080 por default, sobrescrita pela config).  

@@ -71,8 +71,8 @@ restart_on_fail "Search" "python3 Search_api.py" &
 echo "  • TTS API..."
 restart_on_fail "TTS" "python3 TTS.py" &
 
-echo "  • VQA..."
-restart_on_fail "VQA" "python3 VQA.py" &
+echo "  • Vision API..."
+restart_on_fail "Vision" "python3 vision.py" &
 
 echo "  • Local Scraping & Client..."
 restart_on_fail "Local Scraping" "python3 local_scraping.py" &

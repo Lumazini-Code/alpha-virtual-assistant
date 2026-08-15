@@ -78,6 +78,23 @@ VD_MIN_SCORE         = 0.55    # similaridade mínima p/ considerar candidato v�
 VD_TOP_K             = 5
 VD_AMBIGUOUS_MARGIN  = 0.05    # se score#1 - score#2 < margem → resposta ambígua
 
+# ── NEW: Dicionário de Rostos (módulo vision.py — reconhecimento facial) ──────
+# Mesmo padrão do dicionário visual acima, só que pra pessoas: por pessoa,
+# guarda N embeddings de exemplo (EdgeFace) — permite reconhecer o mesmo
+# rosto em ângulos/luz diferentes. Fica em banco/índice separados porque a
+# dimensão do embedding e os thresholds de similaridade de rosto costumam
+# ser bem diferentes dos de objeto genérico (DINOv3).
+FD_DB_PATH           = "./memory/ava_face_dict.db"
+FD_FAISS_INDEX_PATH  = "./memory/ava_face_dict.index"
+FD_FAISS_ID_MAP_PATH = "./memory/ava_face_dict_id_map.npy"
+FD_EMBED_DIM         = 512     # EdgeFace — ajustar se a saída do seu .onnx for outra dim
+FD_MIN_SCORE         = 0.42    # cosine similarity — modelos estilo ArcFace/EdgeFace costumam
+                                # precisar de threshold mais baixo que embeddings genéricos
+                                # (DINOv3 usa 0.55); CALIBRE em cima dos seus próprios exemplos
+                                # antes de confiar nisso em produção
+FD_TOP_K             = 3
+FD_AMBIGUOUS_MARGIN  = 0.05
+
 EMBED_DIM            = 384
 READ_MIN_SCORE       = 0.83
 DEDUP_THRESHOLD      = 0.92
@@ -114,6 +131,11 @@ QUERY_AMBIGUOUS_RATIO = 0.55
 CONTEXT_MAX_CHARS     = 1200
 CONTEXT_TURNS_FETCH   = 6
 DUAL_CONTEXT_WEIGHT   = 0.35
+
+# ── /read_st — leitura crua do short-term (sem busca semântica) ───────────────
+# Usada pelo LLM para montar o histórico recente da conversa como contexto,
+# sem passar pelo pipeline de embeddings/scoring do /read.
+ST_READ_DEFAULT_PAIRS = 5
 
 _STOP_WORDS: frozenset[str] = frozenset({
     "o","a","os","as","um","uma","uns","umas","de","do","da","dos","das",
@@ -170,6 +192,15 @@ class WriteSTResponse(BaseModel):
     stored:   bool
     reason:   str
     turn_ids: list[int] = []
+
+class ReadSTRequest(BaseModel):
+    session_id: str
+    n_pairs:    int = ST_READ_DEFAULT_PAIRS
+
+class ReadSTResponse(BaseModel):
+    session_id:     str
+    turns:          list[Turn]
+    pairs_returned: int
 
 class MemoryEntry(BaseModel):
     id:           int
@@ -341,6 +372,50 @@ class VisualDictEntry(BaseModel):
     access_count:  int
 
 
+# ── NEW: Modelos de request/response — dicionário de rostos ───────────────────
+
+class FaceDictWriteRequest(BaseModel):
+    person_name: str                 # nome da pessoa, ex.: "eu" / "Fulano"
+    embedding:   list[float]         # embedding do rosto alinhado (EdgeFace)
+    description: str   = ""          # quem é essa pessoa (relação, contexto etc.)
+    source:      str   = "vision_pipeline"
+    confidence:  float = 1.0
+
+class FaceDictWriteResponse(BaseModel):
+    stored:       bool
+    reason:       str
+    person_id:    Optional[int] = None
+    embedding_id: Optional[int] = None
+    new_person:   bool = False        # True se a pessoa foi criada agora
+
+class FaceDictReadRequest(BaseModel):
+    embedding: list[float]        # embedding do rosto consultado (EdgeFace)
+    top_k:     int   = FD_TOP_K
+    min_score: float = FD_MIN_SCORE
+
+class FaceCandidate(BaseModel):
+    person_id:    int
+    person_name:  str
+    description:  str
+    score:        float
+    confidence:   float
+    access_count: int
+
+class FaceDictReadResponse(BaseModel):
+    results:   list[FaceCandidate]
+    ambiguous: bool     # True → nenhum candidato confiável / candidatos muito próximos
+
+class FaceDictEntry(BaseModel):
+    person_id:      int
+    person_name:    str
+    description:    str
+    source:         str
+    confidence:     float
+    examples_count: int
+    created_at:     float
+    access_count:   int
+
+
 # ── MODIFIED: EmbeddingEngine now delegates to EmbeddingClient ────────────────
 
 class EmbeddingEngine:
@@ -501,6 +576,22 @@ class ShortTermDB:
             for t in json.loads(row["turns_json"]):
                 lines.append(f"{t['role']}: {t['content']}")
         return lines
+
+    def get_recent_turn_groups(self, session_id: str, n_groups: int) -> tuple[list[dict], int]:
+        """
+        Leitura crua (sem busca semântica) das N duplas pergunta-resposta mais
+        recentes de uma sessão, em ordem cronológica (mais antiga primeiro).
+        Usada pelo /read_st — contexto de conversa direto, sem embeddings.
+        """
+        rows = self._conn.execute(
+            "SELECT turns_json FROM turn_groups "
+            "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+            (session_id, n_groups),
+        ).fetchall()
+        turns: list[dict] = []
+        for row in reversed(rows):
+            turns.extend(json.loads(row["turns_json"]))
+        return turns, len(rows)
 
     def update_access(self, group_id: int):
         try:
@@ -896,6 +987,150 @@ class VisualDictDB:
         ).fetchone()[0]
 
 
+# ── NEW: Dicionário de Rostos ──────────────────────────────────────────────────
+
+class FaceDictDB:
+    """
+    Persiste as pessoas cadastradas pro reconhecimento facial: uma pessoa
+    tem N embeddings de exemplo (um por rosto registrado — permite
+    reconhecer o mesmo rosto em ângulos/luz diferentes).
+
+    Os embeddings em si moram no FAISS (`fd_index`); aqui só ficam o nome
+    e o mapeamento embedding_id → person_id. Estrutura idêntica à
+    VisualDictDB, só que sem `description`/`memory_id` — reconhecimento
+    facial não precisa de "significado" textual gravado na memória geral.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS face_people (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_name   TEXT    NOT NULL,
+                person_key    TEXT    NOT NULL UNIQUE,   -- nome normalizado (lower/strip)
+                description   TEXT    NOT NULL DEFAULT '',  -- quem é a pessoa (relação/contexto)
+                source        TEXT    NOT NULL DEFAULT 'vision_pipeline',
+                confidence    REAL    NOT NULL DEFAULT 1.0,
+                created_at    REAL    NOT NULL,
+                last_accessed REAL    NOT NULL,
+                access_count  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_fp_key ON face_people(person_key);
+
+            CREATE TABLE IF NOT EXISTS face_embeddings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id  INTEGER NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES face_people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fe_person ON face_embeddings(person_id);
+        """)
+        # Migração leve: bancos criados antes deste campo existir não têm a
+        # coluna `description` — adiciona se estiver faltando, sem quebrar
+        # instalações já em uso.
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(face_people)")}
+        if "description" not in cols:
+            self._conn.execute("ALTER TABLE face_people ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    # ── Person operations ──
+
+    def insert_person(self, person_name: str, description: str, source: str, confidence: float) -> int:
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO face_people "
+            "(person_name, person_key, description, source, confidence, created_at, last_accessed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (person_name, self._normalize_key(person_name), description, source, confidence, now, now),
+        )
+        return cur.lastrowid
+
+    def get_by_name(self, person_name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM face_people WHERE person_key = ?",
+            (self._normalize_key(person_name),),
+        ).fetchone()
+
+    def get_person_by_id(self, person_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM face_people WHERE id = ?", (person_id,)
+        ).fetchone()
+
+    def update_description(self, person_id: int, description: str):
+        """Atualiza/edita a descrição de uma pessoa já cadastrada. Chamado
+        quando `person_name` já existe e um `description` não-vazio é
+        enviado num novo /face-dict/write (ex.: cadastrando mais um
+        exemplo de rosto e aproveitando pra corrigir/completar o texto)."""
+        self._conn.execute(
+            "UPDATE face_people SET description = ? WHERE id = ?",
+            (description, person_id),
+        )
+
+    def update_access(self, person_id: int):
+        try:
+            self._conn.execute(
+                "UPDATE face_people SET access_count = access_count + 1, "
+                "last_accessed = ? WHERE id = ?",
+                (time.time(), person_id),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def delete_person(self, person_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM face_people WHERE id = ?", (person_id,))
+        return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM face_people").fetchone()[0]
+
+    def list_people(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT p.*, "
+            "(SELECT COUNT(*) FROM face_embeddings e WHERE e.person_id = p.id) "
+            "AS examples_count "
+            "FROM face_people p ORDER BY p.last_accessed DESC"
+        ).fetchall()
+
+    # ── Embedding-row operations (mapeamento embedding_id → person_id) ──
+
+    def insert_embedding(self, person_id: int) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO face_embeddings (person_id, created_at) VALUES (?, ?)",
+            (person_id, time.time()),
+        )
+        return cur.lastrowid
+
+    def get_person_id_by_embedding(self, embedding_id: int) -> Optional[int]:
+        row = self._conn.execute(
+            "SELECT person_id FROM face_embeddings WHERE id = ?",
+            (embedding_id,),
+        ).fetchone()
+        return row["person_id"] if row else None
+
+    def get_embedding_ids_by_person(self, person_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM face_embeddings WHERE person_id = ?", (person_id,)
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def count_examples(self, person_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM face_embeddings WHERE person_id = ?",
+            (person_id,),
+        ).fetchone()[0]
+
+
 # ── NEW: Chunking de texto ─────────────────────────────────────────────────────
 
 def _chunk_text(
@@ -1113,6 +1348,9 @@ class AppState:
     # ── NEW: Dicionário Visual ──
     vd_db:        VisualDictDB    = field(default=None)
     vd_index:     MemoryIndex     = field(default=None)
+    # ── NEW: Dicionário de Rostos ──
+    fd_db:        FaceDictDB      = field(default=None)
+    fd_index:     MemoryIndex     = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
 
@@ -1194,6 +1432,10 @@ async def lifespan(app: FastAPI):
     state.vd_db    = VisualDictDB(VD_DB_PATH)
     state.vd_index = MemoryIndex(VD_FAISS_INDEX_PATH, VD_FAISS_ID_MAP_PATH, embed_dim=VD_EMBED_DIM)
 
+    # ── NEW: Dicionário de Rostos ──
+    state.fd_db    = FaceDictDB(FD_DB_PATH)
+    state.fd_index = MemoryIndex(FD_FAISS_INDEX_PATH, FD_FAISS_ID_MAP_PATH, embed_dim=FD_EMBED_DIM)
+
     if _VS_AVAILABLE:
         try:
             vs_idx, vs_db, vs_idmap = _resolve_vs_paths()
@@ -1220,7 +1462,8 @@ async def lifespan(app: FastAPI):
         f"{state.pc_db.count()} planos em cache | "
         f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
         f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks) | "
-        f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings)"
+        f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings) | "
+        f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto)"
     )
     yield
 
@@ -1582,6 +1825,28 @@ async def write_short_term(req: WriteSTRequest):
     state.st_index.add(embedding, group_id)
     log.info(f"ST #{group_id} gravado — session={req.session_id} turnos={len(req.turns)}: {embed_text[:80]}")
     return WriteSTResponse(stored=True, reason="ok", turn_ids=[group_id])
+
+
+# ── POST /read_st ────────────────────────────────────────────────────────────
+# Leitura crua do short-term: só as N duplas pergunta-resposta mais recentes
+# de uma sessão, sem embeddings/scoring — pensado para o LLM montar o
+# histórico de conversa como contexto (mais leve/rápido que /read).
+
+@app.post("/read_st", response_model=ReadSTResponse)
+async def read_short_term(req: ReadSTRequest):
+    session_id = req.session_id.strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id vazio")
+
+    n_pairs = req.n_pairs if req.n_pairs > 0 else ST_READ_DEFAULT_PAIRS
+    loop = asyncio.get_event_loop()
+    raw_turns, groups_fetched = await loop.run_in_executor(
+        None, state.st_db.get_recent_turn_groups, session_id, n_pairs
+    )
+    turns = [Turn(**t) for t in raw_turns]
+
+    log.info(f"/read_st session={session_id} n_pairs={n_pairs} grupos={groups_fetched} turnos={len(turns)}")
+    return ReadSTResponse(session_id=session_id, turns=turns, pairs_returned=groups_fetched)
 
 
 # ── POST /read ─────────────────────────────────────────────────────────────────
@@ -2358,6 +2623,191 @@ async def visual_dict_delete(concept_id: int):
     return {"deleted": deleted, "concept_id": concept_id, "embeddings_removed": len(embedding_ids)}
 
 
+# ── NEW: Dicionário de Rostos — endpoints usados pelo vision.py ───────────────
+#
+# Mesma lógica do dicionário visual acima, adaptada pra reconhecimento
+# facial: vision.py detecta+alinha o rosto, extrai o embedding (EdgeFace) e
+# manda pra cá. Aqui decide-se se é uma pessoa nova ou mais um exemplo de
+# uma pessoa já cadastrada.
+
+@app.post("/face-dict/write", response_model=FaceDictWriteResponse)
+async def face_dict_write(req: FaceDictWriteRequest):
+    person_name = req.person_name.strip()
+    if not person_name:
+        return FaceDictWriteResponse(stored=False, reason="empty_person_name")
+
+    if len(req.embedding) != FD_EMBED_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}",
+        )
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    description = req.description.strip()
+    existing = state.fd_db.get_by_name(person_name)
+    new_person = existing is None
+
+    if existing is not None:
+        person_id = existing["id"]
+        # se veio uma descrição não-vazia num cadastro de exemplo adicional,
+        # atualiza/completa a descrição já salva (permite corrigir depois)
+        if description:
+            state.fd_db.update_description(person_id, description)
+    else:
+        person_id = state.fd_db.insert_person(
+            person_name=person_name, description=description,
+            source=req.source, confidence=req.confidence,
+        )
+
+    embedding_id = state.fd_db.insert_embedding(person_id)
+    state.fd_index.add(vec, embedding_id)
+
+    log.info(
+        f"Face-dict: {'nova pessoa' if new_person else 'novo exemplo'} "
+        f"'{person_name}' (person_id={person_id}, embedding_id={embedding_id})"
+    )
+
+    return FaceDictWriteResponse(
+        stored=True, reason="ok", person_id=person_id,
+        embedding_id=embedding_id, new_person=new_person,
+    )
+
+
+@app.post("/face-dict/read", response_model=FaceDictReadResponse)
+async def face_dict_read(req: FaceDictReadRequest):
+    if len(req.embedding) != FD_EMBED_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}",
+        )
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    # sobre-amostra o kNN porque vários embeddings podem apontar pra mesma
+    # pessoa (múltiplos exemplos) — precisamos deduplicar por person_id
+    hits = state.fd_index.search(vec, max(req.top_k * 4, 20))
+
+    best_score_by_person: dict[int, float] = {}
+    for embedding_id, score in hits:
+        person_id = state.fd_db.get_person_id_by_embedding(embedding_id)
+        if person_id is None:
+            continue
+        if person_id not in best_score_by_person or score > best_score_by_person[person_id]:
+            best_score_by_person[person_id] = score
+
+    ranked = sorted(best_score_by_person.items(), key=lambda kv: kv[1], reverse=True)[:req.top_k]
+
+    results: list[FaceCandidate] = []
+    for person_id, score in ranked:
+        if score < req.min_score:
+            continue
+        row = state.fd_db.get_person_by_id(person_id)
+        if row is None:
+            continue
+        state.fd_db.update_access(person_id)
+        results.append(FaceCandidate(
+            person_id=row["id"],
+            person_name=row["person_name"],
+            description=row["description"],
+            score=score,
+            confidence=row["confidence"],
+            access_count=row["access_count"] + 1,
+        ))
+
+    # ambíguo quando: ninguém bateu com confiança suficiente, OU os dois
+    # melhores candidatos estão muito próximos (pode ser qualquer um dos dois)
+    ambiguous = (
+        len(results) == 0
+        or (len(results) > 1 and (results[0].score - results[1].score) < FD_AMBIGUOUS_MARGIN)
+    )
+
+    return FaceDictReadResponse(results=results, ambiguous=ambiguous)
+
+
+@app.get("/face-dict", response_model=dict)
+async def face_dict_list():
+    rows = state.fd_db.list_people()
+    people = [
+        FaceDictEntry(
+            person_id=row["id"],
+            person_name=row["person_name"],
+            description=row["description"],
+            source=row["source"],
+            confidence=row["confidence"],
+            examples_count=row["examples_count"],
+            created_at=row["created_at"],
+            access_count=row["access_count"],
+        ).model_dump()
+        for row in rows
+    ]
+    return {"total": len(people), "people": people}
+
+
+@app.get("/face-dict/{person_id}", response_model=FaceDictEntry)
+async def face_dict_get(person_id: int):
+    row = state.fd_db.get_person_by_id(person_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+    return FaceDictEntry(
+        person_id=row["id"],
+        person_name=row["person_name"],
+        description=row["description"],
+        source=row["source"],
+        confidence=row["confidence"],
+        examples_count=state.fd_db.count_examples(person_id),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+class FaceDictUpdateRequest(BaseModel):
+    description: str
+
+@app.patch("/face-dict/{person_id}", response_model=FaceDictEntry)
+async def face_dict_update(person_id: int, req: FaceDictUpdateRequest):
+    """Edita só a descrição de uma pessoa já cadastrada, sem precisar
+    mandar um novo embedding junto."""
+    row = state.fd_db.get_person_by_id(person_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+    state.fd_db.update_description(person_id, req.description.strip())
+    row = state.fd_db.get_person_by_id(person_id)
+    return FaceDictEntry(
+        person_id=row["id"],
+        person_name=row["person_name"],
+        description=row["description"],
+        source=row["source"],
+        confidence=row["confidence"],
+        examples_count=state.fd_db.count_examples(person_id),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+@app.delete("/face-dict/{person_id}")
+async def face_dict_delete(person_id: int):
+    """Remove uma pessoa e todos os seus embeddings de rosto (DB + FAISS)."""
+    row = state.fd_db.get_person_by_id(person_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+
+    embedding_ids = state.fd_db.get_embedding_ids_by_person(person_id)
+    if embedding_ids:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, state.fd_index.remove_ids, set(embedding_ids))
+
+    deleted = state.fd_db.delete_person(person_id)
+    log.info(f"Face-dict: pessoa #{person_id} removida ({len(embedding_ids)} embeddings)")
+    return {"deleted": deleted, "person_id": person_id, "embeddings_removed": len(embedding_ids)}
+
+
 # ── GET /status ────────────────────────────────────────────────────────────────
 
 @app.get("/status")
@@ -2421,6 +2871,15 @@ async def status():
             "min_score":       VD_MIN_SCORE,
             "top_k":           VD_TOP_K,
             "ambiguous_margin": VD_AMBIGUOUS_MARGIN,
+        },
+        # ── NEW: Face dictionary status ──
+        "face_dict": {
+            "people_total":     state.fd_db.count(),
+            "embeddings_total": state.fd_index.total,
+            "embed_dim":        FD_EMBED_DIM,
+            "min_score":        FD_MIN_SCORE,
+            "top_k":            FD_TOP_K,
+            "ambiguous_margin": FD_AMBIGUOUS_MARGIN,
         },
     }
     if state.vs is not None:

@@ -532,17 +532,23 @@ class CoTPlan(Widget):
     }}
     """
 
-    def __init__(self, steps: list, from_cache: bool = False, **kwargs):
+    def __init__(self, steps: list, from_cache: bool = False, dynamic: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.steps      = steps
         self.from_cache = from_cache
+        # dynamic=True: não há uma lista de steps conhecida de antemão (caso
+        # do loop de tool-calling do /execute, que não emite mais um evento
+        # 'plan' upfront — cada step chega em tempo real via 'tool_call').
+        self.dynamic    = dynamic
         self._rows: dict[int, CoTPlanRow] = {}
 
+    def _header_label(self) -> str:
+        return "🔧 Tool calls" if self.dynamic else "🧠 CoT"
 
     def compose(self) -> ComposeResult:
         cache_tag = "  [cache]" if self.from_cache else ""
         yield Static(
-            f"🧠 CoT — {len(self.steps)} step(s){cache_tag}",
+            f"{self._header_label()} — {len(self.steps)} step(s){cache_tag}",
             id="cot-header",
         )
         for s in self.steps:
@@ -558,6 +564,32 @@ class CoTPlan(Widget):
             )
             self._rows[sn] = row  # 👇 Agora é 100% seguro usar como chave
             yield row
+
+    async def add_step(self, step_num, executor, action: str = "") -> None:
+        """
+        Adiciona (e monta) uma nova linha em tempo real. Usado no modo
+        dinâmico: sem plano prévio, cada 'tool_call' que chega vira uma
+        linha nova — já em estado 'running', já que o tool acabou de ser
+        chamado.
+        """
+        step_num = _safe_step(step_num)
+        if step_num in self._rows:
+            return
+        row = CoTPlanRow(
+            step_num=step_num, executor=_safe_str(executor),
+            action=action, depends_on=[],
+        )
+        self._rows[step_num] = row
+        if not self.is_mounted:
+            return
+        await self.mount(row)
+        row.set_running()
+        try:
+            self.query_one("#cot-header", Static).update(
+                f"{self._header_label()} — {len(self._rows)} step(s)"
+            )
+        except Exception:
+            pass
 
     def mark_running(self, step_num: int) -> None:
         if not self.is_mounted:
@@ -695,6 +727,7 @@ async def stream_ava(
     on_error,
     on_done,
     on_reasoning=None,
+    on_tool_call=None,
     code_mode: bool = False,
 ):
     
@@ -725,9 +758,9 @@ async def stream_ava(
             "voice": DEFAULT_VOICE,
             "lang": DEFAULT_LANG,
             "tts": True,
-            "use_cache": True,
+            "image_path": None,
+            "search_pdfs": False,
             "stream": True,
-            "strategy": "parallel",
         }
     try:
         async with httpx.AsyncClient(
@@ -765,6 +798,9 @@ async def stream_ava(
                                     await on_reasoning(data)
                             elif current_event == "plan":
                                 await on_plan(data)
+                            elif current_event == "tool_call":
+                                if on_tool_call:
+                                    await on_tool_call(data)
                             elif current_event == "step_start":
                                 await on_step_start(data)
                             elif current_event == "step_done":
@@ -1316,13 +1352,13 @@ class AlphaAI(App):
             self._plain_messages.append({"role": role, "content": content})
         return msg
 
-    def _set_route_bar(self, route: str, conf: float, method: str, direct: bool):
-        via = "direto" if direct else "CoT"
-        color = BLUE if direct else AMBER
+    def _set_route_bar(self, label: str, detail: str = "", color: str = None):
+        color = color or GRAY
         try:
-            self.query_one("#route-bar").update(
-                f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {method} • {via}[/]"
-            )
+            text = f"  [{color}]{label}[/]"
+            if detail:
+                text += f" [{GRAY}]{detail}[/]"
+            self.query_one("#route-bar").update(text)
         except Exception:
             return
 
@@ -1735,12 +1771,12 @@ class AlphaAI(App):
 
         async def on_meta(event: dict):
             try:
-                self._set_route_bar(
-                    event.get("route", "?"),
-                    event.get("route_confidence", 0.0),
-                    event.get("route_method", "?"),
-                    event.get("routed_directly", False),
-                )
+                route = event.get("route")
+                sid = str(event.get("session_id", ""))[:8]
+                if route == "alpha_code":
+                    self._set_route_bar("⬢ alpha_code", f"sessão {sid}", BLUE)
+                else:
+                    self._set_route_bar("🔧 tool-calling", f"sessão {sid}", GRAY)
             except Exception as e:
                 log.error(f"Erro em on_meta: {e}\n{traceback.format_exc()}")
 
@@ -1771,6 +1807,43 @@ class AlphaAI(App):
                 log.info(f"Plano CoT recebido com {len(steps)} step(s).")
             except Exception as e:
                 log.error(f"Erro em on_plan: {e}\n{traceback.format_exc()}")
+
+        async def on_tool_call(event):
+            """
+            Trata o evento 'tool_call' — no /execute atual (loop de
+            tool-calling puro, sem router/CoT), não existe mais um 'plan'
+            upfront: cada tool chamada chega em tempo real e vira uma linha
+            nova no widget (criado dinamicamente na primeira chamada).
+
+            No modo /code, o alpha_code já emite um 'plan' antes (tratado
+            por on_plan), então aqui só evitamos duplicar linhas — o
+            'step_start' cuida de marcar o step correspondente como rodando.
+            """
+            nonlocal _cot_plan_widget
+            try:
+                if not isinstance(event, dict):
+                    return
+                step_num = _safe_step(event.get("step", 0))
+                tool_name = _safe_str(event.get("tool", event.get("name", "?")))
+                if tool_name == "finish":
+                    # 'finish' nunca recebe um 'step_done' correspondente —
+                    # o orchestrator quebra o loop logo após emitir este
+                    # tool_call. A resposta final chega via evento 'delta'.
+                    return
+
+                if _cot_plan_widget is None:
+                    _cot_plan_widget = CoTPlan(steps=[], dynamic=True)
+                    await scroll.mount(_cot_plan_widget)
+                elif not _cot_plan_widget.dynamic:
+                    # Já existe um plano vindo de on_plan (modo /code) —
+                    # não cria linhas duplicadas aqui; on_step_start cuida
+                    # de marcar o step correspondente como rodando.
+                    return
+
+                await _cot_plan_widget.add_step(step_num, tool_name)
+                self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
+            except Exception as e:
+                log.error(f"Erro em on_tool_call: {e}\n{traceback.format_exc()}")
 
         async def on_step_start(event):
             try:
@@ -1829,19 +1902,26 @@ class AlphaAI(App):
                 except Exception:
                     pass
 
-                lat    = event.get("total_latency_ms", 0)
-                errs   = event.get("errors", [])
-                route  = event.get("route", "?")
-                conf   = event.get("route_confidence", 0.0)
-                meth   = event.get("route_method", "?")
-                direct = event.get("routed_directly", False)
-                via    = "direto" if direct else "CoT"
-                color  = BLUE if direct else AMBER
-                self.query_one("#route-bar").update(
-                    f"  [{color}]▸ {route}[/] [{GRAY}]{conf:.0%} via {meth}"
-                    f" • {via} • {lat:.0f}ms[/]"
-                    + (f"  [{RED_C}]{len(errs)} erro(s)[/]" if errs else "")
-                )
+                lat   = event.get("total_latency_ms", 0)
+                errs  = event.get("errors", [])
+                route = event.get("route")
+
+                if route == "alpha_code":
+                    tools_used = event.get("tools_called", 0)
+                    label = "⬢ alpha_code"
+                else:
+                    steps = event.get("steps", [])
+                    tools_used = len([
+                        s for s in steps
+                        if isinstance(s, dict) and s.get("executor") != "finish"
+                    ])
+                    label = "🔧 tool-calling"
+
+                detail = f"{tools_used} tool(s) • {lat:.0f}ms"
+                if errs:
+                    detail += f" • {len(errs)} erro(s)"
+                color = RED_C if errs else (BLUE if route == "alpha_code" else GRAY)
+                self._set_route_bar(label, detail, color)
                 # Scroll final garantido
                 self.call_after_refresh(lambda: scroll.scroll_end(animate=False))
                 # Segundo scroll após 200ms (caso o layout ainda esteja se ajustando)
@@ -1856,6 +1936,7 @@ class AlphaAI(App):
                 on_delta, on_meta, on_plan, on_step_start, on_step_done,
                 on_result, on_error, on_done,
                 on_reasoning=on_reasoning,
+                on_tool_call=on_tool_call,
                 code_mode=self.code_mode,  # ← NEW
             )
         except Exception as e:

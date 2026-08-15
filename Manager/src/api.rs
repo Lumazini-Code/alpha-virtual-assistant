@@ -10,7 +10,7 @@
 
 use crate::models::scan_models;
 use crate::process_manager;
-use crate::state::SharedState;
+use crate::state::{LlamaMode, SharedState, VisionConfig};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -28,6 +28,8 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         .route("/models", get(get_models))
         .route("/llama/start", post(post_llama_start))
         .route("/llama/stop", post(post_llama_stop))
+        .route("/llama/switch_mode", post(post_llama_switch_mode))
+        .route("/vision/config", get(get_vision_config).post(post_vision_config))
         .route("/docker/start", post(post_docker_start))
         .route("/docker/stop", post(post_docker_stop))
         .with_state(state);
@@ -58,6 +60,12 @@ struct LlamaStatusDto {
     mmproj: Option<String>,
     port: u16,
     idle_seconds: Option<u64>,
+    /// "text" ou "multimodal" — modo atualmente carregado.
+    mode: String,
+    /// Modelo "principal" escolhido pelo usuário (independente de qual
+    /// modelo esteja de fato carregado agora, caso o modo multimodal
+    /// esteja usando um modelo dedicado diferente).
+    main_model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,6 +94,19 @@ struct SimpleResponse {
     message: String,
 }
 
+#[derive(Deserialize)]
+struct SwitchModeRequest {
+    /// "text" ou "multimodal".
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct VisionConfigRequest {
+    use_main_model: bool,
+    #[serde(default)]
+    dedicated_model_path: Option<String>,
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════════
@@ -102,6 +123,11 @@ async fn get_status(State(state): State<SharedState>) -> impl IntoResponse {
             mmproj: llama.mmproj_path.clone(),
             port: llama.port,
             idle_seconds: llama.last_activity.map(|t| t.elapsed().as_secs()),
+            mode: match llama.mode {
+                LlamaMode::Text => "text".to_string(),
+                LlamaMode::Multimodal => "multimodal".to_string(),
+            },
+            main_model: llama.main_model_path.clone(),
         },
         docker: DockerStatusDto {
             status: docker.status.label().to_string(),
@@ -182,6 +208,79 @@ async fn post_llama_stop(State(state): State<SharedState>) -> impl IntoResponse 
             ok: false,
             message: e.to_string(),
         }),
+    }
+}
+
+async fn post_llama_switch_mode(
+    State(state): State<SharedState>,
+    Json(req): Json<SwitchModeRequest>,
+) -> impl IntoResponse {
+    let mode = match req.mode.to_lowercase().as_str() {
+        "text" => LlamaMode::Text,
+        "multimodal" => LlamaMode::Multimodal,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SimpleResponse {
+                    ok: false,
+                    message: format!("Modo inválido: '{other}'. Use \"text\" ou \"multimodal\"."),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match process_manager::switch_llama_mode(&state, mode).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SimpleResponse {
+                ok: true,
+                message: format!("llama-server trocado para o modo: {}", mode.label()),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SimpleResponse {
+                ok: false,
+                message: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_vision_config(State(state): State<SharedState>) -> impl IntoResponse {
+    let cfg = state.vision_config.lock().await.clone();
+    Json(cfg)
+}
+
+async fn post_vision_config(
+    State(state): State<SharedState>,
+    Json(req): Json<VisionConfigRequest>,
+) -> impl IntoResponse {
+    let cfg = VisionConfig {
+        use_main_model: req.use_main_model,
+        dedicated_model_path: req.dedicated_model_path,
+    };
+
+    match process_manager::set_vision_config(&state, cfg).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SimpleResponse {
+                ok: true,
+                message: "Configuração de visão atualizada.".into(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(SimpleResponse {
+                ok: false,
+                message: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 

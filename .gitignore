@@ -34,3 +34,5 @@ Manager/ava-tray
 .env
 
 *.pyc
+
+*.cpython-311.pyc

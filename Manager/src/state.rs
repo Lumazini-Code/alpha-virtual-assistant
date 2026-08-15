@@ -33,6 +33,32 @@ impl ProcStatus {
     }
 }
 
+/// Modo atual do llama-server: somente texto ou multimodal (com mmproj
+/// carregado). Reflete se `mmproj_path` está presente ou não, mas é
+/// guardado explicitamente para deixar a troca de modo (endpoint
+/// `/llama/switch_mode`) e a UI mais simples de ler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlamaMode {
+    Text,
+    Multimodal,
+}
+
+impl Default for LlamaMode {
+    fn default() -> Self {
+        LlamaMode::Text
+    }
+}
+
+impl LlamaMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            LlamaMode::Text => "Somente texto",
+            LlamaMode::Multimodal => "Multimodal",
+        }
+    }
+}
+
 /// Informações sobre o llama-server atualmente em execução (se houver).
 #[derive(Debug, Clone)]
 pub struct LlamaState {
@@ -45,6 +71,15 @@ pub struct LlamaState {
     /// Último instante em que houve atividade (requisição na API do llama-server
     /// ou ação manual). Usado pelo watcher de 15 minutos.
     pub last_activity: Option<Instant>,
+
+    /// Modo atualmente carregado (texto ou multimodal).
+    pub mode: LlamaMode,
+    /// Caminho do modelo "principal" escolhido explicitamente pelo usuário
+    /// (via `/llama/start` ou tela de seleção de modelo). É preservado
+    /// mesmo quando o modo é trocado para multimodal usando um modelo
+    /// dedicado diferente — permite voltar ao texto/modelo original com
+    /// `/llama/switch_mode { "mode": "text" }`.
+    pub main_model_path: Option<String>,
 }
 
 impl Default for LlamaState {
@@ -57,6 +92,31 @@ impl Default for LlamaState {
             mtp_draft_path: None, 
             port: 2001,
             last_activity: None,
+            mode: LlamaMode::Text,
+            main_model_path: None,
+        }
+    }
+}
+
+/// Configuração de qual modelo usar quando o modo multimodal é ativado.
+///
+///   - `use_main_model = true`  -> usa o mmproj associado ao próprio modelo
+///     principal (`main_model_path`), igual ao comportamento padrão de
+///     `mmproj_used` em `/llama/start`.
+///   - `use_main_model = false` -> ignora o modelo principal e carrega
+///     `dedicated_model_path` (que deve ter um mmproj companheiro na pasta
+///     de Models) sempre que o modo multimodal for solicitado.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VisionConfig {
+    pub use_main_model: bool,
+    pub dedicated_model_path: Option<String>,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            use_main_model: true,
+            dedicated_model_path: None,
         }
     }
 }
@@ -101,6 +161,10 @@ pub struct AppState {
     
     /// Ringbuffer de log do llama-server (adicionar este campo!)
     pub llama_log: SharedLlamaLog,
+
+    /// Configuração de qual modelo usar em modo multimodal (modelo
+    /// principal com seu próprio mmproj, ou um modelo dedicado separado).
+    pub vision_config: Arc<TokioMutex<VisionConfig>>,
 }
 
 
@@ -168,5 +232,6 @@ pub fn new_shared_state() -> SharedState {
         llama_server_bin: resolve_path("../Modules/llama-cpp/llama-server"),
         docker_start_script: find_docker_start_script(),
         llama_log: new_llama_log(),
+        vision_config: Arc::new(TokioMutex::new(VisionConfig::default())),
     })
 }

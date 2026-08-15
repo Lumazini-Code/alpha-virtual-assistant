@@ -55,6 +55,10 @@ BASEFOLDER = Path(__file__).parent.parent
 MEMORY_URL = "http://localhost:3001"
 TTS_URL    = "http://localhost:3004"
 
+# Contexto de curto prazo: quantas duplas pergunta-resposta (turn groups)
+# são lidas cruas do /read_st a cada turno, em paralelo com o /read semântico.
+ST_CONTEXT_PAIRS = 5
+
 # llama-server
 LLAMA_SERVER_PATH = r".\llama-cpp\llama-server"
 LLAMA_HOST        = "localhost"
@@ -405,6 +409,26 @@ async def memory_read(query: str, session_id: Optional[str] = None, top_k: int =
         return []
 
 
+async def memory_read_st(session_id: Optional[str], n_pairs: int = ST_CONTEXT_PAIRS) -> list[dict]:
+    """
+    Lê as N duplas pergunta-resposta mais recentes do short-term (histórico
+    cru da conversa, sem busca semântica) via /read_st. Roda em paralelo com
+    o /read semântico — juntos formam o contexto completo enviado ao modelo.
+    """
+    if not session_id:
+        return []
+    try:
+        client = await _get_memory_client()
+        r = await client.post(
+            "/read_st",
+            json={"session_id": session_id, "n_pairs": n_pairs},
+        )
+        return r.json().get("turns", [])
+    except Exception as e:
+        log.info(f"[MEMORY] Falha na leitura ST (read_st): {e}")
+        return []
+
+
 async def memory_save_turn(session_id: str, user_input: str, assistant_response: str):
     """Grava o par de turnos na memória de curto prazo — fire-and-forget."""
     if not session_id:
@@ -520,6 +544,7 @@ def _build_messages(
     user_input: str,
     lang: str,
     memories: list[dict],
+    recent_turns: Optional[list[dict]] = None,
 ) -> list[dict]:
     """
     Monta a lista de mensagens para o llama-server.
@@ -532,26 +557,31 @@ def _build_messages(
     gets cached after the first request, and subsequent requests
     only need to prefill the NEW tokens.
 
-    Structure (with memories):
-      [0] system:    STABLE prompt — context + username + memory semantics instruction
-      [1] assistant: first-person memory recall (dynamic, AFTER cached prefix)
-      [2] user:      "[Data: DD/MM/YYYY]\n{user_input}"
+    Structure (with memories + recent turns):
+      [0] system:      STABLE prompt — context + username + memory semantics instruction
+      [1] assistant:   first-person memory recall (dynamic, AFTER cached prefix) — from /read
+      [2..N] user/assistant: last N pairs of real conversation history — from /read_st
+      [N+1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
 
-    Structure (without memories):
+    Structure (without memories/turns):
       [0] system:    STABLE prompt
       [1] user:      "[Data: DD/MM/YYYY]\n{user_input}"
 
     MEMORY SEMANTICS:
-    Memories are expressed in the ASSISTANT voice (role:assistant) as a
-    first-person recall. This is semantically correct: the model is
-    "remembering" its own knowledge, not receiving external data from
-    the user. The system prompt explains this contract so the model
-    understands why an assistant turn appears before the user's message.
+    Memories from /read are expressed in the ASSISTANT voice (role:assistant)
+    as a first-person recall — semantic knowledge the model is "remembering",
+    not external data from the user. `recent_turns` (from /read_st) are the
+    opposite: they're the actual conversation as it happened, so they're
+    inserted as real user/assistant turns instead of being folded into the
+    recall block — that keeps the model's literal short-term context (what
+    was actually said) separate from associative long-term recall (relevant
+    facts a semantic search surfaced).
 
     KV CACHE IMPACT:
     - Message [0] (system) is always identical → KV cache HIT
     - Message [1] (assistant recall) varies by query → small prefill cost
-    - Message [2] (user input) varies → small prefill cost
+    - Recent turns + user input vary every turn → prefill cost, but small
+      relative to the alternative of re-embedding the whole history via /read
     """
     messages = [
         # STABLE: This is the cached portion — never changes at runtime
@@ -567,6 +597,14 @@ def _build_messages(
             "role": "assistant",
             "content": recall_text,
         })
+
+    # DYNAMIC: Last N pairs of real conversation turns (from /read_st),
+    # inserted as-is — this is literal history, not associative recall.
+    for turn in (recent_turns or []):
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
 
     # DYNAMIC: Current date + user input
     today = datetime.datetime.now().strftime("%d/%m/%Y")
@@ -712,7 +750,8 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
 
     # ── OPTIMIZATION 3: PARALLEL prep ────────────────────────────────────────
-    # Run language detection and memory read IN PARALLEL instead of sequentially.
+    # Run language detection, memory read (semantic) and memory read_st
+    # (raw recent history) IN PARALLEL instead of sequentially.
     # This saves ~100-300ms when memory API is slow.
     lang_task = asyncio.ensure_future(
         asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
@@ -720,14 +759,17 @@ async def chat(req: ChatRequest):
     memory_task = asyncio.ensure_future(
         memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
     )
+    memory_st_task = asyncio.ensure_future(
+        memory_read_st(req.session_id)
+    )
 
-    # Wait for both to complete
-    lang, memories = await asyncio.gather(lang_task, memory_task)
+    # Wait for all three to complete
+    lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
     if not lang:
         lang = "pt"
 
     # 3. Montar prompt (with stable system prompt for caching)
-    messages = _build_messages(user_input, lang, memories)
+    messages = _build_messages(user_input, lang, memories, recent_turns)
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
     # 4. Inferência (llama-server local, com retry para falhas transitórias)
     t0 = time.perf_counter()
@@ -804,11 +846,14 @@ async def chat_stream(req: ChatRequest):
     memory_task = asyncio.ensure_future(
         memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
     )
-    lang, memories = await asyncio.gather(lang_task, memory_task)
+    memory_st_task = asyncio.ensure_future(
+        memory_read_st(req.session_id)
+    )
+    lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
     if not lang:
         lang = "pt"
 
-    messages = _build_messages(user_input, lang, memories)
+    messages = _build_messages(user_input, lang, memories, recent_turns)
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
     voice = req.voice or voiceModel
 
