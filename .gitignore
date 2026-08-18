@@ -36,3 +36,5 @@ Manager/ava-tray
 *.pyc
 
 *.cpython-311.pyc
+
+node_modules/

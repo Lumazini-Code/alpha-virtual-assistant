@@ -53,7 +53,7 @@ pyfiglet
 
 textual
 
-cv2
+opencv-python-headless
 
 scikit-learn
 

@@ -192,10 +192,10 @@ fn build_llama_args(
 
     // ── Flags do comando validado a ~35t/s (baseline, não mexer sem medir) ──
     args.extend(str_pairs(&[
-        ("--ctx-size", "90000"),
+        ("--ctx-size", "64000"),
         ("--gpu-layers", "99"),
-        ("--cache-type-k", "q4_0"),
-        ("--cache-type-v", "q4_0"),
+        ("--cache-type-k", "q8_0"),
+        ("--cache-type-v", "q8_0"),
         ("--top-k", "80"),
         ("--repeat-penalty", "1.05"),
         ("--host", "0.0.0.0"),

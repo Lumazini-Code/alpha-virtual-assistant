@@ -659,7 +659,16 @@ class ClearRequest(BaseModel):
 
 class ToolCallMessage(BaseModel):
     role: str = Field(..., description="system | user | assistant | tool")
-    content: Optional[str] = None
+    content: Optional[str | list[dict]] = Field(
+        default=None,
+        description=(
+            "Texto simples (str) na maioria dos casos. Também aceita o formato "
+            "multi-parte do OpenAI vision (lista de blocos {type: text|image_url, ...}) "
+            "para requests multimodais — repassado como está para o llama-server, "
+            "que só interpreta corretamente quando o modelo carregado está em "
+            "modo multimodal."
+        ),
+    )
     tool_calls: Optional[list] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None

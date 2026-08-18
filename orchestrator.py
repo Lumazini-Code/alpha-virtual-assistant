@@ -9,14 +9,17 @@ Arquitetura (tool-calling nativo via Jinja chat template):
      prompt, e o parser nativo do servidor devolve `message.tool_calls` já
      estruturado (nome + argumentos JSON), sem precisarmos de uma segunda
      chamada com grammar manual.
-  2. Se a resposta NÃO tiver tool_calls, o texto é apenas adicionado ao
-     histórico como mensagem do assistant e o loop continua normalmente —
-     sem lembrete, sem penalidade.
+  2. Se a resposta NÃO tiver tool_calls, o texto é tratado como resposta
+     final direta (equivalente a um "finish" implícito) e o loop termina —
+     não há re-chamada com o histórico inalterado, pois isso violaria a
+     alternância estrita user/assistant/tool exigida pelo chat template.
   3. Se houver tool_calls, cada uma é executada; o resultado volta ao
      histórico como mensagem role="tool" (atrelada ao tool_call_id) e o
      ciclo reinicia.
-  4. O loop SÓ termina quando o modelo chama a tool "finish" (cujos
-     argumentos contêm a resposta final). Não há limite de rodadas.
+  4. O loop termina quando o modelo chama a tool "finish" (cujos
+     argumentos contêm a resposta final) ou quando responde sem chamar
+     nenhuma tool (resposta direta = finish implícito). Não há limite
+     artificial de rodadas além disso.
 
 Resumo do fluxo:
   pergunta → LLM (+ tools via Jinja) → [sem tool_calls: continua o loop]
@@ -31,7 +34,13 @@ resposta final (igual antes), o modelo nunca decide chamar TTS.
 
 Integra os microserviços AVA:
   - Memory          (port 3001)  — long-term, short-term, knowledge
-  - Search          (port 3002)  — web search + cross-encoder rerank
+  - Search          (port 3002)  — web search + page/URL extraction via
+                                    Tavily API (free tier, 1000 créditos/mês);
+                                    resultados já vêm ranqueados por
+                                    relevância e com o conteúdo real da
+                                    página — a qualidade do resultado ainda
+                                    depende da query formulada pelo modelo
+                                    (ver tools "search" e "read_url")
   - Local Scraping  (port 3003)  — local file search, read & indexing
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
   - LLM Chat        (port 4003)  — conversational inference (llama-server)
@@ -49,10 +58,11 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
-
+import datetime
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -83,11 +93,11 @@ HEALTH_PATHS: dict[str, str] = {
 # Timeout por tool (usado tanto para chamadas de tool quanto pro loop de seleção)
 EXECUTOR_TIMEOUTS: dict[str, float] = {
     "llm": 9999999.0, "memory_read": 60.0, "memory_write": 30.0, "search": 60.0,
-    "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
+    "read_url": 30.0, "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
     "local_scraping": 9999999.0, "alpha_code": 9999999.0,
 }
 
-MAX_CONTEXT_CHARS = 1500
+MAX_CONTEXT_CHARS = 3000
 DEFAULT_TOP_K     = 5
 DEFAULT_MIN_SCORE = 0.30
 # Sem limite de rodadas: o loop só termina quando a tool "finish" é chamada.
@@ -115,14 +125,19 @@ log = logging.getLogger("ava.orchestrator")
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExecuteRequest(BaseModel):
-    input:       str
-    session_id:  Optional[str]  = None
-    voice:       str            = "M1"
-    lang:        str            = "pt"
-    tts:         bool           = True
-    image_path:  Optional[str]  = None
-    search_pdfs: bool           = False
-    stream:      bool           = True
+    input:         str
+    session_id:    Optional[str]  = None
+    voice:         str            = "M1"
+    lang:          str            = "pt"
+    tts:           bool           = True
+    # Base64 puro da imagem (sem prefixo "data:...;base64,"), já codificado
+    # pelo cliente (TUI) — o orchestrator NUNCA lê arquivo de disco nem
+    # decodifica/recodifica isso, só repassa para o vision service. Isso
+    # elimina o problema de path resolution entre cliente e orchestrator
+    # (ex.: orchestrator rodando em container sem o filesystem do host).
+    image_base64:  Optional[str]  = None
+    search_pdfs:   bool           = False
+    stream:        bool           = True
 
 class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
@@ -231,7 +246,9 @@ async def lifespan(app: FastAPI):
 
 def _result_to_text(res) -> str:
     if not res:
-        return "(no result)"
+        return ("(empty result — this tool returned nothing usable. Do NOT repeat the same "
+                 "query worded differently; either try a materially different angle once, "
+                 "or call `finish` now and be upfront that you couldn't find the information.)")
     if isinstance(res, str):
         return res[:MAX_CONTEXT_CHARS]
     if isinstance(res, dict):
@@ -243,7 +260,27 @@ def _result_to_text(res) -> str:
             return res["content"][:MAX_CONTEXT_CHARS]
         return str(res.get("text") or res.get("content") or res.get("answer") or res.get("response") or res)[:MAX_CONTEXT_CHARS]
     if isinstance(res, list):
-        return "\n".join([f"- {(i.get('text') or i.get('content') or str(i))[:300]}" for i in res[:6]])[:MAX_CONTEXT_CHARS]
+        if not res:
+            return ("(empty result — this tool returned zero items. Do NOT repeat the same "
+                     "query worded differently; either try a materially different angle once, "
+                     "or call `finish` now and be upfront that you couldn't find the information.)")
+        # Structured rendering (search-like items): keep title/url separate from
+        # the snippet so the model can actually judge relevance/date/source
+        # instead of an undifferentiated wall of text truncated mid-sentence.
+        lines = []
+        for idx, item in enumerate(res[:5]):
+            if isinstance(item, dict):
+                title = item.get("title") or item.get("name")
+                url = item.get("url") or item.get("link") or item.get("source")
+                snippet = (item.get("text") or item.get("content") or item.get("snippet") or "").strip()
+                snippet = snippet[:600]
+                header = f"[{idx + 1}] " + (title or "(untitled)")
+                if url:
+                    header += f" — {url}"
+                lines.append(header if not snippet else f"{header}\n    {snippet}")
+            else:
+                lines.append(f"[{idx + 1}] {str(item)[:280]}")
+        return ("\n".join(lines))[:MAX_CONTEXT_CHARS]
     return str(res)[:MAX_CONTEXT_CHARS]
 
 
@@ -345,12 +382,43 @@ async def _tool_memory_write(args: dict, req: ExecuteRequest):
     return r.json()
 
 async def _tool_search(args: dict, req: ExecuteRequest):
-    r = await state.search_client.post("/search", json={
+    topic = args.get("topic") or "general"
+    if topic not in ("general", "news"):
+        topic = "general"
+    payload = {
         "query": args.get("query", ""), "max_results": DEFAULT_TOP_K,
-        "use_cache": True, "search_pdfs": req.search_pdfs,
-    })
+        "use_cache": True, "search_pdfs": req.search_pdfs, "topic": topic,
+    }
+    if topic == "news":
+        payload["days"] = 7   # janela padrão pra queries de notícia/atualidade
+    r = await state.search_client.post("/search", json=payload)
     r.raise_for_status()
-    return r.json().get("results", [])
+    data = r.json()
+    results = data.get("results", [])
+    # A Tavily pode gerar uma resposta curta (include_answer) além dos
+    # resultados. IMPORTANTE: sempre devolvemos uma LISTA (nunca um dict com
+    # {"answer":..., "results":...}) — _result_to_text só faz a renderização
+    # rica (título/url/trecho, por item) pra listas; um dict cai num branch
+    # mais pobre que pegaria só o "answer" e descartaria os resultados
+    # inteiros, fazendo o modelo repetir a frase curta da Tavily ao invés de
+    # sintetizar a partir do conteúdo real das páginas.
+    if answer := data.get("answer"):
+        return [{"title": "Resposta rápida (gerada automaticamente pela busca — confirme contra os resultados abaixo)",
+                  "text": answer}] + results
+    return results
+
+async def _tool_read_url(args: dict, req: ExecuteRequest):
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"success": False, "error": "url vazia"}
+    r = await state.search_client.post("/extract", json={"urls": [url], "extract_depth": "basic"})
+    r.raise_for_status()
+    data = r.json()
+    hits = data.get("results", [])
+    if not hits:
+        return {"success": False, "error": "não foi possível extrair conteúdo dessa URL", "url": url}
+    page = hits[0]
+    return {"success": True, "url": page.get("url", url), "title": page.get("title", ""), "text": page.get("text", "")}
 
 async def _tool_deep_search(args: dict, req: ExecuteRequest):
     r = await state.deep_search_client.post("/query", json={"text": args.get("query", "")})
@@ -429,88 +497,210 @@ async def _ensure_text_mode(timeout: float = 60.0, poll_interval: float = 1.0) -
     await _ensure_llama_mode("text", timeout=timeout, poll_interval=poll_interval)
 
 
-async def _describe_crops_with_llm(objects: list[dict], user_prompt: str) -> str:
+# Dá acesso, de dentro de um executor de tool, ao histórico REAL da
+# conversa deste turno (system + user + tool_calls já resolvidas) sem
+# precisar mudar a assinatura `executor(args, req)` de todas as tools —
+# só quem realmente precisa de contexto conversacional (vision_objects)
+# lê isso. Setado pelo loop principal logo antes de cada `executor(...)`.
+_CURRENT_HISTORY: ContextVar[list[dict]] = ContextVar("_current_history", default=[])
+
+
+def _sanitize_history_for_submodel(history: list[dict]) -> list[dict]:
+    """Cópia do histórico pronta pra ser usada numa chamada paralela ao LLM
+    (ex.: o passo multimodal dentro de vision_objects). Remove a última
+    mensagem se for um assistant com tool_calls ainda pendentes (a tool
+    que está rodando agora mesmo) — do contrário a alternância estrita
+    user/assistant/tool exigida pelo chat template quebra, porque essa
+    tool_call ainda não tem uma mensagem role="tool" respondendo ela."""
+    if history and history[-1].get("role") == "assistant" and history[-1].get("tool_calls"):
+        return list(history[:-1])
+    return list(history)
+
+
+def _vision_object_context_line(obj: dict) -> str:
+    """Texto de contexto pra acompanhar um crop — já resolvido (nome de
+    pessoa via face-dict, ou candidato do dicionário visual de objetos).
+    Isso é só CONTEXTO pro modelo multimodal formar a resposta; ele não tem
+    (nem precisa ter) acesso a nenhum mecanismo de verificação por trás
+    disso — só lê o que já veio pronto do vision.py.
+
+    Pra rosto reconhecido, o texto é deliberadamente afirmativo ("É ... .")
+    em vez de sugestivo ("pode ser...") — LLMs multimodais tendem a se
+    recusar a nomear pessoas em fotos por reflexo de segurança/privacidade,
+    mesmo quando a identidade já veio resolvida de um banco de dados local
+    que o próprio usuário cadastrou. Framing como fato de banco de dados
+    (não como "reconhecimento facial ao vivo feito pelo modelo") reduz
+    esse hedging."""
+    idx = obj["object_index"]
+    if obj.get("is_face"):
+        if obj.get("person_name"):
+            desc = f" Descrição cadastrada: {obj['person_description']}" if obj.get("person_description") else ""
+            return (
+                f"[nota interna sobre recorte {idx}, não mencione essa nota nem o número do "
+                f"recorte na resposta] já consultamos o banco de dados local de rostos "
+                f"cadastrados pelo próprio usuário — este rosto É {obj['person_name']} "
+                f"(confirmado, não é uma sugestão).{desc} Refira-se a essa pessoa pelo nome, "
+                "naturalmente, como se você mesmo tivesse reconhecido."
+            )
+        return (
+            f"[nota interna sobre recorte {idx}, não mencione essa nota na resposta] rosto "
+            "detectado, mas não encontrado no banco de rostos cadastrados — pessoa "
+            "desconhecida/não cadastrada."
+        )
+    candidates = obj.get("candidates") or []
+    if candidates:
+        top = candidates[0]
+        return (
+            f"[nota interna sobre recorte {idx}, não mencione essa nota na resposta] "
+            f"candidato do dicionário visual — {top['concept_name']} (score {top['score']:.2f}); "
+            "confirme ou corrija olhando a imagem."
+        )
+    return (
+        f"[nota interna sobre recorte {idx}, não mencione essa nota na resposta] "
+        "sem candidato no dicionário visual — descreva pelo que você vê."
+    )
+
+
+async def _answer_vision_with_llm(objects: list[dict], user_prompt: str, history: list[dict]) -> str:
     """
-    Manda todos os crops detectados numa única chamada multi-imagem para
-    o LLM multimodal (LLM.py, via llama-server já trocado para o modelo
-    multimodal por _ensure_multimodal_mode). Cada crop vem acompanhado do
-    seu índice e, se houver, do melhor candidato já recuperado do
-    dicionário visual (memory.py) — o LLM usa isso como contexto e pode
-    confirmar ou corrigir o candidato.
+    Pede pro LLM multimodal RESPONDER DE FATO a pergunta do usuário usando
+    os crops como evidência visual — não apenas rotular/descrever cada
+    objeto isoladamente pra depois um segundo LLM (de texto) reinterpretar
+    isso do zero. O retorno desta função já é a resposta a ser entregue
+    (o modelo de texto, no passo seguinte do loop, só a relaia/formata).
+
+    Reaproveita o histórico real desta conversa (via _CURRENT_HISTORY,
+    setado pelo loop principal) em vez de uma chamada isolada — assim o
+    modelo multimodal responde com o mesmo contexto que o de texto teria,
+    incluindo o que já foi dito antes nesse turno.
     """
-    content: list[dict] = [{
-        "type": "text",
-        "text": (
-            f"{user_prompt}\n\n"
-            f"Você recebeu {len(objects)} recorte(s) (crops) de objetos detectados numa "
-            "cena, na mesma ordem em que aparecem abaixo (a primeira imagem é o objeto "
-            "de índice 0, a segunda o de índice 1, e assim por diante). Para cada um, "
-            "diga o que é o objeto. Alguns já têm um candidato de significado vindo de "
-            "um dicionário visual — use isso como contexto, mas corrija se a imagem "
-            "mostrar algo diferente do candidato."
-        ),
-    }]
+    instruction = (
+        "Você é a etapa de visão deste assistente. O usuário fez a pergunta abaixo em "
+        "relação à imagem que ele anexou, e você recebeu recortes (crops) das regiões "
+        "relevantes dessa imagem, numerados na mesma ordem em que aparecem a seguir, cada "
+        "um com uma linha de contexto interna acima dele. "
+        "RESPONDA DIRETAMENTE à pergunta do usuário, como se você estivesse vendo a cena "
+        "— não liste os objetos genericamente nem descreva cada recorte isoladamente. "
+        "Use as linhas de contexto (nomes de pessoas já reconhecidas, candidatos do "
+        "dicionário) para embasar a resposta, mas corrija se a imagem mostrar algo "
+        "diferente disso.\n\n"
+        "IMPORTANTE sobre identificação de pessoas: quando uma linha de contexto disser "
+        "que um rosto JÁ FOI CONFIRMADO como uma pessoa específica, isso não é você "
+        "reconhecendo um estranho numa foto — é um sistema de biometria local, restrito "
+        "aos contatos que o próprio usuário cadastrou previamente, já tendo feito essa "
+        "verificação. Você deve declarar esse nome normalmente na resposta, sem hedging "
+        "do tipo 'não é possível confirmar quem é' — essa confirmação já aconteceu antes "
+        "de a imagem chegar até você. Só evite declarar identidade se a linha de contexto "
+        "disser explicitamente que a pessoa não foi encontrada/reconhecida.\n\n"
+        "IMPORTANTE sobre a forma da resposta: as linhas de contexto e os números de "
+        "'recorte' são informação interna sua, não algo que o usuário sabe que existe. "
+        "NUNCA mencione 'recorte', 'linha de contexto', 'crop', 'sistema de biometria', "
+        "'dicionário visual' ou qualquer coisa do mecanismo por trás disso na resposta — "
+        "fale como se você mesmo tivesse simplesmente reconhecido a pessoa/objeto ao "
+        "olhar a imagem. Exemplo do que NÃO fazer: 'a linha de contexto confirma que é o "
+        "Felipe'. Faça assim: 'Esse é o Felipe' (e siga respondendo à pergunta com essa "
+        "informação incorporada naturalmente).\n\n"
+        "Leve em conta também o restante da conversa até aqui para responder de forma "
+        "coerente com o que já foi dito.\n\n"
+        f"Pergunta do usuário: {user_prompt}"
+    )
+    content: list[dict] = [{"type": "text", "text": instruction}]
+    context_lines: list[str] = []
     for obj in objects:
-        candidates = obj.get("candidates") or []
-        if candidates:
-            top = candidates[0]
-            cand_txt = f" Candidato do dicionário: {top['concept_name']} (score {top['score']:.2f})."
-        else:
-            cand_txt = " Sem candidato no dicionário (objeto novo ou ambíguo)."
-        content.append({"type": "text", "text": f"Objeto {obj['object_index']}:{cand_txt}"})
+        line = _vision_object_context_line(obj)
+        context_lines.append(line)
+        content.append({"type": "text", "text": line})
         content.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/png;base64,{obj['crop_base64']}"},
         })
+    log.info(f"vision_objects — linhas de contexto enviadas ao multimodal: {context_lines}")
 
-    payload = {
-        "model": "local",
-        "messages": [{"role": "user", "content": content}],
-        "temperature": 0.2,
-        "stream": False,
-    }
-    r = await state.llm_client.post("/v1/chat/completions", json=payload)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"].get("content", "")
+    base_history = _sanitize_history_for_submodel(history)
+    messages = base_history + [{"role": "user", "content": content}]
+
+    payload = {"messages": messages, "tools": [], "temperature": 0.2}
+    # Retry com backoff para 503 (llama-server pode ainda estar
+    # reiniciando após troca de modo)
+    for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
+        r = await state.llm_client.post("/chat/tools", json=payload)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("too_large"):
+                raise RuntimeError(f"Contexto excede o limite do llama-server: {data.get('usage')}")
+            return data["message"].get("content", "")
+        if r.status_code == 503 and attempt < ORCHESTRATOR_LLM_RETRIES:
+            wait = ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1)
+            log.warning(
+                f"LLM.py retornou 503 em _answer_vision_with_llm, "
+                f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}, "
+                f"aguardando {wait:.0f}s..."
+            )
+            await asyncio.sleep(wait)
+            continue
+        r.raise_for_status()
+    raise RuntimeError(f"LLM.py /chat/tools falhou com 503 após {ORCHESTRATOR_LLM_RETRIES + 1} tentativas em _answer_vision_with_llm")
 
 
 async def _tool_vision_objects(args: dict, req: ExecuteRequest):
     """
-    Roda o pipeline de "Tradução de Objetos" (vision.py /vision/process) na
-    imagem anexada ao request: depth estimation + segmentação + dicionário
-    visual, retornando um crop por objeto detectado. Em seguida garante
-    que o llama-server esteja em modo multimodal (trocando via o
-    gerenciador de processos, porta 9001, se necessário) e manda todos os
-    crops numa única chamada multi-imagem para o LLM final descrever/
-    identificar cada objeto.
+    Roda o pipeline de visão (vision.py /vision/process) na imagem anexada
+    ao request: rostos primeiro (resolvidos direto contra o face-dict),
+    depois objetos genéricos via depth estimation + segmentação +
+    dicionário visual. Em seguida garante que o llama-server esteja em
+    modo multimodal (trocando via o gerenciador de processos, porta 9001,
+    se necessário) e manda os crops, numa única chamada multi-imagem,
+    para o LLM multimodal RESPONDER a pergunta do usuário diretamente —
+    ver _answer_vision_with_llm.
     """
-    if not req.image_path:
+    if not req.image_base64:
         return "[vision_objects: no image was provided with this request]"
 
-    try:
-        image_bytes = Path(req.image_path).read_bytes()
-    except Exception as e:
-        return f"[vision_objects: falha ao ler a imagem em '{req.image_path}': {e}]"
-    image_b64 = base64.b64encode(image_bytes).decode("ascii")
-
+    # O base64 já chega pronto do cliente (TUI) — não há arquivo em disco
+    # pra ler nem path pra resolver. Só repassamos direto pro vision
+    # service. Nenhuma validação de conteúdo aqui: se o base64 estiver
+    # corrompido/inválido, quem detecta isso é o próprio vision service
+    # (ele decodifica antes de processar).
     r = await state.vision_client.post("/vision/process", json={
-        "image_base64": image_b64, "top_k": DEFAULT_TOP_K, "min_score": DEFAULT_MIN_SCORE,
+        "image_base64": req.image_base64, "top_k": DEFAULT_TOP_K, "min_score": DEFAULT_MIN_SCORE,
     })
     r.raise_for_status()
     data = r.json()
 
     objects = data.get("objects", [])
+
+    # Log da resposta CRUA do vision.py (antes do corte pra lean_objects
+    # mais abaixo, que remove is_face/person_name/face_score/etc pra não
+    # inchar o histórico do LLM de texto). Sem isso, o docker.log só mostra
+    # a versão enxuta e não dá pra saber se o vision.py de fato resolveu
+    # (ou não) a identidade de um rosto antes da chamada ao multimodal.
+    face_summary = [
+        {
+            "object_index": o.get("object_index"),
+            "is_face": o.get("is_face", False),
+            "person_name": o.get("person_name"),
+            "face_known": o.get("face_known"),
+            "face_score": o.get("face_score"),
+            "face_dict_error": o.get("face_dict_error"),
+        }
+        for o in objects
+    ]
+    log.info(
+        f"vision_objects — resposta crua do vision.py: total_detected={data.get('total_detected')} "
+        f"faces={json.dumps(face_summary, ensure_ascii=False)}"
+    )
     if not objects:
         return {
             "total_detected": 0,
             "image_width": data.get("image_width"), "image_height": data.get("image_height"),
-            "description": "Nenhum objeto foi detectado na imagem.",
+            "answer": "Não detectei nenhum rosto ou objeto reconhecível nessa imagem.",
         }
 
     await _ensure_multimodal_mode()
 
     prompt = args.get("prompt", req.input)
-    description = await _describe_crops_with_llm(objects, prompt)
+    history = _CURRENT_HISTORY.get()
+    answer = await _answer_vision_with_llm(objects, prompt, history)
 
     # Ao final da requisição de visão, volta o llama-server para o modo
     # texto comum — o restante do loop de tool-calling (e o resto da
@@ -536,7 +726,12 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
     return {
         "total_detected": data.get("total_detected", len(objects)),
         "image_width": data.get("image_width"), "image_height": data.get("image_height"),
-        "objects": lean_objects, "description": description,
+        "objects": lean_objects,
+        # Resposta final do turno — ver AUTO_FINISH_TOOLS no loop principal.
+        # Já foi formulada pelo modelo multimodal olhando as imagens de
+        # verdade e a pergunta real do usuário; não há segunda chamada ao
+        # modelo de texto para reformular isso.
+        "answer": answer,
     }
 
 async def _tool_local_scraping(args: dict, req: ExecuteRequest):
@@ -605,20 +800,67 @@ TOOLS: dict[str, dict[str, Any]] = {
         "executor": _tool_memory_write,
     },
     "search": {
-        "description": "Searches the web for current/general information.",
-        "fields": [("query", "string", True)],
+        "description": (
+            "Searches the web for current or general information. Results come "
+            "back already ranked by relevance, with the real page content (not "
+            "just a short snippet), so trust the order — but the quality of the "
+            "answer still depends entirely on how well you phrase the query.\n\n"
+            "How to write a good query:\n"
+            "- Write it like a real search-engine query (2-6 keywords), not a "
+            "full sentence and not a copy of the user's question.\n"
+            "- Name the actual subject: specific entities, topics, events, "
+            "products, people, or places. 'today', 'notícias', 'news', "
+            "'atualidades' and bare dates are NOT subjects — queries built "
+            "only from these terms return generic daily filler content "
+            "(horoscopes, puzzle-game hints, listicles), not real information.\n"
+            "- Bad: 'today August 16 2026 news' / 'notícias de hoje'. "
+            "Good: 'eleições Brasil 2026 resultado', 'Nvidia earnings Q3 2026', "
+            "'chuvas São Paulo previsão essa semana'.\n"
+            "- If the user's request is vague (e.g. 'me conte uma notícia'), "
+            "pick a concrete, useful angle yourself (e.g. a specific field: "
+            "tecnologia, economia, esportes) instead of searching the vague "
+            "phrase as-is.\n"
+            "- If the question has multiple distinct parts or topics, call "
+            "this tool once per part rather than combining them into one query.\n"
+            "- Include a year only when the topic is genuinely time-sensitive "
+            "and a specific recent event/entity is being named.\n"
+            "- Optional 'topic' field: set it to \"news\" for breaking news or "
+            "fast-moving current events (this narrows results to roughly the "
+            "last 7 days); leave it unset/\"general\" for everything else.\n"
+            "- Homepage/section-index pages (e.g. a portal's root URL) are "
+            "filtered out automatically because they're navigation, not "
+            "articles — a broad query can legitimately return few or zero "
+            "results because of this. If results are empty or don't actually "
+            "answer the question, say so plainly or try a narrower query; "
+            "never turn a fragment, menu label, or partial snippet into a "
+            "claim you can't actually support from the text."
+        ),
+        "fields": [("query", "string", True), ("topic", "string", False)],
         "executor": _tool_search,
     },
-    "deep_search": {
-        "description": "Deep research (knowledge-RAG) with automatic web research for complex questions.",
-        "fields": [("query", "string", True)],
-        "executor": _tool_deep_search,
+    "read_url": {
+        "description": (
+            "Fetches and extracts the real, cleaned content of ONE specific "
+            "URL — use this when the user pasted/mentioned a link and wants "
+            "you to read what's actually on that page, instead of searching "
+            "for it. Do not use this to guess or invent URLs; only call it "
+            "with a URL that actually appeared in the conversation."
+        ),
+        "fields": [("url", "string", True)],
+        "executor": _tool_read_url,
     },
+    #"deep_search": {
+    #    "description": "Deep research (knowledge-RAG) with automatic web research for complex questions.",
+    #    "fields": [("query", "string", True)],
+    #    "executor": _tool_deep_search,
+    #},
     "vision_objects": {
         "description": (
-            "Detects and identifies individual objects in the image attached to the current "
-            "request, using depth-based segmentation and a visual dictionary, then asks the "
-            "multimodal model to respond based on each detected object. Only works if an image was sent."
+            "Looks at the image attached to the current request (face recognition + object "
+            "segmentation) and has the multimodal model directly answer the user's question "
+            "about it — pass the user's actual question as `prompt`. Calling this tool ENDS "
+            "the turn: its result is sent straight back to the user as the final response, you "
+            "do not get to add or rephrase anything after it. Only works if an image was sent."
         ),
         "fields": [("prompt", "string", False)],
         "executor": _tool_vision_objects,
@@ -675,32 +917,141 @@ def _build_tools_schema() -> list[dict]:
 # LLM call helper (tool-calling nativo)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Número de retentativas do orquestrador ao chamar LLM.py — separado
+# do retry interno do próprio LLM.py (que retrya o llama-server). Este
+# retry cobre o cenário onde LLM.py está vivo mas o llama-server ainda
+# está reiniciando após uma troca de modo (text ↔ multimodal), o que
+# faz LLM.py retornar 503 por alguns segundos.
+ORCHESTRATOR_LLM_RETRIES = 4
+ORCHESTRATOR_LLM_BACKOFF_S = 2.0
+
+
 async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
                      temperature: float = 0.0, max_tokens: Optional[int] = None) -> dict:
-    """Chama o endpoint de chat e retorna a mensagem completa (content + tool_calls)."""
-    payload = {
-        "model": "local", "messages": messages, "temperature": temperature, "stream": False,
-    }
+    """
+    Chama o LLM.py (porta 4003) via seu endpoint real de tool-calling,
+    /chat/tools, e retorna a mensagem completa (content + tool_calls).
+
+    LLM.py não expõe um /v1/chat/completions no formato OpenAI puro — quem
+    fala esse dialeto é o llama-server (porta 2001) por baixo. /chat/tools
+    recebe {"messages": [...], "tools": [...], ...} (schema ToolUseRequest)
+    e devolve {"message": {...}, ...} (schema ToolUseResponse), não
+    {"choices": [{"message": {...}}]}.
+
+    Inclui retry com backoff para 503 — necessário porque o
+    llama-server pode retornar 503 temporariamente após uma troca de
+    modo (text ↔ multimodal), e o retry interno do LLM.py (3 tentativas)
+    às vezes não é suficiente para cobrir todo o tempo de reinício.
+    """
+    payload: dict = {"messages": messages, "temperature": temperature}
     if tools:
         payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    r = await state.llm_client.post("/v1/chat/completions", json=payload)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]
+
+    last_error: Optional[Exception] = None
+    for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
+        try:
+            r = await state.llm_client.post("/chat/tools", json=payload)
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            last_error = e
+            log.warning(
+                f"LLM.py (porta 4003): erro de rede ({type(e).__name__}), "
+                f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}."
+            )
+            if attempt < ORCHESTRATOR_LLM_RETRIES:
+                await asyncio.sleep(ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1))
+                continue
+            raise
+
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("too_large"):
+                raise RuntimeError(f"Contexto excede o limite do llama-server: {data.get('usage')}")
+            return data["message"]
+
+        # 503: llama-server provavelmente ainda está reiniciando após
+        # troca de modo — retry com backoff progressivo.
+        if r.status_code == 503:
+            last_error = httpx.HTTPStatusError(
+                f"503 Service Unavailable", request=r.request, response=r,
+            )
+            wait = ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1)
+            log.warning(
+                f"LLM.py retornou 503 (llama-server reiniciando?), "
+                f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}, "
+                f"aguardando {wait:.0f}s antes de retentar..."
+            )
+            if attempt < ORCHESTRATOR_LLM_RETRIES:
+                await asyncio.sleep(wait)
+                continue
+
+        # Qualquer outro erro: não retry, propaga diretamente
+        r.raise_for_status()
+
+    # Se chegou aqui, todas as tentativas falharam
+    raise last_error  # type: ignore
 
 
-def _tools_system_prompt(think_instruction: Optional[str] = None) -> str:
+def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None) -> str:
+    lang_names = {
+        "pt": "Portuguese (Brazil)", "en": "English", "es": "Spanish",
+        "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
+        "zh": "Chinese",
+    }
+    reply_lang = lang_names.get((lang_hint or "").lower(), None)
     lines = [
         "You are AVA, a helpful assistant. You have access to a set of tools/functions.",
+        "",
+        "Always reply in the same language the user wrote their message in"
+        + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
+        + " Never switch languages mid-conversation unless the user does.",
+        "",
+        "You have live tool access (web search, memory, local files, etc.) — you are NOT "
+        "limited to a static training cutoff and you DO have a way to get current "
+        "information when a tool is available for it. Never tell the user you \"don't have "
+        "real-time access\", that your \"knowledge stops at [some date]\", or similar generic "
+        "disclaimers — that is false when you have tools and is especially false after you "
+        "have already called one. If a tool's result was thin, generic, or didn't contain the "
+        "specific fact needed, say exactly that (e.g. \"I searched but only found homepage "
+        "links, not the actual headlines\") instead of falling back to a canned refusal that "
+        "ignores what the tool actually returned.",
         "",
         "Call a tool whenever you need information or need to take an action. You may also "
         "respond with plain text — reasoning, a plan, a clarifying remark — without calling "
         "a tool; in that case you will simply be prompted again on the next turn, so use it "
         "to think out loud if needed.",
         "",
+        "BEFORE calling a tool again, read the content of the most recent role=\"tool\" message "
+        "in the conversation and check: does it already contain enough information to answer "
+        "the user, even partially? If yes, stop searching and use it — synthesize the answer "
+        "from what you already have instead of chasing a more perfect result. If a result is "
+        "irrelevant, empty, or off-topic, do NOT just reword the same query and try again — "
+        "that rarely fixes an irrelevant result. Instead: (a) try a genuinely different angle "
+        "(different tool, different entity, different assumption) at most once, or (b) call "
+        "`finish` and tell the user honestly that you could not find reliable/current "
+        "information on this, rather than guessing or looping. Never call the same tool with "
+        "a near-identical query more than twice in a row.",
+        "",
+        "When a tool returns MULTIPLE results (e.g. `search` returns a list), do NOT pick just the "
+        "first one. Synthesize across all of them: identify the 2–3 distinct items that best match "
+        "the user's question, and compose a single coherent answer that mentions each one briefly "
+        "with its source. Picking the top result and discarding the rest is a failure mode.",
+        "",
+        "When answering about 'news' or 'today', present a brief digest of the top items found — "
+        "do NOT deep-dive into a single article unless the user asked for one specific topic. "
+        "Each item in the digest should carry: (a) the headline, (b) 1–2 sentences of what it is "
+        "about, (c) the source name. Cite source URLs at the end.",
+        "",
+        "Never paraphrase a snippet loosely — if you are translating, keep proper nouns (race names, "
+        "event names) in the original language to avoid mistranslation. If unsure about a date or "
+        "temporal relation in the source, omit it rather than guessing.",
+
         "To deliver your final answer to the user, call the `finish` tool with the complete "
         "response text as its `response` argument. The task is not done until you call `finish`.",
+        "",
+        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
         "",
         "Available tools:",
     ]
@@ -710,6 +1061,40 @@ def _tools_system_prompt(think_instruction: Optional[str] = None) -> str:
         lines.append("")
         lines.append(think_instruction)
     return "\n".join(lines)
+
+
+async def _force_finish(history: list[dict], eid: str) -> str:
+    """
+    Rede de segurança do guarda-corpo anti-loop: chamada quando o modelo
+    insiste na mesma tool repetidas vezes sem nunca chamar `finish`. Faz
+    UMA última chamada ao LLM sem `tools` (o llama-server não tem como
+    devolver tool_calls nesse modo, então ele é obrigado a responder em
+    texto livre) pedindo explicitamente uma resposta final com o que já
+    foi coletado no histórico. Se isso falhar por qualquer motivo, cai
+    num texto fixo — nunca deixamos o loop rodar indefinidamente.
+    """
+    nudge = {
+        "role": "user",
+        "content": (
+            "You've been trying the same tool repeatedly without concluding. Stop here: "
+            "using only the information already gathered above, give me your best final "
+            "answer now in plain text. If it's incomplete, say so plainly instead of "
+            "searching more."
+        ),
+    }
+    try:
+        message = await _llm_chat(history + [nudge], tools=None, temperature=0.3)
+        text = (message.get("content") or "").strip()
+        if text:
+            return text
+    except Exception as e:
+        log.warning(f"[{eid[:8]}] _force_finish: chamada de fechamento falhou: {e}")
+    return (
+        "Não consegui reunir informação suficiente para responder com confiança a essa "
+        "pergunta depois de várias tentativas de busca — os resultados retornados não "
+        "foram relevantes o bastante. Posso tentar de outro jeito se você me der mais "
+        "contexto ou uma fonte específica."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -723,29 +1108,79 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
       1. LLM recebe o histórico + a lista `tools` (formato OpenAI). O servidor
          renderiza isso na chat template do modelo e devolve `message` com
          `content` (texto livre, opcional) e/ou `tool_calls` (já estruturado).
-      2. Se NÃO houver tool_calls: o texto vira uma mensagem assistant no
-         histórico e o loop simplesmente continua — sem lembrete.
+      2. Se NÃO houver tool_calls: o texto é tratado como resposta final
+         direta (equivalente a um "finish" implícito) e o loop termina ali —
+         NÃO re-chamamos o LLM com o histórico inalterado, pois isso geraria
+         mensagens role="assistant" consecutivas, violando a alternância
+         estrita user/assistant/tool exigida pelo chat template do modelo.
       3. Se houver tool_calls: cada uma é executada e o resultado volta ao
          histórico como mensagem role="tool" (tool_call_id correspondente).
-      4. O loop SÓ termina quando a tool "finish" é chamada — não há limite
-         de rodadas.
+      4. O loop também termina quando a tool "finish" é chamada explicitamente.
+         Fora isso, não há limite de rodadas — EXCETO um guarda-corpo anti-loop:
+         se a mesma tool for chamada REPEAT_HARD_LIMIT vezes seguidas sem
+         `finish` (sinal de que o modelo não está "absorvendo" o resultado
+         retornado e só reformulando a mesma chamada), o orquestrador força
+         o encerramento via `_force_finish` em vez de deixar o loop rodar
+         indefinidamente.
     """
     depth, think_instruction = await _think_instruction(req.input)
-    system_prompt = _tools_system_prompt(think_instruction)
+    system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang)
     tools_schema = _build_tools_schema()
+
+    user_content = req.input
+    if req.image_base64:
+        # Sem isso, o LLM não tem nenhum sinal no histórico de que uma
+        # imagem foi de fato anexada a ESTE request — só a descrição
+        # genérica da tool vision_objects ("only works if an image was
+        # sent"), que não é uma confirmação. Resultado: o modelo assume
+        # que não há imagem e pede pro usuário reenviar, mesmo com
+        # req.image_base64 preenchido.
+        user_content = (
+            f"{req.input}\n\n"
+            "[An image was attached to this message. Use the vision_objects "
+            "tool to see it before answering — do not ask the user to send "
+            "it again.]"
+        )
 
     history: list[dict] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": req.input},
+        {"role": "user", "content": user_content},
     ]
 
     step_results: list[StepResult] = []
     final_response = ""
     turn = 0
 
+    # ── Guarda-corpo anti-repetição ──────────────────────────────────────
+    # O modelo às vezes não "entende" que um resultado de tool já é
+    # suficiente (ou já é irrelevante e reformular a query não vai ajudar)
+    # e fica preso chamando a mesma tool em loop (visto em produção: 7+
+    # chamadas seguidas de `search` sem nunca chamar `finish`). Em vez de
+    # só confiar em instrução de prompt, rastreamos a sequência de tools
+    # chamadas e intervimos ativamente:
+    #   - a partir de REPEAT_NUDGE_AT chamadas seguidas da MESMA tool,
+    #     injetamos um lembrete visível pro modelo (role="tool" sintético)
+    #     apontando explicitamente o padrão, para forçar reavaliação;
+    #   - em REPEAT_HARD_LIMIT chamadas seguidas da MESMA tool, paramos o
+    #     loop nós mesmos e pedimos uma última resposta ao modelo usando
+    #     só o que já foi coletado (sem permitir nova tool_call), evitando
+    #     o loop indefinido que derrubou a sessão no log.
+    REPEAT_NUDGE_AT = 3
+    REPEAT_HARD_LIMIT = 5
+    last_tool_name: Optional[str] = None
+    same_tool_streak = 0
+
+    # Tools cujo resultado já É a resposta final ao usuário — nenhuma
+    # segunda chamada ao modelo de texto acontece depois delas. Hoje só
+    # vision_objects: o modelo multimodal já respondeu diretamente à
+    # pergunta do usuário usando os crops (ver _answer_vision_with_llm), e
+    # o llama-server já foi recarregado em modo texto ao final da tool —
+    # só pronto pro PRÓXIMO turno, sem gerar resposta pra este.
+    AUTO_FINISH_TOOLS = {"vision_objects"}
+
     while True:
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
-        message = await _llm_chat(history, tools=tools_schema, max_tokens=2048, temperature=0.3)
+        message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
         tool_calls = message.get("tool_calls") or []
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
@@ -754,10 +1189,22 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         history.append(assistant_msg)
 
         if not tool_calls:
-            # Nenhuma tool chamada — apenas segue o loop, sem lembrete
-            log.debug(f"[{eid[:8]}] Turn {turn}: resposta sem tool_calls, continuando o loop")
-            turn += 1
-            continue
+            # Modelo respondeu sem chamar nenhuma tool: tratamos como resposta
+            # final direta (equivalente a um "finish" implícito).
+            #
+            # Importante: NÃO dá para simplesmente re-chamar o LLM de novo com
+            # o mesmo histórico (sem nova mensagem de user/tool no meio) —
+            # isso produziria duas mensagens role="assistant" consecutivas no
+            # histórico, o que viola a alternância estrita user/assistant/tool
+            # exigida pelo chat template do modelo e derruba a chamada
+            # seguinte com 400 Bad Request no llama-server.
+            final_response = message.get("content") or ""
+            step_results.append(StepResult(
+                step=turn, executor="llm", action="(resposta direta, sem tool_calls)",
+                success=True, result=final_response,
+            ))
+            log.debug(f"[{eid[:8]}] Turn {turn}: resposta sem tool_calls, finalizando")
+            break
 
         finished = False
         for call in tool_calls:
@@ -792,6 +1239,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # ── Executa a tool ──
             spec = TOOLS[tool_name]
             t0 = time.perf_counter()
+            _CURRENT_HISTORY.set(history)
             try:
                 result = await asyncio.wait_for(
                     spec["executor"](args, req),
@@ -801,6 +1249,19 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             except Exception as e:
                 result, success, err = None, False, f"{type(e).__name__}: {e}"
             lat = round((time.perf_counter() - t0) * 1000, 2)
+
+            # ── Log bruto da resposta da tool (debug) ──
+            if success:
+                log.info(
+                    f"[{eid[:8]}] TOOL RESULT '{tool_name}' (call_id={call_id}, "
+                    f"{lat}ms) args={json.dumps(args, ensure_ascii=False)} "
+                    f"result={json.dumps(result, ensure_ascii=False, default=str)}"
+                )
+            else:
+                log.info(
+                    f"[{eid[:8]}] TOOL RESULT '{tool_name}' (call_id={call_id}, "
+                    f"{lat}ms) args={json.dumps(args, ensure_ascii=False)} FAILED err={err}"
+                )
 
             sr = StepResult(
                 step=turn, executor=tool_name,
@@ -816,6 +1277,53 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 "role": "tool", "tool_call_id": call_id,
                 "content": _result_to_text(result) if success else f"ERROR: {err}",
             })
+
+            # ── Auto-finish: tools cuja resposta já é final (vision_objects) ──
+            # Evita a segunda chamada ao modelo de texto — o resultado do
+            # modelo multimodal (campo "answer") vira a resposta do turno
+            # direto. O llama-server já foi trocado de volta pra modo texto
+            # dentro da própria tool (_ensure_text_mode), então ele já sai
+            # "recarregado" e pronto pro próximo turno, sem gerar nada agora.
+            if tool_name in AUTO_FINISH_TOOLS and success and isinstance(result, dict) and result.get("answer"):
+                final_response = result["answer"]
+                finished = True
+                break
+
+            # ── Atualiza a sequência de repetição da mesma tool ──
+            if tool_name == last_tool_name:
+                same_tool_streak += 1
+            else:
+                last_tool_name = tool_name
+                same_tool_streak = 1
+
+            if same_tool_streak == REPEAT_NUDGE_AT:
+                log.warning(
+                    f"[{eid[:8]}] '{tool_name}' chamada {same_tool_streak}x seguidas "
+                    "sem finish — injetando lembrete anti-loop."
+                )
+                history.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": (
+                        f"SYSTEM NOTICE: you have called `{tool_name}` {same_tool_streak} times "
+                        "in a row without calling `finish`. Stop and re-read the results above "
+                        "carefully — either they already answer the question well enough to "
+                        "respond now, or repeating this tool is not going to fix it. Do not call "
+                        f"`{tool_name}` again with a reworded query; call `finish` with your best "
+                        "answer, being explicit about what you could and couldn't confirm."
+                    ),
+                })
+            elif same_tool_streak >= REPEAT_HARD_LIMIT:
+                log.warning(
+                    f"[{eid[:8]}] '{tool_name}' chamada {same_tool_streak}x seguidas — "
+                    "forçando encerramento do loop (guarda-corpo anti-loop)."
+                )
+                finished = True
+                final_response = await _force_finish(history, eid)
+                step_results.append(StepResult(
+                    step=turn, executor="orchestrator",
+                    action="anti-loop hard stop", success=True, result=final_response,
+                ))
+                break
 
         if finished:
             break
@@ -1094,13 +1602,25 @@ async def memory_write(req: MemoryWriteRequest):
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/search")
-async def search(query: str, max_results: int = 5, search_pdfs: bool = False):
+async def search(query: str, max_results: int = 5, search_pdfs: bool = False, topic: str = "general"):
     try:
-        r = await state.search_client.post("/search", json={"query": query, "max_results": max_results, "use_cache": True, "search_pdfs": search_pdfs})
+        r = await state.search_client.post("/search", json={
+            "query": query, "max_results": max_results, "use_cache": True,
+            "search_pdfs": search_pdfs, "topic": topic if topic in ("general", "news") else "general",
+        })
         r.raise_for_status()
         return r.json()
     except Exception as e:
         raise HTTPException(502, f"Search falhou: {e}")
+
+@app.post("/read-url")
+async def read_url(url: str):
+    try:
+        r = await state.search_client.post("/extract", json={"urls": [url], "extract_depth": "basic"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise HTTPException(502, f"Extract falhou: {e}")
 
 @app.post("/chat")
 async def chat(message: str, voice: str = "M1", lang: str = "pt", tts: bool = True):

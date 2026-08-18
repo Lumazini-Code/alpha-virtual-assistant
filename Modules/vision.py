@@ -1063,6 +1063,22 @@ class DetectedObject(BaseModel):
     # Deixa o erro real visível no JSON em vez de só no log do servidor.
     dict_error:   Optional[str] = None
 
+    # ── Campos de identificação facial ──────────────────────────────────
+    # Preenchidos SÓ quando este "objeto" é na verdade um rosto detectado
+    # pelo YuNet. Nesse caso `candidates` fica vazio de propósito — rostos
+    # nunca passam pelo dicionário visual de objetos, só pelo face-dict.
+    # Isso já vem resolvido em texto simples (nome/descrição) pra quem
+    # consome essa resposta (ex.: o LLM multimodal) não precisar — e não
+    # ter acesso — a nenhum mecanismo de verificação facial próprio.
+    is_face:             bool             = False
+    person_name:         Optional[str]    = None
+    person_description:  Optional[str]    = None
+    face_score:          Optional[float]  = None
+    face_known:          bool             = False
+    # Erro ao consultar o face-dict (memory.py) — análogo a dict_error,
+    # mas para o lado da identificação facial.
+    face_dict_error:     Optional[str]    = None
+
 class VisionProcessResponse(BaseModel):
     objects:        list[DetectedObject]
     total_detected: int
@@ -1190,6 +1206,152 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AVA Vision API", lifespan=lifespan)
 
 
+# ── [0] Filtro de rostos — exclui regiões faciais da detecção de objetos ──
+
+# Fração de sobreposição (IoU) entre uma máscara de objeto e uma máscara facial
+# acima da qual o objeto é descartado (tratado como pessoa/rostos, não como
+# objeto genérico).
+FACE_OBJECT_IOU_SKIP_THRESH = _env_float("VISION_FACE_OBJECT_IOU_SKIP_THRESH", 0.25)
+
+
+def _face_bbox_mask(face: dict, h: int, w: int, pad_ratio: float = 0.2) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Converte a bbox crua do YuNet numa máscara binária (h, w) com um
+    padding pra cobrir melhor cabeça/pescoço — mesma máscara é usada tanto
+    pra excluir a região do pipeline de objetos quanto pra gerar o crop
+    devolvido junto com a identificação."""
+    fx, fy, fw, fh = [int(v) for v in face["bbox"]]
+    pad = int(max(fw, fh) * pad_ratio)
+    fx0 = max(0, fx - pad)
+    fy0 = max(0, fy - pad)
+    fx1 = min(w, fx + fw + pad)
+    fy1 = min(h, fy + fh + pad)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[fy0:fy1, fx0:fx1] = True
+    return mask, (fx0, fy0, fx1, fy1)
+
+
+def _detect_faces_raw(image: np.ndarray) -> list[dict]:
+    """Roda só a detecção (YuNet), sem alinhar/embedar nada — usado tanto
+    pra montar as máscaras de exclusão quanto, depois, pra identificação."""
+    if state.face_detector is None or not state.face_detector.available:
+        return []
+    try:
+        faces = state.face_detector.detect(image)
+    except Exception as e:
+        log.warning(f"Falha na detecção facial (pipeline continuará sem checagem de rosto): {e}")
+        return []
+    if faces:
+        log.info(f"Detectados {len(faces)} rosto(s)")
+    return faces
+
+
+def _fill_face_depth(face_objects: list[DetectedObject], depth_map: np.ndarray, h: int, w: int) -> None:
+    """Preenche depth_mean de cada DetectedObject de rosto in-place, usando
+    a própria bbox já resolvida (feito à parte de _identify_faces porque
+    essa função não tem o depth_map em mãos)."""
+    for fo in face_objects:
+        fx0, fy0, fx1, fy1 = fo.bbox
+        face_mask = np.zeros((h, w), dtype=bool)
+        face_mask[fy0:fy1, fx0:fx1] = True
+        depth_mean, _, _ = _mask_depth_stats(face_mask, depth_map)
+        fo.depth_mean = depth_mean
+
+
+async def _identify_faces(image: np.ndarray, faces: list[dict]) -> list[DetectedObject]:
+    """Para cada rosto detectado: alinha, gera o embedding (EdgeFace) e
+    consulta o face-dict (memory.py). Retorna DetectedObject com is_face=True
+    já resolvido em texto — nome/descrição prontos, sem expor o mecanismo de
+    verificação facial em si pra quem consumir esse resultado (ex.: o LLM
+    multimodal só recebe o resultado pronto)."""
+    h, w = image.shape[:2]
+    out: list[DetectedObject] = []
+    face_id_available = state.face_embedder is not None and state.face_embedder.available
+
+    for face in faces:
+        mask, bbox = _face_bbox_mask(face, h, w)
+        crop_img, _ = crop_object(image, mask, mode="rgb")
+        buf = io.BytesIO()
+        crop_img.save(buf, format="PNG")
+        crop_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        depth_mean = 0.0  # preenchido pelo chamador, que tem o depth_map em mãos
+
+        person_name: Optional[str] = None
+        person_description: Optional[str] = None
+        face_score: Optional[float] = None
+        face_known = False
+        face_dict_error: Optional[str] = None
+
+        if not face_id_available:
+            face_dict_error = "embeddings_edgeface indisponível"
+        else:
+            try:
+                aligned = align_face(image, face["landmarks"])
+                vec = state.face_embedder.embed(aligned)
+                result = await state.face_dict_client.read(vec, top_k=FACE_TOP_K, min_score=FACE_MIN_SCORE)
+                matches = result.get("results", [])
+                ambiguous = bool(result.get("ambiguous", True))
+                if matches and not ambiguous:
+                    top = matches[0]
+                    person_name = top.get("person_name")
+                    person_description = top.get("description")
+                    face_score = top.get("score")
+                    face_known = True
+            except httpx.HTTPStatusError as e:
+                face_dict_error = f"{e.response.status_code}: {e.response.text}"
+                log.exception("Falha ao consultar o face-dict (memory.py)")
+            except Exception as e:
+                face_dict_error = str(e)
+                log.exception("Falha ao identificar rosto contra o face-dict")
+
+        out.append(DetectedObject(
+            object_index=-1,  # renumerado pelo chamador junto com os objetos genéricos
+            bbox=bbox,
+            depth_mean=depth_mean,
+            crop_base64=crop_b64,
+            candidates=[],
+            ambiguous=not face_known,
+            dict_error=None,
+            is_face=True,
+            person_name=person_name,
+            person_description=person_description,
+            face_score=face_score,
+            face_known=face_known,
+            face_dict_error=face_dict_error,
+        ))
+    return out
+
+
+def _filter_face_overlaps(
+    masks_scores: list[tuple[np.ndarray, float]],
+    face_masks: list[np.ndarray],
+    iou_thresh: float = FACE_OBJECT_IOU_SKIP_THRESH,
+) -> list[tuple[np.ndarray, float]]:
+    """Filtra máscaras de objeto que têm sobreposição significativa com
+    qualquer máscara facial. Isso evita que rostos sejam tratados como
+    objetos genéricos pelo pipeline de tradução de objetos."""
+    if not face_masks:
+        return masks_scores
+
+    filtered: list[tuple[np.ndarray, float]] = []
+    skipped = 0
+    for m, s in masks_scores:
+        overlaps_face = False
+        for fm in face_masks:
+            iou = _mask_iou(m, fm)
+            if iou >= iou_thresh:
+                overlaps_face = True
+                break
+        if overlaps_face:
+            skipped += 1
+        else:
+            filtered.append((m, s))
+
+    if skipped:
+        log.info(f"Filtrados {skipped} objeto(s) com sobreposição de rosto (IoU >= {iou_thresh})")
+    return filtered
+
+
 def _decode_image(image_base64: str) -> np.ndarray:
     try:
         raw = base64.b64decode(image_base64)
@@ -1222,6 +1384,16 @@ async def vision_process(req: VisionProcessRequest):
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
+    # [0] Detecção facial — SEMPRE roda antes de qualquer coisa de objeto.
+    # Cada rosto encontrado é resolvido direto contra o face-dict (nome +
+    # descrição) e essas regiões são excluídas do pipeline de objeto
+    # genérico — um rosto nunca concorre com o dicionário visual de objetos.
+    raw_faces = _detect_faces_raw(image)
+    face_masks: list[np.ndarray] = []
+    for face in raw_faces:
+        mask, _ = _face_bbox_mask(face, h, w)
+        face_masks.append(mask)
+
     # [1] depth estimation
     depth_map = state.depth.estimate(image)
 
@@ -1232,7 +1404,14 @@ async def vision_process(req: VisionProcessRequest):
         prompt_points.extend(state.clusterer.sample_points(layer))
 
     if not prompt_points:
-        return VisionProcessResponse(objects=[], total_detected=0, image_width=w, image_height=h)
+        # Mesmo sem pontos de profundidade pra propor objetos genéricos, os
+        # rostos já detectados em [0] continuam válidos e devem ser
+        # retornados — não dependem do clusterer de profundidade.
+        face_objects = await _identify_faces(image, raw_faces)
+        _fill_face_depth(face_objects, depth_map, h, w)
+        for idx, obj in enumerate(face_objects):
+            obj.object_index = idx
+        return VisionProcessResponse(objects=face_objects, total_detected=len(face_objects), image_width=w, image_height=h)
 
     # [3] proposer / segmentação class-agnostic
     image_embedding = state.sam.encode_image(image)
@@ -1244,6 +1423,10 @@ async def vision_process(req: VisionProcessRequest):
 
     candidate_masks = dedup_masks(filter_by_area(candidate_masks, h * w))
 
+    # Exclui máscaras que se sobrepõem a rostos — rostos não são objetos
+    # genéricos e não devem passar pelo pipeline de tradução de objetos.
+    candidate_masks = _filter_face_overlaps(candidate_masks, face_masks)
+
     # [4] pós-processamento / verificação de consistência
     final_masks_scores = postprocess_masks(candidate_masks, depth_map, gray, state.sam, image_embedding)
     final_masks_scores = dedup_masks(filter_by_area(final_masks_scores, h * w))
@@ -1251,11 +1434,20 @@ async def vision_process(req: VisionProcessRequest):
     # pra decidir se a "espúria" é a máscara grande (objeto + fundo) ou a
     # pequena (sub-parte de um objeto legítimo) — ver suppress_contained()
     final_masks_scores = suppress_contained(final_masks_scores)
+    # Aplica o filtro facial TAMBÉM após o pós-processamento, pois a
+    # fusão/resplit pode criar novas máscaras que se sobrepõem a rostos.
+    final_masks_scores = _filter_face_overlaps(final_masks_scores, face_masks)
     final_masks_scores = final_masks_scores[: min(req.max_objects, MAX_OBJECTS_PER_IMAGE)]
     final_masks = [m for m, _ in final_masks_scores]
 
-    objects: list[DetectedObject] = []
-    for i, mask in enumerate(final_masks):
+    # Rostos primeiro: cada um já vem resolvido (nome/descrição do face-dict
+    # ou "desconhecido"), sem passar pelo dicionário visual de objetos.
+    face_objects = await _identify_faces(image, raw_faces)
+    _fill_face_depth(face_objects, depth_map, h, w)
+
+    objects: list[DetectedObject] = list(face_objects)
+
+    for mask in final_masks:
         crop_img, bbox = crop_object(image, mask)
         buf = io.BytesIO()
         crop_img.save(buf, format="PNG")
@@ -1274,15 +1466,15 @@ async def vision_process(req: VisionProcessRequest):
             ambiguous = bool(result.get("ambiguous", True))
         except httpx.HTTPStatusError as e:
             dict_error = f"{e.response.status_code}: {e.response.text}"
-            log.exception(f"Falha ao consultar o dicionário visual (memory.py) — objeto {i}")
+            log.exception(f"Falha ao consultar o dicionário visual (memory.py) — objeto {len(objects)}")
         except Exception as e:
             dict_error = str(e)
-            log.exception(f"Falha ao consultar o dicionário visual (memory.py) — objeto {i}")
+            log.exception(f"Falha ao consultar o dicionário visual (memory.py) — objeto {len(objects)}")
 
         depth_mean, _, _ = _mask_depth_stats(mask, depth_map)
 
         objects.append(DetectedObject(
-            object_index=i,
+            object_index=len(objects),
             bbox=bbox,
             depth_mean=depth_mean,
             crop_base64=crop_b64,
@@ -1291,7 +1483,14 @@ async def vision_process(req: VisionProcessRequest):
             dict_error=dict_error,
         ))
 
-    log.info(f"Processada imagem {w}x{h} — {len(objects)} objeto(s) detectado(s)")
+    # Renumera tudo em sequência (rostos primeiro, depois objetos genéricos)
+    for idx, obj in enumerate(objects):
+        obj.object_index = idx
+
+    log.info(
+        f"Processada imagem {w}x{h} — {len(objects)} objeto(s) detectado(s) "
+        f"({len(face_objects)} rosto(s), {len(objects) - len(face_objects)} objeto(s) genérico(s))"
+    )
     return VisionProcessResponse(objects=objects, total_detected=len(objects), image_width=w, image_height=h)
 
 
