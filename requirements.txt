@@ -62,3 +62,5 @@ pillow
 scikit-image
 
 scipy
+
+pytest-playwright

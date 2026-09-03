@@ -38,3 +38,5 @@ Manager/ava-tray
 *.cpython-311.pyc
 
 node_modules/
+
+cache/
