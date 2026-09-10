@@ -2,7 +2,7 @@
 AVA KG-RAG — Pipeline Principal
 Orquestra as 7 etapas do blueprint, adaptadas ao stack do AVA:
 
-  1. Planner        → LLM (llama-server REST) decompõe o objetivo em sub-tópicos
+  1. Planner        → LLM decompõe o objetivo em sub-tópicos
   2. Web Researcher → DuckDuckGo search + httpx fetch + BeautifulSoup parse
   3. Distiller      → LLM extrai triplas (sujeito, relação, objeto) de cada página
   4. Chunker+Graph  → Semantic chunking + construção do KG (NetworkX + SQLite)

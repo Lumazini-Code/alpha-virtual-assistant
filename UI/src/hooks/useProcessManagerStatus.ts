@@ -1,18 +1,9 @@
 import { useEffect, useState } from "react";
 import { API_BASE } from "../lib/constants.js";
 
-// Espelha StatusResponse do api.rs.
+// Fatia docker do StatusResponse do api.rs (o app não usa mais o
+// llama-server local, então só o estado do Docker interessa).
 export interface ProcessManagerStatus {
-  llama: {
-    status: string;
-    pid: number | null;
-    model: string | null;
-    mmproj: string | null;
-    port: number;
-    idleSeconds: number | null;
-    mode: "text" | "multimodal" | string;
-    mainModel: string | null;
-  };
   docker: {
     status: string;
     pid: number | null;
@@ -33,16 +24,6 @@ export function useProcessManagerStatus(intervalMs = 3000): ProcessManagerStatus
         const data = await res.json();
         if (cancelled) return;
         setStatus({
-          llama: {
-            status: data.llama.status,
-            pid: data.llama.pid ?? null,
-            model: data.llama.model ?? null,
-            mmproj: data.llama.mmproj ?? null,
-            port: data.llama.port,
-            idleSeconds: data.llama.idle_seconds ?? null,
-            mode: data.llama.mode,
-            mainModel: data.llama.main_model ?? null,
-          },
           docker: {
             status: data.docker.status,
             pid: data.docker.pid ?? null,

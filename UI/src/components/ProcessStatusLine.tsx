@@ -16,21 +16,8 @@ export function ProcessStatusLine({ status }: { status: ProcessManagerStatus | n
     return <Text color={COLORS.dim}>process manager: conectando…</Text>;
   }
 
-  const modelName = status.llama.model?.split(/[\\/]/).pop();
-
   return (
     <Box>
-      <Text color={statusColor(status.llama.status)}>
-        ● llama {status.llama.status}
-      </Text>
-      {modelName && (
-        <Text color={COLORS.dim}>
-          {" "}
-          ({modelName}, {status.llama.mode}
-          {status.llama.mmproj ? "+mmproj" : ""})
-        </Text>
-      )}
-      <Text color={COLORS.gray}>   </Text>
       <Text color={statusColor(status.docker.status)}>● docker {status.docker.status}</Text>
     </Box>
   );

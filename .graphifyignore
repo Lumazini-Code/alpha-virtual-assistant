@@ -11,8 +11,6 @@ resource/Vosk_Model/*
 
 test/*
 
-openclaude
-
 *.log
 *.onnx
 *.gguf
@@ -28,9 +26,8 @@ Manager/ava-tray
 
 .opencode
 
-Modules/llama-cpp
-
 graphify-out
+
 
 .venv/**
 

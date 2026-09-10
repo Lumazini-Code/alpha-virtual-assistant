@@ -1,49 +1,32 @@
 """
-AVA KG-RAG — Cliente LLM (llama-server REST)
-Chama localhost:4003 exatamente como os outros microserviços do AVA.
-Inclui: chat completion, geração JSON estruturada via GBNF/JSON schema.
+AVA KG-RAG — Cliente LLM
+Chama o backend de LLM do AVA como os outros microserviços.
+Inclui: chat completion, geração JSON estruturada via schema.
 """
 
-import httpx
 import json
 import logging
-from typing import Any, Optional
+from typing import Any
 
-from config import LLM_API_URL, LLM
+from config import LLM
 
 logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_CHARS = 12000
 
-# ─── GBNF grammar para output JSON do planner ────────────────────────────────
-# Garante que o modelo devolva exatamente o schema esperado
-PLANNER_GBNF = r"""
-root   ::= object
-object ::= "{" ws "\"sub_topics\"" ws ":" ws array ws "}"
-array  ::= "[" ws string ("," ws string)* ws "]"
-string ::= "\"" char* "\""
-char   ::= [^"\\] | "\\" ["\\/bfnrt]
-ws     ::= [ \t\n]*
-"""
-
-TRIPLE_GBNF = r"""
-root    ::= array
-array   ::= "[" ws triple ("," ws triple)* ws "]"
-triple  ::= "[" ws string "," ws string "," ws string ws "]"
-string  ::= "\"" char* "\""
-char    ::= [^"\\] | "\\" ["\\/bfnrt]
-ws      ::= [ \t\n]*
-"""
-
 
 class LLMClient:
     """
-    Wrapper sobre o llama-server (OpenAI-compatible REST API).
-    O llama-server é STATELESS — cada chamada recebe o histórico completo.
+    Wrapper sobre o backend de LLM (OpenAI-compatible REST API).
+    O backend é STATELESS — cada chamada recebe o histórico completo.
+
+    A implementação que falava com o llama-server local foi removida —
+    o backend de substituição será plugado em `chat` (que sobe exceção
+    até lá).
     """
 
-    def __init__(self, base_url: str = LLM_API_URL, timeout: float = 120.0):
-        self._url     = base_url
+    def __init__(self, base_url: str | None = None, timeout: float = 120.0):
+        self._url = base_url
         self._timeout = timeout
 
     # ─── API pública ─────────────────────────────────────────────────────────
@@ -51,44 +34,18 @@ class LLMClient:
     def chat(
         self,
         messages: list[dict],
-        max_tokens: int    = None,
+        max_tokens: int = None,
         temperature: float = None,
-        grammar: str       = None,
-        json_schema: dict  = None,
+        grammar: str = None,
+        json_schema: dict = None,
     ) -> str:
         """
         Chamada genérica de chat completion.
         Retorna o texto gerado como string.
         """
-        payload: dict[str, Any] = {
-            "messages":   messages,
-            "max_tokens": max_tokens or LLM.max_tokens,
-            "temperature": temperature if temperature is not None else LLM.temperature,
-            "stream":     False,
-        }
-        if grammar:
-            payload["grammar"] = grammar
-        if json_schema:
-            payload["response_format"] = {
-                "type": "json_object",
-                "schema": json_schema,
-            }
-
-        try:
-            with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(self._url, json=payload)
-                resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.error("LLM HTTP error %s: %s", e.response.status_code, e.response.text)
-            raise
-        except httpx.ConnectError:
-            raise RuntimeError(
-                f"Não foi possível conectar ao llama-server em {self._url}.\n"
-                "Verifique se o serviço AVA LLM (porta 4003) está rodando."
-            )
-
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        raise NotImplementedError(
+            "LLMClient.chat sem backend (llama-server removido; aguardando substituição)."
+        )
 
     def plan_domain(self, user_goal: str) -> dict:
         """
@@ -113,7 +70,6 @@ class LLMClient:
         raw = self.chat(
             messages,
             temperature=LLM.planner_temp,
-            grammar=PLANNER_GBNF,
         )
         try:
             return json.loads(raw)
@@ -150,7 +106,6 @@ class LLMClient:
             messages,
             temperature=0.1,
             max_tokens=512,
-            grammar=TRIPLE_GBNF,
         )
         try:
             data = json.loads(raw)
@@ -160,8 +115,8 @@ class LLMClient:
             logger.warning("Falha ao parsear triplas: %s — raw: %r", e, raw[:200])
             return []
 
-    
-    
+
+
     def _compress_context(self, context: str) -> str:
         """
         Limita tamanho do contexto enviado ao LLM.

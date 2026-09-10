@@ -1,12 +1,11 @@
-//! AVA Tray — gerenciador de processos para llama-server e docker.
+//! AVA Tray — gerenciador de processos do docker.
 //!
 //! Fica em segundo plano na bandeja do sistema, expondo uma API REST em
-//! localhost:9001 para iniciar/parar os processos sob demanda. A janela
-//! de status só aparece quando o usuário clica no ícone da bandeja.
+//! localhost:9001 para iniciar/parar o ambiente docker sob demanda. A
+//! janela de status só aparece quando o usuário clica no ícone da bandeja.
 
 mod api;
 mod idle_watcher;
-mod models;
 mod process_manager;
 mod state;
 mod ui;
@@ -52,7 +51,7 @@ fn main() -> anyhow::Result<()> {
 
     // ✅ Descobre processos que já estão rodando ANTES de tudo
     // Isso permite que a aplicação "se conecte" a instâncias do
-    // llama-server ou docker que foram iniciadas anteriormente.
+    // docker que foram iniciadas anteriormente.
     rt_handle.block_on(process_manager::discover_running_processes(&shared_state));
 
     // Sobe a API REST (axum) em background.
@@ -79,7 +78,6 @@ fn main() -> anyhow::Result<()> {
         rt.spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                process_manager::health_check_llama(&state).await;
                 process_manager::health_check_docker(&state).await;
             }
         });

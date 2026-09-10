@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState, type MutableRefObject } from "react";
 import { existsSync, readFileSync } from "node:fs";
 import { ORCHESTRATOR_URL } from "../lib/constants.js";
-import { ensureProcessesStarted } from "../lib/processManager.js";
+import { ensureDockerStarted } from "../lib/processManager.js";
 import { waitForServicesReady } from "../lib/waitForServices.js";
 import { logger } from "../lib/logger.js";
 import { parseSseStream, tryParseJson } from "../lib/sse.js";
@@ -63,25 +63,25 @@ export function useOrchestratorStream() {
       const controller = new AbortController();
       abortRef.current = controller;
 
-      // Auto-start de llama-server + docker a cada pergunta. O process
-      // manager Rust (porta 9001) já ignora a chamada se o processo
-      // correspondente estiver ativo, então repetir isso aqui é seguro e
-      // barato — evita depender de uma tela de seleção de modelo separada
-      // rodada uma única vez no início. Best-effort: um aviso aqui não
-      // impede a pergunta de seguir para o orchestrator.
+      // Auto-start do container docker a cada pergunta. O process manager
+      // Rust (porta 9001) já ignora a chamada se o processo correspondente
+      // estiver ativo, então repetir isso aqui é seguro e barato. O app
+      // não usa mais llama-server local — o modelo é resolvido pelo
+      // orchestrator. Best-effort: um aviso aqui não impede a pergunta de
+      // seguir para o orchestrator.
       logger.info("submit: pergunta recebida", { codeMode, hasImage: !!pendingImagePathRef.current });
 
-      const procResult = await ensureProcessesStarted();
+      const procResult = await ensureDockerStarted();
       if (procResult.warning) {
         logger.warn("submit: ensureProcessesStarted retornou aviso", { warning: procResult.warning });
         updateLast((m) => ({ ...m, error: procResult.warning }));
       }
 
       // Só dispara a pergunta depois que docker e orchestrator responderem
-      // de verdade — /docker/start e /llama/start acima só disparam o boot,
-      // não esperam ele terminar. Sem isso, a primeira pergunta de uma
-      // sessão fria costuma cair em "Orchestrator offline" porque o
-      // /execute chega antes dos serviços estarem prontos.
+      // de verdade — /docker/start acima só dispara o boot, não espera ele
+      // terminar. Sem isso, a primeira pergunta de uma sessão fria costuma
+      // cair em "Orchestrator offline" porque o /execute chega antes dos
+      // serviços estarem prontos.
       updateLast((m) => ({ ...m, text: "aguardando docker e orchestrator subirem…" }));
       const readyResult = await waitForServicesReady((elapsedMs, dockerReady, orchestratorReady) => {
         logger.debug("submit: ainda aguardando serviços", { elapsedMs, dockerReady, orchestratorReady });

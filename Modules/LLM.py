@@ -189,13 +189,6 @@ searchCfg  = _read(BASEFOLDER / r"resource/SearchCfg.dll")
 # Para o extractor de memórias, modelo dedicado (google/gemma-4-26b-a4b-it:free).
 # ════════════════════════════════════════════════════════════════════════════
 
-def _calc_max_tokens(messages: list, requested: int = 4096) -> int:
-    """
-    Calcula max_tokens para a resposta. OpenRouter respeita o limite do
-    modelo subjacente; aqui só evitamos pedir um número absurdamente alto.
-    """
-    return min(requested, 8000)
-
 
 def _reasoning_payload_extra(thinking_depth: int) -> dict:
     """
@@ -233,8 +226,7 @@ async def _execute_inference(json_payload: dict, stream: bool = False, model: st
     """
     client = await _get_openrouter_client()
     messages = json_payload.get("messages", [])
-    max_tok = _calc_max_tokens(messages, requested=4096)
-    payload = {**json_payload, "model": model, "stream": stream, "max_tokens": max_tok}
+    payload = {**json_payload, "model": model, "stream": stream}
 
     if stream:
         ctx = client.stream("POST", "/chat/completions", json=payload)
@@ -267,8 +259,7 @@ async def _openrouter_post_with_retry(
     """
     client = await _get_openrouter_client()
     messages = json_payload.get("messages", [])
-    max_tok = _calc_max_tokens(messages, requested=4096)
-    payload = {**json_payload, "model": model, "stream": stream, "max_tokens": max_tok}
+    payload = {**json_payload, "model": model, "stream": stream}
 
     if stream:
         # No streaming, devolvemos o context manager — 5xx/erro de rede
@@ -929,12 +920,7 @@ class ToolUseRequest(BaseModel):
             "mais que qualidade — ex.: loops rápidos do alpha_code)."
         ),
     )
-    allow_llama_fallback: bool = Field(
-        default=True,
-        description="Ignorado — mantido por compatibilidade. OpenRouter é o único backend.",
-    )
     max_retries: int = Field(default=3, ge=0, le=10, description="Máximo de retries em falha transitória (5xx/rede/429) do OpenRouter antes de desistir.")
-
 class ToolUseResponse(BaseModel):
     message: dict
     model: str

@@ -16,7 +16,6 @@ FAISS_INDEX_PATH   = STORAGE_DIR / "faiss_knowledge.index"
 FAISS_META_PATH    = STORAGE_DIR / "faiss_knowledge_meta.json"
 
 # ─── Endpoints do AVA (microserviços existentes) ──────────────────────────────
-LLM_API_URL        = "http://localhost:2001/v1/chat/completions"   # llama-server
 MEMORY_API_URL     = "http://localhost:3001"                        # Memory RAG
 TTS_API_URL        = "http://localhost:4003"                        # TTS (mesma porta, rota diferente)
 
@@ -39,7 +38,7 @@ class RetrievalConfig:
 # ─── Parâmetros do LLM ────────────────────────────────────────────────────────
 @dataclass
 class LLMConfig:
-    model: str          = "local"   # Ignorado — llama-server decide o modelo carregado
+    model: str          = "local"   # Nome informativo — quem serve o modelo decide
     max_tokens: int     = 1024
     temperature: float  = 0.3       # Baixo: queremos respostas factuais, não criativas
     planner_temp: float = 0.1       # Ainda mais baixo para o JSON planner

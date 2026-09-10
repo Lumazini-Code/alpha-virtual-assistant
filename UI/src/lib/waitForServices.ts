@@ -68,7 +68,7 @@ async function isOrchestratorReady(): Promise<boolean> {
 /**
  * Faz polling de docker (via process manager) e orchestrator até os dois
  * responderem, ou até estourar WAIT_TIMEOUT_MS. Chamar antes de enviar
- * a pergunta ao orchestrator, depois de ensureProcessesStarted() ter
+ * a pergunta ao orchestrator, depois de ensureDockerStarted() ter
  * disparado o /docker/start.
  */
 export async function waitForServicesReady(

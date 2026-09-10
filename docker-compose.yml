@@ -1,110 +1,11 @@
 services:
 
-  # ─────────────────────────────────────────────
-  # CPU profile
-  # ─────────────────────────────────────────────
-  ava-cpu:
-    profiles: ["cpu"]
+  ava:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: cpu
-        BASE_IMAGE: ubuntu:22.04
-    image: ava:cpu
-    container_name: ava-cpu
-    restart: unless-stopped
-
-    volumes:
-      - ./start.sh:/app/start.sh
-      - ./Modules/Models:/app/Modules/Models:ro
-      - ./Ctxbin:/app/Ctxbin:ro
-      - ./resource:/app/resource
-      - ./Modules:/app/Modules
-      - ./orchestrator.py:/app/orchestrator.py
-      - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
-
-    environment:
-      AVA_N_GPU_LAYERS: "0"
-      ONNX_PROVIDERS: "CPUExecutionProvider"
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: "/root/.cache/huggingface"
-      HF_HUB_TIMEOUT: "600"
-      HF_HUB_DOWNLOAD_TIMEOUT: "600"
-      HF_HUB_ETAG_TIMEOUT: "600"
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
-      interval: 30s
-      timeout: 10s
-      start_period: 240s
-      retries: 5
-
-  # ─────────────────────────────────────────────
-  # CUDA profile
-  # ─────────────────────────────────────────────
-  ava-cuda:
-    profiles: ["cuda"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: cuda
-        BASE_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
-    image: ava:cuda
-    container_name: ava-cuda
-    restart: unless-stopped
-
-    volumes:
-      - ./start.sh:/app/start.sh
-      - ./Modules/Models:/app/Modules/Models:ro
-      - ./Ctxbin:/app/Ctxbin:ro
-      - ./resource:/app/resource
-      - ./Modules:/app/Modules
-      - ./orchestrator.py:/app/orchestrator.py
-      - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
-
-    environment:
-      AVA_N_GPU_LAYERS: "99"
-      ONNX_PROVIDERS: "CUDAExecutionProvider,CPUExecutionProvider"
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: "/root/.cache/huggingface"
-      HF_HUB_TIMEOUT: "600"
-      HF_HUB_DOWNLOAD_TIMEOUT: "600"
-      HF_HUB_ETAG_TIMEOUT: "600"
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
-      interval: 30s
-      timeout: 10s
-      start_period: 240s
-      retries: 5
-
-  # ─────────────────────────────────────────────
-  # Vulkan profile
-  # ─────────────────────────────────────────────
-  ava-vulkan:
-    profiles: ["vulkan"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: vulkan
-        BASE_IMAGE: ubuntu:22.04
-    image: ava:vulkan
-    container_name: ava-vulkan
+    image: ava:latest
+    container_name: ava
     restart: unless-stopped
 
     volumes:
@@ -117,8 +18,8 @@ services:
       - ./Modules:/app/Modules
       - ./orchestrator.py:/app/orchestrator.py
       - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
+      - ava-cache:/root/.cache
+      - ava-logs:/app/logs
 
     environment:
       AVA_DEBUG: "1"
@@ -138,15 +39,7 @@ services:
       retries: 5
 
 volumes:
-  ava-cache-cpu:
+  ava-cache:
     driver: local
-  ava-cache-cuda:
-    driver: local
-  ava-cache-vulkan:
-    driver: local
-  ava-logs-cpu:
-    driver: local
-  ava-logs-cuda:
-    driver: local
-  ava-logs-vulkan:
+  ava-logs:
     driver: local

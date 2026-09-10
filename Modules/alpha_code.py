@@ -27,12 +27,9 @@ load_dotenv()
 SCRAPING_URL = os.environ.get("SCRAPING_URL", "http://localhost:3005")
 CLIENT_TOKEN = os.environ.get("CLIENT_TOKEN", "")
 
-# llama-server local — único backend de inferência. Sem Groq, não há mais
-# múltiplos modelos para rotacionar por rate limit (RPM/RPD/TPM/TPD): é um
-# único modelo local, então essas preocupações simplesmente não se aplicam.
-LLAMA_HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
-LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "2001"))
-LLAMA_URL  = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
+# Backend de inferência: o llama-server local foi removido. O ponto de
+# costura é _call_llama() — ele sobe erro explícito até a substituição
+# ser plugada.
 
 # memory.py — serviço de memória (indexed-file/*, entre outros). Toda leitura
 # de arquivo (read_file) passa a ser espelhada aqui: primeiro gravada via
@@ -82,21 +79,8 @@ TEMPERATURE_BY_KIND: dict[str, float] = {
 # HTTP Clients
 # ══════════════════════════════════════════════════════════════════════════
 
-_llama_client: Optional[httpx.AsyncClient] = None
 _scrape_client: Optional[httpx.AsyncClient] = None
 _memory_client: Optional[httpx.AsyncClient] = None
-
-
-def _get_llama_client() -> httpx.AsyncClient:
-    global _llama_client
-    if _llama_client is None or _llama_client.is_closed:
-        _llama_client = httpx.AsyncClient(
-            base_url=LLAMA_URL,
-            timeout=httpx.Timeout(600.0, connect=5.0),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=6),
-            headers={"Content-Type": "application/json"},
-        )
-    return _llama_client
 
 
 def _get_scrape_client() -> httpx.AsyncClient:
@@ -218,15 +202,12 @@ async def _memory_read_relevant_chunks(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# llama-server — chamada local de inferência
+# Chamada de inferência (backend a definir)
 # ══════════════════════════════════════════════════════════════════════════
-# Único backend de inferência do pipeline. Sem rotação de modelos, sem
-# rate-limit tracking, sem fallback chain: havia só um modelo local rodando
-# no llama-server. Os retries aqui cobrem apenas falhas transitórias de
-# rede/5xx do processo local — não esgotamento de cota, que não existe mais.
-
-LLAMA_MAX_RETRIES = 2
-LLAMA_RETRY_BACKOFF_S = 2.0
+# O llama-server local era o único backend de inferência do pipeline e foi
+# removido. `_call_llama` é o ponto de costura: mantém a assinatura usada
+# pelos call-sites do pipeline e sobe RuntimeError (tratado como step_error
+# fatal pelo loop) até a substituição ser plugada.
 
 
 async def _call_llama(
@@ -238,68 +219,16 @@ async def _call_llama(
     grammar: Optional[str] = None,
 ) -> dict:
     """
-    Chama o llama-server local (endpoint OpenAI-compatible
-    /v1/chat/completions). Retorna o JSON de resposta.
+    Chama o backend de inferência e retorna o JSON de resposta no formato
+    OpenAI-compatible ({"choices": [{"message": {...}}]}).
 
-    Faz um pequeno número de retries apenas para falhas transitórias de rede
-    ou 5xx — não existe mais lógica de rate limit / rotação de modelo, já
-    que há um único modelo local servido pelo llama-server.
-
-    MODO GRAMMAR (otimização extrema):
-      Se `grammar` (string GBNF) for fornecido, o payload NÃO inclui `tools`/
-      `tool_choice` — desabilita function-calling nativo do OpenAI, que
-      consome ~500-1000 tokens de schemas por request e é a fonte #1 de JSON
-      malformado em modelos locais. Em vez disso, a grammar força o output a
-      seguir um formato JSON compacto (definido pelo caller), e a resposta
-      vem em `choices[0].message.content` — não em `message.tool_calls`.
-      `tools` é IGNORADO mesmo se fornecido (mutuamente exclusivo).
+    SEM BACKEND: o llama-server local foi removido; a substituição será
+    plugada aqui. Enquanto isso, sobe RuntimeError com mensagem explícita.
     """
-    client = _get_llama_client()
-    payload: dict = {
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    # ── Modo grammar vs. modo tool-calling nativo (mutuamente exclusivos) ──
-    # Quando grammar está presente, não enviamos `tools` — o llama-server
-    # aplica a grammar no sampler e o output é puro texto em `content`.
-    if grammar:
-        payload["grammar"] = grammar
-    elif tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    tag = f"[{sid[:8]}] " if sid else ""
-    last_error: Optional[Exception] = None
-
-    for attempt in range(LLAMA_MAX_RETRIES + 1):
-        try:
-            log.info(f"{tag}Calling llama-server (attempt {attempt + 1}/{LLAMA_MAX_RETRIES + 1})")
-            r = await client.post("/v1/chat/completions", json=payload)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            last_error = e
-            log.error(f"{tag}llama-server network error: {type(e).__name__}: {e}")
-            if attempt < LLAMA_MAX_RETRIES:
-                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
-                continue
-            raise RuntimeError(
-                f"llama-server unreachable at {LLAMA_URL} — make sure it is running: {e}"
-            ) from e
-
-        if r.status_code >= 500:
-            log.warning(f"{tag}llama-server {r.status_code} (attempt {attempt + 1}/{LLAMA_MAX_RETRIES + 1})")
-            if attempt < LLAMA_MAX_RETRIES:
-                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
-                continue
-            raise RuntimeError(f"llama-server {r.status_code} persistente: {r.text[:500]}")
-
-        if r.status_code != 200:
-            detail = r.text[:500]
-            raise RuntimeError(f"llama-server {r.status_code}: {detail}")
-
-        return r.json()
-
-    raise RuntimeError(f"llama-server: falhou após {LLAMA_MAX_RETRIES + 1} tentativa(s): {last_error}")
+    raise RuntimeError(
+        "Backend de inferência indisponível: llama-server foi removido e a "
+        "substituição ainda não foi plugada em _call_llama()."
+    )
 
 
 
@@ -663,10 +592,10 @@ def _parse_tool_call_from_content(content: str) -> Optional[dict]:
     Ou seja: exatamente a sintaxe de chamada de função nativa do LFM2.5 —
     o mesmo formato que o model card documenta dentro de
     `<|tool_call_start|>[...]<|tool_call_end|>`, só que sem o wrapper de
-    tokens especiais (não precisamos deles: nós mesmos parseamos o texto,
-    não dependemos do parser nativo do llama-server).
+    tokens especiais (não precisamos deles: nós mesmos parseamos o texto).
 
-    Formato de saída (igual ao que o llama-server retornaria em modo nativo):
+    Formato de saída (igual ao que um backend OpenAI-compatible retornaria
+    em modo nativo):
         {
             "id": "call_<hex12>",
             "type": "function",
@@ -734,7 +663,7 @@ def _parse_tool_call_from_content(content: str) -> Optional[dict]:
     except (ValueError, SyntaxError):
         return None
 
-    # Sintetiza um tool_call_id (em modo nativo o llama-server gera isso;
+    # Sintetiza um tool_call_id (em modo nativo o backend gera isso;
     # em modo grammar a aplicação precisa gerar para casar role=tool no histórico)
     return {
         "id": f"call_{uuid.uuid4().hex[:12]}",
@@ -1053,7 +982,7 @@ async def _run_tool(
     """Executes a tool by calling the scraping_client. Returns (success, output).
 
     Em modo grammar, o nome da tool vem do JSON sintetizado pelo parser
-    (_parse_tool_call_from_content), não do tool_calls nativo do llama-server.
+    (_parse_tool_call_from_content), não de tool_calls nativos do backend.
     Os nomes aceitos incluem `create_file` (nome canônico) e `write_file`
     (alias mantido para compat com chamadas legadas e para o caminho fallback
     com tool_calls nativos). A tool virtual `finish` é interceptada pelo
@@ -1853,7 +1782,7 @@ async def _execute_step(
         yield {
             "event": "model_choice",
             "data": {
-                "model": "llama-server (local)",
+                "model": "alpha-code (backend a definir)",
                 "step_kind": "execution",
             },
             "step": step_num,
@@ -1869,14 +1798,14 @@ async def _execute_step(
             )
         except RuntimeError as e:
             step_error = str(e)
-            log.error(f"{tag}llama-server call failed at step {step_num}: {e}")
+            log.error(f"{tag}inference call failed at step {step_num}: {e}")
             yield {"event": "step_error", "data": {"step": step_num, "error": step_error, "fatal": True}, "step": step_num}
             return
 
         # Parse response
         choices = data.get("choices", [])
         if not choices:
-            step_error = f"Step {step_num}: llama-server returned no choices"
+            step_error = f"Step {step_num}: backend returned no choices"
             yield {"event": "step_error", "data": {"step": step_num, "error": step_error, "fatal": True}, "step": step_num}
             return
 
@@ -1884,7 +1813,7 @@ async def _execute_step(
         content = (message.get("content") or "").strip()
 
         # ── MODO GRAMMAR: content é um JSON garantido pela grammar ───────────
-        # O llama-server não retorna `tool_calls` nativos quando uma grammar é
+        # O backend não retorna `tool_calls` nativos quando uma grammar é
         # aplicada — o output é puro texto em `content`, e a grammar força o
         # formato {"tool": "...", "args": {...}}. Parseamos e sintetizamos um
         # tool_call OpenAI-equivalente para manter compatibilidade com o resto
@@ -1970,7 +1899,7 @@ async def _execute_step(
                         # Não é normal — força erro para diagnóstico.
                         step_error = (
                             f"Step {step_num}: grammar mode returned empty content. "
-                            f"This should not happen — check that the llama-server supports "
+                            f"This should not happen — check that the backend supports "
                             f"the `grammar` parameter and that TOOL_GRAMMAR is valid GBNF."
                         )
                         log.error(f"{tag}{step_error}")
@@ -2561,14 +2490,6 @@ def _sse(event: str, data: Any, step: Optional[int] = None) -> str:
 
 @app.get("/health")
 async def health():
-    llama_ok = False
-    try:
-        client = _get_llama_client()
-        r = await client.get("/health", timeout=3.0)
-        llama_ok = r.status_code == 200
-    except Exception:
-        pass
-
     scrape_ok = False
     try:
         client = _get_scrape_client()
@@ -2578,9 +2499,9 @@ async def health():
         pass
 
     return {
-        "status": "ok" if llama_ok and scrape_ok else "degraded",
+        "status": "ok" if scrape_ok else "degraded",
         "service": "alpha_code",
-        "llama_server": "ok" if llama_ok else "unreachable",
+        "inference_backend": "not configured (llama-server removed)",
         "scraping_client": "ok" if scrape_ok else "unreachable",
     }
 
@@ -2644,7 +2565,6 @@ if __name__ == "__main__":
     import uvicorn
     log.info("═══════════════════════════════════════")
     log.info("  AVA Alpha Code — port 4006")
-    log.info(f"  LLAMA_URL: {LLAMA_URL}")
     log.info(f"  SCRAPING_URL: {SCRAPING_URL}")
     log.info("═══════════════════════════════════════")
     uvicorn.run(app, host="0.0.0.0", port=4006, log_level="info")

@@ -1,14 +1,12 @@
 """
 AVA Orchestrator — Tool-Calling Execution Engine
-==================================================
-Arquitetura (tool-calling nativo via Jinja chat template):
+=================================================
+Arquitetura (tool-calling nativo via chat template):
 
   1. O LLM recebe o histórico completo + a lista de tools no formato OpenAI
-     (function-calling). A própria chat template do modelo (renderizada via
-     Jinja pelo llama-server com `--jinja`) embute as definições das tools no
-     prompt, e o parser nativo do servidor devolve `message.tool_calls` já
-     estruturado (nome + argumentos JSON), sem precisarmos de uma segunda
-     chamada com grammar manual.
+     (function-calling). As definições das tools são embutidas no prompt e o
+     backend devolve `message.tool_calls` já estruturado (nome + argumentos
+     JSON), sem precisarmos de uma segunda chamada com grammar manual.
   2. Se a resposta NÃO tiver tool_calls, o texto é tratado como resposta
      final direta (equivalente a um "finish" implícito) e o loop termina —
      não há re-chamada com o histórico inalterado, pois isso violaria a
@@ -22,14 +20,13 @@ Arquitetura (tool-calling nativo via Jinja chat template):
      artificial de rodadas além disso.
 
 Resumo do fluxo:
-  pergunta → LLM (+ tools via Jinja) → [sem tool_calls: continua o loop]
-                                     → [com tool_calls X: executa X
-                                        → resultado (role=tool) → repete]
-                                     → [com tool_call finish: FIM]
+  pergunta → LLM (+ tools) → [sem tool_calls: continua o loop]
+                            → [com tool_calls X: executa X
+                               → resultado (role=tool) → repete]
+                            → [com tool_call finish: FIM]
 
 Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
-  - vision_objects: exige troca de modo do llama-server (texto↔multimodal)
-    e reuso do histórico real da conversa. Auto-finish especial.
+  - vision_objects: reusa o histórico real da conversa. Auto-finish especial.
   - finish: primitiva de controle do próprio loop, não uma capacidade externa.
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
@@ -43,8 +40,7 @@ Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
   schema OpenAI, cada um desses agora é um servidor MCP separado. O loop
   primeiro escolhe a "skill" (servidor) relevante pra pergunta do usuário
   usando só os resumos em MCP_SKILLS (~1 linha cada, barato em tokens),
-  e SÓ ENTÃO conecta e lista as tools reais daquele servidor — evita
-  carregar o schema de tools não usadas no contexto do modelo local.
+  e SÓ ENTÃO conecta e lista as tools reais daquele servidor.
 
   Memory deixou de ser um microserviço HTTP (antigo port 3001, FastAPI) e
   virou 100% MCP (`mcp_servers/memory_server.py`, que importa a lógica de
@@ -56,11 +52,11 @@ Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
 
 Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
-  - LLM Chat        (port 4003)  — conversational inference (llama-server)
+  - LLM Chat        (port 4003)  — conversational inference (OpenRouter)
   - Vision / VQA    (port 4002)  — image understanding (tool nativa)
   - Local Scraping  (port 3003)  — endpoint REST próprio da TUI (/local-scraping),
                                     independente da tool MCP homônima
-Process manager (port 9001) segue controlando o llama-server/Docker.
+Process manager (port 9001) segue controlando o ambiente Docker.
 """
 from __future__ import annotations
 
@@ -112,8 +108,7 @@ ALPHA_CODE_URL       = "http://localhost:4006"
 # porta que você realmente usar.
 SHELL_COMMAND_URL    = "http://localhost:4007"
 CHROME_DEBUG_PORT    = 9222  # mesmo default de COMMAND_REGISTRY["launch_chrome_debug"]
-# Gerenciador de processos (Rust/axum) que sobe/derruba o llama-server e
-# permite trocar entre modo texto e multimodal via /llama/switch_mode.
+# Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 PROCESS_MANAGER_URL  = "http://localhost:9001"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,7 +421,7 @@ async def lifespan(app: FastAPI):
     state.local_scraping_client = _make_client(LOCAL_SCRAPING_URL, 9999999.0)
     state.alpha_code_client = _make_client(ALPHA_CODE_URL, 9999999.0)
     # Timeout curto e finito (não 9999999.0): chamadas ao gerenciador de
-    # processos (status / switch_mode) devem falhar rápido se ele estiver
+    # processos (status) devem falhar rápido se ele estiver
     # offline, em vez de travar o loop de tools esperando para sempre.
     state.process_manager_client = _make_client(PROCESS_MANAGER_URL, 15.0)
 
@@ -530,36 +525,17 @@ def _sse(event: str, data: Any) -> str:
 # de módulo", apenas calibra o quanto o LLM deve raciocinar antes de responder)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_THINK_GRAMMAR = r"""
-root   ::= single-digit | double-digit
-double-digit ::= "10"
-single-digit ::= [0-9]
-"""
-
 async def _verify_think(text: str) -> int:
-    payload = {
-        "model": "local",
-        "messages": [
-            {"role": "system", "content": (
-                "You are a thinking-depth classifier. Given a user input, respond with a single "
-                "integer from 0 to 10 representing how much deep reasoning or complex thinking is "
-                "required. 0 = trivial (greetings, simple facts). 10 = very complex (multi-step "
-                "reasoning, math proofs, deep research, complex coding). Respond with the number only."
-            )},
-            {"role": "user", "content": "Hi, how are you?"}, {"role": "assistant", "content": "0"},
-            {"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "1"},
-            {"role": "user", "content": "Explain what machine learning is."}, {"role": "assistant", "content": "4"},
-            {"role": "user", "content": "Research the economic impacts of AI and summarize them in bullet points."}, {"role": "assistant", "content": "7"},
-            {"role": "user", "content": "Prove that there are infinitely many prime numbers and explain each step."}, {"role": "assistant", "content": "10"},
-            {"role": "user", "content": text},
-        ],
-        "grammar": _THINK_GRAMMAR, "temperature": 0.0, "max_tokens": 4, "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(9999999.0)) as client:
-        response = await client.post("http://localhost:2001/v1/chat/completions", json=payload)
-        response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"].strip()
-    return int(content)
+    """
+    Classifica a profundidade de raciocínio (0-10) necessária para o input.
+    O llama-server local que fazia essa classificação foi removido — o
+    backend de substituição será plugado aqui (a chamada sobe exceção até lá;
+    _think_instruction trata a falha e usa o depth padrão).
+    """
+    raise NotImplementedError(
+        "Classificador de thinking-depth sem backend (llama-server removido; "
+        "aguardando substituição)."
+    )
 
 async def _think_instruction(text: str) -> tuple[int, str]:
     try:
@@ -583,75 +559,7 @@ _WRITE_HINT = "Use this when the user asks you to remember/record/save something
 # MCP (ver MCP_SKILLS + _get_mcp_session), descobertos e despachados
 # dinamicamente pelo loop em vez de uma função Python fixa por tool.
 
-# ── Tradução de Objetos: vision.py (crops) -> garante modo multimodal
-#    no gerenciador de processos (porta 9001) -> LLM.py (multi-imagem) ──
-
-async def _get_process_manager_status() -> dict:
-    r = await state.process_manager_client.get("/status")
-    r.raise_for_status()
-    return r.json()
-
-
-async def _ensure_llama_mode(mode: str, timeout: float = 60.0, poll_interval: float = 1.0) -> None:
-    """
-    Garante que o llama-server gerenciado pelo tray (porta 9001) esteja
-    carregado no modo `mode` ("text" ou "multimodal").
-
-    Consulta GET /status; se `llama.mode` já for o modo pedido e o processo
-    estiver "Ativo", não faz nada (evita reiniciar o servidor à toa a cada
-    chamada). Caso contrário, dispara POST /llama/switch_mode e espera
-    (polling) o processo voltar a ficar Ativo no novo modo antes de
-    retornar — a troca de modo reinicia o llama-server, então leva alguns
-    segundos até o modelo terminar de carregar.
-    """
-    try:
-        status = await _get_process_manager_status()
-    except Exception as e:
-        raise RuntimeError(
-            f"Não foi possível consultar o gerenciador de processos ({PROCESS_MANAGER_URL}/status): {e}"
-        )
-
-    llama_status = status.get("llama", {})
-    if llama_status.get("mode") == mode and llama_status.get("status") == "Ativo":
-        log.info(f"llama-server já está em modo {mode}, nenhuma troca necessária.")
-        return
-
-    log.info(
-        f"llama-server em modo '{llama_status.get('mode')}' "
-        f"(status: {llama_status.get('status')}) — trocando para {mode}..."
-    )
-    r = await state.process_manager_client.post("/llama/switch_mode", json={"mode": mode})
-    r.raise_for_status()
-    body = r.json()
-    if not body.get("ok", False):
-        raise RuntimeError(f"Falha ao trocar o llama-server para modo {mode}: {body.get('message')}")
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        await asyncio.sleep(poll_interval)
-        try:
-            status = await _get_process_manager_status()
-        except Exception:
-            continue
-        llama_status = status.get("llama", {})
-        if llama_status.get("mode") == mode and llama_status.get("status") == "Ativo":
-            log.info(f"llama-server em modo {mode} e pronto.")
-            return
-
-    raise RuntimeError(
-        f"Timeout ({timeout}s) esperando o llama-server ficar pronto em modo {mode}."
-    )
-
-
-async def _ensure_multimodal_mode(timeout: float = 60.0, poll_interval: float = 1.0) -> None:
-    """Garante o llama-server em modo multimodal (usado antes de enviar crops/imagens)."""
-    await _ensure_llama_mode("multimodal", timeout=timeout, poll_interval=poll_interval)
-
-
-async def _ensure_text_mode(timeout: float = 60.0, poll_interval: float = 1.0) -> None:
-    """Garante o llama-server de volta em modo texto (usado ao final de uma requisição de visão)."""
-    await _ensure_llama_mode("text", timeout=timeout, poll_interval=poll_interval)
-
+# ── Tradução de Objetos: vision.py (crops) -> LLM.py (multi-imagem) ──
 
 # Dá acesso, de dentro de um executor de tool, ao histórico REAL da
 # conversa deste turno (system + user + tool_calls já resolvidas) sem
@@ -776,14 +684,13 @@ async def _answer_vision_with_llm(objects: list[dict], user_prompt: str, history
     messages = base_history + [{"role": "user", "content": content}]
 
     payload = {"messages": messages, "tools": [], "temperature": 0.2}
-    # Retry com backoff para 503 (llama-server pode ainda estar
-    # reiniciando após troca de modo)
+    # Retry com backoff para 503 (falha transitória do backend de LLM)
     for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
         r = await state.llm_client.post("/chat/tools", json=payload)
         if r.status_code == 200:
             data = r.json()
             if data.get("too_large"):
-                raise RuntimeError(f"Contexto excede o limite do llama-server: {data.get('usage')}")
+                raise RuntimeError(f"Contexto excede o limite do modelo: {data.get('usage')}")
             return data["message"].get("content", "")
         if r.status_code == 503 and attempt < ORCHESTRATOR_LLM_RETRIES:
             wait = ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1)
@@ -803,11 +710,9 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
     Roda o pipeline de visão (vision.py /vision/process) na imagem anexada
     ao request: rostos primeiro (resolvidos direto contra o face-dict),
     depois objetos genéricos via depth estimation + segmentação +
-    dicionário visual. Em seguida garante que o llama-server esteja em
-    modo multimodal (trocando via o gerenciador de processos, porta 9001,
-    se necessário) e manda os crops, numa única chamada multi-imagem,
-    para o LLM multimodal RESPONDER a pergunta do usuário diretamente —
-    ver _answer_vision_with_llm.
+    dicionário visual. Em seguida manda os crops, numa única chamada
+    multi-imagem, para o LLM multimodal RESPONDER a pergunta do usuário
+    diretamente — ver _answer_vision_with_llm.
     """
     if not req.image_base64:
         return "[vision_objects: no image was provided with this request]"
@@ -852,21 +757,9 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
             "answer": "Não detectei nenhum rosto ou objeto reconhecível nessa imagem.",
         }
 
-    await _ensure_multimodal_mode()
-
     prompt = args.get("prompt", req.input)
     history = _CURRENT_HISTORY.get()
     answer = await _answer_vision_with_llm(objects, prompt, history)
-
-    # Ao final da requisição de visão, volta o llama-server para o modo
-    # texto comum — o restante do loop de tool-calling (e o resto da
-    # conversa) usa o modelo de texto, então não faz sentido deixá-lo
-    # carregado em multimodal. Uma falha aqui não deve derrubar o
-    # resultado já obtido da vision, então só logamos o erro.
-    try:
-        await _ensure_text_mode()
-    except Exception as e:
-        log.warning(f"Falha ao voltar o llama-server para modo texto após vision_objects: {e}")
 
     # Remove os crops (base64 pesado) do retorno que volta pro histórico do
     # LLM de texto — já foram consumidos pela chamada multimodal acima;
@@ -922,9 +815,8 @@ TOOLS: dict[str, dict[str, Any]] = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tools schema (formato OpenAI function-calling) — usado pelo llama-server
-# em modo `--jinja`, que renderiza as definições na chat template do próprio
-# modelo e aplica a grammar de tool-calling automaticamente no lado servidor.
+# Tools schema (formato OpenAI function-calling) — enviado ao backend de LLM,
+# que embute as definições na chat template do modelo.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _JSON_SCHEMA_TYPES = {"string": "string", "number": "number"}
@@ -985,40 +877,13 @@ async def _select_skills(user_input: str) -> list[str]:
     skills_list = "\n".join(f"- {name}: {s.skill_summary}" for name, s in MCP_SKILLS.items())
     log.debug(f"[_select_skills] skills disponíveis: {list(MCP_SKILLS.keys())}")
     log.debug(f"[_select_skills] input do usuário: {user_input!r}")
-    payload = {
-        "model": "local",
-        "messages": [
-            {"role": "system", "content": (
-                "You choose which capability domains (skills) are relevant to a user's request. "
-                "Available skills:\n" + skills_list + "\n\n"
-                "Respond with a comma-separated list of relevant skill names only (e.g. "
-                "\"memory,search\"), or the single word \"none\" if no skill applies. "
-                "Pick every skill that could plausibly help — it's fine to pick more than one."
-            )},
-            {"role": "user", "content": user_input},
-        ],
-        "temperature": 0.0, "stream": False,
-    }
     try:
-        t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            r = await client.post("http://localhost:2001/v1/chat/completions", json=payload)
-            r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip().lower()
-        log.debug(f"[_select_skills] resposta bruta do modelo ({(time.perf_counter()-t0)*1000:.0f}ms): {raw!r}")
+        raise NotImplementedError(
+            "Seleção de skills sem backend (llama-server removido; aguardando substituição)."
+        )
     except Exception as e:
         log.warning(f"_select_skills falhou, liberando todas as skills como fallback: {e}")
         return list(MCP_SKILLS.keys())
-    if "none" in raw:
-        log.debug("[_select_skills] modelo respondeu 'none' — nenhuma skill escolhida")
-        return []
-    chosen = [name.strip() for name in raw.split(",") if name.strip() in MCP_SKILLS]
-    rejected = [name.strip() for name in raw.split(",") if name.strip() not in MCP_SKILLS]
-    if rejected:
-        log.warning(f"[_select_skills] tokens na resposta que NÃO batem com nenhuma skill "
-                    f"registrada (provável causa de tool não ser oferecida): {rejected}")
-    log.info(f"[_select_skills] skills escolhidas para este turno: {chosen}")
-    return chosen
 
 
 async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[ClientSession, str]]]:
@@ -1056,10 +921,9 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Número de retentativas do orquestrador ao chamar LLM.py — separado
-# do retry interno do próprio LLM.py (que retrya o llama-server). Este
-# retry cobre o cenário onde LLM.py está vivo mas o llama-server ainda
-# está reiniciando após uma troca de modo (text ↔ multimodal), o que
-# faz LLM.py retornar 503 por alguns segundos.
+# do retry interno do próprio LLM.py (que retrya o OpenRouter). Este
+# retry cobre falhas transitórias de rede/5xx entre o orchestrator e o
+# LLM.py.
 ORCHESTRATOR_LLM_RETRIES = 4
 ORCHESTRATOR_LLM_BACKOFF_S = 2.0
 
@@ -1070,16 +934,14 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
     Chama o LLM.py (porta 4003) via seu endpoint real de tool-calling,
     /chat/tools, e retorna a mensagem completa (content + tool_calls).
 
-    LLM.py não expõe um /v1/chat/completions no formato OpenAI puro — quem
-    fala esse dialeto é o llama-server (porta 2001) por baixo. /chat/tools
-    recebe {"messages": [...], "tools": [...], ...} (schema ToolUseRequest)
-    e devolve {"message": {...}, ...} (schema ToolUseResponse), não
-    {"choices": [{"message": {...}}]}.
+    LLM.py não expõe um /v1/chat/completions no formato OpenAI puro.
+    /chat/tools recebe {"messages": [...], "tools": [...], ...} (schema
+    ToolUseRequest) e devolve {"message": {...}, ...} (schema
+    ToolUseResponse), não {"choices": [{"message": {...}}]}.
 
-    Inclui retry com backoff para 503 — necessário porque o
-    llama-server pode retornar 503 temporariamente após uma troca de
-    modo (text ↔ multimodal), e o retry interno do LLM.py (3 tentativas)
-    às vezes não é suficiente para cobrir todo o tempo de reinício.
+    Inclui retry com backoff para 503 — cobre falhas transitórias do
+    backend de LLM caso o retry interno do LLM.py (3 tentativas) não seja
+    suficiente.
     """
     payload: dict = {"messages": messages, "temperature": temperature}
     if tools:
@@ -1106,18 +968,17 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
         if r.status_code == 200:
             data = r.json()
             if data.get("too_large"):
-                raise RuntimeError(f"Contexto excede o limite do llama-server: {data.get('usage')}")
+                raise RuntimeError(f"Contexto excede o limite do modelo: {data.get('usage')}")
             return data["message"]
 
-        # 503: llama-server provavelmente ainda está reiniciando após
-        # troca de modo — retry com backoff progressivo.
+        # 503: falha transitória do backend — retry com backoff progressivo.
         if r.status_code == 503:
             last_error = httpx.HTTPStatusError(
                 f"503 Service Unavailable", request=r.request, response=r,
             )
             wait = ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1)
             log.warning(
-                f"LLM.py retornou 503 (llama-server reiniciando?), "
+                f"LLM.py retornou 503, "
                 f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}, "
                 f"aguardando {wait:.0f}s antes de retentar..."
             )
@@ -1211,10 +1072,10 @@ async def _force_finish(history: list[dict], eid: str) -> str:
     """
     Rede de segurança do guarda-corpo anti-loop: chamada quando o modelo
     insiste na mesma tool repetidas vezes sem nunca chamar `finish`. Faz
-    UMA última chamada ao LLM sem `tools` (o llama-server não tem como
-    devolver tool_calls nesse modo, então ele é obrigado a responder em
-    texto livre) pedindo explicitamente uma resposta final com o que já
-    foi coletado no histórico. Se isso falhar por qualquer motivo, cai
+    UMA última chamada ao LLM sem `tools` (nesse modo ele não tem como
+    devolver tool_calls, então é obrigado a responder em texto livre)
+    pedindo explicitamente uma resposta final com o que já foi coletado
+    no histórico. Se isso falhar por qualquer motivo, cai
     num texto fixo — nunca deixamos o loop rodar indefinidamente.
     """
     nudge = {
@@ -1330,8 +1191,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # Tools cujo resultado já É a resposta final ao usuário — nenhuma
     # segunda chamada ao modelo de texto acontece depois delas. Hoje só
     # vision_objects: o modelo multimodal já respondeu diretamente à
-    # pergunta do usuário usando os crops (ver _answer_vision_with_llm), e
-    # o llama-server já foi recarregado em modo texto ao final da tool —
+    # pergunta do usuário usando os crops (ver _answer_vision_with_llm) —
     # só pronto pro PRÓXIMO turno, sem gerar resposta pra este.
     AUTO_FINISH_TOOLS = {"vision_objects"}
 
@@ -1358,7 +1218,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # isso produziria duas mensagens role="assistant" consecutivas no
             # histórico, o que viola a alternância estrita user/assistant/tool
             # exigida pelo chat template do modelo e derruba a chamada
-            # seguinte com 400 Bad Request no llama-server.
+            # seguinte com 400 Bad Request no backend de LLM.
             final_response = message.get("content") or ""
             step_results.append(StepResult(
                 step=turn, executor="llm", action="(resposta direta, sem tool_calls)",
@@ -1464,9 +1324,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # ── Auto-finish: tools cuja resposta já é final (vision_objects) ──
             # Evita a segunda chamada ao modelo de texto — o resultado do
             # modelo multimodal (campo "answer") vira a resposta do turno
-            # direto. O llama-server já foi trocado de volta pra modo texto
-            # dentro da própria tool (_ensure_text_mode), então ele já sai
-            # "recarregado" e pronto pro próximo turno, sem gerar nada agora.
+            # direto, sem gerar nada agora.
             if tool_name in AUTO_FINISH_TOOLS and success and isinstance(result, dict) and result.get("answer"):
                 final_response = result["answer"]
                 finished = True
