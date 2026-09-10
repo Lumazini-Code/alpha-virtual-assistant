@@ -7,14 +7,13 @@ import sqlite3
 import hashlib
 import asyncio
 import logging
+import threading
 from pathlib import Path
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
 import numpy as np
 import faiss
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ── MODIFIED: Import from onnx_client instead of local ONNX ───────────────────
@@ -42,11 +41,6 @@ FAISS_ID_MAP_PATH = "./memory/ava_id_map.npy"
 ST_DB_PATH           = "./memory/ava_short_term.db"
 ST_FAISS_INDEX_PATH  = "./memory/ava_short_term.index"
 ST_FAISS_ID_MAP_PATH = "./memory/ava_short_term_id_map.npy"
-
-# Cache de planos (CoT)
-PC_DB_PATH           = "./memory/ava_plan_cache.db"
-PC_FAISS_INDEX_PATH  = "./memory/ava_plan_cache.index"
-PC_FAISS_ID_MAP_PATH = "./memory/ava_plan_cache_id_map.npy"
 
 # Knowledge (Vector Store / KG-RAG)
 VS_DB_PATH           = "./memory/ava_kg_chunks.db"
@@ -104,8 +98,6 @@ DECAY_JOB_INTERVAL_S = 3600
 
 ST_TTL_HOURS          = 24.0
 ST_CLEANUP_INTERVAL_S = 1800
-
-PC_HIT_THRESHOLD = 0.92
 
 # ── Otimização de tokens (reduzir payload enviado ao LLM) ─────────────────────
 # Evita erros 413 Payload Too Large no Groq quando o /read é chamado múltiplas
@@ -168,9 +160,13 @@ class Turn(BaseModel):
     content: str
 
 class WriteRequest(BaseModel):
-    text:       str
-    source:     str   = "chat"
-    confidence: float = 1.0
+    text:        str
+    source:      str   = "chat"
+    confidence:  float = 1.0
+    # "esquecível?" — quando False, a memória fica isenta do decay por
+    # inatividade (apply_decay a ignora), mas ainda pode ser removida por
+    # deleção explícita. Default True preserva o comportamento anterior.
+    forgettable: bool  = True
 
 class WriteSTRequest(BaseModel):
     session_id: str
@@ -213,6 +209,8 @@ class MemoryEntry(BaseModel):
     session_id:   Optional[str]        = None
     turns:        Optional[list[Turn]] = None
     source:       Optional[str]        = None
+    # ── NEW: esquecível — só populado para memory_type == "long_term" ──
+    forgettable:  Optional[bool]       = None
     # ── NEW: Indexed file metadata ──
     file_path:    Optional[str]        = None
     file_name:    Optional[str]        = None
@@ -225,8 +223,6 @@ class ReadResponse(BaseModel):
     query:    str
     strategy: str
 
-
-# ── Modelos de request/response — cache de planos ─────────────────────────────
 
 # ── NEW: Modelos de request/response — arquivos indexados ─────────────────────
 
@@ -452,6 +448,13 @@ class MemoryDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # ITEM 4 da revisão: esta conexão é usada tanto pelo event loop quanto
+        # por threads do executor (endpoints e jobs em background). O módulo
+        # sqlite3 não serializa automaticamente chamadas concorrentes vindas
+        # de threads diferentes sobre a MESMA conexão — este lock garante que
+        # cada statement de escrita rode de forma atômica em relação aos
+        # outros.
+        self._lock = threading.Lock()
         self._create_tables()
 
     def _create_tables(self):
@@ -469,16 +472,25 @@ class MemoryDB:
             CREATE INDEX IF NOT EXISTS idx_confidence    ON memories(confidence);
             CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed);
         """)
+        # Migração leve: bancos criados antes do campo "esquecível?" existir
+        # não têm a coluna — adiciona com default 1 (esquecível, comportamento
+        # anterior) sem quebrar instalações já em uso.
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(memories)")}
+        if "forgettable" not in cols:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN forgettable INTEGER NOT NULL DEFAULT 1"
+            )
 
-    def insert(self, text: str, source: str, confidence: float) -> int:
+    def insert(self, text: str, source: str, confidence: float, forgettable: bool = True) -> int:
         text_hash = hashlib.sha256(text.encode()).hexdigest()
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO memories (text, text_hash, source, confidence, created_at, last_accessed) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (text, text_hash, source, confidence, now, now),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO memories (text, text_hash, source, confidence, forgettable, "
+                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (text, text_hash, source, confidence, int(forgettable), now, now),
+            )
+            return cur.lastrowid
 
     def exists_exact(self, text: str) -> bool:
         h = hashlib.sha256(text.encode()).hexdigest()
@@ -496,27 +508,33 @@ class MemoryDB:
 
     def update_access(self, memory_id: int):
         try:
-            self._conn.execute(
-                "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                (time.time(), memory_id),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                    (time.time(), memory_id),
+                )
         except sqlite3.OperationalError:
             pass
 
     def apply_decay(self, half_life_days: float):
         now  = time.time()
-        rows = self._conn.execute(
-            "SELECT id, confidence, last_accessed FROM memories WHERE confidence > 0.01"
-        ).fetchall()
-        updates = []
-        for row in rows:
-            days_idle    = (now - row["last_accessed"]) / 86400.0
-            decay_factor = 0.5 ** (days_idle / half_life_days)
-            updates.append((row["confidence"] * decay_factor, row["id"]))
-        if updates:
-            self._conn.executemany("UPDATE memories SET confidence = ? WHERE id = ?", updates)
-            self._conn.execute("DELETE FROM memories WHERE confidence < 0.01")
-            log.info(f"Decay aplicado em {len(updates)} memórias de longo prazo")
+        with self._lock:
+            # forgettable = 0 → memória marcada como "não esquecível":
+            # fica de fora do decay por completo, mesmo que fique muito
+            # tempo sem ser acessada.
+            rows = self._conn.execute(
+                "SELECT id, confidence, last_accessed FROM memories "
+                "WHERE confidence > 0.01 AND forgettable = 1"
+            ).fetchall()
+            updates = []
+            for row in rows:
+                days_idle    = (now - row["last_accessed"]) / 86400.0
+                decay_factor = 0.5 ** (days_idle / half_life_days)
+                updates.append((row["confidence"] * decay_factor, row["id"]))
+            if updates:
+                self._conn.executemany("UPDATE memories SET confidence = ? WHERE id = ?", updates)
+                self._conn.execute("DELETE FROM memories WHERE confidence < 0.01")
+                log.info(f"Decay aplicado em {len(updates)} memórias de longo prazo")
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -531,6 +549,7 @@ class ShortTermDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
 
     def _create_tables(self):
@@ -550,12 +569,13 @@ class ShortTermDB:
 
     def insert(self, session_id: str, turns: list[Turn], embed_text: str) -> int:
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO turn_groups (session_id, turns_json, embed_text, created_at, last_accessed) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, json.dumps([t.model_dump() for t in turns]), embed_text, now, now),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO turn_groups (session_id, turns_json, embed_text, created_at, last_accessed) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, json.dumps([t.model_dump() for t in turns]), embed_text, now, now),
+            )
+            return cur.lastrowid
 
     def get_by_ids(self, ids: list[int]) -> list[sqlite3.Row]:
         if not ids:
@@ -595,19 +615,21 @@ class ShortTermDB:
 
     def update_access(self, group_id: int):
         try:
-            self._conn.execute(
-                "UPDATE turn_groups SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                (time.time(), group_id),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE turn_groups SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                    (time.time(), group_id),
+                )
         except sqlite3.OperationalError:
             pass
 
     def expire_old(self, ttl_hours: float) -> int:
         cutoff = time.time() - ttl_hours * 3600
-        cur = self._conn.execute(
-            "DELETE FROM turn_groups WHERE last_accessed < ?", (cutoff,)
-        )
-        removed = cur.rowcount
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM turn_groups WHERE last_accessed < ?", (cutoff,)
+            )
+            removed = cur.rowcount
         if removed:
             log.info(f"Curto prazo: {removed} grupos expirados (TTL={ttl_hours}h)")
         return removed
@@ -615,64 +637,18 @@ class ShortTermDB:
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM turn_groups").fetchone()[0]
 
+    def get_ids_by_session(self, session_id: str) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM turn_groups WHERE session_id = ?", (session_id,)
+        ).fetchall()
+        return [row["id"] for row in rows]
 
-# ── Banco de dados do cache de planos ─────────────────────────────────────────
-
-class PlanCacheDB:
-    def __init__(self, path: str):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._create_tables()
-
-    def _create_tables(self):
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS plan_cache (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                query_text TEXT    NOT NULL,
-                plan_json  TEXT    NOT NULL,
-                hit_count  INTEGER NOT NULL DEFAULT 0,
-                created_at REAL    NOT NULL,
-                last_hit   REAL    NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_pc_last_hit ON plan_cache(last_hit);
-        """)
-
-    def insert(self, query_text: str, plan: dict) -> int:
-        now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO plan_cache (query_text, plan_json, created_at, last_hit) "
-            "VALUES (?, ?, ?, ?)",
-            (query_text, json.dumps(plan), now, now),
-        )
-        return cur.lastrowid
-
-    def get_by_id(self, cache_id: int) -> Optional[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM plan_cache WHERE id = ?", (cache_id,)
-        ).fetchone()
-
-    def update_hit(self, cache_id: int):
-        try:
-            self._conn.execute(
-                "UPDATE plan_cache SET hit_count = hit_count + 1, last_hit = ? WHERE id = ?",
-                (time.time(), cache_id),
+    def delete_by_session(self, session_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM turn_groups WHERE session_id = ?", (session_id,)
             )
-        except sqlite3.OperationalError:
-            pass
-
-    def delete_all(self) -> int:
-        cur = self._conn.execute("DELETE FROM plan_cache")
-        return cur.rowcount
-
-    def delete_by_id(self, cache_id: int) -> int:
-        cur = self._conn.execute("DELETE FROM plan_cache WHERE id = ?", (cache_id,))
-        return cur.rowcount
-
-    def count(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM plan_cache").fetchone()[0]
+            return cur.rowcount
 
 
 # ── NEW: Banco de dados de arquivos indexados ──────────────────────────────────
@@ -690,6 +666,7 @@ class IndexedFilesDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
 
     def _create_tables(self):
@@ -741,15 +718,16 @@ class IndexedFilesDB:
         confidence:  float,
     ) -> int:
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO indexed_files "
-            "(file_path, file_name, extension, content, content_hash, file_hash, "
-            "size, modified, source, confidence, created_at, last_accessed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (file_path, file_name, extension, content, content_hash, file_hash,
-             size, modified, source, confidence, now, now),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO indexed_files "
+                "(file_path, file_name, extension, content, content_hash, file_hash, "
+                "size, modified, source, confidence, created_at, last_accessed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (file_path, file_name, extension, content, content_hash, file_hash,
+                 size, modified, source, confidence, now, now),
+            )
+            return cur.lastrowid
 
     def update_file(
         self,
@@ -761,11 +739,12 @@ class IndexedFilesDB:
         modified:    str,
     ):
         now = time.time()
-        self._conn.execute(
-            "UPDATE indexed_files SET content=?, content_hash=?, file_hash=?, "
-            "size=?, modified=?, last_accessed=? WHERE id=?",
-            (content, content_hash, file_hash, size, modified, now, file_id),
-        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE indexed_files SET content=?, content_hash=?, file_hash=?, "
+                "size=?, modified=?, last_accessed=? WHERE id=?",
+                (content, content_hash, file_hash, size, modified, now, file_id),
+            )
 
     def get_by_path(self, file_path: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
@@ -779,17 +758,19 @@ class IndexedFilesDB:
 
     def update_access(self, file_id: int):
         try:
-            self._conn.execute(
-                "UPDATE indexed_files SET access_count = access_count + 1, "
-                "last_accessed = ? WHERE id = ?",
-                (time.time(), file_id),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE indexed_files SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), file_id),
+                )
         except sqlite3.OperationalError:
             pass
 
     def delete_file(self, file_id: int) -> int:
-        cur = self._conn.execute("DELETE FROM indexed_files WHERE id = ?", (file_id,))
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM indexed_files WHERE id = ?", (file_id,))
+            return cur.rowcount
 
     def count_files(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM indexed_files").fetchone()[0]
@@ -809,11 +790,12 @@ class IndexedFilesDB:
             (file_id, c["index"], c["text"], c["char_start"], c["char_end"])
             for c in chunks
         ]
-        self._conn.executemany(
-            "INSERT INTO indexed_file_chunks (file_id, chunk_index, chunk_text, char_start, char_end) "
-            "VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO indexed_file_chunks (file_id, chunk_index, chunk_text, char_start, char_end) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
 
     def get_chunks_by_file(self, file_id: int) -> list[sqlite3.Row]:
         return self._conn.execute(
@@ -837,10 +819,11 @@ class IndexedFilesDB:
         ).fetchone()[0]
 
     def delete_chunks_by_file(self, file_id: int) -> int:
-        cur = self._conn.execute(
-            "DELETE FROM indexed_file_chunks WHERE file_id = ?", (file_id,)
-        )
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM indexed_file_chunks WHERE file_id = ?", (file_id,)
+            )
+            return cur.rowcount
 
     def get_chunks_by_ids(self, chunk_ids: list[int]) -> list[sqlite3.Row]:
         if not chunk_ids:
@@ -875,6 +858,7 @@ class VisualDictDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
 
     def _create_tables(self):
@@ -913,14 +897,15 @@ class VisualDictDB:
         confidence: float, memory_id: Optional[int],
     ) -> int:
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO visual_concepts "
-            "(concept_name, concept_key, description, source, confidence, memory_id, "
-            "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (concept_name, self._normalize_key(concept_name), description, source,
-             confidence, memory_id, now, now),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO visual_concepts "
+                "(concept_name, concept_key, description, source, confidence, memory_id, "
+                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (concept_name, self._normalize_key(concept_name), description, source,
+                 confidence, memory_id, now, now),
+            )
+            return cur.lastrowid
 
     def get_by_name(self, concept_name: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
@@ -935,17 +920,19 @@ class VisualDictDB:
 
     def update_access(self, concept_id: int):
         try:
-            self._conn.execute(
-                "UPDATE visual_concepts SET access_count = access_count + 1, "
-                "last_accessed = ? WHERE id = ?",
-                (time.time(), concept_id),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE visual_concepts SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), concept_id),
+                )
         except sqlite3.OperationalError:
             pass
 
     def delete_concept(self, concept_id: int) -> int:
-        cur = self._conn.execute("DELETE FROM visual_concepts WHERE id = ?", (concept_id,))
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM visual_concepts WHERE id = ?", (concept_id,))
+            return cur.rowcount
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM visual_concepts").fetchone()[0]
@@ -961,11 +948,12 @@ class VisualDictDB:
     # ── Embedding-row operations (mapeamento embedding_id → concept_id) ──
 
     def insert_embedding(self, concept_id: int) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO visual_concept_embeddings (concept_id, created_at) VALUES (?, ?)",
-            (concept_id, time.time()),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO visual_concept_embeddings (concept_id, created_at) VALUES (?, ?)",
+                (concept_id, time.time()),
+            )
+            return cur.lastrowid
 
     def get_concept_id_by_embedding(self, embedding_id: int) -> Optional[int]:
         row = self._conn.execute(
@@ -1008,6 +996,7 @@ class FaceDictDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
 
     def _create_tables(self):
@@ -1048,13 +1037,14 @@ class FaceDictDB:
 
     def insert_person(self, person_name: str, description: str, source: str, confidence: float) -> int:
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO face_people "
-            "(person_name, person_key, description, source, confidence, created_at, last_accessed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (person_name, self._normalize_key(person_name), description, source, confidence, now, now),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO face_people "
+                "(person_name, person_key, description, source, confidence, created_at, last_accessed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (person_name, self._normalize_key(person_name), description, source, confidence, now, now),
+            )
+            return cur.lastrowid
 
     def get_by_name(self, person_name: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
@@ -1072,24 +1062,27 @@ class FaceDictDB:
         quando `person_name` já existe e um `description` não-vazio é
         enviado num novo /face-dict/write (ex.: cadastrando mais um
         exemplo de rosto e aproveitando pra corrigir/completar o texto)."""
-        self._conn.execute(
-            "UPDATE face_people SET description = ? WHERE id = ?",
-            (description, person_id),
-        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE face_people SET description = ? WHERE id = ?",
+                (description, person_id),
+            )
 
     def update_access(self, person_id: int):
         try:
-            self._conn.execute(
-                "UPDATE face_people SET access_count = access_count + 1, "
-                "last_accessed = ? WHERE id = ?",
-                (time.time(), person_id),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE face_people SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), person_id),
+                )
         except sqlite3.OperationalError:
             pass
 
     def delete_person(self, person_id: int) -> int:
-        cur = self._conn.execute("DELETE FROM face_people WHERE id = ?", (person_id,))
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM face_people WHERE id = ?", (person_id,))
+            return cur.rowcount
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM face_people").fetchone()[0]
@@ -1105,11 +1098,12 @@ class FaceDictDB:
     # ── Embedding-row operations (mapeamento embedding_id → person_id) ──
 
     def insert_embedding(self, person_id: int) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO face_embeddings (person_id, created_at) VALUES (?, ?)",
-            (person_id, time.time()),
-        )
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO face_embeddings (person_id, created_at) VALUES (?, ?)",
+                (person_id, time.time()),
+            )
+            return cur.lastrowid
 
     def get_person_id_by_embedding(self, embedding_id: int) -> Optional[int]:
         row = self._conn.execute(
@@ -1215,8 +1209,33 @@ def _chunk_text(
 
 # ── Índice FAISS genérico ──────────────────────────────────────────────────────
 
+# Intervalo do job de persistência periódica dos índices (ver index_flush_job).
+# Trocamos "salvar a cada escrita" por "marcar sujo + descarregar em lote" —
+# evita reescrever o índice inteiro em disco a cada add() (ver ITEM 1 da
+# revisão).
+INDEX_FLUSH_INTERVAL_S = 60
+
+
 class MemoryIndex:
-    """FAISS IndexFlatIP — inner product em vetores L2-normalizados = cosine similarity."""
+    """
+    FAISS IndexIDMap2(IndexFlatIP) — inner product em vetores L2-normalizados
+    = cosine similarity. Usar IndexIDMap2 (em vez de IndexFlatIP + lista
+    paralela `_id_map` mantida à mão em Python) resolve dois problemas do
+    design anterior:
+
+      1. `remove_ids` deixa de precisar reconstruir o índice inteiro
+         (reconstruct_n + rebuild em Python) — quem faz a remoção agora é o
+         próprio FAISS, em C++, via IDSelectorBatch.
+      2. O mapeamento id→vetor é interno ao índice e persiste junto no
+         arquivo .index — elimina a possibilidade de `_id_map` e o índice
+         ficarem fora de sincronia (ex.: se o processo morrer entre os dois
+         `np.save`/`write_index`).
+
+    Todas as mutações (add/add_batch/remove_ids/reset) e leituras (search/
+    search_subset) são protegidas por um lock — os métodos podem ser chamados
+    tanto do event loop quanto de threads do executor (ver ITEM 3/4 da
+    revisão: FAISS não garante thread-safety para add/search concorrentes).
+    """
 
     def __init__(
         self,
@@ -1226,25 +1245,53 @@ class MemoryIndex:
         embed_dim: int = EMBED_DIM,
     ):
         self._index_path  = index_path
-        self._id_map_path = id_map_path
-        self._persist     = persist
-        self._embed_dim   = embed_dim
+        self._id_map_path = id_map_path  # mantido só para migrar índices antigos
+        self._persist      = persist
+        self._embed_dim    = embed_dim
+        self._lock         = threading.Lock()
+        self._dirty        = False
         Path(index_path).parent.mkdir(parents=True, exist_ok=True)
 
-        if persist and Path(index_path).exists() and Path(id_map_path).exists():
-            self._index  = faiss.read_index(index_path)
-            self._id_map = list(np.load(id_map_path).tolist())
-            log.info(f"Índice FAISS carregado [{index_path}] — {self._index.ntotal} vetores")
+        if persist and Path(index_path).exists():
+            loaded = faiss.read_index(index_path)
+            if isinstance(loaded, faiss.IndexIDMap2):
+                self._index = loaded
+                log.info(f"Índice FAISS carregado [{index_path}] — {self._index.ntotal} vetores")
+            else:
+                # Migração de índice no formato antigo (IndexFlatIP + .npy
+                # externo) — lê os ids do id_map legado, se existir, e
+                # reconstrói como IndexIDMap2.
+                self._index = self._migrate_legacy_index(loaded, id_map_path)
         else:
-            self._index  = faiss.IndexFlatIP(embed_dim)
-            self._id_map = []
+            self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(embed_dim))
             log.info(f"Novo índice FAISS criado [{index_path}] (dim={embed_dim})")
 
+    def _migrate_legacy_index(self, flat_index, id_map_path: str) -> "faiss.IndexIDMap2":
+        n = flat_index.ntotal
+        ids: list[int] = []
+        if Path(id_map_path).exists():
+            ids = list(np.load(id_map_path).tolist())
+        if len(ids) != n:
+            log.warning(
+                f"Migração [{self._index_path}]: id_map legado tem {len(ids)} "
+                f"entradas mas o índice tem {n} vetores — usando posição como id"
+            )
+            ids = list(range(n))
+        new_index = faiss.IndexIDMap2(faiss.IndexFlatIP(self._embed_dim))
+        if n > 0:
+            vecs = flat_index.reconstruct_n(0, n)
+            new_index.add_with_ids(vecs, np.array(ids, dtype=np.int64))
+        log.info(f"Índice migrado para IndexIDMap2 [{self._index_path}] — {n} vetores")
+        self._dirty = True
+        return new_index
+
     def add(self, embedding: np.ndarray, record_id: int):
-        self._index.add(embedding.reshape(1, -1))
-        self._id_map.append(record_id)
-        if self._persist:
-            self._save()
+        with self._lock:
+            self._index.add_with_ids(
+                embedding.reshape(1, -1).astype(np.float32),
+                np.array([record_id], dtype=np.int64),
+            )
+            self._dirty = True
 
     def add_batch(self, embeddings: np.ndarray, record_ids: list[int]):
         """Adiciona múltiplos vetores de uma vez — mais eficiente que add() individual."""
@@ -1255,43 +1302,48 @@ class MemoryIndex:
             )
         if embeddings.shape[0] == 0:
             return
-        self._index.add(embeddings)
-        self._id_map.extend(record_ids)
-        if self._persist:
-            self._save()
+        with self._lock:
+            self._index.add_with_ids(
+                embeddings.astype(np.float32),
+                np.array(record_ids, dtype=np.int64),
+            )
+            self._dirty = True
 
     def remove_ids(self, record_ids: set[int]):
-        if not record_ids or self._index.ntotal == 0:
+        if not record_ids:
             return
-        all_vectors = self._index.reconstruct_n(0, self._index.ntotal)
-        new_vecs, new_map = [], []
-        for vec, rid in zip(all_vectors, self._id_map):
-            if rid not in record_ids:
-                new_vecs.append(vec)
-                new_map.append(rid)
-        self._index = faiss.IndexFlatIP(self._embed_dim)
-        if new_vecs:
-            self._index.add(np.array(new_vecs, dtype=np.float32))
-        self._id_map = new_map
-        if self._persist:
-            self._save()
-        log.info(f"FAISS: {len(record_ids)} vetores removidos [{self._index_path}]")
+        with self._lock:
+            if self._index.ntotal == 0:
+                return
+            # Construtor "cru" (n + ponteiro) em vez do atalho
+            # `IDSelectorBatch(array)` — compatível com um leque maior de
+            # versões do faiss-cpu/faiss-gpu.
+            ids_arr  = np.ascontiguousarray(list(record_ids), dtype=np.int64)
+            selector = faiss.IDSelectorBatch(ids_arr.size, faiss.swig_ptr(ids_arr))
+            n_removed = self._index.remove_ids(selector)
+            self._dirty = True
+        log.info(f"FAISS: {n_removed} vetores removidos [{self._index_path}]")
 
     def reset(self):
-        self._index  = faiss.IndexFlatIP(self._embed_dim)
-        self._id_map = []
-        if self._persist:
-            self._save()
+        with self._lock:
+            self._index.reset()
+            self._dirty = True
 
     def search(self, query_embedding: np.ndarray, top_k: int) -> list[tuple[int, float]]:
-        if self._index.ntotal == 0:
-            return []
-        k = min(top_k, self._index.ntotal)
-        scores, indices = self._index.search(query_embedding.reshape(1, -1), k)
+        with self._lock:
+            ntotal = self._index.ntotal
+            if ntotal == 0:
+                return []
+            k = min(top_k, ntotal)
+            scores, indices = self._index.search(
+                query_embedding.reshape(1, -1).astype(np.float32), k
+            )
+        # Com IndexIDMap2 os `indices` retornados já SÃO os record_id — não
+        # há mais tradução via `_id_map`. -1 indica slot vazio (padding).
         return [
-            (self._id_map[idx], float(score))
+            (int(idx), float(score))
             for score, idx in zip(scores[0], indices[0])
-            if 0 <= idx < len(self._id_map)
+            if idx != -1
         ]
 
     def search_similar(self, embedding: np.ndarray) -> float:
@@ -1306,28 +1358,37 @@ class MemoryIndex:
         chunks de um único arquivo (ex.: leitura de um arquivo específico
         com top_k de chunks) em vez do índice inteiro.
         """
-        if not record_ids or self._index.ntotal == 0:
+        if not record_ids:
             return []
-        pos_by_id = {rid: i for i, rid in enumerate(self._id_map)}
-        q = query_embedding.reshape(-1)
+        q = query_embedding.reshape(-1).astype(np.float32)
         scored: list[tuple[int, float]] = []
-        for rid in record_ids:
-            pos = pos_by_id.get(rid)
-            if pos is None:
-                continue
-            vec = self._index.reconstruct(pos)
-            score = float(np.dot(vec, q))
-            scored.append((rid, score))
+        with self._lock:
+            if self._index.ntotal == 0:
+                return []
+            for rid in record_ids:
+                try:
+                    vec = self._index.reconstruct(int(rid))
+                except RuntimeError:
+                    continue  # id não presente no índice
+                scored.append((rid, float(np.dot(vec, q))))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:top_k]
 
-    def _save(self):
-        faiss.write_index(self._index, self._index_path)
-        np.save(self._id_map_path, np.array(self._id_map, dtype=np.int64))
+    def flush(self):
+        """Persiste o índice em disco SE houver mudanças pendentes desde o
+        último flush. Chamado periodicamente pelo `index_flush_job` e uma
+        última vez, de forma síncrona, no `shutdown()` — em vez de escrever o
+        índice inteiro a cada add()/remove_ids() (ver ITEM 1 da revisão)."""
+        with self._lock:
+            if not self._persist or not self._dirty:
+                return
+            faiss.write_index(self._index, self._index_path)
+            self._dirty = False
 
     @property
     def total(self) -> int:
-        return self._index.ntotal
+        with self._lock:
+            return self._index.ntotal
 
 
 # ── Estado global ──────────────────────────────────────────────────────────────
@@ -1339,8 +1400,6 @@ class AppState:
     lt_index:     MemoryIndex     = field(default=None)
     st_db:        ShortTermDB     = field(default=None)
     st_index:     MemoryIndex     = field(default=None)
-    pc_db:        PlanCacheDB     = field(default=None)
-    pc_index:     MemoryIndex     = field(default=None)
     vs:           Optional[VectorStore] = field(default=None)
     # ── NEW: Indexed files ──
     if_db:        IndexedFilesDB  = field(default=None)
@@ -1353,8 +1412,21 @@ class AppState:
     fd_index:     MemoryIndex     = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
+    flush_task:   asyncio.Task    = field(default=None)
 
 state = AppState()
+
+
+def _all_indices() -> list["MemoryIndex"]:
+    """Todos os índices FAISS do processo — usado pelo job de flush periódico
+    e pelo shutdown para persistir tudo de uma vez."""
+    return [
+        idx for idx in (
+            state.lt_index, state.st_index,
+            state.if_index, state.vd_index, state.fd_index,
+        )
+        if idx is not None
+    ]
 
 
 # ── Jobs em background ─────────────────────────────────────────────────────────
@@ -1363,9 +1435,25 @@ async def decay_job():
     while True:
         await asyncio.sleep(DECAY_JOB_INTERVAL_S)
         try:
-            state.lt_db.apply_decay(DECAY_HALF_LIFE_DAYS)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, state.lt_db.apply_decay, DECAY_HALF_LIFE_DAYS)
         except Exception as e:
             log.error(f"Erro no decay job: {e}")
+
+
+async def index_flush_job():
+    """Persiste em disco os índices FAISS marcados como 'sujos' desde o
+    último ciclo. Substitui o antigo `_save()` a cada escrita (ver ITEM 1 da
+    revisão) — o custo de I/O passa a ser amortizado em vez de pago a cada
+    add()/remove_ids()."""
+    while True:
+        await asyncio.sleep(INDEX_FLUSH_INTERVAL_S)
+        loop = asyncio.get_event_loop()
+        for index in _all_indices():
+            try:
+                await loop.run_in_executor(None, index.flush)
+            except Exception as e:
+                log.error(f"Erro ao persistir índice FAISS: {e}")
 
 
 async def st_cleanup_job():
@@ -1401,9 +1489,11 @@ def _resolve_vs_paths() -> tuple[str, str, str]:
         return VS_FAISS_INDEX_PATH, VS_DB_PATH, VS_FAISS_ID_MAP_PATH
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("Iniciando AVA Memory API...")
+async def startup():
+    """Inicializa o estado global da memória (DBs, índices FAISS, engine de
+    embeddings, jobs em background). Chamado pelo MCP server no startup do
+    processo — substitui o antigo `lifespan` do FastAPI."""
+    log.info("Iniciando AVA Memory (MCP)...")
 
     try:
         from onnx_client import check_health
@@ -1420,9 +1510,6 @@ async def lifespan(app: FastAPI):
 
     state.st_db    = ShortTermDB(ST_DB_PATH)
     state.st_index = MemoryIndex(ST_FAISS_INDEX_PATH, ST_FAISS_ID_MAP_PATH)
-
-    state.pc_db    = PlanCacheDB(PC_DB_PATH)
-    state.pc_index = MemoryIndex(PC_FAISS_INDEX_PATH, PC_FAISS_ID_MAP_PATH)
 
     # ── NEW: Indexed files ──
     state.if_db    = IndexedFilesDB(IF_DB_PATH)
@@ -1455,28 +1542,51 @@ async def lifespan(app: FastAPI):
 
     state.decay_task   = asyncio.create_task(decay_job())
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
+    state.flush_task   = asyncio.create_task(index_flush_job())
 
     log.info(
         f"Pronto — {state.lt_db.count()} memórias LT | "
         f"{state.st_db.count()} grupos ST | "
-        f"{state.pc_db.count()} planos em cache | "
         f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
         f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks) | "
         f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings) | "
         f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto)"
     )
-    yield
 
+
+async def shutdown():
+    """Encerra o estado global da memória de forma limpa. Chamado pelo MCP
+    server no shutdown do processo — substitui a parte pós-`yield` do antigo
+    `lifespan` do FastAPI."""
     await state.embed_engine.client.close()
 
-    state.decay_task.cancel()
-    state.cleanup_task.cancel()
-    log.info("AVA Memory API encerrada")
+    if state.decay_task is not None:
+        state.decay_task.cancel()
+    if state.cleanup_task is not None:
+        state.cleanup_task.cancel()
+    if state.flush_task is not None:
+        state.flush_task.cancel()
+
+    # Flush final e síncrono de todos os índices — garante que nada gravado
+    # desde o último ciclo do index_flush_job seja perdido ao encerrar.
+    for index in _all_indices():
+        try:
+            index.flush()
+        except Exception as e:
+            log.error(f"Erro ao persistir índice FAISS no shutdown: {e}")
+
+    log.info("AVA Memory (MCP) encerrada")
 
 
-# ── App ────────────────────────────────────────────────────────────────────────
+# ── Erros ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="AVA Memory API", lifespan=lifespan)
+class MemoryToolError(Exception):
+    """Erro de validação/negócio de uma tool de memória — equivalente ao
+    antigo HTTPException do FastAPI, mas agnóstico de transporte (MCP não
+    tem código de status HTTP). A mensagem vira o texto de erro da tool."""
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
 
 
 # ── Helpers de busca contextual ────────────────────────────────────────────────
@@ -1613,6 +1723,7 @@ def _build_lt_entries(
             access_count = row["access_count"],
             memory_type  = "long_term",
             source       = row["source"],
+            forgettable  = bool(row["forgettable"]),
         ))
         loop.run_in_executor(None, state.lt_db.update_access, row["id"])
     return entries
@@ -1770,8 +1881,23 @@ def _build_if_entries(
 
 # ── POST /write ────────────────────────────────────────────────────────────────
 
+# ── Locks de escrita (ITEM 5 da revisão) ───────────────────────────────────────
+# Cada fluxo de escrita "check existe? → embed → dedup semântico → insert" tem
+# um `await` (a chamada de embedding) no meio da checagem. Sem serializar essa
+# sequência, duas escritas quase simultâneas do mesmo conteúdo podem passar as
+# duas pela checagem de duplicata antes de qualquer uma delas inserir —
+# resultando em duplicata (exact ou semântica) ou, no caso de `text_hash`/
+# `person_key`/`concept_key` serem UNIQUE, uma exceção não tratada no insert.
+# Um `asyncio.Lock` por fluxo elimina essa corrida sem serializar o processo
+# inteiro (cada tipo de memória tem o seu).
+_lt_write_lock = asyncio.Lock()
+_st_write_lock = asyncio.Lock()
+_vd_write_lock = asyncio.Lock()
+_fd_write_lock = asyncio.Lock()
+
+
 async def _store_long_term_text(
-    text: str, source: str, confidence: float,
+    text: str, source: str, confidence: float, forgettable: bool = True,
 ) -> tuple[bool, str, Optional[int]]:
     """
     Lógica compartilhada de gravação em memória de longo prazo — usada tanto
@@ -1782,30 +1908,45 @@ async def _store_long_term_text(
     text = text.strip()
     if len(text) < 10:
         return False, "too_short", None
-    if state.lt_db.exists_exact(text):
-        return False, "duplicate_exact", None
 
-    embedding = await state.embed_engine.embed_one(text)
+    loop = asyncio.get_event_loop()
 
-    max_sim = state.lt_index.search_similar(embedding)
-    if max_sim >= DEDUP_THRESHOLD:
-        return False, f"duplicate_semantic:{max_sim:.3f}", None
+    async with _lt_write_lock:
+        if state.lt_db.exists_exact(text):
+            return False, "duplicate_exact", None
 
-    memory_id = state.lt_db.insert(text, source, confidence)
-    state.lt_index.add(embedding, memory_id)
+        embedding = await state.embed_engine.embed_one(text)
+
+        max_sim = state.lt_index.search_similar(embedding)
+        if max_sim >= DEDUP_THRESHOLD:
+            return False, f"duplicate_semantic:{max_sim:.3f}", None
+
+        try:
+            memory_id = state.lt_db.insert(text, source, confidence, forgettable)
+        except sqlite3.IntegrityError:
+            # Rede de segurança: mesmo com o lock, cobre o caso de outro
+            # processo/writer ter inserido o mesmo texto entre o check e o
+            # insert (ex.: dois workers do MCP).
+            log.warning(f"LT: corrida de duplicata detectada no insert — '{text[:60]}'")
+            return False, "duplicate_exact", None
+
+        # add() faz uma cópia/realocação em C++ — pequena, mas offload pro
+        # executor mantém o event loop livre mesmo sob concorrência alta.
+        await loop.run_in_executor(None, state.lt_index.add, embedding, memory_id)
+
     log.info(f"LT #{memory_id} gravada: {text[:60]}")
     return True, "ok", memory_id
 
 
-@app.post("/write", response_model=WriteResponse)
 async def write_memory(req: WriteRequest):
-    stored, reason, memory_id = await _store_long_term_text(req.text, req.source, req.confidence)
+    stored, reason, memory_id = await _store_long_term_text(
+        req.text, req.source, req.confidence, req.forgettable,
+    )
     return WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
 
 
 # ── POST /write_st ─────────────────────────────────────────────────────────────
 
-@app.post("/write_st", response_model=WriteSTResponse)
 async def write_short_term(req: WriteSTRequest):
     if not req.turns:
         return WriteSTResponse(stored=False, reason="no_turns")
@@ -1815,14 +1956,18 @@ async def write_short_term(req: WriteSTRequest):
         return WriteSTResponse(stored=False, reason="too_short")
 
     embed_text = "\n".join(f"{t.role}: {t.content}" for t in req.turns)
-    embedding = await state.embed_engine.embed_one(embed_text)
+    loop = asyncio.get_event_loop()
 
-    max_sim = state.st_index.search_similar(embedding)
-    if max_sim >= DEDUP_THRESHOLD:
-        return WriteSTResponse(stored=False, reason=f"duplicate_semantic:{max_sim:.3f}")
+    async with _st_write_lock:
+        embedding = await state.embed_engine.embed_one(embed_text)
 
-    group_id = state.st_db.insert(req.session_id, req.turns, embed_text)
-    state.st_index.add(embedding, group_id)
+        max_sim = state.st_index.search_similar(embedding)
+        if max_sim >= DEDUP_THRESHOLD:
+            return WriteSTResponse(stored=False, reason=f"duplicate_semantic:{max_sim:.3f}")
+
+        group_id = state.st_db.insert(req.session_id, req.turns, embed_text)
+        await loop.run_in_executor(None, state.st_index.add, embedding, group_id)
+
     log.info(f"ST #{group_id} gravado — session={req.session_id} turnos={len(req.turns)}: {embed_text[:80]}")
     return WriteSTResponse(stored=True, reason="ok", turn_ids=[group_id])
 
@@ -1832,11 +1977,10 @@ async def write_short_term(req: WriteSTRequest):
 # de uma sessão, sem embeddings/scoring — pensado para o LLM montar o
 # histórico de conversa como contexto (mais leve/rápido que /read).
 
-@app.post("/read_st", response_model=ReadSTResponse)
 async def read_short_term(req: ReadSTRequest):
     session_id = req.session_id.strip()
     if not session_id:
-        raise HTTPException(status_code=400, detail="session_id vazio")
+        raise MemoryToolError("session_id vazio")
 
     n_pairs = req.n_pairs if req.n_pairs > 0 else ST_READ_DEFAULT_PAIRS
     loop = asyncio.get_event_loop()
@@ -1851,11 +1995,10 @@ async def read_short_term(req: ReadSTRequest):
 
 # ── POST /read ─────────────────────────────────────────────────────────────────
 
-@app.post("/read", response_model=ReadResponse)
 async def read_memory(req: ReadRequest):
     query = req.query.strip()
     if not query:
-        raise HTTPException(status_code=400, detail="query vazia")
+        raise MemoryToolError("query vazia")
 
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
@@ -1970,17 +2113,13 @@ async def read_memory(req: ReadRequest):
 
 # ── DELETE /session/{session_id} ───────────────────────────────────────────────
 
-@app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    rows = state.st_db._conn.execute(
-        "SELECT id FROM turn_groups WHERE session_id = ?", (session_id,)
-    ).fetchall()
-    ids_to_remove = {row["id"] for row in rows}
+    ids_to_remove = set(state.st_db.get_ids_by_session(session_id))
 
     if not ids_to_remove:
         return {"cleared": 0, "session_id": session_id}
 
-    state.st_db._conn.execute("DELETE FROM turn_groups WHERE session_id = ?", (session_id,))
+    state.st_db.delete_by_session(session_id)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, state.st_index.remove_ids, ids_to_remove)
     log.info(f"Sessão {session_id}: {len(ids_to_remove)} grupos removidos")
@@ -1991,7 +2130,6 @@ async def clear_session(session_id: str):
 # NEW: Arquivos Indexados — /indexed-file/*
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/indexed-file/write", response_model=IndexedFileWriteResponse)
 async def indexed_file_write(req: IndexedFileWriteRequest):
     """
     Armazena o conteúdo COMPLETO de um arquivo indexado.
@@ -2116,8 +2254,8 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     else:
         # Fallback: add one by one if sizes don't match
         log.warning("Chunk/embedding size mismatch — adding individually")
-        for i, (emb, cid) in enumerate(zip(embeddings, chunk_ids)):
-            state.if_index.add(emb, cid)
+        for emb, cid in zip(embeddings, chunk_ids):
+            await loop.run_in_executor(None, state.if_index.add, emb, cid)
 
     hash_match = (
         existing is not None
@@ -2141,7 +2279,6 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     )
 
 
-@app.post("/indexed-file/read", response_model=IndexedFileReadResponse)
 async def indexed_file_read(req: IndexedFileReadRequest):
     """
     Lê arquivos indexados. Três modos, mutuamente exclusivos:
@@ -2243,7 +2380,7 @@ async def indexed_file_read(req: IndexedFileReadRequest):
 
     # ── Modo 3: busca semântica entre todos os arquivos ──
     if not query:
-        raise HTTPException(status_code=400, detail="informe 'file_path' (leitura exata) ou 'query' (busca semântica)")
+        raise MemoryToolError("informe 'file_path' (leitura exata) ou 'query' (busca semântica)")
 
     if state.if_index.total == 0:
         return IndexedFileReadResponse(results=[], query=query)
@@ -2317,7 +2454,6 @@ async def indexed_file_read(req: IndexedFileReadRequest):
     return IndexedFileReadResponse(results=results[:req.top_k], query=query)
 
 
-@app.get("/indexed-file/check", response_model=IndexedFileCheckResponse)
 async def indexed_file_check(file_path: str):
     """
     Verifica se um arquivo está indexado e se o hash bate.
@@ -2328,7 +2464,7 @@ async def indexed_file_check(file_path: str):
       - hash_match=False → indexado mas arquivo mudou → reindexar
     """
     if not file_path:
-        raise HTTPException(status_code=400, detail="file_path vazio")
+        raise MemoryToolError("file_path vazio")
 
     row = state.if_db.get_by_path(file_path)
     if row is None:
@@ -2347,14 +2483,13 @@ async def indexed_file_check(file_path: str):
     )
 
 
-@app.get("/indexed-file/{file_id}")
 async def indexed_file_get(file_id: int):
     """
     Retorna o conteúdo completo de um arquivo indexado pelo seu ID.
     """
     row = state.if_db.get_by_id(file_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Arquivo indexado #{file_id} não encontrado")
+        raise MemoryToolError(f"Arquivo indexado #{file_id} não encontrado")
 
     chunks = state.if_db.get_chunks_by_file(file_id)
 
@@ -2377,7 +2512,6 @@ async def indexed_file_get(file_id: int):
 
 
 
-@app.get("/indexed-file/chunk/{chunk_id}")
 async def get_chunk_by_id(chunk_id: int):
     row = state.if_db._conn.execute(
         "SELECT c.*, f.file_path, f.file_hash, f.content "
@@ -2386,7 +2520,7 @@ async def get_chunk_by_id(chunk_id: int):
         "WHERE c.id = ?", (chunk_id,)
     ).fetchone()
     if row is None:
-        raise HTTPException(404, f"Chunk #{chunk_id} não encontrado")
+        raise MemoryToolError(f"Chunk #{chunk_id} não encontrado")
     return {
         "chunk_id": row["id"],
         "file_path": row["file_path"],
@@ -2398,14 +2532,13 @@ async def get_chunk_by_id(chunk_id: int):
     }
 
 
-@app.delete("/indexed-file/{file_id}")
 async def indexed_file_delete(file_id: int):
     """
     Remove um arquivo indexado e todos os seus chunks (DB + FAISS).
     """
     row = state.if_db.get_by_id(file_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Arquivo indexado #{file_id} não encontrado")
+        raise MemoryToolError(f"Arquivo indexado #{file_id} não encontrado")
 
     # Remove FAISS vectors first
     chunk_ids = state.if_db.get_chunk_ids_by_file(file_id)
@@ -2420,13 +2553,12 @@ async def indexed_file_delete(file_id: int):
     return {"deleted": deleted, "file_id": file_id, "chunks_removed": len(chunk_ids)}
 
 
-@app.delete("/indexed-file/path")
 async def indexed_file_delete_by_path(file_path: str):
     """
     Remove um arquivo indexado pelo caminho.
     """
     if not file_path:
-        raise HTTPException(status_code=400, detail="file_path vazio")
+        raise MemoryToolError("file_path vazio")
 
     row = state.if_db.get_by_path(file_path)
     if row is None:
@@ -2435,7 +2567,6 @@ async def indexed_file_delete_by_path(file_path: str):
     return await indexed_file_delete(row["id"])
 
 
-@app.get("/indexed-file")
 async def indexed_file_list():
     """
     Lista todos os arquivos indexados com metadados.
@@ -2466,42 +2597,50 @@ async def indexed_file_list():
 # conceito já existente, e é quem guarda tudo (FAISS + SQLite + memória de
 # longo prazo).
 
-@app.post("/visual-dict/write", response_model=VisualDictWriteResponse)
 async def visual_dict_write(req: VisualDictWriteRequest):
     concept_name = req.concept_name.strip()
     description  = req.description.strip()
     if not concept_name:
         return VisualDictWriteResponse(stored=False, reason="empty_concept_name")
     if len(req.embedding) != VD_EMBED_DIM:
-        raise HTTPException(
-            status_code=400,
-            detail=f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}",
-        )
+        raise MemoryToolError(f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}")
 
     vec = np.asarray(req.embedding, dtype=np.float32)
     norm = float(np.linalg.norm(vec))
     if norm > 0:
         vec = vec / norm
 
-    existing = state.vd_db.get_by_name(concept_name)
-    new_concept = existing is None
+    loop = asyncio.get_event_loop()
 
-    if existing is not None:
-        concept_id = existing["id"]
-        memory_id  = existing["memory_id"]
-    else:
-        memory_id = None
-        if req.link_to_memory and description:
-            _, _, memory_id = await _store_long_term_text(
-                f"{concept_name}: {description}", "visual_dict", req.confidence,
-            )
-        concept_id = state.vd_db.insert_concept(
-            concept_name, description, req.source, req.confidence, memory_id,
-        )
-        log.info(f"Visual-dict: novo conceito #{concept_id} criado — '{concept_name}'")
+    async with _vd_write_lock:
+        existing = state.vd_db.get_by_name(concept_name)
+        new_concept = existing is None
 
-    embedding_id = state.vd_db.insert_embedding(concept_id)
-    state.vd_index.add(vec, embedding_id)
+        if existing is not None:
+            concept_id = existing["id"]
+            memory_id  = existing["memory_id"]
+        else:
+            memory_id = None
+            if req.link_to_memory and description:
+                _, _, memory_id = await _store_long_term_text(
+                    f"{concept_name}: {description}", "visual_dict", req.confidence,
+                )
+            try:
+                concept_id = state.vd_db.insert_concept(
+                    concept_name, description, req.source, req.confidence, memory_id,
+                )
+            except sqlite3.IntegrityError:
+                # Corrida: outro write criou o mesmo concept_key nesse meio-tempo.
+                existing = state.vd_db.get_by_name(concept_name)
+                if existing is None:
+                    raise
+                concept_id, memory_id, new_concept = existing["id"], existing["memory_id"], False
+            else:
+                log.info(f"Visual-dict: novo conceito #{concept_id} criado — '{concept_name}'")
+
+        embedding_id = state.vd_db.insert_embedding(concept_id)
+        await loop.run_in_executor(None, state.vd_index.add, vec, embedding_id)
+
     log.info(
         f"Visual-dict: embedding #{embedding_id} gravado p/ conceito #{concept_id} "
         f"({'novo' if new_concept else 'exemplo adicional'})"
@@ -2513,13 +2652,9 @@ async def visual_dict_write(req: VisualDictWriteRequest):
     )
 
 
-@app.post("/visual-dict/read", response_model=VisualDictReadResponse)
 async def visual_dict_read(req: VisualDictReadRequest):
     if len(req.embedding) != VD_EMBED_DIM:
-        raise HTTPException(
-            status_code=400,
-            detail=f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}",
-        )
+        raise MemoryToolError(f"embedding deve ter dimensão {VD_EMBED_DIM}, recebido {len(req.embedding)}")
 
     vec = np.asarray(req.embedding, dtype=np.float32)
     norm = float(np.linalg.norm(vec))
@@ -2568,7 +2703,6 @@ async def visual_dict_read(req: VisualDictReadRequest):
     return VisualDictReadResponse(results=results, ambiguous=ambiguous)
 
 
-@app.get("/visual-dict", response_model=dict)
 async def visual_dict_list():
     rows = state.vd_db.list_concepts()
     concepts = [
@@ -2588,11 +2722,10 @@ async def visual_dict_list():
     return {"total": len(concepts), "concepts": concepts}
 
 
-@app.get("/visual-dict/{concept_id}", response_model=VisualDictEntry)
 async def visual_dict_get(concept_id: int):
     row = state.vd_db.get_concept_by_id(concept_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Conceito visual #{concept_id} não encontrado")
+        raise MemoryToolError(f"Conceito visual #{concept_id} não encontrado")
     return VisualDictEntry(
         concept_id=row["id"],
         concept_name=row["concept_name"],
@@ -2606,12 +2739,11 @@ async def visual_dict_get(concept_id: int):
     )
 
 
-@app.delete("/visual-dict/{concept_id}")
 async def visual_dict_delete(concept_id: int):
     """Remove um conceito visual e todos os seus embeddings (DB + FAISS)."""
     row = state.vd_db.get_concept_by_id(concept_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Conceito visual #{concept_id} não encontrado")
+        raise MemoryToolError(f"Conceito visual #{concept_id} não encontrado")
 
     embedding_ids = state.vd_db.get_embedding_ids_by_concept(concept_id)
     if embedding_ids:
@@ -2630,17 +2762,13 @@ async def visual_dict_delete(concept_id: int):
 # manda pra cá. Aqui decide-se se é uma pessoa nova ou mais um exemplo de
 # uma pessoa já cadastrada.
 
-@app.post("/face-dict/write", response_model=FaceDictWriteResponse)
 async def face_dict_write(req: FaceDictWriteRequest):
     person_name = req.person_name.strip()
     if not person_name:
         return FaceDictWriteResponse(stored=False, reason="empty_person_name")
 
     if len(req.embedding) != FD_EMBED_DIM:
-        raise HTTPException(
-            status_code=400,
-            detail=f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}",
-        )
+        raise MemoryToolError(f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}")
 
     vec = np.asarray(req.embedding, dtype=np.float32)
     norm = float(np.linalg.norm(vec))
@@ -2648,23 +2776,33 @@ async def face_dict_write(req: FaceDictWriteRequest):
         vec = vec / norm
 
     description = req.description.strip()
-    existing = state.fd_db.get_by_name(person_name)
-    new_person = existing is None
+    loop = asyncio.get_event_loop()
 
-    if existing is not None:
-        person_id = existing["id"]
-        # se veio uma descrição não-vazia num cadastro de exemplo adicional,
-        # atualiza/completa a descrição já salva (permite corrigir depois)
-        if description:
-            state.fd_db.update_description(person_id, description)
-    else:
-        person_id = state.fd_db.insert_person(
-            person_name=person_name, description=description,
-            source=req.source, confidence=req.confidence,
-        )
+    async with _fd_write_lock:
+        existing = state.fd_db.get_by_name(person_name)
+        new_person = existing is None
 
-    embedding_id = state.fd_db.insert_embedding(person_id)
-    state.fd_index.add(vec, embedding_id)
+        if existing is not None:
+            person_id = existing["id"]
+            # se veio uma descrição não-vazia num cadastro de exemplo adicional,
+            # atualiza/completa a descrição já salva (permite corrigir depois)
+            if description:
+                state.fd_db.update_description(person_id, description)
+        else:
+            try:
+                person_id = state.fd_db.insert_person(
+                    person_name=person_name, description=description,
+                    source=req.source, confidence=req.confidence,
+                )
+            except sqlite3.IntegrityError:
+                # Corrida: outro write criou a mesma person_key nesse meio-tempo.
+                existing = state.fd_db.get_by_name(person_name)
+                if existing is None:
+                    raise
+                person_id, new_person = existing["id"], False
+
+        embedding_id = state.fd_db.insert_embedding(person_id)
+        await loop.run_in_executor(None, state.fd_index.add, vec, embedding_id)
 
     log.info(
         f"Face-dict: {'nova pessoa' if new_person else 'novo exemplo'} "
@@ -2677,13 +2815,9 @@ async def face_dict_write(req: FaceDictWriteRequest):
     )
 
 
-@app.post("/face-dict/read", response_model=FaceDictReadResponse)
 async def face_dict_read(req: FaceDictReadRequest):
     if len(req.embedding) != FD_EMBED_DIM:
-        raise HTTPException(
-            status_code=400,
-            detail=f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}",
-        )
+        raise MemoryToolError(f"embedding deve ter dimensão {FD_EMBED_DIM}, recebido {len(req.embedding)}")
 
     vec = np.asarray(req.embedding, dtype=np.float32)
     norm = float(np.linalg.norm(vec))
@@ -2731,7 +2865,6 @@ async def face_dict_read(req: FaceDictReadRequest):
     return FaceDictReadResponse(results=results, ambiguous=ambiguous)
 
 
-@app.get("/face-dict", response_model=dict)
 async def face_dict_list():
     rows = state.fd_db.list_people()
     people = [
@@ -2750,11 +2883,10 @@ async def face_dict_list():
     return {"total": len(people), "people": people}
 
 
-@app.get("/face-dict/{person_id}", response_model=FaceDictEntry)
 async def face_dict_get(person_id: int):
     row = state.fd_db.get_person_by_id(person_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
     return FaceDictEntry(
         person_id=row["id"],
         person_name=row["person_name"],
@@ -2770,13 +2902,12 @@ async def face_dict_get(person_id: int):
 class FaceDictUpdateRequest(BaseModel):
     description: str
 
-@app.patch("/face-dict/{person_id}", response_model=FaceDictEntry)
 async def face_dict_update(person_id: int, req: FaceDictUpdateRequest):
     """Edita só a descrição de uma pessoa já cadastrada, sem precisar
     mandar um novo embedding junto."""
     row = state.fd_db.get_person_by_id(person_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
     state.fd_db.update_description(person_id, req.description.strip())
     row = state.fd_db.get_person_by_id(person_id)
     return FaceDictEntry(
@@ -2791,12 +2922,11 @@ async def face_dict_update(person_id: int, req: FaceDictUpdateRequest):
     )
 
 
-@app.delete("/face-dict/{person_id}")
 async def face_dict_delete(person_id: int):
     """Remove uma pessoa e todos os seus embeddings de rosto (DB + FAISS)."""
     row = state.fd_db.get_person_by_id(person_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Pessoa #{person_id} não encontrada")
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
 
     embedding_ids = state.fd_db.get_embedding_ids_by_person(person_id)
     if embedding_ids:
@@ -2810,7 +2940,6 @@ async def face_dict_delete(person_id: int):
 
 # ── GET /status ────────────────────────────────────────────────────────────────
 
-@app.get("/status")
 async def status():
     resp = {
         "long_term": {
@@ -2824,11 +2953,6 @@ async def status():
             "index_vectors":      state.st_index.total,
             "ttl_hours":          ST_TTL_HOURS,
             "cleanup_interval_s": ST_CLEANUP_INTERVAL_S,
-        },
-        "plan_cache": {
-            "entries_total":  state.pc_db.count(),
-            "index_vectors":  state.pc_index.total,
-            "hit_threshold":  PC_HIT_THRESHOLD,
         },
         "contextual_search": {
             "query_short_words":     QUERY_SHORT_WORDS,
@@ -2899,10 +3023,3 @@ async def status():
             "vectors_in_index": 0,
         }
     return resp
-
-
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("memory:app", host="0.0.0.0", port=3001, log_level="info")

@@ -27,26 +27,40 @@ Resumo do fluxo:
                                         → resultado (role=tool) → repete]
                                      → [com tool_call finish: FIM]
 
-Módulos expostos como tools: memory (read/write), search, deep_search, vision,
-local_scraping, alpha_code.
+Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
+  - vision_objects: exige troca de modo do llama-server (texto↔multimodal)
+    e reuso do histórico real da conversa. Auto-finish especial.
+  - finish: primitiva de controle do próprio loop, não uma capacidade externa.
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
-Integra os microserviços AVA:
-  - Memory          (port 3001)  — long-term, short-term, knowledge
-  - Search          (port 3002)  — web search + page/URL extraction via
-                                    Tavily API (free tier, 1000 créditos/mês);
-                                    resultados já vêm ranqueados por
-                                    relevância e com o conteúdo real da
-                                    página — a qualidade do resultado ainda
-                                    depende da query formulada pelo modelo
-                                    (ver tools "search" e "read_url")
-  - Local Scraping  (port 3003)  — local file search, read & indexing
+Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
+  memory (read/write), search, read_url, local_scraping, alpha_code,
+  playwright (automação de navegador — microsoft/playwright-mcp, via npx,
+  conectado ao Chrome REAL do usuário via CDP — ver _ensure_chrome_debug —
+  em vez de um Chromium automatizado isolado, pra evitar detecção antibot).
+  Em vez de um executor Python hardcoded por tool + conversão manual pro
+  schema OpenAI, cada um desses agora é um servidor MCP separado. O loop
+  primeiro escolhe a "skill" (servidor) relevante pra pergunta do usuário
+  usando só os resumos em MCP_SKILLS (~1 linha cada, barato em tokens),
+  e SÓ ENTÃO conecta e lista as tools reais daquele servidor — evita
+  carregar o schema de tools não usadas no contexto do modelo local.
+
+  Memory deixou de ser um microserviço HTTP (antigo port 3001, FastAPI) e
+  virou 100% MCP (`mcp_servers/memory_server.py`, que importa a lógica de
+  `Modules/memory.py` diretamente). Tanto as leituras/escritas que o modelo
+  decide chamar quanto o bookkeeping interno do orchestrator (turnos de
+  curto prazo, indexação de arquivos via /local-scraping, limpeza de
+  sessão) passam pela mesma sessão MCP — ver `_get_mcp_session("memory")`
+  e o helper `_call_memory_tool(...)`.
+
+Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
   - LLM Chat        (port 4003)  — conversational inference (llama-server)
-  - Vision / VQA    (port 4002)  — image understanding
-  - Deep Search     (port 4005)  — KG-RAG com pesquisa web automática
-  - Alpha Code      (port 4006)  — agente de geração/edição de código
+  - Vision / VQA    (port 4002)  — image understanding (tool nativa)
+  - Local Scraping  (port 3003)  — endpoint REST próprio da TUI (/local-scraping),
+                                    independente da tool MCP homônima
+Process manager (port 9001) segue controlando o llama-server/Docker.
 """
 from __future__ import annotations
 
@@ -57,22 +71,28 @@ import logging
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 import datetime
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 
+# ── MCP (Model Context Protocol) — cliente usado pelas tools externas ──
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+max
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
-MEMORY_URL           = "http://localhost:3001"
+# MEMORY_URL removido — a memória não é mais um serviço REST (porta 3001).
+# Ela agora é o servidor MCP "memory" (ver MCP_SKILLS), acessado via
+# _get_mcp_session("memory") / _call_memory_tool(...).
 SEARCH_URL           = "http://localhost:3002"
 LOCAL_SCRAPING_URL   = "http://localhost:3003"
 TTS_URL              = "http://localhost:3004"
@@ -80,19 +100,84 @@ LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
 DEEP_SEARCH_URL      = "http://localhost:4005"
 ALPHA_CODE_URL       = "http://localhost:4006"
+# shell_command_api.py — abre/derruba o Chrome real do usuário (debugging
+# remoto via CDP), usado para dar ao playwright-mcp um navegador com
+# fingerprint/cookies/sessão genuínos em vez do Chromium automatizado que
+# ele lançaria sozinho (ver MCP_SKILLS["playwright"] e _ensure_chrome_debug).
+#
+# ATENÇÃO — CONFLITO DE PORTA: o default de shell_command_api.py
+# (AGENT_SHELL_API_PORT) também é 4005, igual ao DEEP_SEARCH_URL acima.
+# Suba o shell_command_api.py com `AGENT_SHELL_API_PORT=4007` (env var) ou
+# ajuste SHELL_COMMAND_URL/CHROME_DEBUG_PORT abaixo para combinar com a
+# porta que você realmente usar.
+SHELL_COMMAND_URL    = "http://localhost:4007"
+CHROME_DEBUG_PORT    = 9222  # mesmo default de COMMAND_REGISTRY["launch_chrome_debug"]
 # Gerenciador de processos (Rust/axum) que sobe/derruba o llama-server e
 # permite trocar entre modo texto e multimodal via /llama/switch_mode.
 PROCESS_MANAGER_URL  = "http://localhost:9001"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MCP Skills Registry — descoberta em duas etapas
+# ══════════════════════════════════════════════════════════════════════════════
+# Etapa 1: o modelo vê só `skill_summary` (barato, ~10-20 tokens cada) e
+# escolhe quais servidores são relevantes pro pedido do usuário.
+# Etapa 2: SÓ ENTÃO conectamos (stdio) e chamamos list_tools() nos
+# servidores escolhidos, carregando o schema completo das tools reais.
+#
+# Substitui os antigos executores hardcoded (_tool_memory_read,
+# _tool_memory_write, _tool_search, _tool_read_url, _tool_local_scraping,
+# _tool_alpha_code) — cada um vira, em vez de uma função Python fixa, um
+# servidor MCP que expõe sua própria lista de tools dinamicamente.
+@dataclass
+class MCPSkill:
+    skill_summary: str                 # descrição curta, usada na etapa 1
+    command: str                       # executável do servidor MCP (stdio)
+    args: list[str] = field(default_factory=list)
+    env: Optional[dict[str, str]] = None
+    # Hook opcional, chamado (awaited) uma única vez, ANTES de subir o
+    # processo stdio, na primeira conexão da skill. Devolve uma lista de
+    # args extras a concatenar em `args` — usado pelo "playwright" pra
+    # resolver dinamicamente o --cdp-endpoint do Chrome real (só se sabe a
+    # porta depois de perguntar pro shell_command_api). None = nenhum extra.
+    pre_connect: Optional[Callable[[], "asyncio.Future[list[str]]"]] = None
+
+MCP_SKILLS: dict[str, MCPSkill] = {
+    "memory": MCPSkill(
+        skill_summary="Grava e busca fatos/contexto salvos na memória de longo/curto prazo.",
+        command="python", args=["mcp_servers/memory_server.py"],
+    ),
+    "playwright": MCPSkill(
+        skill_summary=(
+        "Controla um navegador de verdade (Chrome/Chromium) para acessar sites, clicar em "
+        "botões/links, preencher formulários, rolar a página, tirar screenshot e ler o "
+        "conteúdo real de uma página depois de carregada — inclusive sites que mudam "
+        "dinamicamente (JavaScript, login, resultados de busca renderizados no navegador). "
+        "Use sempre que o pedido envolver ABRIR, NAVEGAR, VISITAR ou INTERAGIR com um site "
+        "específico (ex: 'abra o YouTube', 'entra no meu email', 'clica no primeiro "
+        "resultado', 'tira um print da página', 'preenche esse formulário'). "
+        "Diferente de busca simples: isso não é pra pesquisar um termo na web, é pra "
+        "efetivamente controlar um navegador e ver/interagir com uma página real."
+    ),  command="npx", args=["-y", "@playwright/mcp@latest"],
+        pre_connect=lambda: _ensure_chrome_debug(),
+    ),
+    # Novos MCPs (ex.: sandbox, telegram, tts) entram aqui — só precisam de
+    # um `skill_summary` e dos parâmetros de conexão, nada no loop principal
+    # muda pra suportar um servidor a mais.
+}
+
+# "memory" removido daqui — não é mais um serviço HTTP com endpoint de
+# health próprio; sua saúde é checada via MCP (ver /status).
 HEALTH_PATHS: dict[str, str] = {
-    "memory": "/status", "search": "/status", "local_scraping": "/status", "tts": "/status",
+    "search": "/status", "local_scraping": "/status", "tts": "/status",
     "llm": "/health", "vision": "/vision/status", "deep_search": "/health", "alpha_code": "/health",
     "process_manager": "/status",
 }
 
 # Timeout por tool (usado tanto para chamadas de tool quanto pro loop de seleção)
+# memory_read/memory_write saíram daqui — agora são tools MCP, com timeout
+# controlado pela própria sessão MCP, não por este dict de tools nativas.
 EXECUTOR_TIMEOUTS: dict[str, float] = {
-    "llm": 9999999.0, "memory_read": 60.0, "memory_write": 30.0, "search": 60.0,
+    "llm": 9999999.0, "search": 60.0,
     "read_url": 30.0, "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
     "local_scraping": 9999999.0, "alpha_code": 9999999.0,
 }
@@ -116,7 +201,10 @@ THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     10: "This is a maximally complex task requiring deep, exhaustive reasoning. Think as carefully and thoroughly as possible before responding. Decompose every sub-problem, reason from first principles at each step, validate every intermediate conclusion, consider all relevant edge cases and counter-arguments, and synthesize a complete, precise, and well-justified response. Take as much reasoning space as needed — correctness and depth are the priority.",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("AVA_DEBUG") else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("ava.orchestrator")
 
 
@@ -185,7 +273,8 @@ class AlphaCodeRequest(BaseModel):
 
 @dataclass
 class AppState:
-    memory_client: httpx.AsyncClient = field(default=None)
+    # memory_client (httpx REST) removido — memória agora é MCP, ver
+    # mcp_sessions["memory"] / _call_memory_tool().
     search_client: httpx.AsyncClient = field(default=None)
     tts_client: httpx.AsyncClient = field(default=None)
     llm_client: httpx.AsyncClient = field(default=None)
@@ -194,15 +283,123 @@ class AppState:
     local_scraping_client: httpx.AsyncClient = field(default=None)
     alpha_code_client: httpx.AsyncClient = field(default=None)
     process_manager_client: httpx.AsyncClient = field(default=None)
+    # shell_command_api.py — abre/derruba o Chrome real (debug CDP), usado
+    # pela skill "playwright" via _ensure_chrome_debug.
+    shell_client: httpx.AsyncClient = field(default=None)
+    # ── MCP: pilha de contexto que mantém os processos stdio vivos, e um
+    # cache de sessões já conectadas (lazy — só conecta na primeira vez que
+    # uma skill é escolhida, não em todas as MCP_SKILLS no boot) ──
+    mcp_stack: AsyncExitStack = field(default=None)
+    mcp_sessions: dict[str, ClientSession] = field(default_factory=dict)
 
 state = AppState()
+
+
+async def _ensure_chrome_debug() -> list[str]:
+    """`pre_connect` da skill "playwright": garante que existe um Chrome de
+    verdade (com o profile REAL do usuário — cookies, sessões logadas,
+    extensões) escutando debugging remoto via CDP, pedindo isso ao
+    shell_command_api.py (mesmo padrão de client HTTP do resto do
+    orchestrator — ver alpha_code.py). Devolve os args extras
+    (`--cdp-endpoint ...`) que fazem o playwright-mcp conectar NELE em vez
+    de lançar seu próprio Chromium automatizado — é isso que evita o
+    antibot: aos olhos do site, é o mesmo Chrome que o usuário já usa
+    normalmente, não um navegador headless/isolado recém-criado.
+
+    `launch_chrome_debug` é idempotente (o próprio shell_command_api
+    devolve `already_running: True` se a porta já estiver de pé), então
+    chamar isso toda vez que a skill "playwright" conecta é seguro — não
+    abre um Chrome novo a cada conversa.
+    """
+    if state.shell_client is None:
+        state.shell_client = httpx.AsyncClient(
+            base_url=SHELL_COMMAND_URL, timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+    try:
+        r = await state.shell_client.post("/command", json={
+            "command": "launch_chrome_debug",
+            "params": {"port": CHROME_DEBUG_PORT},
+        })
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("error") or "launch_chrome_debug falhou")
+        port = (data.get("result") or {}).get("port", CHROME_DEBUG_PORT)
+    except Exception as e:
+        # Falha aqui não deveria travar o resto do orchestrator — só a
+        # skill "playwright" fica indisponível até o shell_command_api
+        # voltar. Propaga pra _get_mcp_session logar e devolver erro à
+        # tool call, em vez de silenciosamente conectar num Chrome que não
+        # existe.
+        raise RuntimeError(
+            f"Não consegui garantir o Chrome debug via shell_command_api "
+            f"({SHELL_COMMAND_URL}): {e}"
+        ) from e
+
+    log.info(f"Chrome debug pronto na porta {port} (via shell_command_api) — playwright-mcp vai conectar via CDP")
+    return ["--cdp-endpoint", f"http://localhost:{port}"]
+
+
+async def _get_mcp_session(skill_name: str) -> ClientSession:
+    """Retorna a ClientSession do servidor MCP daquela skill, conectando
+    (e mantendo viva pro resto do processo, via state.mcp_stack) na
+    primeira vez que a skill é usada."""
+    if skill_name in state.mcp_sessions:
+        log.debug(f"[_get_mcp_session] '{skill_name}' já conectado, reusando sessão")
+        return state.mcp_sessions[skill_name]
+    skill = MCP_SKILLS[skill_name]
+    args = list(skill.args)
+    if skill.pre_connect is not None:
+        log.debug(f"[_get_mcp_session] '{skill_name}': rodando pre_connect...")
+        try:
+            extra_args = await skill.pre_connect()
+        except Exception as e:
+            log.error(f"[_get_mcp_session] '{skill_name}': pre_connect FALHOU — skill "
+                      f"ficará indisponível nesta rodada: {type(e).__name__}: {e}")
+            raise
+        log.debug(f"[_get_mcp_session] '{skill_name}': pre_connect ok, args extras: {extra_args}")
+        args.extend(extra_args)
+    log.debug(f"[_get_mcp_session] '{skill_name}': lançando `{skill.command} {' '.join(args)}`")
+    server_params = StdioServerParameters(command=skill.command, args=args, env=skill.env)
+    t0 = time.perf_counter()
+    read, write = await state.mcp_stack.enter_async_context(stdio_client(server_params))
+    session = await state.mcp_stack.enter_async_context(ClientSession(read, write))
+    await session.initialize()
+    state.mcp_sessions[skill_name] = session
+    log.info(f"MCP: conectado à skill '{skill_name}' em {(time.perf_counter()-t0)*1000:.0f}ms")
+    return session
+
+
+async def _call_memory_tool(tool_name: str, arguments: dict) -> Any:
+    """Chama uma tool do servidor MCP "memory" (mcp_servers/memory_server.py)
+    e devolve o resultado já desserializado (dict/list/str conforme o JSON
+    retornado pela tool). Substitui as antigas chamadas REST
+    `state.memory_client.post(...)` — não existe mais um serviço HTTP de
+    memória, só o processo MCP (stdio) conectado via _get_mcp_session.
+
+    Levanta a exceção original se a tool reportar erro (isError=True) ou se
+    a conexão MCP falhar — quem chama decide como tratar (fallback,
+    HTTPException, log-and-ignore, etc.).
+    """
+    session = await _get_mcp_session("memory")
+    result = await session.call_tool(tool_name, arguments)
+    if getattr(result, "isError", False):
+        detail = result.content[0].text if result.content else "erro desconhecido"
+        raise RuntimeError(f"memory tool '{tool_name}' falhou: {detail}")
+    if not result.content:
+        return None
+    text = result.content[0].text
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Orchestrator (tool-calling engine, sem router/CoT)...")
 
     service_urls = {
-        "memory": MEMORY_URL, "search": SEARCH_URL, "local_scraping": LOCAL_SCRAPING_URL,
+        "search": SEARCH_URL, "local_scraping": LOCAL_SCRAPING_URL,
         "tts": TTS_URL, "llm": LLM_URL, "vision": VISION_URL,
         "deep_search": DEEP_SEARCH_URL, "alpha_code": ALPHA_CODE_URL,
         "process_manager": PROCESS_MANAGER_URL,
@@ -214,11 +411,13 @@ async def lifespan(app: FastAPI):
                 log.info(f"  ✓ {name:16s} OK" if r.status_code == 200 else f"  ⚠ {name:16s} {r.status_code}")
             except httpx.ConnectError:
                 log.warning(f"  ✗ {name:16s} OFFLINE")
+    # "memory" não entra no probe HTTP acima — não é mais um serviço HTTP.
+    # Sua conexão MCP é lazy (ver _get_mcp_session) e só é testada quando
+    # a skill "memory" é escolhida pela primeira vez.
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
 
-    state.memory_client = _make_client(MEMORY_URL, 9999999.0)
     state.search_client = _make_client(SEARCH_URL, 9999999.0)
     state.tts_client = _make_client(TTS_URL, 9999999.0)
     state.llm_client = _make_client(LLM_URL, 9999999.0)
@@ -231,12 +430,22 @@ async def lifespan(app: FastAPI):
     # offline, em vez de travar o loop de tools esperando para sempre.
     state.process_manager_client = _make_client(PROCESS_MANAGER_URL, 15.0)
 
+    # MCP: só prepara a pilha de contexto — conexão real é lazy (ver
+    # _get_mcp_session), disparada quando o loop escolhe uma skill pela
+    # primeira vez. Conectar tudo aqui no boot atrasaria a inicialização
+    # à toa com servidores que talvez nunca sejam usados nesta sessão.
+    state.mcp_stack = AsyncExitStack()
+    log.info(f"MCP: {len(MCP_SKILLS)} skills registradas (conexão lazy): {list(MCP_SKILLS.keys())}")
+
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
-    for c in (state.memory_client, state.search_client, state.tts_client, state.llm_client,
+    for c in (state.search_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client, state.local_scraping_client,
               state.alpha_code_client, state.process_manager_client):
         await c.aclose()
+    if state.shell_client is not None:
+        await state.shell_client.aclose()
+    await state.mcp_stack.aclose()
     log.info("AVA Orchestrator encerrado")
 
 
@@ -293,13 +502,16 @@ async def _fire_tts(text, req):
 
 async def _save_turn(u, a, sid):
     try:
-        await state.memory_client.post("/write_st", json={"session_id": sid, "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}]})
+        await _call_memory_tool("memory_write_short_term", {
+            "session_id": sid,
+            "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
+        })
     except Exception:
         pass
 
 async def _save_lt(text, src="chat"):
     try:
-        await state.memory_client.post("/write", json={"text": text[:500], "source": src, "confidence": 0.8})
+        await _call_memory_tool("memory_write", {"text": text[:500], "source": src, "confidence": 0.8})
     except Exception:
         pass
 
@@ -366,66 +578,10 @@ async def _think_instruction(text: str) -> tuple[int, str]:
 
 _WRITE_HINT = "Use this when the user asks you to remember/record/save something."
 
-async def _tool_memory_read(args: dict, req: ExecuteRequest):
-    r = await state.memory_client.post("/read", json={
-        "query": args.get("query", ""), "top_k": DEFAULT_TOP_K,
-        "min_score": DEFAULT_MIN_SCORE, "session_id": req.session_id, "strategy": "auto",
-    })
-    r.raise_for_status()
-    return r.json().get("results", [])
-
-async def _tool_memory_write(args: dict, req: ExecuteRequest):
-    r = await state.memory_client.post("/write", json={
-        "text": args.get("text", ""), "source": "orchestrator", "confidence": 1.0,
-    })
-    r.raise_for_status()
-    return r.json()
-
-async def _tool_search(args: dict, req: ExecuteRequest):
-    topic = args.get("topic") or "general"
-    if topic not in ("general", "news"):
-        topic = "general"
-    payload = {
-        "query": args.get("query", ""), "max_results": DEFAULT_TOP_K,
-        "use_cache": True, "search_pdfs": req.search_pdfs, "topic": topic,
-    }
-    if topic == "news":
-        payload["days"] = 7   # janela padrão pra queries de notícia/atualidade
-    r = await state.search_client.post("/search", json=payload)
-    r.raise_for_status()
-    data = r.json()
-    results = data.get("results", [])
-    # A Tavily pode gerar uma resposta curta (include_answer) além dos
-    # resultados. IMPORTANTE: sempre devolvemos uma LISTA (nunca um dict com
-    # {"answer":..., "results":...}) — _result_to_text só faz a renderização
-    # rica (título/url/trecho, por item) pra listas; um dict cai num branch
-    # mais pobre que pegaria só o "answer" e descartaria os resultados
-    # inteiros, fazendo o modelo repetir a frase curta da Tavily ao invés de
-    # sintetizar a partir do conteúdo real das páginas.
-    if answer := data.get("answer"):
-        return [{"title": "Resposta rápida (gerada automaticamente pela busca — confirme contra os resultados abaixo)",
-                  "text": answer}] + results
-    return results
-
-async def _tool_read_url(args: dict, req: ExecuteRequest):
-    url = (args.get("url") or "").strip()
-    if not url:
-        return {"success": False, "error": "url vazia"}
-    r = await state.search_client.post("/extract", json={"urls": [url], "extract_depth": "basic"})
-    r.raise_for_status()
-    data = r.json()
-    hits = data.get("results", [])
-    if not hits:
-        return {"success": False, "error": "não foi possível extrair conteúdo dessa URL", "url": url}
-    page = hits[0]
-    return {"success": True, "url": page.get("url", url), "title": page.get("title", ""), "text": page.get("text", "")}
-
-async def _tool_deep_search(args: dict, req: ExecuteRequest):
-    r = await state.deep_search_client.post("/query", json={"text": args.get("query", "")})
-    r.raise_for_status()
-    d = r.json()
-    return d.get("answer") or str(d)
-
+# _tool_memory_read, _tool_memory_write, _tool_search, _tool_read_url e
+# _tool_deep_search foram REMOVIDOS — memory e search agora são servidores
+# MCP (ver MCP_SKILLS + _get_mcp_session), descobertos e despachados
+# dinamicamente pelo loop em vez de uma função Python fixa por tool.
 
 # ── Tradução de Objetos: vision.py (crops) -> garante modo multimodal
 #    no gerenciador de processos (porta 9001) -> LLM.py (multi-imagem) ──
@@ -734,94 +890,19 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
         "answer": answer,
     }
 
-async def _tool_local_scraping(args: dict, req: ExecuteRequest):
-    query = args.get("query", "")
-    r = await state.local_scraping_client.post("/scrape", json={
-        "query": query, "search_path": None, "force_reindex": False, "session_id": req.session_id,
-    })
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("multiple_matches"):
-        return {
-            "status": "multiple_matches", "matches": data["matches"],
-            "message": data.get("message", "Múltiplos arquivos encontrados. Escolha qual deseja ler."),
-            "requires_choice": True,
-        }
-
-    file_content = data.get("content", "")
-    file_path = data.get("file_path", "")
-    was_reindexed = data.get("was_reindexed", False)
-    hash_match = data.get("hash_match", True)
-
-    if file_content and file_path:
-        try:
-            await state.memory_client.post("/indexed-file/write", json={
-                "file_path": file_path, "file_name": Path(file_path).name,
-                "extension": Path(file_path).suffix.lower(), "content": file_content,
-                "file_hash": data.get("file_hash"), "size": len(file_content),
-                "modified": data.get("modified", ""), "source": "local_scraping",
-                "confidence": 1.0 if hash_match else 0.9, "force_reindex": False,
-            })
-        except Exception as e:
-            log.warning(f"Falha ao salvar arquivo indexado na memória: {e}")
-
-    return {
-        "status": "success", "content": file_content, "file_path": file_path,
-        "was_reindexed": was_reindexed, "hash_match": hash_match, "requires_choice": False,
-    }
-
-async def _tool_alpha_code(args: dict, req: ExecuteRequest):
-    payload = {
-        "task": args.get("task", ""), "session_id": req.session_id, "project_dir": None,
-        "max_steps": 25, "temperature": 0.3, "streaming": False,
-    }
-    r = await state.alpha_code_client.post("/run", json=payload)
-    r.raise_for_status()
-    data = r.json()
-    return {
-        "status": "success" if data.get("success") else "failed",
-        "answer": data.get("answer", ""), "files_changed": data.get("files_changed", []),
-        "steps_executed": data.get("steps_executed", 0), "tools_called": data.get("tools_called", 0),
-        "session_id": data.get("session_id", ""),
-    }
+# _tool_local_scraping (versão TOOLS) e _tool_alpha_code foram REMOVIDOS —
+# viram servidores MCP (local_scraping, alpha_code em MCP_SKILLS). O
+# endpoint REST @app.post("/local-scraping") mais abaixo é diferente disso:
+# é a busca de arquivo usada pela própria TUI, não uma tool do agente, e
+# continua chamando state.local_scraping_client (httpx) normalmente.
 
 
 # name -> (description, [(field, type, required)], async executor)
+# Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
+# demais com o próprio loop pra virar um servidor MCP genérico. memory,
+# search, local_scraping e alpha_code saíram daqui: são descobertas
+# dinamicamente via MCP_SKILLS (ver _run_tool_loop).
 TOOLS: dict[str, dict[str, Any]] = {
-    "memory_read": {
-        "description": f"Retrieves relevant information saved in long/short-term memory.",
-        "fields": [("query", "string", True)],
-        "executor": _tool_memory_read,
-    },
-    "memory_write": {
-        "description": f"Saves a piece of information to long-term memory. {_WRITE_HINT}",
-        "fields": [("text", "string", True)],
-        "executor": _tool_memory_write,
-    },
-    "search": {
-        "description": (
-            "search in the web using a autonomous agent that can read and search in pages to get the results. "
-        ),
-        "fields": [("query", "string", True), ("topic", "string", False)],
-        "executor": _tool_search,
-    },
-    "read_url": {
-        "description": (
-            "Fetches and extracts the real, cleaned content of ONE specific "
-            "URL — use this when the user pasted/mentioned a link and wants "
-            "you to read what's actually on that page, instead of searching "
-            "for it. Do not use this to guess or invent URLs; only call it "
-            "with a URL that actually appeared in the conversation."
-        ),
-        "fields": [("url", "string", True)],
-        "executor": _tool_read_url,
-    },
-    #"deep_search": {
-    #    "description": "Deep research (knowledge-RAG) with automatic web research for complex questions.",
-    #    "fields": [("query", "string", True)],
-    #    "executor": _tool_deep_search,
-    #},
     "vision_objects": {
         "description": (
             "Looks at the image attached to the current request (face recognition + object "
@@ -832,16 +913,6 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "fields": [("prompt", "string", False)],
         "executor": _tool_vision_objects,
-    },
-    "local_scraping": {
-        "description": "Searches for and reads a local file on the user's machine.",
-        "fields": [("query", "string", True)],
-        "executor": _tool_local_scraping,
-    },
-    "alpha_code": {
-        "description": "Autonomous code generation/editing agent for a project.",
-        "fields": [("task", "string", True)],
-        "executor": _tool_alpha_code,
     },
     "finish": {
         "description": "Ends the cycle and delivers the final response to the user. Call this tool once you already have everything you need (or if no other tool is required).",
@@ -858,8 +929,9 @@ TOOLS: dict[str, dict[str, Any]] = {
 
 _JSON_SCHEMA_TYPES = {"string": "string", "number": "number"}
 
-def _build_tools_schema() -> list[dict]:
-    """Converte o TOOLS registry para a lista `tools` no formato OpenAI."""
+def _build_native_tools_schema() -> list[dict]:
+    """Converte o TOOLS registry (só as nativas: vision_objects, finish)
+    para a lista `tools` no formato OpenAI."""
     schema = []
     for name, spec in TOOLS.items():
         properties = {}
@@ -879,6 +951,104 @@ def _build_tools_schema() -> list[dict]:
             },
         })
     return schema
+
+
+def _mcp_tool_to_openai_schema(tool) -> dict:
+    """Converte uma Tool do MCP (name, description, inputSchema) direto
+    pro formato OpenAI function-calling — substitui a conversão manual de
+    campo-por-campo que o _build_native_tools_schema fazia, já que aqui o
+    schema já vem pronto (JSON Schema) do próprio servidor MCP."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seleção de skill (etapa 1 da descoberta em duas etapas) — escolhe quais
+# servidores MCP são relevantes pro pedido, usando só os resumos leves de
+# MCP_SKILLS, ANTES de conectar em qualquer servidor ou carregar tools reais.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _select_skills(user_input: str) -> list[str]:
+    """Pergunta ao LLM local quais skills (servidores MCP) parecem
+    relevantes pro pedido do usuário, usando só ~1 linha de resumo por
+    skill (barato em tokens). Retorna a lista de nomes escolhidos — pode
+    ser vazia (pedido não precisa de nenhuma tool MCP, só vision/finish).
+    """
+    if not MCP_SKILLS:
+        return []
+    skills_list = "\n".join(f"- {name}: {s.skill_summary}" for name, s in MCP_SKILLS.items())
+    log.debug(f"[_select_skills] skills disponíveis: {list(MCP_SKILLS.keys())}")
+    log.debug(f"[_select_skills] input do usuário: {user_input!r}")
+    payload = {
+        "model": "local",
+        "messages": [
+            {"role": "system", "content": (
+                "You choose which capability domains (skills) are relevant to a user's request. "
+                "Available skills:\n" + skills_list + "\n\n"
+                "Respond with a comma-separated list of relevant skill names only (e.g. "
+                "\"memory,search\"), or the single word \"none\" if no skill applies. "
+                "Pick every skill that could plausibly help — it's fine to pick more than one."
+            )},
+            {"role": "user", "content": user_input},
+        ],
+        "temperature": 0.0, "stream": False,
+    }
+    try:
+        t0 = time.perf_counter()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            r = await client.post("http://localhost:2001/v1/chat/completions", json=payload)
+            r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip().lower()
+        log.debug(f"[_select_skills] resposta bruta do modelo ({(time.perf_counter()-t0)*1000:.0f}ms): {raw!r}")
+    except Exception as e:
+        log.warning(f"_select_skills falhou, liberando todas as skills como fallback: {e}")
+        return list(MCP_SKILLS.keys())
+    if "none" in raw:
+        log.debug("[_select_skills] modelo respondeu 'none' — nenhuma skill escolhida")
+        return []
+    chosen = [name.strip() for name in raw.split(",") if name.strip() in MCP_SKILLS]
+    rejected = [name.strip() for name in raw.split(",") if name.strip() not in MCP_SKILLS]
+    if rejected:
+        log.warning(f"[_select_skills] tokens na resposta que NÃO batem com nenhuma skill "
+                    f"registrada (provável causa de tool não ser oferecida): {rejected}")
+    log.info(f"[_select_skills] skills escolhidas para este turno: {chosen}")
+    return chosen
+
+
+async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[ClientSession, str]]]:
+    """Etapa 2: conecta (ou reusa) as sessões MCP das skills escolhidas,
+    lista as tools reais de cada uma, e devolve:
+      - o schema combinado no formato OpenAI (pra somar com as tools nativas)
+      - um dispatch map: nome da tool -> (sessão MCP, nome original na sessão)
+        usado no loop pra saber pra qual sessão encaminhar cada tool_call.
+    """
+    schema: list[dict] = []
+    dispatch: dict[str, tuple[ClientSession, str]] = {}
+    log.debug(f"[_load_mcp_tools] conectando nas skills: {skill_names}")
+    for skill_name in skill_names:
+        try:
+            t0 = time.perf_counter()
+            session = await _get_mcp_session(skill_name)
+            result = await session.list_tools()
+            log.debug(
+                f"[_load_mcp_tools] skill '{skill_name}': {len(result.tools)} tool(s) "
+                f"em {(time.perf_counter()-t0)*1000:.0f}ms -> {[t.name for t in result.tools]}"
+            )
+        except Exception as e:
+            log.warning(f"MCP: falha ao carregar tools da skill '{skill_name}': {type(e).__name__}: {e}")
+            continue
+        for tool in result.tools:
+            schema.append(_mcp_tool_to_openai_schema(tool))
+            dispatch[tool.name] = (session, tool.name)
+
+    log.debug(f"[_load_mcp_tools] tools MCP disponíveis nesta rodada: {list(dispatch.keys())}")
+    return schema, dispatch
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -962,7 +1132,11 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
     raise last_error  # type: ignore
 
 
-def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None) -> str:
+def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
+                          mcp_tool_names: Optional[dict[str, str]] = None) -> str:
+    """`mcp_tool_names`: nome da tool MCP -> descrição, já carregadas pela
+    etapa 2 da descoberta (_load_mcp_tools) para ESTA rodada específica —
+    somadas às tools nativas (TOOLS) na listagem final do prompt."""
     lang_names = {
         "pt": "Portuguese (Brazil)", "en": "English", "es": "Spanish",
         "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
@@ -1025,6 +1199,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     ]
     for name, spec in TOOLS.items():
         lines.append(f"- {name}: {spec['description']}")
+    for name, description in (mcp_tool_names or {}).items():
+        lines.append(f"- {name}: {description}")
     if think_instruction:
         lines.append("")
         lines.append(think_instruction)
@@ -1092,8 +1268,21 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
          indefinidamente.
     """
     depth, think_instruction = await _think_instruction(req.input)
-    system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang)
-    tools_schema = _build_tools_schema()
+
+    # ── Descoberta de tools em duas etapas ──
+    # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
+    # usando só os resumos leves — sem conectar em nada ainda.
+    chosen_skills = await _select_skills(req.input)
+    
+    # Etapa 2: conecta só nessas skills e carrega as tools reais delas.
+    mcp_schema, mcp_dispatch = await _load_mcp_tools(chosen_skills)
+    mcp_descriptions = {name: spec["function"]["description"] for spec in mcp_schema
+                         for name in [spec["function"]["name"]]}
+
+    system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang, mcp_tool_names=mcp_descriptions)
+    tools_schema = _build_native_tools_schema() + mcp_schema
+    log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
+             f"{[t['function']['name'] for t in tools_schema]}")
 
     user_content = req.input
     if req.image_base64:
@@ -1150,6 +1339,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
         message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
         tool_calls = message.get("tool_calls") or []
+        log.debug(
+            f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "
+            f"tool_calls={[c.get('function', {}).get('name') for c in tool_calls]}"
+        )
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
         if tool_calls:
@@ -1184,8 +1377,16 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             except json.JSONDecodeError:
                 args = {}
 
-            if tool_name not in TOOLS:
-                log.warning(f"[{eid[:8]}] Tool desconhecida '{tool_name}'")
+            is_native = tool_name in TOOLS
+            is_mcp = tool_name in mcp_dispatch
+            log.debug(
+                f"[{eid[:8]}] tool_call recebido: name={tool_name!r} args={args} "
+                f"is_native={is_native} is_mcp={is_mcp}"
+            )
+            if not is_native and not is_mcp:
+                log.warning(f"[{eid[:8]}] Tool desconhecida '{tool_name}' — o modelo pediu uma tool "
+                            f"que não está no schema desta rodada (tools_schema atual: "
+                            f"{[t['function']['name'] for t in tools_schema]})")
                 history.append({"role": "tool", "tool_call_id": call_id,
                                  "content": f"ERROR: tool '{tool_name}' não existe"})
                 continue
@@ -1204,15 +1405,29 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 finished = True
                 break
 
-            # ── Executa a tool ──
-            spec = TOOLS[tool_name]
+            # ── Executa a tool: nativa (executor Python direto) ou MCP
+            # (despachada pra sessão correspondente via call_tool) ──
             t0 = time.perf_counter()
             _CURRENT_HISTORY.set(history)
             try:
-                result = await asyncio.wait_for(
-                    spec["executor"](args, req),
-                    timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
-                )
+                if is_native:
+                    result = await asyncio.wait_for(
+                        TOOLS[tool_name]["executor"](args, req),
+                        timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                    )
+                else:
+                    session, mcp_tool_name = mcp_dispatch[tool_name]
+                    mcp_result = await asyncio.wait_for(
+                        session.call_tool(mcp_tool_name, arguments=args),
+                        timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                    )
+                    # Conteúdo MCP vem como lista de blocos (TextContent,
+                    # ImageContent, ...) — junta os textuais num único
+                    # texto, no formato que _result_to_text já sabe tratar.
+                    result = "\n".join(
+                        block.text for block in mcp_result.content
+                        if hasattr(block, "text")
+                    ) or str(mcp_result.content)
                 success, err = True, None
             except Exception as e:
                 result, success, err = None, False, f"{type(e).__name__}: {e}"
@@ -1554,18 +1769,19 @@ async def deep_search(req: DeepSearchRequest):
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):
     try:
-        r = await state.memory_client.post("/read", json={"query": req.query, "top_k": req.top_k, "min_score": req.min_score, "session_id": req.session_id, "strategy": "auto"})
-        r.raise_for_status()
-        return r.json()
+        return await _call_memory_tool("memory_read", {
+            "query": req.query, "top_k": req.top_k, "min_score": req.min_score,
+            "session_id": req.session_id, "strategy": "auto",
+        })
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/memory/write")
 async def memory_write(req: MemoryWriteRequest):
     try:
-        r = await state.memory_client.post("/write", json={"text": req.text, "source": req.source, "confidence": req.confidence})
-        r.raise_for_status()
-        return r.json()
+        return await _call_memory_tool("memory_write", {
+            "text": req.text, "source": req.source, "confidence": req.confidence,
+        })
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
 
@@ -1624,7 +1840,7 @@ async def local_scraping(req: LocalScrapingRequest):
         if file_content and file_path:
             try:
                 summary = file_content[:500] if len(file_content) > 500 else file_content
-                await state.memory_client.post("/write", json={
+                await _call_memory_tool("memory_write", {
                     "text": f"[ARQUIVO INDEXADO] {file_path}: {summary}",
                     "source": "local_scraping", "confidence": 1.0 if hash_match else 0.9,
                 })
@@ -1659,7 +1875,7 @@ async def local_scraping_choose(req: LocalScrapingChooseRequest):
         if file_content and file_path:
             try:
                 summary = file_content[:500] if len(file_content) > 500 else file_content
-                await state.memory_client.post("/write", json={
+                await _call_memory_tool("memory_write", {
                     "text": f"[ARQUIVO INDEXADO] {file_path}: {summary}",
                     "source": "local_scraping", "confidence": 1.0 if hash_match else 0.9,
                 })
@@ -1706,7 +1922,6 @@ async def local_scraping_delete_index(file_id: str):
 async def status():
     checks = {}
     cfg = {
-        "memory": (state.memory_client, HEALTH_PATHS["memory"]),
         "search": (state.search_client, HEALTH_PATHS["search"]),
         "local_scraping": (state.local_scraping_client, HEALTH_PATHS["local_scraping"]),
         "tts": (state.tts_client, HEALTH_PATHS["tts"]),
@@ -1722,14 +1937,27 @@ async def status():
             checks[n] = {"healthy": r.status_code == 200, "status_code": r.status_code}
         except Exception:
             checks[n] = {"healthy": False, "status_code": None}
-    return {"orchestrator": "ok", "architecture": "tool-calling", "services": checks, "tools": list(TOOLS.keys())}
+
+    # "memory" não tem endpoint HTTP — sua saúde é checada chamando a
+    # própria tool MCP `memory_status` (conecta lazily se ainda não conectado).
+    try:
+        mem_status = await _call_memory_tool("memory_status", {})
+        checks["memory"] = {"healthy": mem_status is not None, "status_code": None, "mcp": True}
+    except Exception as e:
+        checks["memory"] = {"healthy": False, "status_code": None, "mcp": True, "error": str(e)}
+
+    return {
+        "orchestrator": "ok", "architecture": "tool-calling + MCP (two-stage discovery)",
+        "services": checks,
+        "native_tools": list(TOOLS.keys()),
+        "mcp_skills": {name: skill.skill_summary for name, skill in MCP_SKILLS.items()},
+        "mcp_connected": list(state.mcp_sessions.keys()),
+    }
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     try:
-        r = await state.memory_client.delete(f"/session/{session_id}", timeout=5.0)
-        r.raise_for_status()
-        return r.json()
+        return await _call_memory_tool("memory_clear_session", {"session_id": session_id})
     except Exception as e:
         raise HTTPException(502, f"Session clear falhou: {e}")
 

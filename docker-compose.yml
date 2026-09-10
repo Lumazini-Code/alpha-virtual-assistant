@@ -108,6 +108,8 @@ services:
     restart: unless-stopped
 
     volumes:
+      - ./mcp_servers:/app/mcp_servers
+      - ./ctxBin:/app/ctxBin
       - ./start.sh:/app/start.sh
       - ./Modules/Models:/app/Modules/Models:ro
       - ./Ctxbin:/app/Ctxbin:ro
@@ -119,6 +121,7 @@ services:
       - ava-logs-vulkan:/app/logs
 
     environment:
+      AVA_DEBUG: "1"
       AVA_N_GPU_LAYERS: "99"
       ONNX_PROVIDERS: "CPUExecutionProvider"
       PYTHONUNBUFFERED: "1"

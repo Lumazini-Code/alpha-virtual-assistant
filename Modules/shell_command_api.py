@@ -55,7 +55,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-API_PORT = _env_int("AGENT_SHELL_API_PORT", 4005)
+API_PORT = _env_int("AGENT_SHELL_API_PORT", 4007)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ShellCommandAPI] %(message)s")
 log = logging.getLogger("ava.shell_command_api")

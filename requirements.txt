@@ -64,3 +64,5 @@ scikit-image
 scipy
 
 pytest-playwright
+
+mcp<2

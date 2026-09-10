@@ -62,12 +62,6 @@ restart_on_fail "Deep Search" "python3 deep_search.py" &
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &
 
-echo "  • Memory API..."
-restart_on_fail "Memory" "python3 memory.py" &
-
-echo "  • Search API..."
-restart_on_fail "Search" "python3 Search_api.py" &
-
 echo "  • TTS API..."
 restart_on_fail "TTS" "python3 TTS.py" &
 
