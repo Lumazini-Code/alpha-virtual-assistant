@@ -96,6 +96,16 @@ TOP_K_READ           = 5
 DECAY_HALF_LIFE_DAYS = 90
 DECAY_JOB_INTERVAL_S = 3600
 
+# ── NEW (solução 2): faixa de similaridade "provável correção" ────────────────
+# Entre UPDATE_SIM_THRESHOLD e DEDUP_THRESHOLD, um texto novo não é nem uma
+# duplicata clara (>= DEDUP_THRESHOLD, rejeitada) nem algo totalmente
+# diferente (< UPDATE_SIM_THRESHOLD, vira memória nova). Nessa faixa, o
+# write é recusado com reason="possible_update:<score>" e a memória mais
+# próxima (candidate_id/candidate_text/candidate_score) volta na resposta
+# — cabe a quem chamou (o extrator LLM) decidir se reenvia o /write com
+# action="update" e memory_id=candidate_id, ou se era mesmo um fato novo.
+UPDATE_SIM_THRESHOLD = 0.75
+
 ST_TTL_HOURS          = 24.0
 ST_CLEANUP_INTERVAL_S = 1800
 
@@ -123,6 +133,17 @@ QUERY_AMBIGUOUS_RATIO = 0.55
 CONTEXT_MAX_CHARS     = 1200
 CONTEXT_TURNS_FETCH   = 6
 DUAL_CONTEXT_WEIGHT   = 0.35
+
+# ── NEW: Decomposição de query composta (busca por segmento, sem LLM) ─────────
+# Quando a query tem vários "sub-pedidos" numa frase só (ex.: "quero fazer X
+# usando Y para conseguir Z"), embedar a frase inteira dilui a atenção
+# semântica e nenhum sub-tópico fica bem representado no vetor final. Em vez
+# de pedir a um LLM para gerar sub-queries, a query é quebrada por regras
+# heurísticas (pontuação, vírgula, gerúndio, "para <verbo>") e cada pedaço é
+# embedado/buscado separadamente — puro cosine similarity, sem custo de LLM.
+SEGMENT_TRIGGER_WORDS = 12   # frases com até isso não valem a pena segmentar
+SEGMENT_MIN_WORDS     = 3    # fragmento menor que isso é remendado no vizinho
+SEGMENT_MAX_COUNT     = 4    # teto de segmentos por query (custo de embed/batch)
 
 # ── /read_st — leitura crua do short-term (sem busca semântica) ───────────────
 # Usada pelo LLM para montar o histórico recente da conversa como contexto,
@@ -167,6 +188,27 @@ class WriteRequest(BaseModel):
     # inatividade (apply_decay a ignora), mas ainda pode ser removida por
     # deleção explícita. Default True preserva o comportamento anterior.
     forgettable: bool  = True
+    # ── NEW (solução 3): meia-vida específica desta memória, em dias.
+    # Quando None, apply_decay cai para o default global
+    # (DECAY_HALF_LIFE_DAYS). Ex.: ttl_days=7 para "viagem essa semana",
+    # deixado em branco para memórias sem prazo específico.
+    ttl_days:    Optional[float] = None
+    # ── NEW (solução 2): "criar" (default) ou "atualizar/corrigir" uma
+    # memória existente. Em action="update":
+    #   - se memory_id vier preenchido, atualiza diretamente essa memória;
+    #   - se memory_id vier vazio, procura a memória de longo prazo mais
+    #     semelhante (score >= UPDATE_SIM_THRESHOLD) e atualiza ela; se
+    #     nenhuma candidata suficientemente parecida existir, o write falha
+    #     com reason="update_target_not_found" em vez de criar uma memória
+    #     nova (evita que uma correção vire um fato solto).
+    action:      Literal["create", "update"] = "create"
+    memory_id:   Optional[int] = None
+
+class WriteBatchRequest(BaseModel):
+    # ── NEW (solução 1): grava várias memórias em uma única chamada,
+    # evitando N round-trips HTTP/MCP quando o extrator LLM devolve um
+    # array de fatos para uma mesma dupla pergunta-resposta.
+    items: list[WriteRequest]
 
 class WriteSTRequest(BaseModel):
     session_id: str
@@ -183,6 +225,20 @@ class WriteResponse(BaseModel):
     stored:    bool
     reason:    str
     memory_id: Optional[int] = None
+    # ── NEW (solução 2): só populados quando reason começa com
+    # "possible_update:" — a memória de longo prazo mais parecida
+    # encontrada na faixa [UPDATE_SIM_THRESHOLD, DEDUP_THRESHOLD), para o
+    # chamador decidir se reenvia como action="update".
+    candidate_id:    Optional[int]   = None
+    candidate_text:  Optional[str]   = None
+    candidate_score: Optional[float] = None
+
+class WriteBatchResponse(BaseModel):
+    # ── NEW (solução 1): um WriteResponse por item de entrada, na mesma
+    # ordem de WriteBatchRequest.items.
+    results: list[WriteResponse]
+    stored_count: int
+    total: int
 
 class WriteSTResponse(BaseModel):
     stored:   bool
@@ -211,6 +267,10 @@ class MemoryEntry(BaseModel):
     source:       Optional[str]        = None
     # ── NEW: esquecível — só populado para memory_type == "long_term" ──
     forgettable:  Optional[bool]       = None
+    # ── NEW (solução 3): meia-vida por memória, em dias — só populado
+    # para memory_type == "long_term" quando definida (senão usa o
+    # default global DECAY_HALF_LIFE_DAYS).
+    ttl_days:     Optional[float]      = None
     # ── NEW: Indexed file metadata ──
     file_path:    Optional[str]        = None
     file_name:    Optional[str]        = None
@@ -480,15 +540,30 @@ class MemoryDB:
             self._conn.execute(
                 "ALTER TABLE memories ADD COLUMN forgettable INTEGER NOT NULL DEFAULT 1"
             )
+        # ── NEW (solução 3): mesma migração leve de sempre — bancos criados
+        # antes de ttl_days existir não têm a coluna; adiciona como NULL
+        # (== "usar o default global DECAY_HALF_LIFE_DAYS"), sem quebrar
+        # instalações já em uso.
+        if "ttl_days" not in cols:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN ttl_days REAL DEFAULT NULL"
+            )
 
-    def insert(self, text: str, source: str, confidence: float, forgettable: bool = True) -> int:
+    def insert(
+        self,
+        text: str,
+        source: str,
+        confidence: float,
+        forgettable: bool = True,
+        ttl_days: Optional[float] = None,
+    ) -> int:
         text_hash = hashlib.sha256(text.encode()).hexdigest()
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO memories (text, text_hash, source, confidence, forgettable, "
-                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (text, text_hash, source, confidence, int(forgettable), now, now),
+                "ttl_days, created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (text, text_hash, source, confidence, int(forgettable), ttl_days, now, now),
             )
             return cur.lastrowid
 
@@ -497,6 +572,11 @@ class MemoryDB:
         return self._conn.execute(
             "SELECT 1 FROM memories WHERE text_hash = ?", (h,)
         ).fetchone() is not None
+
+    def get_by_id(self, memory_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
 
     def get_by_ids(self, ids: list[int]) -> list[sqlite3.Row]:
         if not ids:
@@ -516,6 +596,62 @@ class MemoryDB:
         except sqlite3.OperationalError:
             pass
 
+    def update(
+        self,
+        memory_id: int,
+        text: str,
+        source: Optional[str]      = None,
+        confidence: Optional[float] = None,
+        forgettable: Optional[bool] = None,
+        ttl_days: Optional[float]   = None,
+        ttl_days_set: bool          = False,
+    ) -> bool:
+        """
+        Atualiza o texto (e opcionalmente source/confidence/forgettable/
+        ttl_days) de uma memória já existente, em vez de inserir uma nova
+        — usado pelo fluxo action="update" (solução 2 da revisão), quando
+        o extrator identifica que um texto novo é uma correção de um fato
+        já gravado, e não um fato adicional.
+
+        `text_hash` é recalculado a partir do novo texto para que a
+        dedup exata (`exists_exact`) continue funcionando corretamente
+        depois da correção. `created_at` não é alterado — só o conteúdo,
+        a confiança e o "relógio" de acesso.
+
+        `ttl_days_set` distingue "não mexer no ttl_days atual" (default)
+        de "setar ttl_days para None explicitamente" (chamador passou
+        ttl_days=None de propósito) — sem isso não daria pra diferenciar
+        os dois casos só olhando `ttl_days is None`.
+        """
+        row = self.get_by_id(memory_id)
+        if row is None:
+            return False
+
+        new_text        = text.strip()
+        new_text_hash   = hashlib.sha256(new_text.encode()).hexdigest()
+        new_source      = source if source is not None else row["source"]
+        new_confidence  = confidence if confidence is not None else row["confidence"]
+        new_forgettable = int(forgettable) if forgettable is not None else row["forgettable"]
+        new_ttl_days    = ttl_days if ttl_days_set else row["ttl_days"]
+        now = time.time()
+
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "UPDATE memories SET text = ?, text_hash = ?, source = ?, "
+                    "confidence = ?, forgettable = ?, ttl_days = ?, last_accessed = ? "
+                    "WHERE id = ?",
+                    (
+                        new_text, new_text_hash, new_source, new_confidence,
+                        new_forgettable, new_ttl_days, now, memory_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # O texto novo já é idêntico (mesmo text_hash) a OUTRA
+                # memória existente — não faz sentido duplicar o hash.
+                return False
+        return True
+
     def apply_decay(self, half_life_days: float):
         now  = time.time()
         with self._lock:
@@ -523,13 +659,18 @@ class MemoryDB:
             # fica de fora do decay por completo, mesmo que fique muito
             # tempo sem ser acessada.
             rows = self._conn.execute(
-                "SELECT id, confidence, last_accessed FROM memories "
+                "SELECT id, confidence, last_accessed, ttl_days FROM memories "
                 "WHERE confidence > 0.01 AND forgettable = 1"
             ).fetchall()
             updates = []
             for row in rows:
+                # ── NEW (solução 3): ttl_days por linha tem prioridade
+                # sobre o half_life_days global quando presente (> 0);
+                # cai para o default global quando ausente/NULL.
+                row_ttl = row["ttl_days"]
+                effective_half_life = row_ttl if (row_ttl is not None and row_ttl > 0) else half_life_days
                 days_idle    = (now - row["last_accessed"]) / 86400.0
-                decay_factor = 0.5 ** (days_idle / half_life_days)
+                decay_factor = 0.5 ** (days_idle / effective_half_life)
                 updates.append((row["confidence"] * decay_factor, row["id"]))
             if updates:
                 self._conn.executemany("UPDATE memories SET confidence = ? WHERE id = ?", updates)
@@ -1346,6 +1487,34 @@ class MemoryIndex:
             if idx != -1
         ]
 
+    # ── NEW: busca em lote — N queries de uma vez em UMA chamada ao FAISS ──
+    def search_batch(
+        self, query_embeddings: np.ndarray, top_k: int
+    ) -> list[list[tuple[int, float]]]:
+        """
+        Mesma lógica de search(), mas para várias queries simultâneas
+        (ex.: os N segmentos de uma pergunta composta). O FAISS já faz
+        busca em lote nativamente — uma única chamada, sem loop em Python —
+        então isso é praticamente tão rápido quanto uma busca única.
+        """
+        n = query_embeddings.shape[0] if query_embeddings.ndim == 2 else 0
+        with self._lock:
+            ntotal = self._index.ntotal
+            if ntotal == 0 or n == 0:
+                return [[] for _ in range(n)]
+            k = min(top_k, ntotal)
+            scores, indices = self._index.search(
+                query_embeddings.astype(np.float32), k
+            )
+        return [
+            [
+                (int(idx), float(score))
+                for score, idx in zip(row_scores, row_indices)
+                if idx != -1
+            ]
+            for row_scores, row_indices in zip(scores, indices)
+        ]
+
     def search_similar(self, embedding: np.ndarray) -> float:
         results = self.search(embedding, top_k=1)
         return results[0][1] if results else 0.0
@@ -1629,6 +1798,116 @@ def _apply_token_budget(
     return selected
 
 
+# ── NEW: Segmentação heurística de query composta (sem LLM) ───────────────────
+
+# Fronteira antes de gerúndios ("usando", "utilizando", "aplicando", "seguindo"
+# ...) — em português, costumam introduzir um novo sub-meio/estratégia dentro
+# da mesma frase.
+_GERUND_BOUNDARY_RE = re.compile(r'(?<=\s)(?=\w+(?:ando|endo|indo)\b)', re.IGNORECASE)
+
+# Fronteira antes de "para <verbo no infinitivo>" — costuma introduzir um
+# novo sub-objetivo/resultado dentro da mesma frase.
+_PURPOSE_BOUNDARY_RE = re.compile(r'(?<=\s)(?=para\s+\w+(?:ar|er|ir)\b)', re.IGNORECASE)
+
+
+def _split_query_segments(query: str) -> list[str]:
+    """
+    Decompõe a query em sub-tópicos SEM LLM, para busca por segmento.
+
+    Regra: (1) separa por pontuação forte → sentenças; (2) dentro de
+    sentenças longas, separa por vírgula e por fronteiras heurísticas
+    (gerúndio, "para <verbo>") que tendem a introduzir um novo sub-pedido;
+    (3) funde fragmentos curtos demais no vizinho; (4) deduplica e limita
+    a quantidade de segmentos.
+
+    Cada segmento resultante é embedado e buscado separadamente — isso é o
+    que evita a "diluição de atenção semântica" de embedar a pergunta
+    inteira de uma vez.
+    """
+    query = query.strip()
+    if not query:
+        return []
+
+    sentences = [s.strip() for s in re.split(r'[.!?;]+', query) if s.strip()]
+
+    raw_segments: list[str] = []
+    for sent in sentences:
+        if len(sent.split()) <= SEGMENT_TRIGGER_WORDS:
+            raw_segments.append(sent)
+            continue
+
+        for part in re.split(r'\s*,\s*', sent):
+            for sub in _GERUND_BOUNDARY_RE.split(part):
+                raw_segments.extend(
+                    p.strip() for p in _PURPOSE_BOUNDARY_RE.split(sub) if p.strip()
+                )
+
+    # funde fragmentos curtos demais no segmento anterior
+    merged: list[str] = []
+    for seg in raw_segments:
+        if merged and len(seg.split()) < SEGMENT_MIN_WORDS:
+            merged[-1] = f"{merged[-1]} {seg}"
+        else:
+            merged.append(seg)
+    if len(merged) >= 2 and len(merged[0].split()) < SEGMENT_MIN_WORDS:
+        merged[1] = f"{merged[0]} {merged[1]}"
+        merged.pop(0)
+
+    # dedup preservando ordem
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for seg in merged:
+        key = seg.lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(seg)
+
+    # teto de segmentos — mantém os mais "carregados" semanticamente
+    if len(dedup) > SEGMENT_MAX_COUNT:
+        dedup = sorted(dedup, key=lambda s: len(s.split()), reverse=True)[:SEGMENT_MAX_COUNT]
+
+    return dedup
+
+
+def _fuse_max(
+    base: list[tuple[int, float]],
+    extra: list[tuple[int, float]],
+) -> list[tuple[int, float]]:
+    """Une dois conjuntos (id, score) mantendo o maior score por id. Usado
+    para combinar a busca da query inteira com a busca por segmento, sem
+    que um sub-tópico "afogue" o score de outro (diferente de uma média)."""
+    scores: dict[int, float] = dict(base)
+    for mid, score in extra:
+        if score > scores.get(mid, -1.0):
+            scores[mid] = score
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+async def _search_segmented(
+    segments: list[str],
+    top_k: int,
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """
+    Embeda TODOS os segmentos em uma única chamada em lote à API de
+    embeddings, busca todos de uma vez no FAISS (batch nativo) e funde por
+    max-score. Determinístico, sem LLM — apenas cosine similarity aplicado
+    a cada pedaço da pergunta em vez da pergunta inteira.
+    """
+    embeddings = await state.embed_engine.embed(segments)  # shape (N, dim)
+    loop = asyncio.get_event_loop()
+    lt_batches, st_batches = await asyncio.gather(
+        loop.run_in_executor(None, state.lt_index.search_batch, embeddings, top_k),
+        loop.run_in_executor(None, state.st_index.search_batch, embeddings, top_k),
+    )
+    lt_fused: list[tuple[int, float]] = []
+    st_fused: list[tuple[int, float]] = []
+    for seg_results in lt_batches:
+        lt_fused = _fuse_max(lt_fused, seg_results)
+    for seg_results in st_batches:
+        st_fused = _fuse_max(st_fused, seg_results)
+    return lt_fused, st_fused
+
+
 def _classify_query(query: str) -> str:
     tokens = re.findall(r"\w+", query.lower())
     if not tokens:
@@ -1724,6 +2003,7 @@ def _build_lt_entries(
             memory_type  = "long_term",
             source       = row["source"],
             forgettable  = bool(row["forgettable"]),
+            ttl_days     = row["ttl_days"],
         ))
         loop.run_in_executor(None, state.lt_db.update_access, row["id"])
     return entries
@@ -1897,52 +2177,153 @@ _fd_write_lock = asyncio.Lock()
 
 
 async def _store_long_term_text(
-    text: str, source: str, confidence: float, forgettable: bool = True,
-) -> tuple[bool, str, Optional[int]]:
+    text: str,
+    source: str,
+    confidence: float,
+    forgettable: bool = True,
+    # ── NEW (solução 3) ──
+    ttl_days: Optional[float] = None,
+    # ── NEW (solução 2) ──
+    action: Literal["create", "update"] = "create",
+    memory_id: Optional[int] = None,
+) -> tuple[bool, str, Optional[int], Optional[dict]]:
     """
     Lógica compartilhada de gravação em memória de longo prazo — usada tanto
-    pelo endpoint /write quanto pelo /visual-dict/write (para persistir a
-    descrição textual de um conceito visual como memória normal).
-    Retorna (stored, reason, memory_id).
+    pelo endpoint /write (e /write_batch) quanto pelo /visual-dict/write
+    (para persistir a descrição textual de um conceito visual como memória
+    normal).
+    Retorna (stored, reason, memory_id, candidate) — `candidate` só vem
+    preenchido (dict com id/text/score) quando `reason` começa com
+    "possible_update:".
     """
     text = text.strip()
     if len(text) < 10:
-        return False, "too_short", None
+        return False, "too_short", None, None
 
     loop = asyncio.get_event_loop()
 
+    # ── NEW (solução 2): fluxo de atualização/correção ─────────────────
+    # Em vez de inserir um fato novo que conflita com um já existente, o
+    # texto substitui o conteúdo de uma memória já gravada.
+    if action == "update":
+        async with _lt_write_lock:
+            target_id = memory_id
+            if target_id is None:
+                # Sem memory_id explícito: acha a memória de LT mais
+                # parecida semanticamente e usa ela como alvo, desde que
+                # a similaridade seja alta o bastante para termos certeza
+                # de que é "a mesma coisa, dita de outro jeito" — não
+                # queremos "atualizar" um fato não relacionado por engano.
+                embedding = await state.embed_engine.embed_one(text)
+                hits = state.lt_index.search(embedding, top_k=1)
+                if hits and hits[0][1] >= UPDATE_SIM_THRESHOLD:
+                    target_id = hits[0][0]
+
+            if target_id is None:
+                return False, "update_target_not_found", None, None
+
+            row = state.lt_db.get_by_id(target_id)
+            if row is None:
+                return False, "update_target_not_found", None, None
+
+            ok = state.lt_db.update(
+                target_id, text,
+                source=source, confidence=confidence,
+                forgettable=forgettable,
+                ttl_days=ttl_days, ttl_days_set=True,
+            )
+            if not ok:
+                return False, "update_conflict", None, None
+
+            # O vetor antigo aponta pro texto anterior — remove e adiciona
+            # de novo com o mesmo id, pra busca semântica continuar
+            # refletindo o texto atual em vez do corrigido.
+            new_embedding = await state.embed_engine.embed_one(text)
+            await loop.run_in_executor(None, state.lt_index.remove_ids, {target_id})
+            await loop.run_in_executor(None, state.lt_index.add, new_embedding, target_id)
+
+        log.info(f"LT #{target_id} atualizada: {text[:60]}")
+        return True, "updated", target_id, None
+
+    # ── Fluxo normal de criação ─────────────────────────────────────────
     async with _lt_write_lock:
         if state.lt_db.exists_exact(text):
-            return False, "duplicate_exact", None
+            return False, "duplicate_exact", None, None
 
         embedding = await state.embed_engine.embed_one(text)
 
-        max_sim = state.lt_index.search_similar(embedding)
+        hits = state.lt_index.search(embedding, top_k=1)
+        max_sim, nearest_id = (hits[0][1], hits[0][0]) if hits else (0.0, None)
+
         if max_sim >= DEDUP_THRESHOLD:
-            return False, f"duplicate_semantic:{max_sim:.3f}", None
+            return False, f"duplicate_semantic:{max_sim:.3f}", None, None
+
+        # ── NEW (solução 2): faixa "provável correção" — nem duplicata
+        # clara nem claramente um fato novo. Não decide sozinho: devolve
+        # a candidata pro chamador decidir (reenviar com action="update").
+        if max_sim >= UPDATE_SIM_THRESHOLD and nearest_id is not None:
+            candidate_row = state.lt_db.get_by_id(nearest_id)
+            candidate = None
+            if candidate_row is not None:
+                candidate = {
+                    "id":    candidate_row["id"],
+                    "text":  candidate_row["text"],
+                    "score": round(max_sim, 4),
+                }
+            return False, f"possible_update:{max_sim:.3f}", None, candidate
 
         try:
-            memory_id = state.lt_db.insert(text, source, confidence, forgettable)
+            memory_id = state.lt_db.insert(text, source, confidence, forgettable, ttl_days)
         except sqlite3.IntegrityError:
             # Rede de segurança: mesmo com o lock, cobre o caso de outro
             # processo/writer ter inserido o mesmo texto entre o check e o
             # insert (ex.: dois workers do MCP).
             log.warning(f"LT: corrida de duplicata detectada no insert — '{text[:60]}'")
-            return False, "duplicate_exact", None
+            return False, "duplicate_exact", None, None
 
         # add() faz uma cópia/realocação em C++ — pequena, mas offload pro
         # executor mantém o event loop livre mesmo sob concorrência alta.
         await loop.run_in_executor(None, state.lt_index.add, embedding, memory_id)
 
     log.info(f"LT #{memory_id} gravada: {text[:60]}")
-    return True, "ok", memory_id
+    return True, "ok", memory_id, None
+
+
+async def _process_write_request(req: WriteRequest) -> WriteResponse:
+    """Ponto único usado tanto por /write quanto por /write_batch (solução 1),
+    pra garantir que os dois caminhos tenham exatamente a mesma lógica de
+    dedup/update/ttl."""
+    stored, reason, memory_id, candidate = await _store_long_term_text(
+        req.text, req.source, req.confidence, req.forgettable,
+        ttl_days=req.ttl_days, action=req.action, memory_id=req.memory_id,
+    )
+    resp = WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
+    if candidate is not None:
+        resp.candidate_id    = candidate["id"]
+        resp.candidate_text  = candidate["text"]
+        resp.candidate_score = candidate["score"]
+    return resp
 
 
 async def write_memory(req: WriteRequest):
-    stored, reason, memory_id = await _store_long_term_text(
-        req.text, req.source, req.confidence, req.forgettable,
+    return await _process_write_request(req)
+
+
+# ── POST /write_batch ──────────────────────────────────────────────────────
+# NEW (solução 1): grava vários WriteRequest numa chamada só, em vez de N
+# chamadas separadas ao /write. Cada item é processado com a mesma lógica de
+# _process_write_request (dedup/update/ttl inclusos) — um item que falha
+# (ex.: duplicata) não impede os demais de serem processados.
+
+async def write_memory_batch(req: WriteBatchRequest):
+    results: list[WriteResponse] = []
+    for item in req.items:
+        results.append(await _process_write_request(item))
+    stored_count = sum(1 for r in results if r.stored)
+    log.info(f"write_batch: {stored_count}/{len(results)} memórias gravadas")
+    return WriteBatchResponse(
+        results=results, stored_count=stored_count, total=len(results),
     )
-    return WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
 
 
 # ── POST /write_st ─────────────────────────────────────────────────────────────
@@ -2058,6 +2439,19 @@ async def read_memory(req: ReadRequest):
             loop.run_in_executor(None, state.lt_index.search, query_emb, req.top_k * 2),
             loop.run_in_executor(None, state.st_index.search, query_emb, req.top_k * 2),
         )
+
+    # ── NEW: query composta → busca adicional por segmento, sem LLM ───────────
+    # Se a pergunta tem vários sub-pedidos numa frase só (ex.: "quero fazer X
+    # usando Y para conseguir Z"), a busca acima (query inteira) tende a
+    # trazer só o que é mais "central" na frase. Aqui cada sub-tópico é
+    # embedado/buscado à parte e o resultado é fundido por max-score — sem
+    # afogar um sub-tópico no outro nem gerar custo de LLM.
+    query_segments = _split_query_segments(query)
+    if len(query_segments) > 1:
+        lt_seg, st_seg = await _search_segmented(query_segments, req.top_k)
+        lt_raw = _fuse_max(lt_raw, lt_seg)
+        st_raw = _fuse_max(st_raw, st_seg)
+        log.info(f"/read query segmentada em {len(query_segments)} partes: {query_segments}")
 
     # Await VS results
     vs_results = []
@@ -2622,7 +3016,7 @@ async def visual_dict_write(req: VisualDictWriteRequest):
         else:
             memory_id = None
             if req.link_to_memory and description:
-                _, _, memory_id = await _store_long_term_text(
+                _, _, memory_id, _ = await _store_long_term_text(
                     f"{concept_name}: {description}", "visual_dict", req.confidence,
                 )
             try:
@@ -2947,6 +3341,7 @@ async def status():
             "index_vectors":        state.lt_index.total,
             "decay_half_life_days": DECAY_HALF_LIFE_DAYS,
             "dedup_threshold":      DEDUP_THRESHOLD,
+            "update_sim_threshold": UPDATE_SIM_THRESHOLD,
         },
         "short_term": {
             "turn_groups_total":  state.st_db.count(),

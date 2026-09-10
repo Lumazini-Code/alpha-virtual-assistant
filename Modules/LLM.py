@@ -1,20 +1,26 @@
 """
-AVA — LLM Inference API
-========================
+AVA — LLM Inference API (OpenRouter Edition)
+=============================================
 REST API para inferência conversacional com:
-  - Gerenciamento do llama-server (subida/desligamento)
-  - Integração correta com API de Memória (LT + ST via session_id)
+  - Backend 100% via OpenRouter (sem llama-server local)
+  - Modelo principal: z-ai/glm-5.3-flash
+  - Modelo extrator de memórias: google/gemma-4-26b-a4b-it:free
+  - Integração com API de Memória (LT + ST via session_id)
   - Integração com API de TTS (localhost:3004)
   - Streaming de texto + disparo paralelo de áudio
   - Histórico de chat persistido via módulo de memória externo
   - Detecção de idioma para resposta automática
+  - EXTRAÇÃO AUTOMÁTICA DE MEMÓRIAS de longo prazo:
+      Após cada dupla pergunta-resposta, um modelo extractor
+      dedicado identifica informações úteis (esquecíveis ou não,
+      episódicas ou semânticas) usando JSON schema estruturado.
 
-TTFT OPTIMIZATIONS (v2.1):
+OPTIMIZATIONS:
   1. Persistent httpx clients — no TCP handshake per request (saves ~50-150ms)
-  2. Stable system prompt prefix — enables llama-server prompt caching (saves ~200-500ms)
-  3. Memory read parallel with prompt construction (saves ~100-300ms)
-  4. Real-length warmup — KV cache pre-allocated for actual context sizes
-  5. Connection pooling — keep-alive to llama-server and memory API
+  2. Stable system prompt prefix — habilita prompt caching no provedor
+  3. Memory read paralelo com construção de prompt (saves ~100-300ms)
+  4. Connection pooling — keep-alive para OpenRouter, Memory e TTS
+  5. Extração de memórias fire-and-forget em background
 
 Porta: localhost:4003
 """
@@ -41,8 +47,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM
 log = logging.getLogger("ava.llm")
 
 
-
-
 load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 
 # ─────────────────────────────────────────────────────────────
@@ -55,50 +59,61 @@ BASEFOLDER = Path(__file__).parent.parent
 MEMORY_URL = "http://localhost:3001"
 TTS_URL    = "http://localhost:3004"
 
+# OpenRouter API
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+
+# Modelos (fixos — não há mais servido local via llama-server)
+MAIN_MODEL              = "z-ai/glm-5.3-flash"
+MEMORY_EXTRACTOR_MODEL  = "google/gemma-4-26b-a4b-it:free"
+
 # Contexto de curto prazo: quantas duplas pergunta-resposta (turn groups)
 # são lidas cruas do /read_st a cada turno, em paralelo com o /read semântico.
 ST_CONTEXT_PAIRS = 5
 
-# llama-server
-LLAMA_SERVER_PATH = r".\llama-cpp\llama-server"
-LLAMA_HOST        = "localhost"
-LLAMA_PORT        = 2001
-LLAMA_URL         = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
-
 # ─────────────────────────────────────────────────────────────
 #          OPTIMIZATION 1: PERSISTENT HTTP CLIENTS
 # ─────────────────────────────────────────────────────────────
-# Instead of creating a new httpx.AsyncClient per request (which
-# costs ~50-150ms for TCP handshake + HTTP/1.1 upgrade), we
-# create them once at startup and reuse across all requests.
-# This is the SINGLE BIGGEST latency win for TTFT.
+# Em vez de criar um httpx.AsyncClient novo a cada request (custo de
+# ~50-150ms de handshake TCP + HTTP upgrade), criamos uma vez na
+# inicialização e reutilizamos em todas as requests. Essa é a maior
+# otimização de latência para TTFT.
 
-_llama_client: httpx.AsyncClient | None = None
+_openrouter_client: httpx.AsyncClient | None = None
 _memory_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
 
 
-async def _get_llama_client() -> httpx.AsyncClient:
-    """Persistent client to llama-server — connection pooling + keep-alive."""
-    global _llama_client
-    if _llama_client is None or _llama_client.is_closed:
-        _llama_client = httpx.AsyncClient(
-            base_url=LLAMA_URL,
-            timeout=httpx.Timeout(9999999.0, connect=5.0),
+async def _get_openrouter_client() -> httpx.AsyncClient:
+    """Persistent client para OpenRouter — connection pooling + keep-alive."""
+    global _openrouter_client
+    if _openrouter_client is None or _openrouter_client.is_closed:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY não configurada. Defina a variável de "
+                "ambiente OPENROUTER_API_KEY (arquivo .env ou shell)."
+            )
+        _openrouter_client = httpx.AsyncClient(
+            base_url=OPENROUTER_BASE_URL,
+            timeout=httpx.Timeout(9999999.0, connect=10.0),
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=6,
-                keepalive_expiry=60.0,       # Keep connections warm for 60s
+                keepalive_expiry=60.0,       # Mantém conexões quentes por 60s
             ),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type":   "application/json",
+                "Authorization":   f"Bearer {OPENROUTER_API_KEY}",
+                # OpenRouter usa esses cabeçalhos para ranking/atribuição
+                "HTTP-Referer":    "http://localhost:4003",
+                "X-Title":         "AVA-LLM",
+            },
         )
-    return _llama_client
-
-
+    return _openrouter_client
 
 
 async def _get_memory_client() -> httpx.AsyncClient:
-    """Persistent client to memory API — connection pooling + keep-alive."""
+    """Persistent client para a API de Memória — connection pooling + keep-alive."""
     global _memory_client
     if _memory_client is None or _memory_client.is_closed:
         _memory_client = httpx.AsyncClient(
@@ -169,171 +184,155 @@ ctxUsed    = _read(BASEFOLDER / r"resource/ctxConfig.dll")
 context    = _read(BASEFOLDER / f"ctxBin/{ctxUsed}.bin")
 searchCfg  = _read(BASEFOLDER / r"resource/SearchCfg.dll")
 
-model_raw = _read(BASEFOLDER / r"resource/Aiconfig.dll")
-model_path = re.split(r"[\\/]", model_raw)
-MODEL_PATH = model_path[-1]
-MODEL_NAME = model_raw
-
-try:
-    with open(BASEFOLDER / f"CfgModels/{model_raw}.json", "r", encoding="utf-8") as f:
-        MODELCFG = json.load(f)
-except FileNotFoundError:
-    MODELCFG = {}
-
-import re
-import time
-import asyncio
-import logging
-import httpx
-
-log = logging.getLogger("ava.llm")
-
 # ════════════════════════════════════════════════════════════════════════════
-# Inferência 100% local via llama-server — um único modelo, sem rate-limit
-# tracking por modelo e sem estado de "esgotado".
+# Inferência 100% via OpenRouter — modelo principal fixo (z-ai/glm-5.3-flash).
+# Para o extractor de memórias, modelo dedicado (google/gemma-4-26b-a4b-it:free).
 # ════════════════════════════════════════════════════════════════════════════
 
 def _calc_max_tokens(messages: list, requested: int = 4096) -> int:
     """
-    Calcula max_tokens para a resposta. O llama-server local não impõe
-    limite prático de tokens por minuto, então isso só evita pedir um
-    max_tokens absurdamente alto por engano.
+    Calcula max_tokens para a resposta. OpenRouter respeita o limite do
+    modelo subjacente; aqui só evitamos pedir um número absurdamente alto.
     """
     return min(requested, 8000)
 
 
 def _reasoning_payload_extra(thinking_depth: int) -> dict:
     """
-    Traduz `thinking_depth` (0-10) em parâmetros de reasoning para o
-    llama-server. LFM2.5-8B-A1B é um reasoning model — a decisão do time
-    (2026-08-05) é priorizar QUALIDADE por padrão, então depth=0 não manda
-    nenhum override e deixa o comportamento nativo do template agir
-    (raciocínio sem teto).
+    Traduz `thinking_depth` (0-10) no formato `reasoning: {effort: ...}`
+    aceito pela API OpenRouter para modelos que suportam reasoning.
 
-    Para depth > 0, tentamos limitar via `reasoning_budget_tokens` — mas o
-    nome desse campo mudou entre versões recentes do llama.cpp (havia
-    `think_budget` via CLI, `thinking_budget_tokens` numa proposta anterior,
-    e `reasoning_budget_tokens` é o confirmado como funcional per-request na
-    build mais recente checada). Se o seu build não reconhecer o campo, ele
-    é ignorado silenciosamente pelo llama-server — sem quebrar o request,
-    só sem efeito. Vale conferir contra `--help`/`/props` do seu binário.
+    Para depth=0 (padrão), nenhum override é enviado — deixa o comportamento
+    nativo do template agir.
+
+    Mapeamento (aproximado, melhor-esforço):
+      depth 0     → sem override
+      depth 1-3   → reasoning.effort = "low"
+      depth 4-7   → reasoning.effort = "medium"
+      depth 8-10  → reasoning.effort = "high"
+
+    Se o modelo não suportar reasoning, o provedor deve ignorar o campo.
     """
     if thinking_depth <= 0:
         return {}
-    return {"reasoning_budget_tokens": thinking_depth * 300}
+    if thinking_depth <= 3:
+        effort = "low"
+    elif thinking_depth <= 7:
+        effort = "medium"
+    else:
+        effort = "high"
+    return {"reasoning": {"effort": effort}}
 
 
-async def _execute_inference(json_payload: dict, stream: bool = False):
+async def _execute_inference(json_payload: dict, stream: bool = False, model: str = MAIN_MODEL):
     """
-    Executa a inferência contra o llama-server local (único backend).
+    Executa a inferência contra a API OpenRouter.
+
+    `stream=True` retorna um context manager pronto para iteração SSE.
+    `stream=False` retorna a resposta síncrona completa.
     """
-    client = await _get_llama_client()
+    client = await _get_openrouter_client()
     messages = json_payload.get("messages", [])
     max_tok = _calc_max_tokens(messages, requested=4096)
-    payload = {**json_payload, "model": MODEL_NAME, "stream": stream, "max_tokens": max_tok}
+    payload = {**json_payload, "model": model, "stream": stream, "max_tokens": max_tok}
 
     if stream:
-        ctx = client.stream("POST", "/v1/chat/completions", json=payload)
-        return client, MODEL_NAME, ctx
+        ctx = client.stream("POST", "/chat/completions", json=payload)
+        return client, model, ctx
     else:
-        r = await client.post("/v1/chat/completions", json=payload)
-        return client, MODEL_NAME, r
+        r = await client.post("/chat/completions", json=payload)
+        return client, model, r
 
 
 # ─────────────────────────────────────────────────────────────
 #          INFERÊNCIA SÍNCRONA COM RETRY (falhas transitórias)
 # ─────────────────────────────────────────────────────────────
-# Único backend: llama-server local. Apenas um pequeno retry para
-# 5xx/erro de rede transitório.
+# Único backend: OpenRouter. Pequeno retry para 5xx ou erro de rede
+# transitório. Erros 429 (rate limit) respeitam Retry-After quando presente.
 
-LLAMA_MAX_RETRIES = 2
-LLAMA_RETRY_BACKOFF_S = 1.0
+OPENROUTER_MAX_RETRIES   = 2
+OPENROUTER_RETRY_BACKOFF = 1.0
 
 
-async def _llama_post_with_retry(
+async def _openrouter_post_with_retry(
     json_payload: dict,
     stream: bool = False,
+    model: str = MAIN_MODEL,
 ):
     """
-    Executa POST no /v1/chat/completions do llama-server local, com um
-    pequeno retry em caso de 5xx ou erro de rede transitório.
+    Executa POST no /chat/completions do OpenRouter, com um pequeno retry
+    em caso de 5xx / 429 / erro de rede transitório.
 
-    Retorna tupla: (client, model_name, response_obj).
+    Retorna tupla: (client, model_name, response_obj | stream_ctx).
     """
-    client = await _get_llama_client()
+    client = await _get_openrouter_client()
     messages = json_payload.get("messages", [])
     max_tok = _calc_max_tokens(messages, requested=4096)
-    payload = {**json_payload, "model": MODEL_NAME, "stream": stream, "max_tokens": max_tok}
+    payload = {**json_payload, "model": model, "stream": stream, "max_tokens": max_tok}
 
     if stream:
         # No streaming, devolvemos o context manager — 5xx/erro de rede
         # dentro do stream é tratado por quem consome (ver /chat/stream).
-        ctx = client.stream("POST", "/v1/chat/completions", json=payload)
-        return client, MODEL_NAME, ctx
+        ctx = client.stream("POST", "/chat/completions", json=payload)
+        return client, model, ctx
 
     last_error: Optional[Exception] = None
-    for attempt in range(LLAMA_MAX_RETRIES + 1):
+    for attempt in range(OPENROUTER_MAX_RETRIES + 1):
         try:
-            r = await client.post("/v1/chat/completions", json=payload)
+            r = await client.post("/chat/completions", json=payload)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             last_error = e
-            log.warning(f"llama-server: erro de rede ({type(e).__name__}), tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}.")
-            if attempt < LLAMA_MAX_RETRIES:
-                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+            log.warning(
+                f"OpenRouter: erro de rede ({type(e).__name__}), "
+                f"tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1}."
+            )
+            if attempt < OPENROUTER_MAX_RETRIES:
+                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
                 continue
-            raise RuntimeError(f"llama-server inacessível em {LLAMA_URL}: {e}") from e
+            raise RuntimeError(f"OpenRouter inacessível: {e}") from e
 
-        if r.status_code >= 500 and attempt < LLAMA_MAX_RETRIES:
-            log.warning(f"llama-server: {r.status_code} (tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}).")
-            await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+        # 429: rate limit — respeita Retry-After se presente
+        if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
+            retry_after = r.headers.get("Retry-After")
+            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
+            log.warning(
+                f"OpenRouter: 429 (rate limit). Aguardando {wait_s}s "
+                f"antes de tentar {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1}."
+            )
+            await asyncio.sleep(wait_s)
             continue
 
-        return client, MODEL_NAME, r
+        if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
+            log.warning(
+                f"OpenRouter: {r.status_code} (tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
+            )
+            await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
+            continue
 
-    raise RuntimeError(f"llama-server: falhou após {LLAMA_MAX_RETRIES + 1} tentativa(s): {last_error}")
+        return client, model, r
+
+    raise RuntimeError(
+        f"OpenRouter: falhou após {OPENROUTER_MAX_RETRIES + 1} tentativa(s): {last_error}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
 #          OPTIMIZATION 2: STABLE SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────
-# The original code rebuilds the system prompt EVERY request with:
-#   - Full context string
-#   - Memory block (changes every request)
-#   - Current timestamp (changes every second)
-#   - Username + language instruction
-#
-# This DESTROYS prompt caching because llama-server's --cache-prompt
-# works by matching the prompt PREFIX. If the prefix changes even one
-# character, the entire KV cache is invalidated.
-#
-# FIX: Split into:
-#   1. STABLE system prompt (context + username + instructions)
-#      → This part is cached by llama-server after the first request
-#   2. DYNAMIC memory block expressed in the ASSISTANT voice
-#      → Model "recalls" its own knowledge instead of receiving external data
-#   3. Timestamp moved to a user message (not in the system prompt)
-#
-# MEMORY SEMANTICS FIX (v2.2):
-# Injecting memories as role:user causes the model to treat them as
-# external data provided by the user, not as its own knowledge.
-# The fix is two-pronged:
-#   a) The system prompt explicitly explains the memory injection mechanism
-#      so the model understands the semantic contract.
-#   b) The memories are expressed in the ASSISTANT voice (role:assistant),
-#      as a first-person recall, so the model "owns" that knowledge.
-#
-# CACHE IMPACT: The stable prefix [system: _SYSTEM_PROMPT_BASE] is always
-# the same → KV cache HIT. The assistant memory recall turn varies but is
-# small and comes AFTER the cached prefix.
+# O prompt de sistema é mantido ESTÁVEL (não muda entre requests) para
+# maximizar a taxa de prompt cache hits no provedor OpenRouter. O bloco
+# dinâmico de memória vai DEPOIS do prefixo estável, em uma mensagem
+# separada (role:assistant) — o custo de prefill é pequeno, mas o prefixo
+# ainda aproveita o cache.
 
 _SYSTEM_PROMPT_BASE = (
     f"{context}\n\n"
     f"O nome do usuário é {username}. "
     f"Responda sempre no idioma em que o usuário escrever.\n\n"
     # ── MEMORY SEMANTICS INSTRUCTION ─────────────────────────────────────────
-    # This tells the model HOW to interpret the injected memory block.
-    # Without this, the model may treat the assistant recall turn as a
-    # previous response rather than as retrieved self-knowledge.
+    # Diz ao modelo COMO interpretar o bloco de memória injetado.
+    # Sem isso, o modelo pode tratar o recall em voz de assistant como
+    # uma resposta anterior em vez de conhecimento próprio recuperado.
     "Você possui um sistema de memória persistente. Antes de cada resposta, "
     "fragmentos relevantes da sua memória de longo prazo e do histórico recente "
     "são recuperados e apresentados em uma mensagem sua anterior nesta conversa. "
@@ -343,45 +342,6 @@ _SYSTEM_PROMPT_BASE = (
 )
 
 
-async def _warmup():
-    """
-    Warmup with a REPRESENTATIVE prompt — not just "ok".
-    This pre-allocates the KV cache for the actual context sizes we use,
-    so the first real request doesn't pay the allocation cost.
-    """
-    log.info("[LLM] Warmup do modelo (representative prompt)...")
-    try:
-        client = await _get_llama_client()
-
-        # Send a warmup request that's similar in structure to real requests
-        # This allocates KV cache for the system prompt + a user message
-        warmup_messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT_BASE},
-            {"role": "user", "content": "ok"},
-        ]
-
-        r = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": MODEL_NAME,
-                "messages": warmup_messages,
-                "max_tokens": 1,
-                "temperature": 0.1,
-            },
-        )
-
-        if r.status_code == 200:
-            # Check if prompt was cached
-            usage = r.json().get("usage", {})
-            cached_tokens = usage.get("prompt_tokens_cached", 0)
-            log.info(f"[LLM] Warmup concluído. Cached tokens: {cached_tokens}")
-        else:
-            log.info(f"[LLM] Warmup response: {r.status_code}")
-
-    except Exception as e:
-        log.info(f"[LLM] Warmup falhou (não crítico): {e}")
-
-
 # ─────────────────────────────────────────────────────────────
 #                     INTEGRAÇÃO: MEMÓRIA
 # ─────────────────────────────────────────────────────────────
@@ -389,7 +349,7 @@ async def _warmup():
 async def memory_read(query: str, session_id: Optional[str] = None, top_k: int = 10) -> list[dict]:
     """
     Busca memórias relevantes (Long-Term e Short-Term) para o contexto da conversa.
-    OPTIMIZED: Uses persistent HTTP client — no TCP handshake per call.
+    Otimizado: usa HTTP client persistente — sem handshake TCP por chamada.
     """
     try:
         client = await _get_memory_client()
@@ -449,16 +409,312 @@ async def memory_save_turn(session_id: str, user_input: str, assistant_response:
         log.info(f"[MEMORY] Falha ao salvar turno ST: {e}")
 
 
-async def memory_write_fact(text: str, source: str = "chat", confidence: float = 0.7):
-    """Grava informações na memória de longo prazo — fire-and-forget."""
+async def memory_write_st_episodic(session_id: str, text: str):
+    """
+    Grava uma memória EPISÓDICA na memória de curto prazo (ST) — fire-and-forget.
+
+    Episódica = evento específico (algo que aconteceu em um momento). Como ST
+    é organizada como turnos de conversa por session_id, gravamos o evento
+    como um turno único role=assistant, sem um par user correspondente — isso
+    evita poluir o histórico de chat com mensagens vazias do usuário.
+    """
+    if not session_id or not text:
+        return
+    try:
+        client = await _get_memory_client()
+        await client.post(
+            "/write_st",
+            json={
+                "session_id": session_id,
+                "turns": [
+                    {"role": "assistant", "content": text},
+                ],
+            },
+        )
+    except Exception as e:
+        log.info(f"[MEMORY] Falha na escrita ST episódica: {e}")
+
+
+async def memory_write_fact(
+    text: str,
+    source: str = "chat",
+    confidence: float = 0.7,
+    forgetable: bool = True,
+):
+    """
+    Grava informações na memória de longo prazo (LT) — fire-and-forget.
+
+    A LT armazena apenas memórias SEMÂNTICAS (fatos/conhecimento geral sobre
+    o usuário ou o mundo). Memórias EPISÓDICAS (eventos específicos da
+    conversa) não entram aqui — elas vão para a ST via
+    `memory_write_st_episodic`.
+
+    Parâmetro estendido para suportar o metadado identificado pelo extractor:
+      - forgetable: True se a memória pode decair com o tempo; False se é
+        considerada permanente (ex.: nome do usuário, alergias).
+    """
     try:
         client = await _get_memory_client()
         await client.post(
             "/write",
-            json={"text": text, "source": source, "confidence": confidence},
+            json={
+                "text":         text,
+                "source":       source,
+                "confidence":   confidence,
+                "forgetable":   forgetable,
+            },
         )
     except Exception as e:
         log.info(f"[MEMORY] Falha na escrita LT: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+#              EXTRAÇÃO AUTOMÁTICA DE MEMÓRIAS (LT + ST)
+# ─────────────────────────────────────────────────────────────
+# Para cada dupla pergunta-resposta (considerando o assistant prefill e
+# múltiplas requisições na mesma resposta — ou seja, usamos o user_input
+# ORIGINAL e a resposta FINAL agregada, não importa quantas chamadas
+# internas tenham ocorrido), um modelo extractor dedicado recebe o par
+# e decide:
+#   1. Quais informações (pergunta + resposta) valem gravar.
+#   2. Se cada uma é "esquecível" ou não (aplica-se apenas às semânticas).
+#   3. Se cada uma é "episódica" ou "semântica" — este campo define
+#      o ROTEAMENTO da memória:
+#        - semantic  → LT (memória de longo prazo, via /write)
+#        - episodic  → ST (memória de curto prazo, via /write_st)
+# A resposta é forçada via JSON schema estruturado para garantir parsing
+# confiável.
+
+_MEMORY_EXTRACTION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "memories": {
+            "type": "array",
+            "description": (
+                "Lista de memórias úteis extraídas da dupla pergunta-resposta. "
+                "Pode ser vazia se nenhuma informação merecer ser gravada."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Texto autocontido da memória, redigido em terceira "
+                            "pessoa. Ex.: 'O usuário chama-se João' ou "
+                            "'Usuário preferiu Python para o novo projeto'."
+                        ),
+                    },
+                    "forgettable": {
+                        "type": "boolean",
+                        "description": (
+                            "true  → memória transitória, pode decair com o tempo "
+                            "(ex.: projeto atual, tarefa em andamento). "
+                            "false → memória permanente (ex.: nome, alergia, "
+                            "preferência gastronômica estável). Aplicável apenas "
+                            "a memórias semânticas (LT); para episódicas (ST) "
+                            "ignore este campo, pois ST já é efêmera por natureza."
+                        ),
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["episodic", "semantic"],
+                        "description": (
+                            "Define o ROTEAMENTO da memória: "
+                            "semantic  → gravada na memória de longo prazo (LT) "
+                            "como fato/conhecimento geral (ex.: 'usuário é "
+                            "alérgico a amendoim'). "
+                            "episodic  → gravada na memória de curto prazo (ST) "
+                            "como evento específico do momento (ex.: 'em 2024 o "
+                            "usuário viajou para Paris')."
+                        ),
+                    },
+                },
+                "required": ["content", "forgettable", "type"],
+            },
+        }
+    },
+    "required": ["memories"],
+}
+
+
+_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
+    "Você é um extrator de memórias para um assistente conversacional chamado AVA. "
+    "Com base na dupla PERGUNTA-RESPOSTA fornecida, identifique TODAS as informações "
+    "presentes (tanto na pergunta do usuário quanto na resposta do assistente) que "
+    "seriam úteis de serem gravadas sobre o usuário, o contexto da conversa, ou o "
+    "mundo.\n\n"
+    "Para cada memória identificada, classifique:\n"
+    "  - type: 'semantic' se é um fato ou conhecimento geral (ex.: 'usuário sabe "
+    "    programar em Python', 'usuário é alérgico a amendoim'). Essas memórias "
+    "    vão para a memória de LONGO prazo (LT). 'episodic' se descreve um evento "
+    "    específico (algo que aconteceu em um momento — ex.: 'em 2024 o usuário "
+    "    viajou para Paris', 'hoje o usuário perguntou sobre X'). Essas memórias "
+    "    vão para a memória de CURTO prazo (ST).\n"
+    "  - forgettable: aplicável apenas a memórias semânticas (LT). true se é uma "
+    "    informação transitória que pode perder relevância com o tempo (ex.: "
+    "    tarefa atual, projeto do momento, humor atual); false se é permanente "
+    "    (ex.: nome do usuário, alergias, profissão, preferências estáveis). Para "
+    "    memórias episódicas (ST), preencha com true — ST é efêmera por natureza.\n\n"
+    "Redija cada memória em terceira pessoa e de forma autocontida (sem referenciar "
+    "esta instrução nem a conversa). Evite duplicar informações que já estão "
+    "implícitas em outra memória da mesma resposta.\n\n"
+    "Se nenhuma informação merecer ser gravada, retorne uma lista vazia."
+)
+
+
+async def _extract_and_save_memories(
+    user_input: str,
+    assistant_response: str,
+    *,
+    session_id: Optional[str] = None,
+) -> list[dict]:
+    """
+    Roda o modelo extractor (google/gemma-4-26b-a4b-it:free) sobre a dupla
+    pergunta-resposta, força a saída em JSON schema estruturado, e roteia
+    cada memória identificada:
+      - semantic  → LT (memória de longo prazo, via /write)
+      - episodic  → ST (memória de curto prazo, via /write_st)
+
+    `user_input`        — texto ORIGINAL que o usuário enviou (não o prefill
+                          nem um turno intermediário de tool use).
+    `assistant_response`— texto FINAL agregado da resposta (mesmo que tenha
+                          sido montado a partir de múltiplas requisições
+                          internas: streaming, reasoning, múltiplos turnos
+                          de tool use). Só chamamos o extractor UMA vez por
+                          turno de conversa, sobre o produto final.
+
+    Retorna a lista de memórias extraídas (para fins de logging/inspeção).
+    """
+    if not user_input or not assistant_response:
+        return []
+    if not OPENROUTER_API_KEY:
+        log.info("[MEMORY-EXTRACT] OPENROUTER_API_KEY ausente — extração pulada.")
+        return []
+
+    messages = [
+        {"role": "system", "content": _MEMORY_EXTRACTOR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"=== PERGUNTA DO USUÁRIO ===\n{user_input}\n\n"
+                f"=== RESPOSTA DO ASSISTENTE ===\n{assistant_response}\n\n"
+                "=== TAREFA ===\n"
+                "Com base nessa dupla pergunta-resposta, identifique se alguma "
+                "informação presente (tanto na pergunta quanto na resposta) seria "
+                "útil de ser gravada. Para cada uma, indique se é esquecível ou "
+                "não, e se é episódica (→ ST) ou semântica (→ LT). "
+                "Responda SOMENTE no formato JSON definido."
+            ),
+        },
+    ]
+
+    payload: dict = {
+        "model":       MEMORY_EXTRACTOR_MODEL,
+        "messages":    messages,
+        "temperature": 0.2,
+        "max_tokens":  1024,
+        # Força saída estruturada em JSON — o provedor valida o schema.
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name":   "memory_extraction",
+                "strict": True,
+                "schema": _MEMORY_EXTRACTION_SCHEMA,
+            },
+        },
+    }
+
+    try:
+        client = await _get_openrouter_client()
+        r = await client.post("/chat/completions", json=payload)
+        if r.status_code != 200:
+            # Alguns modelos :free podem não suportar json_schema estrito.
+            # Tentamos fallback para json_object (sem validação de schema).
+            log.info(
+                f"[MEMORY-EXTRACT] {r.status_code} com json_schema — "
+                f"tentando fallback json_object. Body: {r.text[:200]}"
+            )
+            payload["response_format"] = {"type": "json_object"}
+            r = await client.post("/chat/completions", json=payload)
+            if r.status_code != 200:
+                log.info(
+                    f"[MEMORY-EXTRACT] Fallback falhou: {r.status_code} — {r.text[:300]}"
+                )
+                return []
+
+        data = r.json()
+        content = data["choices"][0]["message"].get("content") or ""
+        if not content.strip():
+            return []
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as je:
+            # Tenta recuperar extraindo o primeiro bloco JSON da string.
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                log.info(f"[MEMORY-EXTRACT] JSON inválido: {je}. Raw: {content[:200]}")
+                return []
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                log.info(f"[MEMORY-EXTRACT] Recovery falhou. Raw: {content[:200]}")
+                return []
+
+        memories_raw = parsed.get("memories", []) if isinstance(parsed, dict) else []
+
+        # Roteia cada memória identificada (fire-and-forget individual).
+        #   semantic  → LT (memória de longo prazo, via /write)
+        #   episodic  → ST (memória de curto prazo, via /write_st)
+        saved: list[dict] = []
+        for mem in memories_raw:
+            if not isinstance(mem, dict):
+                continue
+            text = (mem.get("content") or "").strip()
+            if not text:
+                continue
+            mem_type = mem.get("type") or "semantic"
+            if mem_type not in ("episodic", "semantic"):
+                mem_type = "semantic"
+            forgetable = bool(mem.get("forgettable", True))
+
+            if mem_type == "semantic":
+                # LT: confidence mais alta para memórias não-esquecíveis —
+                # elas tendem a ser fatos estáveis sobre o usuário e
+                # merecem prioridade na busca.
+                confidence = 0.9 if not forgetable else 0.6
+                asyncio.create_task(
+                    memory_write_fact(
+                        text=text,
+                        source="chat:semantic",
+                        confidence=confidence,
+                        forgetable=forgetable,
+                    )
+                )
+            else:
+                # episodic → ST (curto prazo). ST é efêmera por natureza,
+                # então o forgetable do extractor é ignorado neste caso.
+                asyncio.create_task(
+                    memory_write_st_episodic(session_id=session_id, text=text)
+                )
+
+            saved.append({
+                "content":    text,
+                "type":       mem_type,
+                "target":     "LT" if mem_type == "semantic" else "ST",
+                "forgettable": forgetable,
+            })
+
+        log.info(
+            f"[MEMORY-EXTRACT] {len(saved)} memória(s) extraída(s) "
+            f"(session={session_id})."
+        )
+        return saved
+
+    except Exception as e:
+        log.info(f"[MEMORY-EXTRACT] Falha: {type(e).__name__}: {e}")
+        return []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -470,7 +726,7 @@ _tts_queue: Optional[asyncio.Queue] = None
 async def _tts_sender_worker():
     """
     Worker em background que envia sentenças para o TTS SEQUENCIALMENTE.
-    OPTIMIZED: Uses persistent HTTP client.
+    Otimizado: usa HTTP client persistente.
     """
     tts_client = _get_tts_client()
     while True:
@@ -507,18 +763,17 @@ async def tts_speak(text: str, voice: str, lang: str):
 def _build_memory_recall(memories: list[dict]) -> str | None:
     """
     Formata o bloco de memórias como texto de recall em primeira pessoa.
+    Retorna None se não houver memórias válidas.
 
-    Returns None se não houver memórias válidas.
-
-    SEMANTIC RATIONALE:
-    The memory block is expressed as an ASSISTANT turn (first-person recall)
-    instead of a USER turn (external data injection). This ensures the model
-    treats the information as self-knowledge it's retrieving, not as
-    instructions or data provided by the user.
-
-    The phrasing uses verbs of recall ("Lembro que", "Sei que") to reinforce
-    the epistemic ownership. The closing line signals readiness, anchoring
-    the model's stance before the actual user message arrives.
+    Rationale semântico:
+      O bloco de memória é expresso como um turno ASSISTANT (recall em
+      primeira pessoa) em vez de USER (injeção de dados externos). Assim
+      o modelo trata a informação como conhecimento próprio que está
+      recuperando, e não como instrução ou dado fornecido pelo usuário.
+      A frase usa verbos de recall ("Lembro que", "Sei que") para
+      reforçar a propriedade epistêmica, e a linha final sinaliza
+      prontidão — ancorando a postura do modelo antes da mensagem real
+      do usuário chegar.
     """
     if not memories:
         return None
@@ -547,50 +802,30 @@ def _build_messages(
     recent_turns: Optional[list[dict]] = None,
 ) -> list[dict]:
     """
-    Monta a lista de mensagens para o llama-server.
+    Monta a lista de mensagens para o OpenRouter.
 
-    CRITICAL for prompt caching:
-    ─────────────────────────────────
-    The system prompt is STABLE (never changes at runtime).
-    llama-server's --cache-prompt works by matching the PREFIX of
-    the message list. If the system prompt is always the same, it
-    gets cached after the first request, and subsequent requests
-    only need to prefill the NEW tokens.
+    Crítico para prompt caching:
+      O prompt de sistema é ESTÁVEL (não muda em runtime). O provedor
+      (OpenRouter/modelo subjacente) tipicamente mantém cache do prefixo;
+      manter o system prompt idêntico maximiza cache hits.
 
-    Structure (with memories + recent turns):
-      [0] system:      STABLE prompt — context + username + memory semantics instruction
-      [1] assistant:   first-person memory recall (dynamic, AFTER cached prefix) — from /read
-      [2..N] user/assistant: last N pairs of real conversation history — from /read_st
-      [N+1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
+    Estrutura (com memórias + turnos recentes):
+      [0] system:     prompt ESTÁVEL — contexto + nome + instrução de memória
+      [1] assistant:  recall de memória em 1ª pessoa (DINÂMICO, depois do prefixo)
+      [2..N] user/assistant: últimas N duplas da conversa real — de /read_st
+      [N+1] user:     "[Data: DD/MM/YYYY]\n{user_input}"
 
-    Structure (without memories/turns):
-      [0] system:    STABLE prompt
-      [1] user:      "[Data: DD/MM/YYYY]\n{user_input}"
-
-    MEMORY SEMANTICS:
-    Memories from /read are expressed in the ASSISTANT voice (role:assistant)
-    as a first-person recall — semantic knowledge the model is "remembering",
-    not external data from the user. `recent_turns` (from /read_st) are the
-    opposite: they're the actual conversation as it happened, so they're
-    inserted as real user/assistant turns instead of being folded into the
-    recall block — that keeps the model's literal short-term context (what
-    was actually said) separate from associative long-term recall (relevant
-    facts a semantic search surfaced).
-
-    KV CACHE IMPACT:
-    - Message [0] (system) is always identical → KV cache HIT
-    - Message [1] (assistant recall) varies by query → small prefill cost
-    - Recent turns + user input vary every turn → prefill cost, but small
-      relative to the alternative of re-embedding the whole history via /read
+    Estrutura (sem memórias/turnos):
+      [0] system:     prompt ESTÁVEL
+      [1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
     """
     messages = [
-        # STABLE: This is the cached portion — never changes at runtime
+        # ESTÁVEL: porção que aproveita cache no provedor
         {"role": "system", "content": _SYSTEM_PROMPT_BASE},
     ]
 
-    # DYNAMIC: Memory recall expressed in the assistant's own voice.
-    # Role is "assistant" so the model treats this as self-knowledge,
-    # not as external input from the user.
+    # DINÂMICO: recall de memória em voz do próprio assistant.
+    # role=assistant para o modelo tratar como autoconhecimento.
     recall_text = _build_memory_recall(memories)
     if recall_text:
         messages.append({
@@ -598,15 +833,15 @@ def _build_messages(
             "content": recall_text,
         })
 
-    # DYNAMIC: Last N pairs of real conversation turns (from /read_st),
-    # inserted as-is — this is literal history, not associative recall.
+    # DINÂMICO: últimas N duplas de turnos reais (de /read_st),
+    # inseridas como estão — é histórico literal, não recall associativo.
     for turn in (recent_turns or []):
         role = turn.get("role")
         content = turn.get("content")
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content})
 
-    # DYNAMIC: Current date + user input
+    # DINÂMICO: data atual + input do usuário
     today = datetime.datetime.now().strftime("%d/%m/%Y")
     messages.append({
         "role": "user",
@@ -621,7 +856,7 @@ def _build_messages(
 #                           FASTAPI
 # ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="AVA — LLM API", version="2.2.0")
+app = FastAPI(title="AVA — LLM API", version="3.0.0")
 
 # ── Schemas ───────────────────────────────────────────────────
 
@@ -635,18 +870,23 @@ class ChatRequest(BaseModel):
     thinking_depth: int = Field(
         default=0, ge=0, le=10,
         description=(
-            "Orçamento de raciocínio (best-effort). LFM2.5-8B-A1B é um reasoning "
-            "model — por padrão (0) usamos o comportamento nativo do template "
-            "(raciocina livremente, sem teto), priorizando qualidade sobre "
-            "latência. Valores 1-10 tentam limitar o raciocínio via "
-            "`reasoning_budget_tokens` do llama-server (depth * 300 tokens) "
-            "para reduzir latência quando isso importar mais — mas esse campo "
-            "do servidor mudou de nome recentemente entre builds do llama.cpp, "
-            "então trate como melhor-esforço, não garantia."
+            "Orçamento de raciocínio (melhor-esforço). Por padrão (0) nenhum "
+            "override é enviado — usa o comportamento nativo do modelo. "
+            "Valores 1-10 são mapeados para reasoning.effort = low/medium/high "
+            "no payload OpenRouter (modelos que não suportam ignorarão o campo)."
         ),
     )
     stream_reasoning: bool = Field(default=True, description="Se True e o modelo emitir reasoning_content, envia para a UI. Se False, ignora completamente.")
-    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o único modelo servido pelo llama-server local.")
+    extract_memories: bool = Field(
+        default=True,
+        description=(
+            "Se True, após gerar a resposta final, dispara em background o "
+            "modelo extractor de memórias (google/gemma-4-26b-a4b-it:free) "
+            "para identificar informações úteis a serem gravadas em LT, "
+            "rotulando-as como esquecíveis/permanentes e episódicas/semânticas."
+        ),
+    )
+    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
 
 class ClearRequest(BaseModel):
     confirm: bool = False
@@ -664,9 +904,7 @@ class ToolCallMessage(BaseModel):
         description=(
             "Texto simples (str) na maioria dos casos. Também aceita o formato "
             "multi-parte do OpenAI vision (lista de blocos {type: text|image_url, ...}) "
-            "para requests multimodais — repassado como está para o llama-server, "
-            "que só interpreta corretamente quando o modelo carregado está em "
-            "modo multimodal."
+            "para requests multimodais — repassado como está para o OpenRouter."
         ),
     )
     tool_calls: Optional[list] = None
@@ -675,29 +913,27 @@ class ToolCallMessage(BaseModel):
 
 class ToolUseRequest(BaseModel):
     messages: list[ToolCallMessage]
-    tools: list[dict] = Field(default_factory=list, description="Lista de tool schemas no formato OpenAI function-calling. IGNORADO quando `grammar` está presente — nesse caso o llama-server usa a grammar para restringir o output e o caller deve parsear `message.content` em vez de `message.tool_calls`.")
+    tools: list[dict] = Field(default_factory=list, description="Lista de tool schemas no formato OpenAI function-calling. IGNORADO quando `grammar` está presente — nesse caso o OpenRouter usa response_format json_object para restringir o output.")
     tool_choice: Optional[str] = Field(default="auto", description="auto | required | none | {type:function,function:{name:...}}. IGNORADO quando `grammar` está presente.")
-    grammar: Optional[str] = Field(default=None, description="Gramática GBNF (llama.cpp) para restringir o output do modelo. Quando presente, o payload enviado ao llama-server NÃO inclui `tools`/`tool_choice` (desabilita function-calling nativo) e a resposta deve ser lida de `message.content`. O caller é responsável por parsear o content segundo a grammar — garantidamente válido pelo servidor.")
-    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o único modelo servido pelo llama-server local.")
+    grammar: Optional[str] = Field(default=None, description="Mantido por compatibilidade com chamadores antigos do llama-server. No OpenRouter, quando presente, ativamos response_format=json_object (equivalente aproximado de GBNF). A resposta vem em message.content e o caller é responsável por parsear.")
+    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=32000)
     reasoning_effort: Optional[str] = Field(
         default=None,
         description=(
-            "Passado direto para o llama-server. Padrão (None) = comportamento "
-            "nativo do template (LFM2.5-8B-A1B raciocina antes de responder — "
-            "prioriza qualidade). Envie \"none\" para desligar reasoning nesta "
-            "chamada específica (único valor com efeito documentado no "
-            "tools/server/README.md do llama.cpp; use quando latência por "
-            "passo importar mais que qualidade — ex.: loops rápidos do "
-            "alpha_code)."
+            "Passado direto para o OpenRouter como reasoning.effort. Padrão "
+            "(None) = não envia o campo. Envie \"low\"|\"medium\"|\"high\" "
+            "para modelos que suportam, ou \"none\" para desligar reasoning "
+            "nesta chamada específica (use quando latência por passo importar "
+            "mais que qualidade — ex.: loops rápidos do alpha_code)."
         ),
     )
     allow_llama_fallback: bool = Field(
         default=True,
-        description="Ignorado — mantido por compatibilidade. O llama-server local já é o único backend."
+        description="Ignorado — mantido por compatibilidade. OpenRouter é o único backend.",
     )
-    max_retries: int = Field(default=3, ge=0, le=10, description="Máximo de retries em falha transitória (5xx/rede) do llama-server local antes de desistir.")
+    max_retries: int = Field(default=3, ge=0, le=10, description="Máximo de retries em falha transitória (5xx/rede/429) do OpenRouter antes de desistir.")
 
 class ToolUseResponse(BaseModel):
     message: dict
@@ -705,26 +941,29 @@ class ToolUseResponse(BaseModel):
     usage: dict
     elapsed_ms: float
     fallback_used: bool = False
-    too_large: bool = Field(default=False, description="True se request excedeu limite TPM do modelo (caller deve reduzir contexto ou trocar modelo)")
+    too_large: bool = Field(default=False, description="True se request excedeu limite de contexto do modelo (caller deve reduzir contexto ou trocar modelo)")
 
 
 # ── Lifecycle ────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    """
-    OPTIMIZED: Async warmup that uses the persistent client
-    and sends a representative-length prompt.
-    """
-    await _warmup()
+    """Verifica que a OPENROUTER_API_KEY está configurada."""
+    if not OPENROUTER_API_KEY:
+        log.warning(
+            "[STARTUP] OPENROUTER_API_KEY não configurada — inferência vai falhar "
+            "até a variável ser definida."
+        )
+    else:
+        log.info(f"[STARTUP] OpenRouter configurado. Modelo principal: {MAIN_MODEL}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Close persistent HTTP clients gracefully."""
-    global _llama_client, _memory_client, _tts_http
-    if _llama_client and not _llama_client.is_closed:
-        await _llama_client.aclose()
+    """Fecha HTTP clients persistentes graciosamente."""
+    global _openrouter_client, _memory_client, _tts_http
+    if _openrouter_client and not _openrouter_client.is_closed:
+        await _openrouter_client.aclose()
     if _memory_client and not _memory_client.is_closed:
         await _memory_client.aclose()
     if _tts_http and not _tts_http.is_closed:
@@ -735,33 +974,30 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    """Verifica se a API e o llama-server estão no ar."""
-    try:
-        client = await _get_llama_client()
-        r = await client.get("/health")
-        llama_ok = r.status_code == 200
-    except Exception:
-        llama_ok = False
-    return {"api": "ok", "llama_server": "ok" if llama_ok else "down"}
+    """Verifica se a API está no ar e se a chave OpenRouter está configurada."""
+    return {
+        "api":               "ok",
+        "openrouter_key":    "ok" if OPENROUTER_API_KEY else "missing",
+        "main_model":        MAIN_MODEL,
+        "memory_extractor":  MEMORY_EXTRACTOR_MODEL,
+    }
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     """
     Inferência síncrona — retorna a resposta completa em JSON.
-    OPTIMIZED:
-      - Persistent llama + memory clients (no TCP handshake)
-      - Stable system prompt (prompt cache hits after 1st request)
-      - Parallel memory read + language detection
+    Otimizações:
+      - HTTP client persistente para OpenRouter (sem TCP handshake)
+      - System prompt estável (maximiza cache hits no provedor)
+      - Memória read paralelo com detecção de idioma
+      - Extração de memórias LT em background (fire-and-forget)
     """
     user_input = req.message.strip()
     if not user_input:
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
 
-    # ── OPTIMIZATION 3: PARALLEL prep ────────────────────────────────────────
-    # Run language detection, memory read (semantic) and memory read_st
-    # (raw recent history) IN PARALLEL instead of sequentially.
-    # This saves ~100-300ms when memory API is slow.
+    # ── PARALLEL prep: detecção de idioma + leitura LT + leitura ST ────────
     lang_task = asyncio.ensure_future(
         asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
     )
@@ -772,27 +1008,33 @@ async def chat(req: ChatRequest):
         memory_read_st(req.session_id)
     )
 
-    # Wait for all three to complete
     lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
     if not lang:
         lang = "pt"
 
-    # 3. Montar prompt (with stable system prompt for caching)
+    # Monta prompt
     messages = _build_messages(user_input, lang, memories, recent_turns)
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
-    # 4. Inferência (llama-server local, com retry para falhas transitórias)
+
+    # Inferência (OpenRouter, com retry para falhas transitórias)
     t0 = time.perf_counter()
     log.info(messages)
     try:
-        client_used, model_used, r = await _llama_post_with_retry(
+        client_used, model_used, r = await _openrouter_post_with_retry(
             json_payload={
                 "messages":    messages,
                 "temperature": 0.7,
                 **_reasoning_payload_extra(req.thinking_depth),
             },
             stream=False,
+            model=MAIN_MODEL,
         )
         r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"openrouter error {e.response.status_code}: {e.response.text[:300]}",
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"inference error: {e}")
 
@@ -802,9 +1044,9 @@ async def chat(req: ChatRequest):
                       resp_data["choices"][0]["message"].get("reasoning", "")
     elapsed = time.perf_counter() - t0
 
-    # Log cache stats
+    # Log cache stats (quando o provedor reportar)
     usage = resp_data.get("usage", {})
-    cached = usage.get("prompt_tokens_cached", 0)
+    cached = usage.get("prompt_tokens_cached", 0) or usage.get("cached_tokens", 0)
     total_prompt = usage.get("prompt_tokens", 0)
     log.info(
         f"[CHAT] {elapsed:.2f}s | {len(response_text)} chars | "
@@ -812,15 +1054,22 @@ async def chat(req: ChatRequest):
         f"prompt: {total_prompt} tokens (cached: {cached})"
     )
 
-    # 5. Gravar turno na memória (fire-and-forget)
+    # Gravar turno na memória de curto prazo (fire-and-forget)
     asyncio.create_task(
         memory_save_turn(req.session_id, user_input, response_text)
     )
-    asyncio.create_task(
-        memory_write_fact(f"Usuário disse: {user_input[:300]}", "chat", 0.7)
-    )
 
-    # 6. Disparar TTS em background
+    # ── EXTRAÇÃO DE MEMÓRIAS LT (fire-and-forget) ─────────────────────────
+    # Dispara o modelo extractor sobre a dupla (user_input, response_text)
+    # — isto é a "resposta final agregada" do assistente. Não importa se
+    # internamente o modelo fez reasoning, tool calls, ou múltiplas
+    # requisições: aqui só interessa o produto final visto pelo usuário.
+    if req.extract_memories:
+        asyncio.create_task(
+            _extract_and_save_memories(user_input, response_text, session_id=req.session_id)
+        )
+
+    # Disparar TTS em background
     voice = req.voice or voiceModel
     if req.tts and voice:
         asyncio.create_task(tts_speak(response_text, voice, lang))
@@ -838,17 +1087,18 @@ async def chat(req: ChatRequest):
 async def chat_stream(req: ChatRequest):
     """
     Inferência com streaming — retorna Server-Sent Events (SSE).
-    OPTIMIZED:
-      - Persistent llama + memory clients (no TCP handshake)
-      - Stable system prompt (prompt cache hits after 1st request)
-      - Parallel memory read + language detection
-      - Connection reuse for streaming
+    Otimizações:
+      - HTTP client persistente para OpenRouter
+      - System prompt estável
+      - Memória read + detecção de idioma em paralelo
+      - Reuso de conexão para streaming
+      - Extração de memórias LT ao final do stream (sobre a resposta completa)
     """
     user_input = req.message.strip()
     if not user_input:
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
 
-    # ── OPTIMIZATION 3: PARALLEL prep ────────────────────────────────────────
+    # ── PARALLEL prep ──────────────────────────────────────────────────────
     lang_task = asyncio.ensure_future(
         asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
     )
@@ -889,12 +1139,12 @@ async def chat_stream(req: ChatRequest):
     async def generator():
         nonlocal _tts_buf
         full_response = ""
-        full_reasoning = ""  
+        full_reasoning = ""
         t0 = time.perf_counter()
         cached_tokens = 0
 
-        # Retry simples para falhas transitórias (5xx/erro de rede) do llama-server local
-        for attempt in range(LLAMA_MAX_RETRIES + 1):
+        # Retry simples para falhas transitórias (5xx/rede/429) do OpenRouter
+        for attempt in range(OPENROUTER_MAX_RETRIES + 1):
             client_used, model_used, r_ctx = await _execute_inference(
                 json_payload={
                     "messages":    messages,
@@ -902,18 +1152,31 @@ async def chat_stream(req: ChatRequest):
                     **_reasoning_payload_extra(req.thinking_depth),
                 },
                 stream=True,
+                model=MAIN_MODEL,
             )
 
             try:
                 async with r_ctx as r:
-                    if r.status_code >= 500 and attempt < LLAMA_MAX_RETRIES:
-                        log.warning(f"llama-server: {r.status_code} no stream (tentativa {attempt + 1}/{LLAMA_MAX_RETRIES + 1}).")
-                        await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                    if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
+                        retry_after = r.headers.get("Retry-After")
+                        wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
+                        log.warning(
+                            f"OpenRouter stream: 429. Aguardando {wait_s}s "
+                            f"(tentativa {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1})."
+                        )
+                        await asyncio.sleep(wait_s)
+                        continue
+                    if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
+                        log.warning(
+                            f"OpenRouter stream: {r.status_code} "
+                            f"(tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
+                        )
+                        await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
                         continue
 
                     r.raise_for_status()
 
-                    # Se chegou aqui, a conexão foi aceita e não há erros. Processa as linhas:
+                    # Se chegou aqui, conexão aceita. Processa as linhas SSE:
                     async for line in r.aiter_lines():
                         if not line or not line.startswith("data:"):
                             continue
@@ -932,9 +1195,11 @@ async def chat_stream(req: ChatRequest):
 
                             content = delta_obj.get("content", "")
                             if not content:
-                                timings = chunk.get("timings", {})
-                                if timings and "cache_n" in timings:
-                                    cached_tokens = timings.get("cache_n", 0)
+                                # Alguns provedores enviam usage na última chunk
+                                usage = chunk.get("usage", {})
+                                if usage:
+                                    cached_tokens = usage.get("prompt_tokens_cached", 0) or \
+                                                     usage.get("cached_tokens", 0)
                                 continue
 
                             full_response += content
@@ -948,9 +1213,9 @@ async def chat_stream(req: ChatRequest):
                                     _flush_tts_buf()
                         except (json.JSONDecodeError, KeyError):
                             continue
-                    
+
                     # Se o stream terminou com sucesso, quebra o loop de retry
-                    break 
+                    break
 
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -969,13 +1234,21 @@ async def chat_stream(req: ChatRequest):
 
         yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prompt_cached_tokens': cached_tokens})}\n\n"
 
+        # Persistência pós-stream
         if full_response:
+            # Grava turno na memória ST
             asyncio.create_task(
                 memory_save_turn(req.session_id, user_input, full_response)
             )
-            asyncio.create_task(
-                memory_write_fact(f"Usuário disse: {user_input[:300]}", "chat", 0.7)
-            )
+            # ── EXTRAÇÃO DE MEMÓRIAS LT ─────────────────────────────────────
+            # Mesma lógica do /chat síncrono: usa o texto final agregado,
+            # independente de quantas chunks SSE tenham vindo. Garante que
+            # mesmo respostas longas com reasoning/tool calls intermediários
+            # só disparem o extractor UMA vez, sobre o produto final.
+            if req.extract_memories:
+                asyncio.create_task(
+                    _extract_and_save_memories(user_input, full_response, session_id=req.session_id)
+                )
 
     return StreamingResponse(
         generator(),
@@ -1019,42 +1292,35 @@ async def get_history(session_id: str = "default", last_n: int = 20):
         raise HTTPException(status_code=502, detail=f"Falha ao buscar histórico: {e}")
 
 
-# ── Cache stats endpoint ─────────────────────────────────────
+# ── Endpoint manual para extração de memórias (debug / testes) ────────────────
 
-@app.get("/cache_stats")
-async def cache_stats():
+class MemoryExtractionRequest(BaseModel):
+    user_input: str = Field(..., description="Pergunta original do usuário.")
+    assistant_response: str = Field(..., description="Resposta final do assistente.")
+    session_id: Optional[str] = Field(default=None)
+
+
+@app.post("/memories/extract")
+async def memories_extract(req: MemoryExtractionRequest):
     """
-    Check how well the prompt cache is working.
-    If prompt_cached_tokens is always 0, the system prompt is changing
-    between requests and caching is not effective.
+    Endpoint manual para disparar o extractor de memórias sobre uma dupla
+    pergunta-resposta arbitrária. Útil para depurar o modelo extractor ou
+    para reprocessar turnos antigos em batch.
+
+    Em condições normais, o /chat e /chat/stream já disparam o extractor
+    automaticamente em background (quando extract_memories=true).
     """
-    try:
-        client = await _get_llama_client()
-        # Send a minimal request with the stable system prompt
-        r = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": MODEL_NAME,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT_BASE},
-                    {"role": "user", "content": "test"},
-                ],
-                "max_tokens": 1,
-            },
-        )
-        if r.status_code == 200:
-            usage = r.json().get("usage", {})
-            return {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "prompt_tokens_cached": usage.get("prompt_tokens_cached", 0),
-                "cache_hit_rate": (
-                    round(usage.get("prompt_tokens_cached", 0) / max(usage.get("prompt_tokens", 1), 1) * 100, 1)
-                ),
-                "system_prompt_length": len(_SYSTEM_PROMPT_BASE),
-            }
-        return {"error": f"llama-server returned {r.status_code}"}
-    except Exception as e:
-        return {"error": str(e)}
+    saved = await _extract_and_save_memories(
+        req.user_input,
+        req.assistant_response,
+        session_id=req.session_id,
+    )
+    return {
+        "extractor_model": MEMORY_EXTRACTOR_MODEL,
+        "session_id":      req.session_id,
+        "memories":        saved,
+        "count":           len(saved),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1064,15 +1330,7 @@ async def cache_stats():
 def _safe_detect(text: str) -> str:
     """
     Detecta o idioma do texto para escolher a pronúncia do TTS.
-
-    Estava hardcoded para sempre retornar "pt" (langdetect importado mas
-    nunca usado) — provavelmente um atalho de debug que ficou. Isso não
-    afeta a RESPOSTA do modelo (o system prompt já instrui a responder no
-    idioma do usuário, e o LFM2.5 segue isso bem por conta própria), mas
-    afeta o TTS: `lang` é passado para o serviço de voz, então uma
-    conversa em qualquer idioma diferente de português seria falada com
-    pronúncia errada. Restaurado com fallback seguro para "pt" se a
-    detecção falhar (texto curto demais, erro do langdetect, etc.).
+    Fallback seguro para "pt" se a detecção falhar.
     """
     try:
         return detect(text) if len(text.strip()) >= 3 else "pt"
@@ -1081,25 +1339,25 @@ def _safe_detect(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#                   TOOL USE NATIVO (llama-server local)
+#                   TOOL USE NATIVO (OpenRouter)
 # ─────────────────────────────────────────────────────────────
 # Endpoint para o módulo alpha_code (agente ReAct). Não compartilha
 # memória/TTS do /chat — mensagens e tools são controlados pelo caller.
 
 class RequestTooLargeError(RuntimeError):
-    """Sinaliza que o request excedeu o contexto máximo do llama-server local."""
+    """Sinaliza que o request excedeu o contexto máximo do modelo."""
     pass
 
 
 def _is_request_too_large_error(msg: str) -> bool:
-    """Detecta mensagens de erro indicando que o prompt excede o contexto do modelo."""
+    """Detecta mensagens de erro indicando que o prompt excede o contexto."""
     if not msg:
         return False
     msg_l = msg.lower()
-    return any(s in msg_l for s in ("context", "too large", "exceeds", "n_ctx", "exceed"))
+    return any(s in msg_l for s in ("context", "too large", "exceeds", "n_ctx", "exceed", "maximum context"))
 
 
-async def _llama_tool_call(
+async def _openrouter_tool_call(
     messages: list[dict],
     tools: list[dict],
     tool_choice,
@@ -1109,49 +1367,42 @@ async def _llama_tool_call(
     reasoning_effort: Optional[str] = None,
 ) -> tuple[dict, str, bool]:
     """
-    Executa tool call no llama-server local, com retry em falhas transitórias.
+    Executa tool call no OpenRouter, com retry em falhas transitórias.
 
     Estratégia:
-      - Em erro de rede (ConnectError/ReadTimeout/RemoteProtocolError): retry
-        com backoff, até esgotar max_retries.
-      - Em 5xx: retry com backoff, até esgotar max_retries.
-      - Em erro indicando contexto grande demais: NÃO retenta — levanta
-        RequestTooLargeError (esperar não adianta, o tamanho não muda).
-      - Outros erros (4xx): não retry.
+      - Erro de rede (ConnectError/ReadTimeout/RemoteProtocolError): retry com backoff.
+      - 429 (rate limit): retry respeitando Retry-After.
+      - 5xx: retry com backoff.
+      - Erro de contexto grande demais: NÃO retenta — levanta RequestTooLargeError.
+      - Outros 4xx: não retry.
 
-    MODO GRAMMAR (otimização extrema):
+    MODO GRAMMAR (compatibilidade com chamadores antigos do llama-server):
       Quando `grammar` (string GBNF) é fornecida, o payload NÃO inclui
-      `tools`/`tool_choice` — isso desabilita o function-calling nativo do
-      OpenAI, que consome ~500-1000 tokens de schemas por request e é a fonte
-      #1 de JSON malformado em modelos locais. Em vez disso, a grammar força
-      o output a seguir um formato JSON compacto (definido pelo caller), e a
-      resposta vem em `message.content` — não em `message.tool_calls`.
-      O caller é responsável por parsear o content. Como a grammar garante
-      validade estrutural, o parse só falha se o caller cometer erro na
-      definição da grammar — nunca por output malformado do modelo.
+      `tools`/`tool_choice` e ativamos `response_format: {type: "json_object"}`
+      no OpenRouter — isso força o output em JSON válido (sem validação de
+      schema estrito). A resposta vem em `message.content` (não em
+      `message.tool_calls`) e o caller é responsável por parsear.
+      Nota: o OpenRouter não aceita GBNF nativamente; a gramática é
+      interpretada como "forçar JSON".
 
     Retorna (message_dict, model_used, fallback_used=False sempre — não há
-    mais fallback entre provedores, só o llama-server local).
+    mais fallback entre provedores, só OpenRouter).
     """
-    client = await _get_llama_client()
+    client = await _get_openrouter_client()
     payload: dict = {
-        "model": MODEL_NAME,
-        "messages": messages,
+        "model":       MAIN_MODEL,
+        "messages":    messages,
         "temperature": temperature,
     }
-    # `reasoning_effort` é passado direto — o único valor com efeito
-    # documentado no llama-server é "none" (desliga reasoning nesta
-    # chamada). Padrão (None) = não manda o campo, deixa o comportamento
-    # nativo do template agir (prioriza qualidade). Ver ToolUseRequest.
     if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    # ── Modo grammar vs. modo tool-calling nativo ─────────────────────────
-    # São mutuamente exclusivos no llama-server: se `grammar` está presente,
-    # não enviamos `tools` — o output vem em `content` e a grammar garante o
-    # formato. Isso economiza tokens de prompt (schemas) e elimina retries
-    # por JSON malformado.
+        # reasoning.effort é o formato OpenRouter para controlar raciocínio
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+    # ── Modo grammar vs. tool-calling nativo ─────────────────────────────
+    # Mutuamente exclusivos: se grammar está presente, usamos response_format
+    # para forçar JSON (equivalente aproximado do GBNF do llama-server).
     if grammar:
-        payload["grammar"] = grammar
+        payload["response_format"] = {"type": "json_object"}
     elif tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
@@ -1159,21 +1410,21 @@ async def _llama_tool_call(
     last_error: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
-            r = await client.post("/v1/chat/completions", json=payload)
+            r = await client.post("/chat/completions", json=payload)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             last_error = e
             log.warning(
-                f"llama-server /chat/tools: erro de rede ({type(e).__name__}), "
+                f"OpenRouter /chat/tools: erro de rede ({type(e).__name__}), "
                 f"tentativa {attempt + 1}/{max_retries + 1}."
             )
             if attempt < max_retries:
-                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
                 continue
-            raise RuntimeError(f"llama-server inacessível em {LLAMA_URL}: {e}") from e
+            raise RuntimeError(f"OpenRouter inacessível: {e}") from e
 
         if r.status_code == 200:
             data = r.json()
-            return data["choices"][0]["message"], MODEL_NAME, False
+            return data["choices"][0]["message"], MAIN_MODEL, False
 
         # Erro de contexto grande demais: não faz sentido retentar
         try:
@@ -1183,46 +1434,55 @@ async def _llama_tool_call(
             err_msg = r.text
 
         if _is_request_too_large_error(err_msg):
-            log.warning(f"llama-server /chat/tools: contexto excede o limite. Erro: {err_msg[:200]}")
-            raise RequestTooLargeError(f"Contexto excede o limite do llama-server: {err_msg[:300]}")
+            log.warning(f"OpenRouter /chat/tools: contexto excede o limite. Erro: {err_msg[:200]}")
+            raise RequestTooLargeError(f"Contexto excede o limite do modelo: {err_msg[:300]}")
+
+        # 429: rate limit — respeita Retry-After
+        if r.status_code == 429 and attempt < max_retries:
+            retry_after = r.headers.get("Retry-After")
+            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
+            log.warning(
+                f"OpenRouter /chat/tools: 429. Aguardando {wait_s}s "
+                f"(tentativa {attempt + 2}/{max_retries + 1})."
+            )
+            await asyncio.sleep(wait_s)
+            continue
 
         # 5xx: retry com backoff
         if r.status_code >= 500:
-            log.warning(f"llama-server /chat/tools: {r.status_code} (tentativa {attempt + 1}/{max_retries + 1}).")
+            log.warning(f"OpenRouter /chat/tools: {r.status_code} (tentativa {attempt + 1}/{max_retries + 1}).")
             if attempt < max_retries:
-                await asyncio.sleep(LLAMA_RETRY_BACKOFF_S)
+                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
                 continue
-            raise RuntimeError(f"llama-server /chat/tools: {r.status_code} persistente. Erro: {err_msg[:300]}")
+            raise RuntimeError(f"OpenRouter /chat/tools: {r.status_code} persistente. Erro: {err_msg[:300]}")
 
-        # Outros erros (4xx): não retry
-        raise RuntimeError(f"llama-server /chat/tools: {r.status_code} - {err_msg[:300]}")
+        # Outros 4xx: não retry
+        raise RuntimeError(f"OpenRouter /chat/tools: {r.status_code} - {err_msg[:300]}")
 
-    raise RuntimeError(f"llama-server /chat/tools: falhou após {max_retries + 1} tentativa(s): {last_error}")
+    raise RuntimeError(f"OpenRouter /chat/tools: falhou após {max_retries + 1} tentativa(s): {last_error}")
 
 
 @app.post("/chat/tools", response_model=ToolUseResponse)
 async def chat_tools(req: ToolUseRequest):
     """
-    Tool use nativo (llama-server local) — para o módulo alpha_code.
+    Tool use nativo (OpenRouter) — para o módulo alpha_code.
 
     Recebe messages + tools (formato OpenAI function-calling) e retorna
     a mensagem do assistant (pode conter tool_calls ou content).
 
-    MODO GRAMMAR (otimizado):
-      Se `req.grammar` estiver presente, o payload enviado ao llama-server
-      NÃO inclui `tools`/`tool_choice`. A grammar GBNF restringe o output
-      do modelo a um formato JSON compacto definido pelo caller, e a
-      resposta é devolvida em `message.content` (não em `message.tool_calls`).
-      O caller faz o parse do content — garantidamente válido pelo servidor.
-      Economiza ~500-1000 tokens de prompt por request (schemas) e elimina
-      retries por JSON malformado.
+    MODO GRAMMAR (compatibilidade):
+      Se `req.grammar` estiver presente, o payload enviado ao OpenRouter
+      NÃO inclui `tools`/`tool_choice`. Em vez disso, ativamos
+      `response_format: {type: "json_object"}` (equivalente aproximado
+      do GBNF do llama-server). A resposta vem em `message.content` e o
+      caller faz o parse — garantidamente JSON válido pelo provedor.
 
     Diferenças vs /chat:
       - Sem memória persistida (caller gerencia)
       - Sem TTS, sem detecção de idioma
       - Sem streaming (síncrono — alpha_code faz seu próprio streaming de steps)
-      - too_large=true quando o contexto excede o limite do llama-server
-        local (caller deve reduzir o contexto)
+      - too_large=true quando o contexto excede o limite do modelo
+        (caller deve reduzir o contexto)
     """
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages vazio.")
@@ -1231,7 +1491,7 @@ async def chat_tools(req: ToolUseRequest):
 
     t0 = time.perf_counter()
     try:
-        message, model_used, fallback = await _llama_tool_call(
+        message, model_used, fallback = await _openrouter_tool_call(
             messages=messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
@@ -1241,11 +1501,10 @@ async def chat_tools(req: ToolUseRequest):
             reasoning_effort=req.reasoning_effort,
         )
     except RequestTooLargeError as e:
-        # Contexto excede o limite do llama-server local — caller precisa agir
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return ToolUseResponse(
             message={"role": "assistant", "content": "", "tool_calls": None},
-            model=MODEL_NAME,
+            model=MAIN_MODEL,
             usage={"error": "request_too_large", "detail": str(e)[:500]},
             elapsed_ms=round(elapsed_ms, 1),
             fallback_used=False,
@@ -1266,9 +1525,9 @@ async def chat_tools(req: ToolUseRequest):
         message=message,
         model=model_used,
         usage={
-            "prompt_tokens_approx": approx_prompt_tokens,
+            "prompt_tokens_approx":     approx_prompt_tokens,
             "completion_tokens_approx": approx_completion_tokens,
-            "total_approx": approx_prompt_tokens + approx_completion_tokens,
+            "total_approx":             approx_prompt_tokens + approx_completion_tokens,
         },
         elapsed_ms=round(elapsed_ms, 1),
         fallback_used=fallback,
