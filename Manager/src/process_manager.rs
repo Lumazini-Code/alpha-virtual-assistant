@@ -13,7 +13,7 @@ use tokio::process::Command;
 // DESCOBERTA: detecta processos que já estão rodando
 // ════════════════════════════════════════════════════════════════════════
 
-/// Descobre se o Docker (ambiente vulkan) já está rodando.
+/// Descobre se o Docker já está rodando.
 async fn discover_docker(state: &SharedState) {
     tracing::info!("Verificando se Docker já está em execução...");
 
@@ -37,8 +37,6 @@ async fn discover_docker(state: &SharedState) {
             "compose",
             "-f",
             compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile",
-            "vulkan",
             "ps",
             "--status",
             "running",
@@ -125,7 +123,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
 
     let child = if cfg!(target_os = "windows") {
         Command::new(script)
-            .args(["--profile", "vulkan", "up"])
+            .args(["up"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -134,7 +132,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     } else {
         Command::new("bash")
             .arg(script)
-            .args(["--profile", "vulkan", "up"])
+            .args(["up"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -150,7 +148,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     docker.pid = pid;
     docker.last_activity = Some(Instant::now());
 
-    tracing::info!("Docker iniciado (perfil vulkan).");
+    tracing::info!("Docker iniciado.");
     Ok(())
 }
 
@@ -174,7 +172,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
     let result = if script.exists() {
         if cfg!(target_os = "windows") {
             Command::new(script)
-                .args(["--profile", "vulkan", "down"])
+                .args(["down"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
@@ -183,7 +181,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
         } else {
             Command::new("bash")
                 .arg(script)
-                .args(["--profile", "vulkan", "down"])
+                .args(["down"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
@@ -194,7 +192,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
         // Fallback: chama docker compose diretamente.
         tracing::warn!("Script não encontrado, usando docker compose diretamente...");
         Command::new("docker")
-            .args(["compose", "--profile", "vulkan", "down"])
+            .args(["compose", "down"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -255,8 +253,6 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
             "compose",
             "-f",
             compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile",
-            "vulkan",
             "ps",
             "--status",
             "running",

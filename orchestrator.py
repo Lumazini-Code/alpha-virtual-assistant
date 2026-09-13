@@ -32,7 +32,7 @@ TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
 Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
-  memory (read/write), search, read_url, local_scraping, alpha_code,
+  memory (read/write), search, read_url, alpha_code,
   playwright (automação de navegador — microsoft/playwright-mcp, via npx,
   conectado ao Chrome REAL do usuário via CDP — ver _ensure_chrome_debug —
   em vez de um Chromium automatizado isolado, pra evitar detecção antibot).
@@ -42,20 +42,23 @@ Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
   usando só os resumos em MCP_SKILLS (~1 linha cada, barato em tokens),
   e SÓ ENTÃO conecta e lista as tools reais daquele servidor.
 
-  Memory deixou de ser um microserviço HTTP (antigo port 3001, FastAPI) e
-  virou 100% MCP (`mcp_servers/memory_server.py`, que importa a lógica de
-  `Modules/memory.py` diretamente). Tanto as leituras/escritas que o modelo
-  decide chamar quanto o bookkeeping interno do orchestrator (turnos de
-  curto prazo, indexação de arquivos via /local-scraping, limpeza de
-  sessão) passam pela mesma sessão MCP — ver `_get_mcp_session("memory")`
+  Memory deixou de falar REST e virou MCP (`mcp_servers/memory_server.py`,
+  que importa a lógica de `Modules/memory.py` diretamente) — mas continua
+  sendo um processo HTTP compartilhado (streamable-http, porta 3001,
+  MEMORY_MCP_URL), porque LLM.py também precisa enxergar o MESMO estado
+  (SQLite/FAISS). Diferente das demais skills MCP (playwright etc.), que
+  este orchestrator spawna como subprocesso stdio sob demanda, "memory" é
+  um processo externo que precisa estar de pé antes do primeiro uso (ver
+  MCP_SKILLS["memory"], transport="http"). Tanto as leituras/escritas que o
+  modelo decide chamar quanto o bookkeeping interno do orchestrator (turnos
+  de curto prazo, limpeza de sessão) passam pela mesma sessão MCP — ver
+  `_get_mcp_session("memory")`
   e o helper `_call_memory_tool(...)`.
 
 Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
   - LLM Chat        (port 4003)  — conversational inference (OpenRouter)
   - Vision / VQA    (port 4002)  — image understanding (tool nativa)
-  - Local Scraping  (port 3003)  — endpoint REST próprio da TUI (/local-scraping),
-                                    independente da tool MCP homônima
 Process manager (port 9001) segue controlando o ambiente Docker.
 """
 from __future__ import annotations
@@ -81,16 +84,21 @@ from fastapi.responses import StreamingResponse
 # ── MCP (Model Context Protocol) — cliente usado pelas tools externas ──
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-max
+from mcp.client.streamable_http import streamable_http_client
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
-# MEMORY_URL removido — a memória não é mais um serviço REST (porta 3001).
-# Ela agora é o servidor MCP "memory" (ver MCP_SKILLS), acessado via
-# _get_mcp_session("memory") / _call_memory_tool(...).
-SEARCH_URL           = "http://localhost:3002"
-LOCAL_SCRAPING_URL   = "http://localhost:3003"
+# MEMORY_URL (REST, porta 3001) removido — a memória não é mais um serviço
+# REST. Ela agora é o servidor MCP "memory" (ver MCP_SKILLS), rodando como
+# processo HTTP COMPARTILHADO (mcp_servers/memory_server.py, streamable-http)
+# — não é mais spawnado como subprocesso stdio por este orchestrator, porque
+# LLM.py também precisa falar com o MESMO processo/estado (SQLite/FAISS).
+# Acessado via _get_mcp_session("memory") / _call_memory_tool(...). Mesma env
+# var (mesmo default) usada por LLM.py — os dois processos devem apontar
+# para a mesma instância do memory_server.py.
+MEMORY_MCP_URL       = os.getenv("MEMORY_MCP_URL", "http://localhost:3001/mcp")
 TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
@@ -120,13 +128,14 @@ PROCESS_MANAGER_URL  = "http://localhost:9001"
 # servidores escolhidos, carregando o schema completo das tools reais.
 #
 # Substitui os antigos executores hardcoded (_tool_memory_read,
-# _tool_memory_write, _tool_search, _tool_read_url, _tool_local_scraping,
+# _tool_memory_write, _tool_search, _tool_read_url,
 # _tool_alpha_code) — cada um vira, em vez de uma função Python fixa, um
 # servidor MCP que expõe sua própria lista de tools dinamicamente.
 @dataclass
 class MCPSkill:
     skill_summary: str                 # descrição curta, usada na etapa 1
-    command: str                       # executável do servidor MCP (stdio)
+    # ── stdio (default): subimos um subprocesso próprio por skill ──
+    command: Optional[str] = None      # executável do servidor MCP (stdio)
     args: list[str] = field(default_factory=list)
     env: Optional[dict[str, str]] = None
     # Hook opcional, chamado (awaited) uma única vez, ANTES de subir o
@@ -135,11 +144,23 @@ class MCPSkill:
     # resolver dinamicamente o --cdp-endpoint do Chrome real (só se sabe a
     # porta depois de perguntar pro shell_command_api). None = nenhum extra.
     pre_connect: Optional[Callable[[], "asyncio.Future[list[str]]"]] = None
+    # ── http: conecta a um processo MCP JÁ RODANDO (streamable-http) em vez
+    # de spawnar um subprocesso — necessário para skills com estado que
+    # precisa ser compartilhado com OUTROS processos além deste orchestrator
+    # (ex.: "memory", também consumido por LLM.py). Quando transport="http",
+    # `url` é obrigatório e `command`/`args`/`pre_connect` são ignorados.
+    transport: Literal["stdio", "http"] = "stdio"
+    url: Optional[str] = None
 
 MCP_SKILLS: dict[str, MCPSkill] = {
     "memory": MCPSkill(
         skill_summary="Grava e busca fatos/contexto salvos na memória de longo/curto prazo.",
-        command="python", args=["mcp_servers/memory_server.py"],
+        # HTTP, não stdio: o memory_server.py roda como processo único e
+        # compartilhado (ver seu docstring) — LLM.py conecta na MESMA
+        # instância para que SQLite/FAISS fiquem consistentes entre os dois
+        # consumidores. Suba-o separadamente (ex.: via start.sh) ANTES do
+        # orchestrator ou do LLM.py tentarem usar a skill "memory".
+        transport="http", url=MEMORY_MCP_URL,
     ),
     "playwright": MCPSkill(
         skill_summary=(
@@ -163,7 +184,7 @@ MCP_SKILLS: dict[str, MCPSkill] = {
 # "memory" removido daqui — não é mais um serviço HTTP com endpoint de
 # health próprio; sua saúde é checada via MCP (ver /status).
 HEALTH_PATHS: dict[str, str] = {
-    "search": "/status", "local_scraping": "/status", "tts": "/status",
+    "search": "/status", "tts": "/status",
     "llm": "/health", "vision": "/vision/status", "deep_search": "/health", "alpha_code": "/health",
     "process_manager": "/status",
 }
@@ -174,7 +195,7 @@ HEALTH_PATHS: dict[str, str] = {
 EXECUTOR_TIMEOUTS: dict[str, float] = {
     "llm": 9999999.0, "search": 60.0,
     "read_url": 30.0, "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
-    "local_scraping": 9999999.0, "alpha_code": 9999999.0,
+    "alpha_code": 9999999.0,
 }
 
 MAX_CONTEXT_CHARS = 3000
@@ -239,18 +260,10 @@ class MemoryReadRequest(BaseModel):
 
 class MemoryWriteRequest(BaseModel):
     text: str; source: str = "chat"; confidence: float = 1.0
-
-class LocalScrapingRequest(BaseModel):
-    query: str = Field(..., description="Nome ou descrição do arquivo a buscar")
-    search_path: Optional[str] = Field(None, description="Caminho base para a busca (padrão: diretório da Alpha)")
-    force_reindex: bool = Field(False, description="Forçar reindexação mesmo se o arquivo não mudou")
-    session_id: Optional[str] = None
-
-class LocalScrapingChooseRequest(BaseModel):
-    query: str = Field(..., description="Query original da busca")
-    file_path: str = Field(..., description="Caminho completo do arquivo escolhido")
-    force_reindex: bool = Field(False, description="Forçar reindexação")
-    session_id: Optional[str] = None
+    forgettable: bool = True
+    ttl_days: Optional[float] = None
+    action: Literal["create", "update"] = "create"
+    memory_id: Optional[int] = None
 
 class AlphaCodeRequest(BaseModel):
     task: str = Field(..., description="Descrição da tarefa em linguagem natural")
@@ -275,7 +288,6 @@ class AppState:
     llm_client: httpx.AsyncClient = field(default=None)
     vision_client: httpx.AsyncClient = field(default=None)
     deep_search_client: httpx.AsyncClient = field(default=None)
-    local_scraping_client: httpx.AsyncClient = field(default=None)
     alpha_code_client: httpx.AsyncClient = field(default=None)
     process_manager_client: httpx.AsyncClient = field(default=None)
     # shell_command_api.py — abre/derruba o Chrome real (debug CDP), usado
@@ -338,11 +350,37 @@ async def _ensure_chrome_debug() -> list[str]:
 async def _get_mcp_session(skill_name: str) -> ClientSession:
     """Retorna a ClientSession do servidor MCP daquela skill, conectando
     (e mantendo viva pro resto do processo, via state.mcp_stack) na
-    primeira vez que a skill é usada."""
+    primeira vez que a skill é usada. Duas topologias, conforme
+    `skill.transport`:
+      - "stdio" (default): spawna um subprocesso próprio para esta skill.
+      - "http": conecta via streamable-http a um processo MCP que já está
+        rodando de forma independente (ex.: "memory" — precisa ser o MESMO
+        processo que LLM.py também usa, não uma cópia spawnada aqui)."""
     if skill_name in state.mcp_sessions:
         log.debug(f"[_get_mcp_session] '{skill_name}' já conectado, reusando sessão")
         return state.mcp_sessions[skill_name]
     skill = MCP_SKILLS[skill_name]
+    t0 = time.perf_counter()
+
+    if skill.transport == "http":
+        if not skill.url:
+            raise RuntimeError(f"MCP skill '{skill_name}': transport='http' sem `url` configurado")
+        log.debug(f"[_get_mcp_session] '{skill_name}': conectando via streamable-http em {skill.url}")
+        try:
+            read, write, _ = await state.mcp_stack.enter_async_context(streamable_http_client(skill.url))
+        except Exception as e:
+            log.error(
+                f"[_get_mcp_session] '{skill_name}': falha ao conectar em {skill.url} — "
+                f"o processo do servidor MCP está rodando? ({type(e).__name__}: {e})"
+            )
+            raise
+        session = await state.mcp_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        state.mcp_sessions[skill_name] = session
+        log.info(f"MCP: conectado à skill '{skill_name}' (http, {skill.url}) em {(time.perf_counter()-t0)*1000:.0f}ms")
+        return session
+
+    # ── stdio: comportamento original (subprocesso próprio) ──
     args = list(skill.args)
     if skill.pre_connect is not None:
         log.debug(f"[_get_mcp_session] '{skill_name}': rodando pre_connect...")
@@ -356,21 +394,25 @@ async def _get_mcp_session(skill_name: str) -> ClientSession:
         args.extend(extra_args)
     log.debug(f"[_get_mcp_session] '{skill_name}': lançando `{skill.command} {' '.join(args)}`")
     server_params = StdioServerParameters(command=skill.command, args=args, env=skill.env)
-    t0 = time.perf_counter()
     read, write = await state.mcp_stack.enter_async_context(stdio_client(server_params))
     session = await state.mcp_stack.enter_async_context(ClientSession(read, write))
     await session.initialize()
     state.mcp_sessions[skill_name] = session
-    log.info(f"MCP: conectado à skill '{skill_name}' em {(time.perf_counter()-t0)*1000:.0f}ms")
+    log.info(f"MCP: conectado à skill '{skill_name}' (stdio) em {(time.perf_counter()-t0)*1000:.0f}ms")
     return session
 
 
 async def _call_memory_tool(tool_name: str, arguments: dict) -> Any:
-    """Chama uma tool do servidor MCP "memory" (mcp_servers/memory_server.py)
-    e devolve o resultado já desserializado (dict/list/str conforme o JSON
-    retornado pela tool). Substitui as antigas chamadas REST
-    `state.memory_client.post(...)` — não existe mais um serviço HTTP de
-    memória, só o processo MCP (stdio) conectado via _get_mcp_session.
+    """Chama uma tool do servidor MCP "memory" (mcp_servers/memory_server.py,
+    processo HTTP compartilhado — ver MCP_SKILLS["memory"]) e devolve o
+    resultado já desserializado (dict/list/str). Substitui as antigas
+    chamadas REST `state.memory_client.post(...)`.
+
+    Prefere `structuredContent` (populado automaticamente pelo FastMCP/
+    MCPServer para tools com retorno tipado) e cai para parsing do primeiro
+    content-block como JSON quando ausente — mesma lógica de
+    `_unwrap_tool_result` em LLM.py, para os dois consumidores tratarem a
+    resposta do mesmo jeito.
 
     Levanta a exceção original se a tool reportar erro (isError=True) ou se
     a conexão MCP falhar — quem chama decide como tratar (fallback,
@@ -381,6 +423,9 @@ async def _call_memory_tool(tool_name: str, arguments: dict) -> Any:
     if getattr(result, "isError", False):
         detail = result.content[0].text if result.content else "erro desconhecido"
         raise RuntimeError(f"memory tool '{tool_name}' falhou: {detail}")
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
     if not result.content:
         return None
     text = result.content[0].text
@@ -394,7 +439,6 @@ async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Orchestrator (tool-calling engine, sem router/CoT)...")
 
     service_urls = {
-        "search": SEARCH_URL, "local_scraping": LOCAL_SCRAPING_URL,
         "tts": TTS_URL, "llm": LLM_URL, "vision": VISION_URL,
         "deep_search": DEEP_SEARCH_URL, "alpha_code": ALPHA_CODE_URL,
         "process_manager": PROCESS_MANAGER_URL,
@@ -406,19 +450,23 @@ async def lifespan(app: FastAPI):
                 log.info(f"  ✓ {name:16s} OK" if r.status_code == 200 else f"  ⚠ {name:16s} {r.status_code}")
             except httpx.ConnectError:
                 log.warning(f"  ✗ {name:16s} OFFLINE")
-    # "memory" não entra no probe HTTP acima — não é mais um serviço HTTP.
-    # Sua conexão MCP é lazy (ver _get_mcp_session) e só é testada quando
-    # a skill "memory" é escolhida pela primeira vez.
+    # "memory" não entra no probe HTTP simples acima (é MCP, não REST puro),
+    # mas AGORA é um processo externo de longa duração que precisa estar de
+    # pé ANTES do primeiro uso — diferente das demais skills MCP (stdio),
+    # que este orchestrator spawna sozinho sob demanda. Sua conexão é lazy
+    # (ver _get_mcp_session) e só é testada quando a skill "memory" é
+    # escolhida pela primeira vez; se o processo não estiver rodando em
+    # MEMORY_MCP_URL, essa primeira chamada falhará com erro de conexão.
+    log.info(f"  ℹ memory           serviço MCP compartilhado esperado em {MEMORY_MCP_URL} "
+             f"(suba mcp_servers/memory_server.py separadamente antes do primeiro uso)")
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
 
-    state.search_client = _make_client(SEARCH_URL, 9999999.0)
     state.tts_client = _make_client(TTS_URL, 9999999.0)
     state.llm_client = _make_client(LLM_URL, 9999999.0)
     state.vision_client = _make_client(VISION_URL, 9999999.0)
     state.deep_search_client = _make_client(DEEP_SEARCH_URL, 9999999.0)
-    state.local_scraping_client = _make_client(LOCAL_SCRAPING_URL, 9999999.0)
     state.alpha_code_client = _make_client(ALPHA_CODE_URL, 9999999.0)
     # Timeout curto e finito (não 9999999.0): chamadas ao gerenciador de
     # processos (status) devem falhar rápido se ele estiver
@@ -434,8 +482,8 @@ async def lifespan(app: FastAPI):
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
-    for c in (state.search_client, state.tts_client, state.llm_client,
-              state.vision_client, state.deep_search_client, state.local_scraping_client,
+    for c in (state.tts_client, state.llm_client,
+              state.vision_client, state.deep_search_client,
               state.alpha_code_client, state.process_manager_client):
         await c.aclose()
     if state.shell_client is not None:
@@ -783,17 +831,13 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
         "answer": answer,
     }
 
-# _tool_local_scraping (versão TOOLS) e _tool_alpha_code foram REMOVIDOS —
-# viram servidores MCP (local_scraping, alpha_code em MCP_SKILLS). O
-# endpoint REST @app.post("/local-scraping") mais abaixo é diferente disso:
-# é a busca de arquivo usada pela própria TUI, não uma tool do agente, e
-# continua chamando state.local_scraping_client (httpx) normalmente.
-
+# _tool_alpha_code foi REMOVIDO — virou servidor MCP (alpha_code em
+# MCP_SKILLS).
 
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
-# search, local_scraping e alpha_code saíram daqui: são descobertas
+# search e alpha_code saíram daqui: são descobertas
 # dinamicamente via MCP_SKILLS (ver _run_tool_loop).
 TOOLS: dict[str, dict[str, Any]] = {
     "vision_objects": {
@@ -1639,6 +1683,24 @@ async def memory_write(req: MemoryWriteRequest):
     try:
         return await _call_memory_tool("memory_write", {
             "text": req.text, "source": req.source, "confidence": req.confidence,
+            "forgettable": req.forgettable, "ttl_days": req.ttl_days,
+            "action": req.action, "memory_id": req.memory_id,
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Memory falhou: {e}")
+
+@app.post("/memory/write-batch")
+async def memory_write_batch(reqs: list[MemoryWriteRequest]):
+    try:
+        return await _call_memory_tool("memory_write_batch", {
+            "items": [
+                {
+                    "text": r.text, "source": r.source, "confidence": r.confidence,
+                    "forgettable": r.forgettable, "ttl_days": r.ttl_days,
+                    "action": r.action, "memory_id": r.memory_id,
+                }
+                for r in reqs
+            ],
         })
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
@@ -1674,106 +1736,6 @@ async def chat(message: str, voice: str = "M1", lang: str = "pt", tts: bool = Tr
         raise HTTPException(502, f"Chat falhou: {e}")
 
 
-# ── Local Scraping Endpoints ────────────────────────────────────────────────
-
-@app.post("/local-scraping")
-async def local_scraping(req: LocalScrapingRequest):
-    if not req.query.strip():
-        raise HTTPException(400, "query vazio")
-    try:
-        r = await state.local_scraping_client.post("/scrape", json={
-            "query": req.query, "search_path": req.search_path,
-            "force_reindex": req.force_reindex, "session_id": req.session_id,
-        })
-        r.raise_for_status()
-        data = r.json()
-
-        if data.get("multiple_matches"):
-            return data
-
-        file_content = data.get("content", "")
-        file_path = data.get("file_path", "")
-        hash_match = data.get("hash_match", True)
-
-        if file_content and file_path:
-            try:
-                summary = file_content[:500] if len(file_content) > 500 else file_content
-                await _call_memory_tool("memory_write", {
-                    "text": f"[ARQUIVO INDEXADO] {file_path}: {summary}",
-                    "source": "local_scraping", "confidence": 1.0 if hash_match else 0.9,
-                })
-            except Exception as e:
-                log.warning(f"Falha ao salvar arquivo indexado na memória: {e}")
-
-        return data
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Local Scraping falhou: HTTP {e.response.status_code}")
-    except httpx.ConnectError:
-        raise HTTPException(502, "Local Scraping serviço offline")
-    except Exception as e:
-        raise HTTPException(502, f"Local Scraping falhou: {e}")
-
-
-@app.post("/local-scraping/choose")
-async def local_scraping_choose(req: LocalScrapingChooseRequest):
-    if not req.file_path.strip():
-        raise HTTPException(400, "file_path vazio")
-    try:
-        r = await state.local_scraping_client.post("/choose", json={
-            "query": req.query, "file_path": req.file_path,
-            "force_reindex": req.force_reindex, "session_id": req.session_id,
-        })
-        r.raise_for_status()
-        data = r.json()
-
-        file_content = data.get("content", "")
-        file_path = data.get("file_path", req.file_path)
-        hash_match = data.get("hash_match", True)
-
-        if file_content and file_path:
-            try:
-                summary = file_content[:500] if len(file_content) > 500 else file_content
-                await _call_memory_tool("memory_write", {
-                    "text": f"[ARQUIVO INDEXADO] {file_path}: {summary}",
-                    "source": "local_scraping", "confidence": 1.0 if hash_match else 0.9,
-                })
-            except Exception as e:
-                log.warning(f"Falha ao salvar arquivo escolhido na memória: {e}")
-
-        return data
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Local Scraping choose falhou: HTTP {e.response.status_code}")
-    except httpx.ConnectError:
-        raise HTTPException(502, "Local Scraping serviço offline")
-    except Exception as e:
-        raise HTTPException(502, f"Local Scraping choose falhou: {e}")
-
-
-@app.get("/local-scraping/indexed")
-async def local_scraping_indexed(file_path: Optional[str] = None):
-    try:
-        params = {"file_path": file_path} if file_path else {}
-        r = await state.local_scraping_client.get("/indexed", params=params)
-        r.raise_for_status()
-        return r.json()
-    except httpx.ConnectError:
-        raise HTTPException(502, "Local Scraping serviço offline")
-    except Exception as e:
-        raise HTTPException(502, f"Local Scraping indexed falhou: {e}")
-
-
-@app.delete("/local-scraping/index/{file_id}")
-async def local_scraping_delete_index(file_id: str):
-    try:
-        r = await state.local_scraping_client.delete(f"/index/{file_id}")
-        r.raise_for_status()
-        return r.json()
-    except httpx.ConnectError:
-        raise HTTPException(502, "Local Scraping serviço offline")
-    except Exception as e:
-        raise HTTPException(502, f"Local Scraping delete falhou: {e}")
-
-
 # ── Status / utilitários ─────────────────────────────────────────────────────
 
 @app.get("/status")
@@ -1781,7 +1743,6 @@ async def status():
     checks = {}
     cfg = {
         "search": (state.search_client, HEALTH_PATHS["search"]),
-        "local_scraping": (state.local_scraping_client, HEALTH_PATHS["local_scraping"]),
         "tts": (state.tts_client, HEALTH_PATHS["tts"]),
         "llm": (state.llm_client, HEALTH_PATHS["llm"]),
         "vision": (state.vision_client, HEALTH_PATHS["vision"]),

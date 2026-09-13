@@ -1,7 +1,6 @@
 #!/bin/bash
 # start.sh — Linux
-# Uso: ./start.sh --profile <cpu|cuda|vulkan> up [-d]
-# Exemplo: ./start.sh --profile vulkan up -d
+# Uso: ./start.sh up [-d]
 
 docker compose \
   -f docker-compose.yml \

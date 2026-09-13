@@ -48,13 +48,13 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
+echo "  • Memory Server..."
+restart_on_fail "Memory Server" "python3 mcp_servers/memory_server.py" &
+
 cd /app/Modules
 
 echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
-
-echo "  • CoT Generator..."
-restart_on_fail "CoT" "python3 'CoT generator.py'" &
 
 echo "  • Deep Search..."
 restart_on_fail "Deep Search" "python3 deep_search.py" &
@@ -67,9 +67,6 @@ restart_on_fail "TTS" "python3 TTS.py" &
 
 echo "  • Vision API..."
 restart_on_fail "Vision" "python3 vision.py" &
-
-echo "  • Local Scraping & Client..."
-restart_on_fail "Local Scraping" "python3 local_scraping.py" &
 
 echo "  • Alpha-code Agent..."
 # Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports

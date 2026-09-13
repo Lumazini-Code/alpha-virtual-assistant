@@ -5,10 +5,10 @@ REST API para inferência conversacional com:
   - Backend 100% via OpenRouter (sem llama-server local)
   - Modelo principal: z-ai/glm-5.3-flash
   - Modelo extrator de memórias: google/gemma-4-26b-a4b-it:free
-  - Integração com API de Memória (LT + ST via session_id)
+  - Integração com API de Memória via MCP (LT + ST via session_id)
   - Integração com API de TTS (localhost:3004)
   - Streaming de texto + disparo paralelo de áudio
-  - Histórico de chat persistido via módulo de memória externo
+  - Histórico de chat persistido via servidor MCP de memória externo
   - Detecção de idioma para resposta automática
   - EXTRAÇÃO AUTOMÁTICA DE MEMÓRIAS de longo prazo:
       Após cada dupla pergunta-resposta, um modelo extractor
@@ -16,10 +16,12 @@ REST API para inferência conversacional com:
       episódicas ou semânticas) usando JSON schema estruturado.
 
 OPTIMIZATIONS:
-  1. Persistent httpx clients — no TCP handshake per request (saves ~50-150ms)
+  1. Clients/sessões persistentes — sem handshake de transporte por
+     request (httpx para OpenRouter/TTS, sessão MCP para a memória)
   2. Stable system prompt prefix — habilita prompt caching no provedor
   3. Memory read paralelo com construção de prompt (saves ~100-300ms)
-  4. Connection pooling — keep-alive para OpenRouter, Memory e TTS
+  4. Connection pooling — keep-alive para OpenRouter e TTS; sessão MCP
+     única e persistente para a Memória
   5. Extração de memórias fire-and-forget em background
 
 Porta: localhost:4003
@@ -31,8 +33,10 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Optional
+from contextlib import AsyncExitStack
 import re
 import httpx
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -41,6 +45,9 @@ from langdetect import detect
 import logging
 from dotenv import load_dotenv
 import os
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM] %(message)s")
@@ -56,7 +63,22 @@ load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 BASEFOLDER = Path(__file__).parent.parent
 
 # URLs das APIs satélite
-MEMORY_URL = "http://localhost:3001"
+# MEMORY_MCP_URL aponta pro endpoint MCP (streamable-http) de
+# mcp_servers/memory_server.py — processo compartilhado, rodado à parte
+# (default MCP_TRANSPORT=streamable-http nele mesmo). orchestrator.py usa a
+# MESMA env var/default (ver MEMORY_MCP_URL em orchestrator.py) para
+# conectar à mesma instância — os dois processos precisam enxergar o mesmo
+# estado (SQLite/FAISS), então NENHUM dos dois deve spawnar sua própria
+# cópia do servidor de memória. Path "/mcp" é o default do MCPServer/
+# FastMCP quando montado via mcp.run(transport="streamable-http").
+MEMORY_MCP_URL = os.getenv("MEMORY_MCP_URL", "http://localhost:3001/mcp")
+# Timeout para abrir a sessão MCP com a memória (handshake completo:
+# streamable-http + initialize()). Sem isso, uma memória lenta/travada
+# deixava _get_memory_session() pendurado indefinidamente até algo
+# externo (timeout de supervisor, healthcheck, etc.) cancelar a task —
+# e um CancelledError nesse ponto derrubava o startup inteiro (ver
+# comentário em _get_memory_session).
+MEMORY_MCP_CONNECT_TIMEOUT_S = float(os.getenv("MEMORY_MCP_CONNECT_TIMEOUT_S", "10"))
 TTS_URL    = "http://localhost:3004"
 
 # OpenRouter API
@@ -80,8 +102,17 @@ ST_CONTEXT_PAIRS = 5
 # otimização de latência para TTFT.
 
 _openrouter_client: httpx.AsyncClient | None = None
-_memory_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
+
+# ── Sessão MCP persistente (memória) ──
+# Substitui o antigo _memory_client (httpx.AsyncClient). Uma conexão MCP
+# não é um simples request/response — é um handshake (initialize()) sobre
+# um transporte (aqui, streamable-http) que precisa ficar aberto durante
+# toda a vida do processo, daí o AsyncExitStack guardando os context
+# managers abertos em vez de um "with" de escopo curto.
+_memory_session:    ClientSession   | None = None
+_memory_exit_stack: AsyncExitStack  | None = None
+_memory_session_lock = asyncio.Lock()
 
 
 async def _get_openrouter_client() -> httpx.AsyncClient:
@@ -112,20 +143,107 @@ async def _get_openrouter_client() -> httpx.AsyncClient:
     return _openrouter_client
 
 
-async def _get_memory_client() -> httpx.AsyncClient:
-    """Persistent client para a API de Memória — connection pooling + keep-alive."""
-    global _memory_client
-    if _memory_client is None or _memory_client.is_closed:
-        _memory_client = httpx.AsyncClient(
-            base_url=MEMORY_URL,
-            timeout=httpx.Timeout(9999999.0, connect=3.0),
-            limits=httpx.Limits(
-                max_connections=6,
-                max_keepalive_connections=4,
-                keepalive_expiry=60.0,
-            ),
-        )
-    return _memory_client
+async def _get_memory_session() -> ClientSession:
+    """Sessão MCP persistente com o servidor de memória — substitui o
+    antigo _get_memory_client() (httpx). Reaberta automaticamente se cair
+    (ver _call_memory_tool)."""
+    global _memory_session, _memory_exit_stack
+    if _memory_session is not None:
+        return _memory_session
+
+    async with _memory_session_lock:
+        if _memory_session is not None:   # outra task já abriu enquanto esperávamos o lock
+            return _memory_session
+
+        exit_stack = AsyncExitStack()
+        try:
+            # anyio.fail_after (não asyncio.wait_for!) — o cliente MCP usa
+            # cancel scopes/task groups do anyio por baixo dos panos.
+            # Misturar isso com o timeout do asyncio quebra a contabilidade
+            # de qual task "possui" cada cancel scope; o fail_after do
+            # próprio anyio é estruturado corretamente para esse aninhamento
+            # e propaga como TimeoutError comum (Exception, não BaseException).
+            with anyio.fail_after(MEMORY_MCP_CONNECT_TIMEOUT_S):
+                read, write, _ = await exit_stack.enter_async_context(
+                    streamablehttp_client(MEMORY_MCP_URL)
+                )
+                session = await exit_stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+        except BaseException:
+            # BaseException (não só Exception!) de propósito: desde o
+            # Python 3.8, asyncio.CancelledError herda de BaseException, não
+            # de Exception. Se algo cancelar esta task no meio do handshake
+            # (ex.: um supervisor externo derrubando um startup lento) e a
+            # gente só capturasse Exception, o aclose() abaixo seria pulado
+            # — deixando o cancel scope interno do anyio aberto na task
+            # atual. Ele só seria finalizado depois, via GC/athrow, em OUTRA
+            # task (ex.: no shutdown do asyncio.run()), e o anyio lançaria
+            # "Attempted to exit cancel scope in a different task than it
+            # was entered in". Fechar aqui, na mesma task, evita isso.
+            await exit_stack.aclose()
+            raise
+
+        _memory_exit_stack = exit_stack
+        _memory_session    = session
+        log.info(f"[MEMORY] Sessão MCP conectada em {MEMORY_MCP_URL}")
+        return _memory_session
+
+
+async def _close_memory_session():
+    """Encerra a sessão MCP da memória, se houver uma aberta."""
+    global _memory_session, _memory_exit_stack
+    if _memory_exit_stack is not None:
+        try:
+            await _memory_exit_stack.aclose()
+        except Exception as e:
+            log.info(f"[MEMORY] Erro ao fechar sessão MCP: {e}")
+    _memory_session    = None
+    _memory_exit_stack = None
+
+
+def _unwrap_tool_result(result) -> dict:
+    """Extrai o payload estruturado do resultado de uma tool MCP.
+
+    As tools de memory_mcp.py têm tipo de retorno anotado (Pydantic model
+    ou dict), então o FastMCP popula `structuredContent` automaticamente
+    — preferimos isso. Fallback: tenta decodificar o primeiro content
+    block como JSON (compatibilidade com tools sem output schema)."""
+    if getattr(result, "structuredContent", None) is not None:
+        return result.structuredContent
+    if result.content:
+        text = getattr(result.content[0], "text", None)
+        if text:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"text": text}
+    return {}
+
+
+async def _call_memory_tool(name: str, arguments: dict) -> dict:
+    """Chama uma tool do servidor MCP de memória e devolve o payload já
+    desserializado. Erros de negócio (MemoryToolError, em memory_mcp.py)
+    chegam como isError=True — viram RuntimeError aqui. Erros de
+    transporte invalidam a sessão em cache, para a próxima chamada
+    reconectar do zero em vez de reusar um transporte morto."""
+    try:
+        session = await _get_memory_session()
+        result = await session.call_tool(name, arguments)
+    except BaseException:
+        # BaseException por causa do CancelledError (ver _get_memory_session)
+        # — sem isso, uma chamada cancelada no meio do call_tool deixaria a
+        # sessão morta em cache, e a PRÓXIMA chamada reusaria um transporte
+        # inválido em vez de reconectar do zero.
+        global _memory_session, _memory_exit_stack
+        _memory_session    = None
+        _memory_exit_stack = None
+        raise
+
+    if result.isError:
+        msg = result.content[0].text if result.content else "erro desconhecido na tool de memória"
+        raise RuntimeError(msg)
+
+    return _unwrap_tool_result(result)
 
 
 def _get_tts_client() -> httpx.AsyncClient:
@@ -182,11 +300,18 @@ username   = _read(BASEFOLDER / r"resource/username.dll")
 voiceModel = _read(BASEFOLDER / r"resource/VoiceModel.dll") or "F1"
 ctxUsed    = _read(BASEFOLDER / r"resource/ctxConfig.dll")
 context    = _read(BASEFOLDER / f"ctxBin/{ctxUsed}.bin")
-searchCfg  = _read(BASEFOLDER / r"resource/SearchCfg.dll")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Inferência 100% via OpenRouter — modelo principal fixo (z-ai/glm-5.3-flash).
 # Para o extractor de memórias, modelo dedicado (google/gemma-4-26b-a4b-it:free).
+#
+# /chat/stream é o endpoint UNIFICADO: streaming (SSE) + tool calling nativo
+# no mesmo request. Dois modos:
+#   - modo CHAT (`message`): memória LT+ST, TTS, extração de memórias;
+#   - modo TOOLS (`messages` + `tools`): loop ReAct gerenciado pelo caller —
+#     as tool_calls são emitidas em evento único ao FINAL do stream.
+# /chat/tools permanece como wrapper SÍNCRONO de compatibilidade.
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -340,13 +465,13 @@ _SYSTEM_PROMPT_BASE = (
 async def memory_read(query: str, session_id: Optional[str] = None, top_k: int = 10) -> list[dict]:
     """
     Busca memórias relevantes (Long-Term e Short-Term) para o contexto da conversa.
-    Otimizado: usa HTTP client persistente — sem handshake TCP por chamada.
+    Usa a sessão MCP persistente — sem handshake de transporte por chamada
+    (só a chamada JSON-RPC em cima da conexão já aberta).
     """
     try:
-        client = await _get_memory_client()
-        r = await client.post(
-            "/read",
-            json={
+        resp = await _call_memory_tool(
+            "memory_read",
+            {
                 "query": query,
                 "top_k": top_k,
                 "min_score": 0.3,
@@ -354,7 +479,7 @@ async def memory_read(query: str, session_id: Optional[str] = None, top_k: int =
                 "strategy": "auto",
             },
         )
-        return r.json().get("results", [])
+        return resp.get("results", [])
     except Exception as e:
         log.info(f"[MEMORY] Falha na leitura: {e}")
         return []
@@ -363,18 +488,18 @@ async def memory_read(query: str, session_id: Optional[str] = None, top_k: int =
 async def memory_read_st(session_id: Optional[str], n_pairs: int = ST_CONTEXT_PAIRS) -> list[dict]:
     """
     Lê as N duplas pergunta-resposta mais recentes do short-term (histórico
-    cru da conversa, sem busca semântica) via /read_st. Roda em paralelo com
-    o /read semântico — juntos formam o contexto completo enviado ao modelo.
+    cru da conversa, sem busca semântica) via a tool memory_read_short_term.
+    Roda em paralelo com o memory_read semântico — juntos formam o contexto
+    completo enviado ao modelo.
     """
     if not session_id:
         return []
     try:
-        client = await _get_memory_client()
-        r = await client.post(
-            "/read_st",
-            json={"session_id": session_id, "n_pairs": n_pairs},
+        resp = await _call_memory_tool(
+            "memory_read_short_term",
+            {"session_id": session_id, "n_pairs": n_pairs},
         )
-        return r.json().get("turns", [])
+        return resp.get("turns", [])
     except Exception as e:
         log.info(f"[MEMORY] Falha na leitura ST (read_st): {e}")
         return []
@@ -385,15 +510,14 @@ async def memory_save_turn(session_id: str, user_input: str, assistant_response:
     if not session_id:
         return
     try:
-        client = await _get_memory_client()
-        await client.post(
-            "/write_st",
-            json={
+        await _call_memory_tool(
+            "memory_write_short_term",
+            {
                 "session_id": session_id,
                 "turns": [
                     {"role": "user", "content": user_input},
-                    {"role": "assistant", "content": assistant_response}
-                ]
+                    {"role": "assistant", "content": assistant_response},
+                ],
             },
         )
     except Exception as e:
@@ -412,10 +536,9 @@ async def memory_write_st_episodic(session_id: str, text: str):
     if not session_id or not text:
         return
     try:
-        client = await _get_memory_client()
-        await client.post(
-            "/write_st",
-            json={
+        await _call_memory_tool(
+            "memory_write_short_term",
+            {
                 "session_id": session_id,
                 "turns": [
                     {"role": "assistant", "content": text},
@@ -426,37 +549,124 @@ async def memory_write_st_episodic(session_id: str, text: str):
         log.info(f"[MEMORY] Falha na escrita ST episódica: {e}")
 
 
+async def _resolve_possible_update(payload: dict, data: dict) -> None:
+    """Segue o protocolo de `reason="possible_update:<score>"` de um único
+    resultado de `memory_write`/`memory_write_batch`: reenvia a escrita com
+    action="update" e memory_id=candidate_id, efetivando a correção na
+    memória candidata em vez de descartar o fato silenciosamente.
+
+    Se possible_update vier sem candidate_id (resposta inconsistente do
+    serviço de memória), o fato NÃO é criado como registro solto — por
+    design, uma correção não deve virar um fato novo desancorado — mas o
+    descarte é logado em WARNING para não passar despercebido. Compartilhado
+    entre `memory_write_fact` (write único) e `memory_write_facts_batch`
+    (write em lote), que têm exatamente a mesma lógica de retry."""
+    reason = data.get("reason") or ""
+    if not reason.startswith("possible_update:"):
+        return
+
+    candidate_id = data.get("candidate_id")
+    text = payload.get("text", "")
+    if candidate_id is None:
+        log.warning(
+            f"[MEMORY] possible_update sem candidate_id — fato descartado "
+            f"sem reenvio (reason={reason!r}, text={text[:80]!r})"
+        )
+        return
+
+    log.info(
+        f"[MEMORY] possible_update — candidate_id={candidate_id}, "
+        f"candidate_score={data.get('candidate_score')}, "
+        f"candidate_text={data.get('candidate_text')!r}"
+    )
+
+    try:
+        data2 = await _call_memory_tool(
+            "memory_write",
+            {**payload, "action": "update", "memory_id": candidate_id},
+        )
+    except Exception as e:
+        log.info(f"[MEMORY] Falha no update LT (candidate_id={candidate_id}): {e}")
+        return
+
+    if not data2.get("stored"):
+        log.info(
+            f"[MEMORY] Update LT não efetivado (candidate_id={candidate_id}): "
+            f"{data2.get('reason')}"
+        )
+
+
 async def memory_write_fact(
     text: str,
     source: str = "chat",
     confidence: float = 0.7,
-    forgetable: bool = True,
+    forgettable: bool = True,
+    ttl_days: Optional[float] = None,
 ):
     """
-    Grava informações na memória de longo prazo (LT) — fire-and-forget.
+    Grava UMA informação na memória de longo prazo (LT) — fire-and-forget.
+    Para gravar várias memórias extraídas de uma mesma dupla
+    pergunta-resposta, prefira `memory_write_facts_batch` (1 round-trip MCP
+    em vez de N).
 
     A LT armazena apenas memórias SEMÂNTICAS (fatos/conhecimento geral sobre
     o usuário ou o mundo). Memórias EPISÓDICAS (eventos específicos da
     conversa) não entram aqui — elas vão para a ST via
     `memory_write_st_episodic`.
 
-    Parâmetro estendido para suportar o metadado identificado pelo extractor:
-      - forgetable: True se a memória pode decair com o tempo; False se é
+    Parâmetros:
+      - forgettable: True se a memória pode decair com o tempo; False se é
         considerada permanente (ex.: nome do usuário, alergias).
+      - ttl_days: meia-vida específica desta memória, em dias (None usa o
+        default global do serviço de memória).
     """
+    payload = {
+        "text":         text,
+        "source":       source,
+        "confidence":   confidence,
+        "forgettable":  forgettable,
+        "ttl_days":     ttl_days,
+    }
     try:
-        client = await _get_memory_client()
-        await client.post(
-            "/write",
-            json={
-                "text":         text,
-                "source":       source,
-                "confidence":   confidence,
-                "forgetable":   forgetable,
-            },
-        )
+        data = await _call_memory_tool("memory_write", payload)
     except Exception as e:
         log.info(f"[MEMORY] Falha na escrita LT: {e}")
+        return
+
+    await _resolve_possible_update(payload, data)
+
+
+async def memory_write_facts_batch(items: list[dict]) -> list[dict]:
+    """
+    Grava VÁRIAS memórias de longo prazo (LT) em uma única chamada MCP via
+    `memory_write_batch` — usada pelo extrator (`_extract_and_save_memories`)
+    para evitar N round-trips quando uma mesma dupla pergunta-resposta
+    produz várias memórias semânticas.
+
+    Cada item de `items` é um dict com as mesmas chaves de `memory_write_fact`
+    (text, source, confidence, forgettable, ttl_days). Itens que caírem em
+    "possible_update" recebem o mesmo reenvio com action="update" que
+    `memory_write_fact` faz — só que aplicado individualmente APÓS o batch,
+    já que o retry (achar/confirmar a memória candidata) é inerentemente
+    por-item. Retorna a lista bruta de resultados (um dict por item, mesma
+    ordem de `items`) para fins de logging/inspeção.
+    """
+    if not items:
+        return []
+    try:
+        resp = await _call_memory_tool("memory_write_batch", {"items": items})
+    except Exception as e:
+        log.info(f"[MEMORY] Falha na escrita LT em lote: {e}")
+        return []
+
+    results = resp.get("results", [])
+    log.info(
+        f"[MEMORY] write_batch: {resp.get('stored_count', 0)}/{resp.get('total', len(items))} "
+        f"memórias gravadas em 1 round-trip"
+    )
+    for item, data in zip(items, results):
+        await _resolve_possible_update(item, data)
+    return results
 
 
 # ─────────────────────────────────────────────────────────────
@@ -655,10 +865,13 @@ async def _extract_and_save_memories(
 
         memories_raw = parsed.get("memories", []) if isinstance(parsed, dict) else []
 
-        # Roteia cada memória identificada (fire-and-forget individual).
-        #   semantic  → LT (memória de longo prazo, via /write)
-        #   episodic  → ST (memória de curto prazo, via /write_st)
+        # Roteia cada memória identificada:
+        #   semantic  → LT (memória de longo prazo) — TODAS de uma vez via
+        #               memory_write_batch (1 round-trip MCP em vez de N).
+        #   episodic  → ST (memória de curto prazo, via /write_st) —
+        #               continua individual (não existe write_st em lote).
         saved: list[dict] = []
+        semantic_payloads: list[dict] = []
         for mem in memories_raw:
             if not isinstance(mem, dict):
                 continue
@@ -675,14 +888,13 @@ async def _extract_and_save_memories(
                 # elas tendem a ser fatos estáveis sobre o usuário e
                 # merecem prioridade na busca.
                 confidence = 0.9 if not forgetable else 0.6
-                asyncio.create_task(
-                    memory_write_fact(
-                        text=text,
-                        source="chat:semantic",
-                        confidence=confidence,
-                        forgetable=forgetable,
-                    )
-                )
+                semantic_payloads.append({
+                    "text":        text,
+                    "source":      "chat:semantic",
+                    "confidence":  confidence,
+                    "forgettable": forgetable,
+                    "ttl_days":    None,
+                })
             else:
                 # episodic → ST (curto prazo). ST é efêmera por natureza,
                 # então o forgetable do extractor é ignorado neste caso.
@@ -696,6 +908,11 @@ async def _extract_and_save_memories(
                 "target":     "LT" if mem_type == "semantic" else "ST",
                 "forgettable": forgetable,
             })
+
+        if semantic_payloads:
+            # fire-and-forget: o /chat não espera a gravação terminar para
+            # responder, mas as N memórias semânticas viram 1 chamada MCP.
+            asyncio.create_task(memory_write_facts_batch(semantic_payloads))
 
         log.info(
             f"[MEMORY-EXTRACT] {len(saved)} memória(s) extraída(s) "
@@ -851,8 +1068,24 @@ app = FastAPI(title="AVA — LLM API", version="3.0.0")
 
 # ── Schemas ───────────────────────────────────────────────────
 
+class ToolCallMessage(BaseModel):
+    role: str = Field(..., description="system | user | assistant | tool")
+    content: Optional[str | list[dict]] = Field(
+        default=None,
+        description=(
+            "Texto simples (str) na maioria dos casos. Também aceita o formato "
+            "multi-parte do OpenAI vision (lista de blocos {type: text|image_url, ...}) "
+            "para requests multimodais — repassado como está para o OpenRouter."
+        ),
+    )
+    tool_calls: Optional[list] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+
 class ChatRequest(BaseModel):
-    message: str
+    # ── Modo CHAT: mensagem única — o servidor monta o prompt (memória + data) ──
+    message: Optional[str] = Field(default=None, description="Mensagem do usuário (modo chat). Obrigatório quando `messages` não for enviado.")
     session_id: Optional[str] = Field(default="default", description="ID da sessão para memória de curto prazo")
     voice:   Optional[str] = Field(default=None, description="Voz TTS. None = usa padrão.")
     lang:    Optional[str] = Field(default=None, description="Idioma forçado. None = detectado.")
@@ -879,28 +1112,54 @@ class ChatRequest(BaseModel):
     )
     model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
 
+    # ── Tool calling nativo (unificação com o antigo /chat/tools) ──────────
+    messages: Optional[list[ToolCallMessage]] = Field(
+        default=None,
+        description=(
+            "Modo TOOLS: mensagens prontas no formato OpenAI (system/user/assistant/"
+            "tool, com tool_call_id nas resultados). Quando presente, o endpoint NÃO "
+            "lê/grava memória nem dispara TTS — o caller gerencia o estado do loop "
+            "ReAct. Mutuamente exclusivo com `message`."
+        ),
+    )
+    tools: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Tool schemas no formato OpenAI function-calling. O texto é streamado "
+            "normalmente (eventos delta); como a decisão de tool call só acontece "
+            "no FINAL da geração, as tool_calls completas são emitidas em um único "
+            "evento SSE {'tool_calls': [...]} ao final da resposta (antes do done)."
+        ),
+    )
+    tool_choice: Optional[str] = Field(
+        default="auto",
+        description="auto | required | none | {type:function,function:{name:...}}.",
+    )
+    temperature: Optional[float] = Field(
+        default=None, ge=0.0, le=2.0,
+        description="None = usa o padrão do modo (chat: 0.7, tools: 0.3).",
+    )
+    max_tokens: Optional[int] = Field(
+        default=None, ge=1, le=32000,
+        description="None = não envia o campo (usa o padrão do provedor).",
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description=(
+            "Override direto de reasoning.effort no OpenRouter (low|medium|high|"
+            "none). Tem precedência sobre `thinking_depth` quando definido."
+        ),
+    )
+
 class ClearRequest(BaseModel):
     confirm: bool = False
     session_id: Optional[str] = "default"
 
 
-# ── Schemas para tool use nativo (endpoint /chat/tools) ───────────────────────
-# Usado pelo módulo alpha_code para ReAct loop. Não compartilha memória/TTS
-# do /chat padrão — mensagens e tools são controlados pelo caller.
-
-class ToolCallMessage(BaseModel):
-    role: str = Field(..., description="system | user | assistant | tool")
-    content: Optional[str | list[dict]] = Field(
-        default=None,
-        description=(
-            "Texto simples (str) na maioria dos casos. Também aceita o formato "
-            "multi-parte do OpenAI vision (lista de blocos {type: text|image_url, ...}) "
-            "para requests multimodais — repassado como está para o OpenRouter."
-        ),
-    )
-    tool_calls: Optional[list] = None
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
+# ── Schemas para tool use nativo (endpoint /chat/tools — COMPATIBILIDADE) ─────
+# O /chat/tools permanece como wrapper SÍNCRONO para o orquestrador/alpha_code.
+# A unificação (tools + streaming no mesmo request) vive no /chat/stream — os
+# schemas (ToolCallMessage) estão definidos junto ao ChatRequest.
 
 class ToolUseRequest(BaseModel):
     messages: list[ToolCallMessage]
@@ -934,7 +1193,8 @@ class ToolUseResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    """Verifica que a OPENROUTER_API_KEY está configurada."""
+    """Verifica a OPENROUTER_API_KEY e abre a sessão MCP persistente com o
+    servidor de memória (memory_mcp.py)."""
     if not OPENROUTER_API_KEY:
         log.warning(
             "[STARTUP] OPENROUTER_API_KEY não configurada — inferência vai falhar "
@@ -943,17 +1203,35 @@ async def startup():
     else:
         log.info(f"[STARTUP] OpenRouter configurado. Modelo principal: {MAIN_MODEL}")
 
+    try:
+        await _get_memory_session()
+    except asyncio.CancelledError as e:
+        # Ver comentário em _get_memory_session: sem o fix de lá, isso
+        # DERRUBAVA o startup inteiro ("Application startup failed. Exiting.")
+        # porque CancelledError não é capturado por "except Exception".
+        # Mantido aqui como rede de segurança extra — o objetivo declarado
+        # já era "a API sobe mesmo assim".
+        log.warning(
+            f"[STARTUP] Conexão com a memória MCP cancelada durante o startup "
+            f"({MEMORY_MCP_URL}): {e}. A API sobe mesmo assim."
+        )
+    except Exception as e:
+        log.warning(
+            f"[STARTUP] Memory MCP não acessível em {MEMORY_MCP_URL}: {e}. "
+            "A API sobe mesmo assim — chamadas de memória vão falhar (e "
+            "tentar reconectar sozinhas) até o servidor de memória subir."
+        )
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Fecha HTTP clients persistentes graciosamente."""
-    global _openrouter_client, _memory_client, _tts_http
+    """Fecha HTTP clients e a sessão MCP persistentes graciosamente."""
+    global _openrouter_client, _tts_http
     if _openrouter_client and not _openrouter_client.is_closed:
         await _openrouter_client.aclose()
-    if _memory_client and not _memory_client.is_closed:
-        await _memory_client.aclose()
     if _tts_http and not _tts_http.is_closed:
         await _tts_http.aclose()
+    await _close_memory_session()
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -979,7 +1257,7 @@ async def chat(req: ChatRequest):
       - Memória read paralelo com detecção de idioma
       - Extração de memórias LT em background (fire-and-forget)
     """
-    user_input = req.message.strip()
+    user_input = (req.message or "").strip()
     if not user_input:
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
 
@@ -1072,37 +1350,96 @@ async def chat(req: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     """
-    Inferência com streaming — retorna Server-Sent Events (SSE).
-    Otimizações:
-      - HTTP client persistente para OpenRouter
-      - System prompt estável
-      - Memória read + detecção de idioma em paralelo
-      - Reuso de conexão para streaming
-      - Extração de memórias LT ao final do stream (sobre a resposta completa)
+    Endpoint UNIFICADO de inferência com streaming (SSE) — absorve o antigo
+    /chat/tools, permitindo tool calling nativo e streaming no MESMO request:
+
+      - Modo CHAT (envie `message`): o servidor monta o prompt completo
+        (memória LT + ST, data, idioma) e cuida do pipeline inteiro —
+        TTS em streaming, persistência do turno em ST e extração de
+        memórias LT em background ao final.
+
+      - Modo TOOLS (envie `messages`): mensagens prontas no formato OpenAI
+        (com role="tool" para resultados), sem memória/TTS — o caller
+        (orquestrador/agente) gerencia o histórico, executa as tools e
+        re-chama este endpoint com os resultados (loop ReAct).
+
+    TOOLS (opcional nos dois modos, via `tools`): o texto é streamado
+    normalmente (eventos `delta`). Como a decisão de tool call só ocorre no
+    FINAL da geração, os fragmentos de tool_calls que chegam no stream são
+    apenas ACUMULADOS e emitidos UMA vez, no evento `{"tool_calls": [...]}`,
+    logo antes do `done`. Se houver tool_calls, TTS/persistência são pulados
+    (o turno não terminou — o caller executa as tools e continua o loop).
+
+    Eventos SSE:
+      {"reasoning": "..."}   — raciocínio (se stream_reasoning)
+      {"delta": "..."}       — texto do content
+      {"tool_calls": [...]}  — tool_calls completas (ao final, se houver)
+      {"done": true, "elapsed": ..., "prompt_cached_tokens": ..., "had_tool_calls": bool}
+      {"error": "...", "too_large": bool}  — aborta o stream
     """
-    user_input = req.message.strip()
-    if not user_input:
-        raise HTTPException(status_code=400, detail="Mensagem vazia.")
+    if req.messages is not None and (req.message or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Envie apenas um dos campos: `message` (modo chat) ou `messages` (modo tools).",
+        )
 
-    # ── PARALLEL prep ──────────────────────────────────────────────────────
-    lang_task = asyncio.ensure_future(
-        asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
-    )
-    memory_task = asyncio.ensure_future(
-        memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
-    )
-    memory_st_task = asyncio.ensure_future(
-        memory_read_st(req.session_id)
-    )
-    lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
-    if not lang:
-        lang = "pt"
+    # ── Resolução de modo ──────────────────────────────────────────────────
+    tool_mode = req.messages is not None
+    if tool_mode:
+        messages = [m.model_dump(exclude_none=True) for m in req.messages]
+        if not messages:
+            raise HTTPException(status_code=400, detail="messages vazio.")
+        user_input = None
+        lang = None
+        temperature = req.temperature if req.temperature is not None else 0.3
+    else:
+        user_input = (req.message or "").strip()
+        if not user_input:
+            raise HTTPException(
+                status_code=400,
+                detail="Envie `message` (modo chat) ou `messages` (modo tools).",
+            )
 
-    messages = _build_messages(user_input, lang, memories, recent_turns)
+        # ── PARALLEL prep: detecção de idioma + leitura LT + leitura ST ────
+        lang_task = asyncio.ensure_future(
+            asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
+        )
+        memory_task = asyncio.ensure_future(
+            memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
+        )
+        memory_st_task = asyncio.ensure_future(
+            memory_read_st(req.session_id)
+        )
+        lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
+        if not lang:
+            lang = "pt"
+
+        messages = _build_messages(user_input, lang, memories, recent_turns)
+        temperature = req.temperature if req.temperature is not None else 0.7
+
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
-    voice = req.voice or voiceModel
 
-    _ensure_tts_queue()
+    # ── Payload OpenRouter (com tool calling nativo quando `tools` presente) ──
+    reasoning_extra = _reasoning_payload_extra(req.thinking_depth)
+    if req.reasoning_effort:
+        reasoning_extra = {"reasoning": {"effort": req.reasoning_effort}}
+
+    payload: dict = {
+        "messages":    messages,
+        "temperature": temperature,
+        **reasoning_extra,
+    }
+    if req.max_tokens is not None:
+        payload["max_tokens"] = req.max_tokens
+    if req.tools:
+        payload["tools"] = req.tools
+        payload["tool_choice"] = req.tool_choice or "auto"
+
+    # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
+    voice = req.voice or voiceModel
+    use_tts = (not tool_mode) and bool(req.tts and voice)
+    if use_tts:
+        _ensure_tts_queue()
     _tts_buf = ""
 
     def _clean_for_tts(text: str) -> str:
@@ -1126,17 +1463,14 @@ async def chat_stream(req: ChatRequest):
         nonlocal _tts_buf
         full_response = ""
         full_reasoning = ""
+        tool_calls_acc: dict[int, dict] = {}   # index -> tool_call em montagem
         t0 = time.perf_counter()
         cached_tokens = 0
 
         # Retry simples para falhas transitórias (5xx/rede/429) do OpenRouter
         for attempt in range(OPENROUTER_MAX_RETRIES + 1):
             client_used, model_used, r_ctx = await _execute_inference(
-                json_payload={
-                    "messages":    messages,
-                    "temperature": 0.7,
-                    **_reasoning_payload_extra(req.thinking_depth),
-                },
+                json_payload=payload,
                 stream=True,
                 model=MAIN_MODEL,
             )
@@ -1160,9 +1494,21 @@ async def chat_stream(req: ChatRequest):
                         await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
                         continue
 
-                    r.raise_for_status()
+                    if r.status_code >= 400:
+                        # Erro definitivo (retries esgotados ou 4xx): reporta no
+                        # stream — com a marcação too_large (mesmo contrato do
+                        # /chat/tools) para o caller reduzir o contexto.
+                        try:
+                            err_body = (await r.aread()).decode("utf-8", errors="replace")
+                        except Exception:
+                            err_body = ""
+                        log.warning(
+                            f"OpenRouter stream: {r.status_code} — {err_body[:200]}"
+                        )
+                        yield f"data: {json.dumps({'error': f'openrouter {r.status_code}: {err_body[:400]}', 'too_large': _is_request_too_large_error(err_body)})}\n\n"
+                        return
 
-                    # Se chegou aqui, conexão aceita. Processa as linhas SSE:
+                    # Conexão aceita. Processa as linhas SSE:
                     async for line in r.aiter_lines():
                         if not line or not line.startswith("data:"):
                             continue
@@ -1171,7 +1517,15 @@ async def chat_stream(req: ChatRequest):
                             break
                         try:
                             chunk = json.loads(data)
-                            delta_obj = chunk["choices"][0].get("delta", {})
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                # Chunk final só com usage (sem choices)
+                                usage = chunk.get("usage", {})
+                                if usage:
+                                    cached_tokens = usage.get("prompt_tokens_cached", 0) or \
+                                                     usage.get("cached_tokens", 0)
+                                continue
+                            delta_obj = choices[0].get("delta", {}) or {}
 
                             if req.stream_reasoning:
                                 reasoning = delta_obj.get("reasoning_content", "") or delta_obj.get("reasoning", "")
@@ -1179,7 +1533,27 @@ async def chat_stream(req: ChatRequest):
                                     full_reasoning += reasoning
                                     yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
 
-                            content = delta_obj.get("content", "")
+                            # ── Fragments de tool_calls: apenas ACUMULA aqui.
+                            # A "ativação" das tools acontece ao FINAL da
+                            # resposta, num único evento — os deltas de text
+                            # continuam fluindo normalmente durante a geração.
+                            for tc in (delta_obj.get("tool_calls") or []):
+                                idx = tc.get("index", 0)
+                                entry = tool_calls_acc.setdefault(idx, {
+                                    "id": "", "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                })
+                                if tc.get("id"):
+                                    entry["id"] = tc["id"]
+                                if tc.get("type"):
+                                    entry["type"] = tc["type"]
+                                fn = tc.get("function") or {}
+                                if fn.get("name"):
+                                    entry["function"]["name"] += fn["name"]
+                                if fn.get("arguments"):
+                                    entry["function"]["arguments"] += fn["arguments"]
+
+                            content = delta_obj.get("content", "") or ""
                             if not content:
                                 # Alguns provedores enviam usage na última chunk
                                 usage = chunk.get("usage", {})
@@ -1191,13 +1565,18 @@ async def chat_stream(req: ChatRequest):
                             full_response += content
                             yield f"data: {json.dumps({'delta': content})}\n\n"
 
-                            if req.tts and voice:
+                            # TTS incremental apenas quando não há tools na
+                            # jogada — com tools, o content pode ser texto
+                            # intermediário (a tool_call vem no fim), então
+                            # bufferizamos e só falamos se o turno for final.
+                            if use_tts:
                                 _tts_buf += content
-                                buf_rstrip = _tts_buf.rstrip()
-                                if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
-                                   or len(_tts_buf) > 150:
-                                    _flush_tts_buf()
-                        except (json.JSONDecodeError, KeyError):
+                                if not req.tools:
+                                    buf_rstrip = _tts_buf.rstrip()
+                                    if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
+                                       or len(_tts_buf) > 150:
+                                        _flush_tts_buf()
+                        except (json.JSONDecodeError, KeyError, IndexError):
                             continue
 
                     # Se o stream terminou com sucesso, quebra o loop de retry
@@ -1207,21 +1586,33 @@ async def chat_stream(req: ChatRequest):
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 return
 
-        # Rotina de finalização (TTS e memória)
-        if _tts_buf.strip():
+        # ── FINALIZAÇÃO: monta as tool_calls acumuladas ──────────────────────
+        tool_calls_final = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+        turno_final = not tool_calls_final
+
+        # Rotina de finalização (TTS e memória) — só em turno FINAL
+        if use_tts and turno_final and _tts_buf.strip():
             _flush_tts_buf()
 
         elapsed = time.perf_counter() - t0
         log.info(
             f"[STREAM] {elapsed:.2f}s | {len(full_response)} chars | "
             f"reasoning: {len(full_reasoning)} chars | "
+            f"tool_calls: {[tc['function']['name'] for tc in tool_calls_final] or 'nenhuma'} | "
             f"cached: {cached_tokens} tokens"
         )
 
-        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prompt_cached_tokens': cached_tokens})}\n\n"
+        if tool_calls_final:
+            # ── ATIVAÇÃO DAS TOOLS: evento único ao final da resposta ──
+            # Formato idêntico a message.tool_calls do OpenAI — o caller pode
+            # anexar direto no histórico como mensagem role="assistant" e
+            # responder com role="tool".
+            yield f"data: {json.dumps({'tool_calls': tool_calls_final})}\n\n"
 
-        # Persistência pós-stream
-        if full_response:
+        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prompt_cached_tokens': cached_tokens, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
+
+        # Persistência pós-stream — apenas turno FINAL do modo chat
+        if turno_final and (not tool_mode) and full_response:
             # Grava turno na memória ST
             asyncio.create_task(
                 memory_save_turn(req.session_id, user_input, full_response)
@@ -1255,8 +1646,7 @@ async def clear_history(req: ClearRequest):
         raise HTTPException(status_code=400, detail="Envie confirm=true para confirmar.")
 
     try:
-        client = await _get_memory_client()
-        await client.delete(f"/session/{req.session_id}")
+        await _call_memory_tool("memory_clear_session", {"session_id": req.session_id})
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Falha ao limpar sessão: {e}")
 
@@ -1267,12 +1657,11 @@ async def clear_history(req: ClearRequest):
 async def get_history(session_id: str = "default", last_n: int = 20):
     """Retorna as últimas N mensagens do histórico via módulo de memória."""
     try:
-        client = await _get_memory_client()
-        r = await client.post(
-            "/read",
-            json={"query": "histórico recente", "session_id": session_id, "top_k": last_n}
+        resp = await _call_memory_tool(
+            "memory_read",
+            {"query": "histórico recente", "session_id": session_id, "top_k": last_n},
         )
-        results = r.json().get("results", [])
+        results = resp.get("results", [])
         return {"history": results, "session_id": session_id}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Falha ao buscar histórico: {e}")
@@ -1451,7 +1840,15 @@ async def _openrouter_tool_call(
 @app.post("/chat/tools", response_model=ToolUseResponse)
 async def chat_tools(req: ToolUseRequest):
     """
-    Tool use nativo (OpenRouter) — para o módulo alpha_code.
+    [COMPATIBILIDADE] Tool use nativo síncrono (OpenRouter) — mantido para o
+    orquestrador (_llm_chat) e alpha_code, que esperam resposta JSON única.
+
+    A versão UNIFICADA deste comportamento com streaming agora vive em
+    /chat/stream: envie `messages` + `tools` no ChatRequest e as tool_calls
+    chegam no evento SSE {"tool_calls": [...]} ao final da resposta.
+
+    Recebe messages + tools (formato OpenAI function-calling) e retorna
+    a mensagem do assistant (pode conter tool_calls ou content).
 
     Recebe messages + tools (formato OpenAI function-calling) e retorna
     a mensagem do assistant (pode conter tool_calls ou content).

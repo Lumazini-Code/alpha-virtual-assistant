@@ -96,6 +96,24 @@ TOP_K_READ           = 5
 DECAY_HALF_LIFE_DAYS = 90
 DECAY_JOB_INTERVAL_S = 3600
 
+# ── Hebbian graph / PPR retrieval ──────────────────────────────────────────
+# Grafo de co-ativação sobre as memórias de longo prazo, com recuperação por
+# Personalized PageRank. NENHUM valor hardcodado na lógica abaixo — tudo é
+# lido daqui pra poder ser tunado depois sem tocar no código.
+EDGE_DECAY_HALF_LIFE_DAYS    = 90     # pode diferir de DECAY_HALF_LIFE_DAYS; começar igual
+EDGE_PRUNE_THRESHOLD         = 0.05   # arestas abaixo desse peso são deletadas
+EDGE_LEARNING_RATE           = 0.15   # lr do crescimento saturante hebbiano
+EDGE_MIN_SCORE_TO_LINK       = 0.80   # ambas as memórias precisam disso p/ criar aresta NOVA
+LTP_ACCESS_BOOST             = 0.05   # boost de confiança por leitura (saturante)
+PPR_DAMPING                  = 0.85
+PPR_MAX_ITER                 = 20
+PPR_CONVERGENCE_EPS          = 1e-4
+PPR_MIN_NEIGHBORS_PER_HOP    = 20     # teto de vizinhos por nó (SQLite barato)
+PPR_MIN_ACTIVATION_REINFORCE = 0.05   # threshold de elegibilidade p/ reforço (Opção B)
+PPR_SPREAD_WEIGHT            = 0.4    # peso do score PPR vs score direto FAISS
+MMR_LAMBDA                   = 0.7    # 1.0 = pura relevância, 0.0 = pura diversidade
+HEBBIAN_LINK_MAX_IDS         = 12     # safeguard: teto de ids linkados por /read (anti-O(n²))
+
 # ── NEW (solução 2): faixa de similaridade "provável correção" ────────────────
 # Entre UPDATE_SIM_THRESHOLD e DEDUP_THRESHOLD, um texto novo não é nem uma
 # duplicata clara (>= DEDUP_THRESHOLD, rejeitada) nem algo totalmente
@@ -271,6 +289,11 @@ class MemoryEntry(BaseModel):
     # para memory_type == "long_term" quando definida (senão usa o
     # default global DECAY_HALF_LIFE_DAYS).
     ttl_days:     Optional[float]      = None
+    # ── NEW (Hebbian graph): "primary" = hit direto (FAISS/VS/IF/ST);
+    # "related" = alcançado SÓ via propagação PPR no grafo de co-ativação —
+    # deixa o LLM downstream distinguir fato diretamente relevante de
+    # contexto associativo ──
+    match_type:   Literal["primary", "related"] = "primary"
     # ── NEW: Indexed file metadata ──
     file_path:    Optional[str]        = None
     file_name:    Optional[str]        = None
@@ -531,6 +554,21 @@ class MemoryDB:
             );
             CREATE INDEX IF NOT EXISTS idx_confidence    ON memories(confidence);
             CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed);
+
+            -- ── NEW (Hebbian graph): co-ativação entre memórias LT ──
+            -- Grafo NÃO-direcionado: o par é sempre armazenado com
+            -- memory_id_a = min(id1,id2), memory_id_b = max(id1,id2) —
+            -- nunca existe linha duplicada na ordem inversa.
+            CREATE TABLE IF NOT EXISTS memory_edges (
+                memory_id_a        INTEGER NOT NULL,
+                memory_id_b        INTEGER NOT NULL,
+                weight             REAL    NOT NULL DEFAULT 0.0,
+                coactivation_count INTEGER NOT NULL DEFAULT 0,
+                last_coactivated   REAL    NOT NULL,
+                PRIMARY KEY (memory_id_a, memory_id_b)
+            );
+            CREATE INDEX IF NOT EXISTS idx_edges_a ON memory_edges(memory_id_a);
+            CREATE INDEX IF NOT EXISTS idx_edges_b ON memory_edges(memory_id_b);
         """)
         # Migração leve: bancos criados antes do campo "esquecível?" existir
         # não têm a coluna — adiciona com default 1 (esquecível, comportamento
@@ -589,12 +627,151 @@ class MemoryDB:
     def update_access(self, memory_id: int):
         try:
             with self._lock:
+                # ── NEW (LTP): reforço saturante de confiança a cada
+                # acesso — "use it and improve it". Compõe com o decay:
+                # o decay multiplica o que quer que a confiança seja; o
+                # reforço puxa pra cima no acesso, o decay puxa pra baixo
+                # com o tempo. Caminho único — nenhum outro lugar incrementa
+                # access_count de LT.
                 self._conn.execute(
-                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                    (time.time(), memory_id),
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ?, "
+                    "confidence = confidence + ? * (1 - confidence) WHERE id = ?",
+                    (time.time(), LTP_ACCESS_BOOST, memory_id),
                 )
         except sqlite3.OperationalError:
             pass
+
+    # ── NEW (Hebbian graph): operações sobre memory_edges ─────────────────
+
+    def get_neighbors(self, memory_id: int, limit: int) -> list[sqlite3.Row]:
+        """Vizinhos de um nó, dos dois lados da aresta (grafo não-direcionado),
+        ordenados por peso. Usa idx_edges_a + idx_edges_b."""
+        return self._conn.execute(
+            "SELECT * FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ? "
+            "ORDER BY weight DESC LIMIT ?",
+            (memory_id, memory_id, limit),
+        ).fetchall()
+
+    def get_edges_for_ids(self, ids: list[int]) -> list[sqlite3.Row]:
+        """Todas as arestas com QUALQUER extremidade em `ids` — constrói a
+        adjacência local pro PPR sem carregar o grafo inteiro."""
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        return self._conn.execute(
+            f"SELECT * FROM memory_edges WHERE memory_id_a IN ({ph}) OR memory_id_b IN ({ph})",
+            ids + ids,
+        ).fetchall()
+
+    def upsert_edge(self, id_a: int, id_b: int, lr: float, now: float):
+        """Cria ou reforça a aresta (id_a, id_b). Ordem normalizada
+        (min/max). Crescimento saturante: w_new = w_old + lr * (1 - w_old) —
+        nunca ultrapassa 1.0."""
+        if id_a == id_b:
+            return
+        a, b = min(id_a, id_b), max(id_a, id_b)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT weight FROM memory_edges WHERE memory_id_a = ? AND memory_id_b = ?",
+                (a, b),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO memory_edges "
+                    "(memory_id_a, memory_id_b, weight, coactivation_count, last_coactivated) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    (a, b, lr, now),
+                )
+            else:
+                w_old = row["weight"]
+                w_new = w_old + lr * (1.0 - w_old)
+                self._conn.execute(
+                    "UPDATE memory_edges SET weight = ?, "
+                    "coactivation_count = coactivation_count + 1, last_coactivated = ? "
+                    "WHERE memory_id_a = ? AND memory_id_b = ?",
+                    (w_new, now, a, b),
+                )
+
+    def reinforce_edges_batch(
+        self,
+        pairs_with_activation: list[tuple[int, int, float]],
+        lr: float,
+        min_activation: float,
+        now: float,
+    ) -> int:
+        """Reforço em lote (Step 8 / Opção B) — SÓ atualiza arestas que já
+        existem; criar aresta nova é trabalho exclusivo do Step 4.
+        `pairs_with_activation` = [(id_a, id_b, activation)] com
+        activation = ppr_rank[i] * ppr_rank[j]. A elegibilidade por rank
+        (ambos > PPR_MIN_ACTIVATION_REINFORCE) é checada pelo chamador; aqui
+        há um piso extra de força de co-ativação (activation >= min_activation).
+        Atualização: w += lr * (activation * w) * (1 - w)  [reinforcement inclui w_ij]
+        Tudo numa única transação."""
+        if not pairs_with_activation:
+            return 0
+        rows = [
+            (lr, act, now, min(a, b), max(a, b), act, min_activation)
+            for a, b, act in pairs_with_activation
+            if act >= min_activation
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(
+                    "UPDATE memory_edges SET "
+                    "weight = MIN(1.0, weight + ? * (? * weight) * (1.0 - weight)), "
+                    "coactivation_count = coactivation_count + 1, "
+                    "last_coactivated = ? "
+                    "WHERE memory_id_a = ? AND memory_id_b = ? AND ? >= ?",
+                    rows,
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
+    def decay_and_prune_edges(self, half_life_days: float, prune_threshold: float) -> int:
+        """Decay das arestas com a MESMA matemática de apply_decay
+        (fator = 0.5 ** (dias_idle / half_life)), depois DELETE das arestas
+        abaixo de prune_threshold. Retorna quantas foram podadas."""
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT memory_id_a, memory_id_b, weight, last_coactivated FROM memory_edges"
+            ).fetchall()
+            updates = []
+            for row in rows:
+                days_idle    = (now - row["last_coactivated"]) / 86400.0
+                decay_factor = 0.5 ** (days_idle / half_life_days)
+                updates.append((
+                    row["weight"] * decay_factor,
+                    row["memory_id_a"], row["memory_id_b"],
+                ))
+            if updates:
+                self._conn.executemany(
+                    "UPDATE memory_edges SET weight = ? WHERE memory_id_a = ? AND memory_id_b = ?",
+                    updates,
+                )
+            cur = self._conn.execute(
+                "DELETE FROM memory_edges WHERE weight < ?", (prune_threshold,)
+            )
+            return cur.rowcount
+
+    def delete_edges_for_memory(self, memory_id: int):
+        """Remove todas as arestas de um nó — chamado sempre que memórias são
+        apagadas (branch de expiry dentro de apply_decay e deletes explícitos),
+        pra o grafo nunca manter aresta apontando pra linha inexistente."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
+                (memory_id, memory_id),
+            )
+
+    def count_edges(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0]
 
     def update(
         self,
@@ -674,6 +851,17 @@ class MemoryDB:
                 updates.append((row["confidence"] * decay_factor, row["id"]))
             if updates:
                 self._conn.executemany("UPDATE memories SET confidence = ? WHERE id = ?", updates)
+                # ── NEW (Hebbian graph): antes de apagar as memórias
+                # expiradas, apaga as arestas que apontam pra elas — o
+                # grafo nunca mantém aresta pra linha morta.
+                expired = self._conn.execute(
+                    "SELECT id FROM memories WHERE confidence < 0.01"
+                ).fetchall()
+                for expired_row in expired:
+                    self._conn.execute(
+                        "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
+                        (expired_row["id"], expired_row["id"]),
+                    )
                 self._conn.execute("DELETE FROM memories WHERE confidence < 0.01")
                 log.info(f"Decay aplicado em {len(updates)} memórias de longo prazo")
 
@@ -1606,6 +1794,17 @@ async def decay_job():
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, state.lt_db.apply_decay, DECAY_HALF_LIFE_DAYS)
+            # ── NEW (Hebbian graph): decay + poda das arestas no MESMO job —
+            # sem criar segundo loop/task (reusa o decay_task existente).
+            pruned = await loop.run_in_executor(
+                None, state.lt_db.decay_and_prune_edges,
+                EDGE_DECAY_HALF_LIFE_DAYS, EDGE_PRUNE_THRESHOLD,
+            )
+            if pruned:
+                log.info(
+                    f"Grafo Hebbiano: {pruned} arestas podadas "
+                    f"(threshold={EDGE_PRUNE_THRESHOLD})"
+                )
         except Exception as e:
             log.error(f"Erro no decay job: {e}")
 
@@ -1981,16 +2180,252 @@ async def _search_dual(
     return lt_fused, st_fused
 
 
+
+# ── NEW (Hebbian graph): PPR + helpers ─────────────────────────────────────
+
+def personalized_pagerank(
+    adjacency: dict[int, dict[int, float]],
+    personalization: dict[int, float],
+    damping: float,
+    max_iter: int,
+    eps: float,
+) -> dict[int, float]:
+    """Personalized PageRank por power iteration esparsa — síncrono, rode via
+    run_in_executor. Só dicts, sem networkx: nesse tamanho de grafo é mais
+    que suficiente e o damping cuida da propagação multi-hop (sem travessia
+    manual de 2+ hops)."""
+    nodes = set(adjacency) | set(personalization)
+    if not nodes:
+        return {}
+    rank = {n: personalization.get(n, 0.0) for n in nodes}
+    for _ in range(max_iter):
+        new_rank = {n: (1 - damping) * personalization.get(n, 0.0) for n in nodes}
+        for n in nodes:
+            neighbors = adjacency.get(n, {})
+            total_w = sum(neighbors.values())
+            if total_w <= 0:
+                continue
+            for nb, w in neighbors.items():
+                new_rank[nb] = new_rank.get(nb, 0.0) + damping * rank[n] * (w / total_w)
+        delta = sum(abs(new_rank[n] - rank[n]) for n in nodes)
+        rank = new_rank
+        if delta < eps:
+            break
+    return rank
+
+
+def _edge_key(id_a: int, id_b: int) -> tuple[int, int]:
+    """Chave canônica de uma aresta não-direcionada (min, max)."""
+    return (min(id_a, id_b), max(id_a, id_b))
+
+
+async def _ppr_spread(
+    lt_raw: list[tuple[int, float]],
+    loop: asyncio.AbstractEventLoop,
+) -> dict:
+    """Step 6 — propagação PPR no grafo Hebbiano, com sementes nos hits LT.
+
+    Roda DEPOIS que `lt_raw` está finalizado (todas as estratégias convergem
+    nele) e ANTES de converter em MemoryEntry. Retorna:
+      related_raw  — [(memory_id, score)] dos ids alcançados SÓ pelo grafo
+      ppr_rank     — {id: rank} completo (sementes + vizinhos), p/ Step 8
+      adjacency    — {id: {vizinho: weight}} do subgrafo local, p/ Step 8
+      edge_rows    — linhas brutas de memory_edges do subgrafo
+      elapsed_ms   — tempo da propagação (profiling, mesma linha do /read)
+    """
+    result: dict = {
+        "related_raw": [], "ppr_rank": {}, "adjacency": {}, "edge_rows": [],
+        "elapsed_ms": 0.0,
+    }
+    seed_ids = [mid for mid, _ in lt_raw]
+    if not seed_ids:
+        return result
+    t0 = time.perf_counter()
+    edges = state.lt_db.get_edges_for_ids(seed_ids)
+    if not edges:
+        return result
+    # Expansão de 1 hop: busca arestas dos vizinhos alcançados (2ª query,
+    # barata — NÃO carrega a tabela inteira). O PPR em si propaga quantos
+    # hops forem necessários via damping.
+    neighbor_ids = (
+        {row["memory_id_a"] for row in edges} | {row["memory_id_b"] for row in edges}
+    ) - set(seed_ids)
+    if neighbor_ids:
+        edges += state.lt_db.get_edges_for_ids(list(neighbor_ids))
+    # Adjacência simétrica, com teto de vizinhos por nó (SQLite barato).
+    adjacency: dict[int, dict[int, float]] = {}
+    for row in edges:
+        a, b, w = row["memory_id_a"], row["memory_id_b"], row["weight"]
+        if a == b or w <= 0:
+            continue
+        adjacency.setdefault(a, {})[b] = w
+        adjacency.setdefault(b, {})[a] = w
+    for node, nbs in adjacency.items():
+        if len(nbs) > PPR_MIN_NEIGHBORS_PER_HOP:
+            top = sorted(nbs.items(), key=lambda kv: kv[1], reverse=True)[:PPR_MIN_NEIGHBORS_PER_HOP]
+            adjacency[node] = dict(top)
+    # Vetor de personalização: scores FAISS clipados (>= 0) e normalizados.
+    clipped = {mid: max(score, 0.0) for mid, score in lt_raw}
+    total = sum(clipped.values())
+    if total <= 0:
+        return result
+    personalization = {mid: s / total for mid, s in clipped.items()}
+    rank = await loop.run_in_executor(
+        None, personalized_pagerank,
+        adjacency, personalization, PPR_DAMPING, PPR_MAX_ITER, PPR_CONVERGENCE_EPS,
+    )
+    seed_set = set(seed_ids)
+    related_raw = [
+        (mid, PPR_SPREAD_WEIGHT * r)
+        for mid, r in rank.items()
+        if mid not in seed_set and r >= PPR_MIN_ACTIVATION_REINFORCE
+    ]
+    related_raw.sort(key=lambda x: x[1], reverse=True)
+    result.update(
+        related_raw=related_raw, ppr_rank=rank,
+        adjacency=adjacency, edge_rows=edges,
+        elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+    )
+    return result
+
+
+def _lateral_inhibition_filter(results: list[MemoryEntry]) -> list[MemoryEntry]:
+    """Step 7 — MMR (inibição lateral) restrito às entradas "related".
+
+    "Similaridade" entre candidatos = PESO DE ARESTA entre elas no grafo
+    (aproximação por peso de aresta, conforme o design doc): suprimir hub
+    genérico é redundância GRÁFICA, não de embedding — e evita um reconstruct
+    por candidato no FAISS. Entradas "primary" passam intactas (foram
+    explicitamente pedidas pela query; é o contexto espalhado pelo grafo que
+    precisa de pressão de diversidade)."""
+    primary = [r for r in results if r.match_type != "related"]
+    related = [r for r in results if r.match_type == "related"]
+    if len(related) <= 1:
+        return results
+    edge_rows = state.lt_db.get_edges_for_ids([r.id for r in related])
+    wmap = {
+        (row["memory_id_a"], row["memory_id_b"]): row["weight"] for row in edge_rows
+    }
+
+    def edge_w(i: int, j: int) -> float:
+        return wmap.get(_edge_key(i, j), 0.0)
+
+    selected: list[MemoryEntry] = []
+    pool = list(related)
+    while pool:
+        def mmr_score(c: MemoryEntry) -> float:
+            relevance = c.score * c.confidence
+            if not selected:
+                return relevance
+            max_sim = max(edge_w(c.id, s.id) for s in selected)
+            return MMR_LAMBDA * relevance - (1.0 - MMR_LAMBDA) * max_sim
+
+        best = max(pool, key=mmr_score)
+        selected.append(best)
+        pool.remove(best)
+
+    merged = primary + selected
+    merged.sort(key=lambda r: r.score * r.confidence, reverse=True)
+    return merged
+
+
+def _upsert_edges_sync(pairs: list[tuple[int, int]], now: float) -> int:
+    """Helper síncrono p/ executor: cria/reforça arestas em lote (Step 4)."""
+    for id_a, id_b in pairs:
+        state.lt_db.upsert_edge(id_a, id_b, EDGE_LEARNING_RATE, now)
+    return len(pairs)
+
+
+async def _hebbian_link_task(results: list[MemoryEntry]) -> None:
+    """Step 4 (background) — regra hebbiana NO CONJUNTO FINAL do /read: todo
+    par de memórias LT com score >= EDGE_MIN_SCORE_TO_LINK co-ativou, então
+    cria/reforça a aresta. Fire-and-forget: loga falhas, nunca levanta —
+    o cliente já recebeu a resposta antes disso começar."""
+    try:
+        scored = [
+            (r.id, r.score)
+            for r in results
+            if r.memory_type == "long_term" and r.score >= EDGE_MIN_SCORE_TO_LINK
+        ]
+        if len(scored) < 2:
+            return
+        now = time.time()
+        if len(scored) > HEBBIAN_LINK_MAX_IDS:
+            # Safeguard: leitura multi-tópico não pode virar O(n²) de arestas
+            # — liga cada id apenas ao de maior score e avisa.
+            scored.sort(key=lambda x: x[1], reverse=True)
+            hub_id = scored[0][0]
+            pairs = [(hub_id, other) for other, _ in scored[1:]]
+            log.warning(
+                f"Grafo Hebbiano: {len(scored)} ids acima de {EDGE_MIN_SCORE_TO_LINK} "
+                f"no /read — ligando cada um apenas ao top-score (anti-O(n²))"
+            )
+        else:
+            ids = [mid for mid, _ in scored]
+            pairs = [
+                (ids[i], ids[j])
+                for i in range(len(ids))
+                for j in range(i + 1, len(ids))
+            ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _upsert_edges_sync, pairs, now)
+    except Exception as e:
+        log.error(f"Grafo Hebbiano: falha ao criar arestas pós-/read: {e}")
+
+
+async def _ppr_reinforce_task(ppr_ctx: dict) -> None:
+    """Step 8 (background, Opção B) — reforço das arestas EXISTENTES do
+    subgrafo PPR pela regra literal de co-ativação:
+        reinforcement = rank_i * rank_j * w_ij
+        w_new = w_old + lr * reinforcement * (1 - w_old)
+    NÃO cria aresta nova (isso é exclusivamente do Step 4). Elegibilidade:
+    rank_i e rank_j ambos > PPR_MIN_ACTIVATION_REINFORCE. Mais barato que
+    rastrear caminhos exatos de propagação — e mais hebbiano de qualquer
+    forma (co-ativação, não causalidade de caminho)."""
+    try:
+        rank = ppr_ctx.get("ppr_rank") or {}
+        adjacency = ppr_ctx.get("adjacency") or {}
+        if not rank or not adjacency:
+            return
+        updates: list[tuple[int, int, float]] = []
+        seen: set[tuple[int, int]] = set()
+        for a, neighbors in adjacency.items():
+            rank_a = rank.get(a, 0.0)
+            if rank_a <= PPR_MIN_ACTIVATION_REINFORCE:
+                continue
+            for b in neighbors:
+                rank_b = rank.get(b, 0.0)
+                if rank_b <= PPR_MIN_ACTIVATION_REINFORCE:
+                    continue
+                key = _edge_key(a, b)
+                if key in seen:
+                    continue  # adjacência é simétrica — não reforça 2x a mesma aresta
+                seen.add(key)
+                updates.append((key[0], key[1], rank_a * rank_b))
+        if not updates:
+            return
+        now = time.time()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, state.lt_db.reinforce_edges_batch,
+            updates, EDGE_LEARNING_RATE, PPR_MIN_ACTIVATION_REINFORCE, now,
+        )
+    except Exception as e:
+        log.error(f"Grafo Hebbiano: falha no reforço por ativação PPR: {e}")
+
+
 def _build_lt_entries(
     lt_raw: list[tuple[int, float]],
     min_score: float,
     loop: asyncio.AbstractEventLoop,
     max_chars: int = READ_LT_MAX_CHARS,
+    related_ids: Optional[set[int]] = None,
 ) -> list[MemoryEntry]:
     ids_filtered = [mid for mid, score in lt_raw if score >= min_score]
     score_map    = {mid: score for mid, score in lt_raw}
     if not ids_filtered:
         return []
+    related_ids = related_ids or set()
     entries = []
     for row in state.lt_db.get_by_ids(ids_filtered):
         entries.append(MemoryEntry(
@@ -2004,6 +2439,8 @@ def _build_lt_entries(
             source       = row["source"],
             forgettable  = bool(row["forgettable"]),
             ttl_days     = row["ttl_days"],
+            # ── NEW (Hebbian graph): id alcançado só via PPR vira "related" ──
+            match_type   = "related" if row["id"] in related_ids else "primary",
         ))
         loop.run_in_executor(None, state.lt_db.update_access, row["id"])
     return entries
@@ -2453,6 +2890,13 @@ async def read_memory(req: ReadRequest):
         st_raw = _fuse_max(st_raw, st_seg)
         log.info(f"/read query segmentada em {len(query_segments)} partes: {query_segments}")
 
+    # ── NEW (Hebbian graph / Step 6): PPR no grafo, com sementes em lt_raw ──
+    # lt_raw já está finalizado aqui (todas as estratégias convergem nele) e
+    # a conversão pra MemoryEntry ainda não aconteceu — posição exata do Step 6.
+    ppr_ctx = await _ppr_spread(lt_raw, loop)
+    related_raw: list[tuple[int, float]] = ppr_ctx["related_raw"]
+    related_ids = {mid for mid, _ in related_raw}
+
     # Await VS results
     vs_results = []
     if vs_future is not None:
@@ -2482,11 +2926,20 @@ async def read_memory(req: ReadRequest):
 
     results: list[MemoryEntry] = (
         _build_lt_entries(lt_raw, strict_min_score, loop) +
+        # "related" tem threshold próprio: score PPR é massa de probabilidade
+        # (<= PPR_SPREAD_WEIGHT), jamais passaria no strict_min_score (0.85).
+        # O piso real de elegibilidade é PPR_MIN_ACTIVATION_REINFORCE, já
+        # aplicado dentro de _ppr_spread no próprio rank.
+        _build_lt_entries(related_raw, 0.0, loop, related_ids=related_ids) +
         _build_st_entries(st_raw, strict_min_score, loop) +
         _build_vs_entries(vs_results, strict_min_score) +
         _build_if_entries(if_raw, if_strict_min_score, loop)  # NEW
     )
     results.sort(key=lambda r: r.score * r.confidence, reverse=True)
+
+    # ── NEW (Step 7): inibição lateral (MMR) SÓ no subconjunto "related",
+    # antes do orçamento de tokens — primary não é penalizado. ──
+    results = _lateral_inhibition_filter(results)
 
     # ── Orçamento global de tokens ─────────────────────────────────────────────
     # Limita o total de caracteres retornados, cortando entradas de menor score.
@@ -2499,10 +2952,21 @@ async def read_memory(req: ReadRequest):
     log.info(
         f"/read query='{query[:50]}' strategy={effective_strategy} "
         f"results={len(results)} total_chars={total_chars} "
-        f"budget={READ_TOTAL_MAX_CHARS} strict_score={strict_min_score:.2f}"
+        f"budget={READ_TOTAL_MAX_CHARS} strict_score={strict_min_score:.2f} "
+        f"ppr_ms={ppr_ctx['elapsed_ms']:.1f} related={len(related_raw)}"
     )
 
-    return ReadResponse(results=results, query=query, strategy=effective_strategy)
+    response = ReadResponse(results=results, query=query, strategy=effective_strategy)
+
+    # ── NEW (Step 4, background): criação de arestas hebbianas entre as
+    # memórias LT FINAIS com score >= EDGE_MIN_SCORE_TO_LINK. Fire-and-forget
+    # — o caller já recebeu a resposta; falhas só logam. ──
+    asyncio.ensure_future(_hebbian_link_task(results))
+    # ── NEW (Step 8, background): reforço das arestas EXISTENTES do subgrafo
+    # PPR pela regra de co-ativação (Opção B). Também fire-and-forget. ──
+    asyncio.ensure_future(_ppr_reinforce_task(ppr_ctx))
+
+    return response
 
 
 # ── DELETE /session/{session_id} ───────────────────────────────────────────────
@@ -3334,7 +3798,17 @@ async def face_dict_delete(person_id: int):
 
 # ── GET /status ────────────────────────────────────────────────────────────────
 
-async def status():
+def _gather_status_sync() -> dict:
+    """Coleta bloqueante (várias queries SQLite + state.vs.status()).
+    Extraída para função síncrona própria para poder rodar via
+    run_in_executor (ver status() abaixo) — igual ao padrão já usado no
+    resto do arquivo para .search()/.apply_decay()/etc. Sem isso, essas
+    ~8 queries síncronas rodavam direto no corpo da coroutine e, sob
+    contenção com uma escrita concorrente seguranco o lock/transação
+    SQLite (embedding batch, decay job, cleanup de short-term — todas via
+    run_in_executor em outra thread), travavam o event loop inteiro
+    enquanto esperavam — inclusive impedindo o servidor de responder ao
+    handshake MCP de outros clientes (ver orchestrator._get_mcp_session)."""
     resp = {
         "long_term": {
             "memories_total":       state.lt_db.count(),
@@ -3342,6 +3816,18 @@ async def status():
             "decay_half_life_days": DECAY_HALF_LIFE_DAYS,
             "dedup_threshold":      DEDUP_THRESHOLD,
             "update_sim_threshold": UPDATE_SIM_THRESHOLD,
+        },
+        # ── NEW: grafo Hebbiano de co-ativação ──
+        "hebbian_graph": {
+            "edges_total":              state.lt_db.count_edges(),
+            "edge_decay_half_life_d":   EDGE_DECAY_HALF_LIFE_DAYS,
+            "edge_prune_threshold":     EDGE_PRUNE_THRESHOLD,
+            "edge_learning_rate":       EDGE_LEARNING_RATE,
+            "edge_min_score_to_link":   EDGE_MIN_SCORE_TO_LINK,
+            "ltp_access_boost":         LTP_ACCESS_BOOST,
+            "ppr_damping":              PPR_DAMPING,
+            "ppr_spread_weight":        PPR_SPREAD_WEIGHT,
+            "mmr_lambda":               MMR_LAMBDA,
         },
         "short_term": {
             "turn_groups_total":  state.st_db.count(),
@@ -3418,3 +3904,8 @@ async def status():
             "vectors_in_index": 0,
         }
     return resp
+
+
+async def status():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _gather_status_sync)

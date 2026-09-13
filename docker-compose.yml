@@ -22,7 +22,7 @@ services:
       - ava-logs:/app/logs
 
     environment:
-      AVA_DEBUG: "1"
+      AVA_DEBUG: ""
       AVA_N_GPU_LAYERS: "99"
       ONNX_PROVIDERS: "CPUExecutionProvider"
       PYTHONUNBUFFERED: "1"
