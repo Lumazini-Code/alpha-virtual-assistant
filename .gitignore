@@ -43,3 +43,5 @@ graphify-out
 node_modules/
 
 cache/
+
+Modules/transcribe/build
