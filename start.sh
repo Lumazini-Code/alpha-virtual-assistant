@@ -48,8 +48,10 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
-echo "  • Memory Server..."
-restart_on_fail "Memory Server" "python3 mcp_servers/memory_server.py" &
+restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py" &
+sleep 1
+
+
 
 cd /app/Modules
 
@@ -68,10 +70,15 @@ restart_on_fail "TTS" "python3 TTS.py" &
 echo "  • Vision API..."
 restart_on_fail "Vision" "python3 vision.py" &
 
+echo "  • Memory Server..."
+restart_on_fail "Memory Server" "python3 memory_api.py" &
+
 echo "  • Alpha-code Agent..."
 # Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports
 # relativos), então roda igual aos outros serviços em /app/Modules.
 restart_on_fail "alpha_code" "python3 alpha_code.py" &
+
+
 
 echo "✓ Todos os serviços iniciados"
 echo ""

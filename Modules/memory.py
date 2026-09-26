@@ -12,12 +12,16 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
+import heapq
+
 import numpy as np
-import faiss
+import pyarrow as pa
+import lancedb
+import scipy.sparse as sp
 from pydantic import BaseModel
 
 # ── MODIFIED: Import from onnx_client instead of local ONNX ───────────────────
-from onnx_client import EmbeddingClient, DEFAULT_ONNX_BASE_URL
+from onnx_client import EmbeddingClient, RerankerClient, DEFAULT_ONNX_BASE_URL
 
 # ── MODIFIED: Import VectorStore from vector_store (graceful fallback) ────────
 try:
@@ -31,6 +35,16 @@ except ImportError as _imp_err:
 # ── Configuração ───────────────────────────────────────────────────────────────
 
 ONNX_SERVING_URL = DEFAULT_ONNX_BASE_URL
+
+# ── Prefixos E5 (multilingual-e5-small/base/large e primos) ─────────────────
+# Modelos da família E5 são treinados com prefixos textuais fixos — sem eles,
+# o embedding de QUALQUER texto colapsa para uma região estreita do espaço,
+# e cosine similarity entre frases sem nenhuma relação semântica sai
+# artificialmente alta (~0.85-0.93), quebrando dedup e busca por igual.
+# Ref.: model card intfloat/multilingual-e5-small.
+# Se um dia trocar pra um modelo que não é da família E5, ajuste isso pra "".
+EMBED_QUERY_PREFIX   = "query: "
+EMBED_PASSAGE_PREFIX = "passage: "
 
 # Longo prazo
 DB_PATH           = "./memory/ava_memory.db"
@@ -89,9 +103,74 @@ FD_MIN_SCORE         = 0.42    # cosine similarity — modelos estilo ArcFace/Ed
 FD_TOP_K             = 3
 FD_AMBIGUOUS_MARGIN  = 0.05
 
+# ── NEW: Dicionário de Voz (embeddings de locutor — ex.: CAM++/3D-Speaker) ────
+# Mesmo padrão do dicionário de rostos, só que pra identificação de locutor a
+# partir de embeddings extraídos de áudio: por pessoa, guarda N embeddings de
+# exemplo (um por frase falada registrada — permite reconhecer a mesma voz em
+# condições/ângulos de captação diferentes). A descrição de quem é a pessoa é
+# REPLICADA na memória de longo prazo (igual ao link_to_memory do dicionário
+# visual), então ela é recuperável pela leitura normal (/read).
+VO_DB_PATH           = "./memory/ava_voice_dict.db"
+VO_FAISS_INDEX_PATH  = "./memory/ava_voice_dict.index"
+VO_FAISS_ID_MAP_PATH = "./memory/ava_voice_dict_id_map.npy"
+VO_EMBED_DIM         = 192     # CAM++ (3D-Speaker) — ajustar se a saída do seu .onnx for outra dim
+VO_MIN_SCORE         = 0.45    # cosine similarity — CALIBRE em cima dos seus próprios exemplos
+                                # antes de confiar nisso em produção (threshold de voz varia
+                                # bastante com microfone, ruído e distância da boca)
+VO_TOP_K             = 3
+VO_AMBIGUOUS_MARGIN  = 0.05
+
+# ── NEW: LanceDB (substitui FAISS + .npy de id-map) ───────────────────────────
+# Um único diretório LanceDB guarda os vetores de TODOS os stores (longo prazo,
+# curto prazo, arquivos indexados, dicionários visual/rosto/voz, tools). Vetores
+# de dimensões diferentes não cabem na mesma coluna FixedSizeList, então existe
+# UMA tabela por dimensão (`vectors_384`, `vectors_512`, `vectors_192`…) e a
+# coluna `memory_type` separa os stores dentro dela (filtro nativo, pré-filtro).
+# Os caminhos FAISS_*_PATH / *_ID_MAP_PATH acima passam a ser usados SÓ para a
+# migração automática one-shot dos índices antigos (ver MemoryIndex).
+LANCE_DIR          = "./memory/ava_lance"
+LANCE_TABLE_PREFIX = "vectors"
+
+MT_LONG_TERM    = "long_term"
+MT_SHORT_TERM   = "short_term"
+MT_INDEXED_FILE = "indexed_file"
+MT_VISUAL_DICT  = "visual_dict"
+MT_FACE_DICT    = "face_dict"
+MT_VOICE_DICT   = "voice_dict"
+MT_TOOL         = "tool"
+
+# ── NEW: retrieval de tools (RAG de tool selection) ───────────────────────────
+# Recall é mais crítico que precisão aqui: uma tool que não aparece não pode ser
+# chamada — por isso os thresholds são BEM mais permissivos que os do /read
+# (READ_MIN_SCORE_STRICT = 0.85).
+TOOLS_DB_PATH               = "./memory/ava_tools.db"
+TOOLS_TOP_K                 = 8      # tools "primary" por seleção
+TOOLS_MIN_SCORE             = 0.45   # cosine mínimo p/ uma tool entrar como primary
+TOOLS_LOW_CONFIDENCE_SCORE  = 0.55   # top-1 abaixo disso → confiança baixa → rede mais larga
+TOOLS_FALLBACK_TOP_K        = 12     # quantas tools devolver (sem threshold) se confiança baixa
+TOOLS_MAX_RELATED           = 4      # tools extras trazidas só pelo grafo (co-uso/sequência)
+TOOLS_MAX_EXAMPLES          = 10     # exemplos de query fornecidos no cadastro, por tool
+TOOLS_MAX_LEARNED_EXAMPLES  = 20     # queries reais aprendidas via tools_record_usage, por tool
+TOOLS_LEARN_DEDUP_SCORE     = 0.95   # query aprendida ≥ isso de outra já existente → não duplica
+TOOLS_USAGE_MAX_SEQUENCE    = 12     # teto de tools por registro de uso (anti-O(n²))
+
+# ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
+DICT_GRAPH_MAX_RELATED = 3
+
 EMBED_DIM            = 384
 READ_MIN_SCORE       = 0.83
-DEDUP_THRESHOLD      = 0.92
+# ── Thresholds recalibrados (ver diagnóstico) ────────────────────────────────
+# multilingual-e5-small tem anisotropia alta: MEDIMOS cosine médio de ~0.78
+# (chegando a ~0.86) entre frases SEM NENHUMA relação semântica (idiomas e
+# domínios completamente diferentes). Os valores antigos (DEDUP=0.92,
+# UPDATE=0.75) estavam dentro/abaixo desse piso de ruído — por isso qualquer
+# fato novo batia como "possible_update"/"duplicate_semantic" contra
+# qualquer fato antigo. Subimos os dois pra ficarem acima do piso medido, e
+# a decisão final na faixa "parecido" passa a ser confirmada pelo reranker
+# cross-encoder (RERANK_DUPLICATE_SCORE/RERANK_UPDATE_SCORE abaixo), que não
+# sofre do mesmo problema de anisotropia — os thresholds de cosine aqui viram
+# só um filtro de RECALL (candidatos a checar), não mais a decisão final.
+DEDUP_THRESHOLD      = 0.95
 TOP_K_READ           = 5
 DECAY_HALF_LIFE_DAYS = 90
 DECAY_JOB_INTERVAL_S = 3600
@@ -110,9 +189,62 @@ PPR_MAX_ITER                 = 20
 PPR_CONVERGENCE_EPS          = 1e-4
 PPR_MIN_NEIGHBORS_PER_HOP    = 20     # teto de vizinhos por nó (SQLite barato)
 PPR_MIN_ACTIVATION_REINFORCE = 0.05   # threshold de elegibilidade p/ reforço (Opção B)
-PPR_SPREAD_WEIGHT            = 0.4    # peso do score PPR vs score direto FAISS
+PPR_SPREAD_WEIGHT            = 0.4    # peso do score PPR vs score direto do índice vetorial
 MMR_LAMBDA                   = 0.7    # 1.0 = pura relevância, 0.0 = pura diversidade
+
+# ── NEW: log de ativação p/ visualização em tempo real (live_activation_server.py) ──
+ACTIVATION_LOG_PATH          = "./memory/activation_log.jsonl"
+ACTIVATION_LOG_MAX_IDS       = 60     # não loga o rank inteiro se o subgrafo for gigante
 HEBBIAN_LINK_MAX_IDS         = 12     # safeguard: teto de ids linkados por /read (anti-O(n²))
+
+# ── NEW: expansão ADAPTATIVA do grafo (substitui os 2 hops fixos) ─────────────
+# BFS priorizado por peso acumulado: sempre expande o nó de maior peso de
+# caminho (produto dos pesos de aresta ao longo do melhor caminho até ele).
+# Para quando (a) o número de nós carregados chega ao teto, ou (b) o melhor nó
+# restante tem peso de caminho abaixo do mínimo.
+PPR_EXPAND_MAX_NODES         = 200
+PPR_EXPAND_MIN_PATH_WEIGHT   = 0.05
+
+# ── NEW: MMR — fallback quando NÃO existe aresta entre dois candidatos ────────
+# Nesse caso a "similaridade" passa a ser a cosine direta entre os embeddings
+# (em vez de 0.0). Cosines de embeddings quaisquer raramente ficam perto de 0,
+# então MMR_COSINE_FLOOR desconta esse piso: sim = max(0, (cos-floor)/(1-floor)).
+# 0.0 = usa a cosine crua.
+MMR_COSINE_FLOOR             = 0.0
+
+# ── NEW: arestas tipadas/direcionadas ─────────────────────────────────────────
+# Convenção de direção (memory_id_a → memory_id_b) nos tipos dirigidos:
+#   temporal_precedence : a veio ANTES de b
+#   updates             : a é a versão NOVA que substitui b
+# Tipos simétricos guardam o par normalizado (min, max), como antes.
+EDGE_CO_ACTIVATION = "co_activation"
+EDGE_TEMPORAL      = "temporal_precedence"
+EDGE_CONTRADICTS   = "contradicts"
+EDGE_UPDATES       = "updates"
+EDGE_TYPES          = (EDGE_CO_ACTIVATION, EDGE_TEMPORAL, EDGE_CONTRADICTS, EDGE_UPDATES)
+EDGE_DIRECTED_TYPES = frozenset({EDGE_TEMPORAL, EDGE_UPDATES})
+# Fator aplicado ao peso da aresta ao PROPAGAR no PPR: (a→b, b→a).
+#   contradicts: (0,0) — não propaga ativação por contradição (o MMR ainda a usa);
+#   updates: de a memória ANTIGA pra NOVA propaga forte (1.0), da nova pra antiga quase nada.
+EDGE_PPR_FACTORS = {
+    EDGE_CO_ACTIVATION: (1.0, 1.0),
+    EDGE_TEMPORAL:      (0.6, 0.3),
+    EDGE_CONTRADICTS:   (0.0, 0.0),
+    EDGE_UPDATES:       (0.1, 1.0),
+}
+# Fator do peso da aresta como "similaridade" no MMR (redundância entre candidatos).
+EDGE_MMR_FACTORS = {
+    EDGE_CO_ACTIVATION: 1.0,
+    EDGE_TEMPORAL:      0.3,
+    EDGE_CONTRADICTS:   1.0,   # mesmo assunto, versões conflitantes → não mostrar as duas
+    EDGE_UPDATES:       1.0,
+}
+# Arestas estruturais (correção/contradição) não sofrem decay nem poda por inatividade.
+EDGE_TYPES_NO_DECAY    = frozenset({EDGE_CONTRADICTS, EDGE_UPDATES})
+# Peso inicial de arestas criadas de forma EXPLÍCITA (link_to no /write) — o
+# lr hebbiano (0.15) é fraco demais pra um vínculo declarado.
+EDGE_EXPLICIT_LINK_WEIGHT = 0.8
+EDGE_EXPLICIT_TYPES       = frozenset({EDGE_CONTRADICTS, EDGE_UPDATES})
 
 # ── NEW (solução 2): faixa de similaridade "provável correção" ────────────────
 # Entre UPDATE_SIM_THRESHOLD e DEDUP_THRESHOLD, um texto novo não é nem uma
@@ -122,7 +254,19 @@ HEBBIAN_LINK_MAX_IDS         = 12     # safeguard: teto de ids linkados por /rea
 # próxima (candidate_id/candidate_text/candidate_score) volta na resposta
 # — cabe a quem chamou (o extrator LLM) decidir se reenvia o /write com
 # action="update" e memory_id=candidate_id, ou se era mesmo um fato novo.
-UPDATE_SIM_THRESHOLD = 0.75
+UPDATE_SIM_THRESHOLD = 0.87
+
+# ── NEW: confirmação por reranker cross-encoder ───────────────────────────────
+# Bi-encoder (embedding + cosine) é só triagem/recall aqui — decide se existe
+# um candidato "parecido o bastante pra vale a pena checar", não se É de fato
+# duplicata/atualização. Quem decide isso é o cross-encoder (ms-marco-MiniLM
+# via /v1/score), que compara os dois textos diretamente e não tem o mesmo
+# problema de anisotropia do espaço de embeddings. Scores do /v1/score são
+# sigmoid-normalizados em [0, 1] (ver onnx_client.RerankerClient.score).
+RERANK_DUPLICATE_SCORE = 0.90   # cross-encoder >= isso → duplicate_semantic
+RERANK_UPDATE_SCORE     = 0.55   # cross-encoder >= isso (e < duplicate) → possible_update
+# abaixo de RERANK_UPDATE_SCORE → o bi-encoder deu falso positivo (anisotropia/
+# domínio compartilhado); grava como fato novo mesmo assim.
 
 ST_TTL_HOURS          = 24.0
 ST_CLEANUP_INTERVAL_S = 1800
@@ -221,12 +365,30 @@ class WriteRequest(BaseModel):
     #     nova (evita que uma correção vire um fato solto).
     action:      Literal["create", "update"] = "create"
     memory_id:   Optional[int] = None
+    # ── NEW (arestas tipadas): grava como memória NOVA já ligada a uma
+    # existente por uma aresta tipada. Complementa o fluxo "possible_update":
+    # em vez de action="update" (sobrescreve o texto), o extrator pode manter as
+    # duas memórias e declarar a relação:
+    #   updates             → a nova substitui `link_to` (aresta nova → antiga)
+    #   contradicts         → a nova conflita com `link_to` (simétrica)
+    #   temporal_precedence → `link_to` veio ANTES da nova (aresta link_to → nova)
+    #   co_activation       → associação simples
+    # Quando link_to + link_type vêm preenchidos, a faixa "possible_update" NÃO
+    # bloqueia o write (o chamador já decidiu que é um fato distinto); duplicata
+    # exata/semântica (>= DEDUP_THRESHOLD) continua sendo recusada.
+    link_to:     Optional[int] = None
+    link_type:   Optional[Literal["co_activation", "temporal_precedence", "contradicts", "updates"]] = None
 
 class WriteBatchRequest(BaseModel):
     # ── NEW (solução 1): grava várias memórias em uma única chamada,
     # evitando N round-trips HTTP/MCP quando o extrator LLM devolve um
     # array de fatos para uma mesma dupla pergunta-resposta.
     items: list[WriteRequest]
+    # ── NEW (arestas tipadas): quando True, memórias gravadas consecutivamente
+    # neste batch recebem aresta temporal_precedence (anterior → seguinte), na
+    # ordem do array. Default False — a ordem do array só é sinal temporal
+    # quando o extrator garante isso.
+    sequential: bool = False
 
 class WriteSTRequest(BaseModel):
     session_id: str
@@ -250,6 +412,10 @@ class WriteResponse(BaseModel):
     candidate_id:    Optional[int]   = None
     candidate_text:  Optional[str]   = None
     candidate_score: Optional[float] = None
+    # ── NEW: score do reranker cross-encoder que confirmou/descartou o
+    # candidato do bi-encoder (ver RERANK_UPDATE_SCORE/RERANK_DUPLICATE_SCORE).
+    # None quando não houve candidato a checar.
+    candidate_rerank_score: Optional[float] = None
 
 class WriteBatchResponse(BaseModel):
     # ── NEW (solução 1): um WriteResponse por item de entrada, na mesma
@@ -305,6 +471,14 @@ class ReadResponse(BaseModel):
     results:  list[MemoryEntry]
     query:    str
     strategy: str
+
+
+# ── NEW: memória alcançada pelo grafo a partir de um hit de dicionário ────────
+
+class RelatedMemory(BaseModel):
+    memory_id: int
+    text:      str
+    score:     float     # PPR_SPREAD_WEIGHT * rank PPR — comparável só entre itens desta lista
 
 
 # ── NEW: Modelos de request/response — arquivos indexados ─────────────────────
@@ -424,6 +598,9 @@ class VisualDictReadRequest(BaseModel):
     embedding: list[float]        # embedding do crop consultado (DINOv3)
     top_k:     int   = VD_TOP_K
     min_score: float = VD_MIN_SCORE
+    # ── NEW: expande os hits pelo grafo Hebbiano (memórias LT relacionadas).
+    # Desligue em loops por-frame se a latência importar.
+    include_related: bool = True
 
 class VisualDictCandidate(BaseModel):
     concept_id:   int
@@ -438,6 +615,7 @@ class VisualDictReadResponse(BaseModel):
     results:   list[VisualDictCandidate]
     ambiguous: bool     # True → nenhum candidato confiável / candidatos muito próximos;
                          # quem chama (vision.py / orquestrador) deve perguntar ao usuário
+    related:   list[RelatedMemory] = []   # NEW: memórias vizinhas no grafo dos hits com memory_id
 
 class VisualDictEntry(BaseModel):
     concept_id:    int
@@ -459,18 +637,26 @@ class FaceDictWriteRequest(BaseModel):
     description: str   = ""          # quem é essa pessoa (relação, contexto etc.)
     source:      str   = "vision_pipeline"
     confidence:  float = 1.0
+    # ── NEW: replica a descrição na memória de longo prazo (source="face_dict"),
+    # o que dá ao rosto um nó no grafo Hebbiano (necessário pra busca por
+    # grafo funcionar em rostos). Default False = comportamento anterior: a
+    # descrição do rosto NÃO entra no /read geral. Também "promove" uma pessoa
+    # já cadastrada sem link, se vier com description.
+    link_to_memory: bool = False
 
 class FaceDictWriteResponse(BaseModel):
     stored:       bool
     reason:       str
     person_id:    Optional[int] = None
     embedding_id: Optional[int] = None
+    memory_id:    Optional[int] = None   # NEW: id em `memories`, se linkado
     new_person:   bool = False        # True se a pessoa foi criada agora
 
 class FaceDictReadRequest(BaseModel):
     embedding: list[float]        # embedding do rosto consultado (EdgeFace)
     top_k:     int   = FD_TOP_K
     min_score: float = FD_MIN_SCORE
+    include_related: bool = True   # NEW: expansão por grafo (só p/ rostos com memory_id)
 
 class FaceCandidate(BaseModel):
     person_id:    int
@@ -479,10 +665,12 @@ class FaceCandidate(BaseModel):
     score:        float
     confidence:   float
     access_count: int
+    memory_id:    Optional[int] = None   # NEW
 
 class FaceDictReadResponse(BaseModel):
     results:   list[FaceCandidate]
     ambiguous: bool     # True → nenhum candidato confiável / candidatos muito próximos
+    related:   list[RelatedMemory] = []   # NEW
 
 class FaceDictEntry(BaseModel):
     person_id:      int
@@ -490,31 +678,162 @@ class FaceDictEntry(BaseModel):
     description:    str
     source:         str
     confidence:     float
+    memory_id:      Optional[int] = None   # NEW
     examples_count: int
     created_at:     float
     access_count:   int
 
 
+# ── NEW: Modelos de request/response — dicionário de voz ──────────────────────
+
+class VoiceDictWriteRequest(BaseModel):
+    person_name: str                 # nome da pessoa, ex.: "eu" / "Fulano"
+    embedding:   list[float]         # embedding do locutor (CAM++ etc.), normalizado ou não
+    description: str   = ""          # quem é essa pessoa (relação, contexto etc.) —
+                                     # também gravada na memória de longo prazo
+    source:      str   = "voice_pipeline"
+    confidence:  float = 1.0
+
+class VoiceDictWriteResponse(BaseModel):
+    stored:       bool
+    reason:       str
+    person_id:    Optional[int] = None
+    embedding_id: Optional[int] = None
+    memory_id:    Optional[int] = None   # id em `memories`, se a descrição foi linkada
+    new_person:   bool = False           # True se a pessoa foi criada agora
+
+class VoiceDictReadRequest(BaseModel):
+    embedding: list[float]        # embedding do locutor consultado
+    top_k:     int   = VO_TOP_K
+    min_score: float = VO_MIN_SCORE
+    include_related: bool = True   # NEW: expansão por grafo Hebbiano
+
+class VoiceCandidate(BaseModel):
+    person_id:    int
+    person_name:  str
+    description:  str
+    score:        float
+    confidence:   float
+    access_count: int
+    memory_id:    Optional[int] = None
+
+class VoiceDictReadResponse(BaseModel):
+    results:   list[VoiceCandidate]
+    ambiguous: bool     # True → nenhum candidato confiável / candidatos muito próximos
+    related:   list[RelatedMemory] = []   # NEW
+
+class VoiceDictEntry(BaseModel):
+    person_id:      int
+    person_name:    str
+    description:    str
+    source:         str
+    confidence:     float
+    memory_id:      Optional[int] = None
+    examples_count: int
+    created_at:     float
+    access_count:   int
+
+class VoiceDictUpdateRequest(BaseModel):
+    description: str
+
+
+# ── NEW: Modelos — retrieval de tools (tool selection dinâmica) ───────────────
+
+class ToolRegisterRequest(BaseModel):
+    name:        str
+    description: str
+    # queries reais/representativas que deveriam disparar esta tool. Cada
+    # exemplo vira um vetor PRÓPRIO (max-pooling por tool na busca) — evita o
+    # problema de descrições genéricas parecidas demais entre tools.
+    examples:    list[str] = []
+    # tools "core" entram em TODA seleção, independente do score
+    core:        bool = False
+
+class ToolRegisterBatchRequest(BaseModel):
+    tools: list[ToolRegisterRequest]
+    # remove do índice as tools que não estão nesta lista (sincroniza com o
+    # registry do orquestrador no startup)
+    prune_missing: bool = False
+
+class ToolRegisterResponse(BaseModel):
+    name:    str
+    tool_id: int
+    status:  Literal["created", "updated", "unchanged"]
+    vectors: int
+
+class ToolRegisterBatchResponse(BaseModel):
+    results: list[ToolRegisterResponse]
+    pruned:  list[str] = []
+
+class ToolSelectRequest(BaseModel):
+    query:           str
+    top_k:           int   = TOOLS_TOP_K
+    min_score:       float = TOOLS_MIN_SCORE
+    include_related: bool  = True
+
+class ToolMatch(BaseModel):
+    name:        str
+    description: str
+    score:       float
+    match_type:  Literal["primary", "related", "core"]
+
+class ToolSelectResponse(BaseModel):
+    tools:          list[ToolMatch]
+    top1_score:     float
+    low_confidence: bool
+
+class ToolUsageRequest(BaseModel):
+    # tools realmente chamadas para atender `query`, NA ORDEM da chamada
+    tools_used: list[str]
+    query:      str = ""
+
+
 # ── MODIFIED: EmbeddingEngine now delegates to EmbeddingClient ────────────────
 
 class EmbeddingEngine:
-    """Motor de embeddings via ONNX Serving API."""
+    """
+    Motor de embeddings via ONNX Serving API.
+
+    IMPORTANTE (E5): toda chamada precisa dizer se o texto é uma QUERY (algo
+    que vai ser usado para *buscar*) ou uma PASSAGE (algo que vai ser
+    *armazenado* e depois encontrado por uma query). Os métodos genéricos
+    antigos (embed/embed_one/embed_batch_two) foram removidos de propósito —
+    cada call site abaixo precisa escolher explicitamente `_query`/`_passage`,
+    pra não reintroduzir por engano uma chamada sem prefixo.
+    """
 
     def __init__(self, base_url: str = ONNX_SERVING_URL):
         self._client = EmbeddingClient(base_url=base_url)
         log.info(f"EmbeddingEngine carregado — via API: {base_url}")
 
-    async def embed(self, texts: list[str]) -> np.ndarray:
+    @staticmethod
+    def _prefixed(texts: list[str], prefix: str) -> list[str]:
+        return [f"{prefix}{t}" for t in texts]
+
+    # ── lado "documento" (o que fica gravado/indexado) ──────────────────────
+
+    async def embed_passages(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.empty((0, EMBED_DIM), dtype=np.float32)
-        return await self._client.embed(texts)
+        return await self._client.embed(self._prefixed(texts, EMBED_PASSAGE_PREFIX))
 
-    async def embed_one(self, text: str) -> np.ndarray:
-        result = await self._client.embed([text])
+    async def embed_passage_one(self, text: str) -> np.ndarray:
+        result = await self.embed_passages([text])
         return result[0]
 
-    async def embed_batch_two(self, text_a: str, text_b: str) -> tuple[np.ndarray, np.ndarray]:
-        results = await self._client.embed([text_a, text_b])
+    # ── lado "busca" (o que vai comparar contra o índice) ───────────────────
+
+    async def embed_queries(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, EMBED_DIM), dtype=np.float32)
+        return await self._client.embed(self._prefixed(texts, EMBED_QUERY_PREFIX))
+
+    async def embed_query_one(self, text: str) -> np.ndarray:
+        result = await self.embed_queries([text])
+        return result[0]
+
+    async def embed_query_two(self, text_a: str, text_b: str) -> tuple[np.ndarray, np.ndarray]:
+        results = await self.embed_queries([text_a, text_b])
         return results[0], results[1]
 
     @property
@@ -522,9 +841,230 @@ class EmbeddingEngine:
         return self._client
 
 
+class RerankEngine:
+    """
+    Motor de rerank via ONNX Serving API (/v1/score) — usado para CONFIRMAR
+    duplicata/atualização quando o bi-encoder (cosine) encontra um candidato
+    na faixa "parecido", em vez de decidir só pelo cosine bruto (que sofre de
+    anisotropia em modelos multilíngues pequenos como o multilingual-e5-small
+    — ver comentário perto de DEDUP_THRESHOLD/UPDATE_SIM_THRESHOLD).
+    """
+
+    def __init__(self, base_url: str = ONNX_SERVING_URL):
+        self._client = RerankerClient(base_url=base_url)
+
+    async def score_one(self, text_a: str, text_b: str) -> float:
+        """Score cross-encoder sigmoid [0,1] de quão relacionados text_a e
+        text_b são — não confundir com a cosine do bi-encoder."""
+        scores = await self._client.score(text_a, [text_b])
+        return float(scores[0]) if len(scores) else 0.0
+
+    @property
+    def client(self) -> RerankerClient:
+        return self._client
+
+
+# ── NEW: grafo de arestas tipadas (mixin reutilizado por MemoryDB e ToolsDB) ───
+#
+# Tabela de arestas com PK (memory_id_a, memory_id_b, edge_type). Tipos
+# SIMÉTRICOS guardam o par normalizado (min, max); tipos DIRIGIDOS (ver
+# EDGE_DIRECTED_TYPES) guardam origem em memory_id_a e destino em memory_id_b.
+# Só `co_activation` é reforçado pela ativação do PPR e só os tipos fora de
+# EDGE_TYPES_NO_DECAY sofrem decay/poda.
+
+class EdgeGraphMixin:
+    EDGE_TABLE = "memory_edges"     # sobrescrito em ToolsDB
+
+    def _edge_table_ddl(self) -> str:
+        return f"""
+            CREATE TABLE IF NOT EXISTS {self.EDGE_TABLE} (
+                memory_id_a        INTEGER NOT NULL,
+                memory_id_b        INTEGER NOT NULL,
+                edge_type          TEXT    NOT NULL DEFAULT 'co_activation',
+                weight             REAL    NOT NULL DEFAULT 0.0,
+                coactivation_count INTEGER NOT NULL DEFAULT 0,
+                last_coactivated   REAL    NOT NULL,
+                PRIMARY KEY (memory_id_a, memory_id_b, edge_type)
+            )"""
+
+    def _create_edge_table(self):
+        T = self.EDGE_TABLE
+        cols = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({T})")}
+        if cols and "edge_type" not in cols:
+            # Migração one-shot: o schema antigo tinha PK (a, b) e nenhum tipo.
+            # SQLite não altera PK — recria a tabela; toda aresta antiga vira
+            # co_activation (que era a única semântica que existia).
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("DROP INDEX IF EXISTS idx_edges_a")
+                self._conn.execute("DROP INDEX IF EXISTS idx_edges_b")
+                self._conn.execute(f"ALTER TABLE {T} RENAME TO {T}_legacy")
+                self._conn.execute(self._edge_table_ddl())
+                self._conn.execute(
+                    f"INSERT INTO {T} (memory_id_a, memory_id_b, edge_type, weight, "
+                    f"coactivation_count, last_coactivated) "
+                    f"SELECT memory_id_a, memory_id_b, 'co_activation', weight, "
+                    f"coactivation_count, last_coactivated FROM {T}_legacy"
+                )
+                self._conn.execute(f"DROP TABLE {T}_legacy")
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            log.info(f"Grafo [{T}]: schema migrado p/ arestas tipadas (legado → co_activation)")
+        else:
+            self._conn.execute(self._edge_table_ddl())
+        self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{T}_a ON {T}(memory_id_a)")
+        self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{T}_b ON {T}(memory_id_b)")
+
+    def get_neighbors(self, memory_id: int, limit: int) -> list[sqlite3.Row]:
+        """Arestas de um nó (dos dois lados), ordenadas por peso. Cada linha
+        traz `edge_type` — quem consome decide a direção efetiva."""
+        return self._conn.execute(
+            f"SELECT * FROM {self.EDGE_TABLE} WHERE memory_id_a = ? OR memory_id_b = ? "
+            f"ORDER BY weight DESC LIMIT ?",
+            (memory_id, memory_id, limit),
+        ).fetchall()
+
+    def get_edges_for_ids(self, ids: list[int]) -> list[sqlite3.Row]:
+        """Todas as arestas com QUALQUER extremidade em `ids`."""
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        return self._conn.execute(
+            f"SELECT * FROM {self.EDGE_TABLE} "
+            f"WHERE memory_id_a IN ({ph}) OR memory_id_b IN ({ph})",
+            list(ids) + list(ids),
+        ).fetchall()
+
+    def upsert_edge(
+        self, id_a: int, id_b: int, lr: float, now: float,
+        edge_type: str = EDGE_CO_ACTIVATION,
+        initial_weight: Optional[float] = None,
+    ):
+        """Cria ou reforça a aresta (id_a, id_b, edge_type). Tipos simétricos
+        normalizam a ordem (min/max); tipos dirigidos preservam id_a → id_b.
+        Crescimento saturante: w_new = w_old + lr * (1 - w_old)."""
+        if id_a == id_b:
+            return
+        if edge_type not in EDGE_TYPES:
+            raise ValueError(f"edge_type inválido: {edge_type!r}")
+        if edge_type in EDGE_DIRECTED_TYPES:
+            a, b = id_a, id_b
+        else:
+            a, b = min(id_a, id_b), max(id_a, id_b)
+        if initial_weight is None:
+            initial_weight = EDGE_EXPLICIT_LINK_WEIGHT if edge_type in EDGE_EXPLICIT_TYPES else lr
+        T = self.EDGE_TABLE
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT weight FROM {T} WHERE memory_id_a = ? AND memory_id_b = ? AND edge_type = ?",
+                (a, b, edge_type),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    f"INSERT INTO {T} (memory_id_a, memory_id_b, edge_type, weight, "
+                    f"coactivation_count, last_coactivated) VALUES (?, ?, ?, ?, 1, ?)",
+                    (a, b, edge_type, initial_weight, now),
+                )
+            else:
+                w_old = row["weight"]
+                w_new = w_old + lr * (1.0 - w_old)
+                self._conn.execute(
+                    f"UPDATE {T} SET weight = ?, coactivation_count = coactivation_count + 1, "
+                    f"last_coactivated = ? WHERE memory_id_a = ? AND memory_id_b = ? AND edge_type = ?",
+                    (w_new, now, a, b, edge_type),
+                )
+
+    def reinforce_edges_batch(
+        self,
+        pairs_with_activation: list[tuple[int, int, float]],
+        lr: float,
+        min_activation: float,
+        now: float,
+    ) -> int:
+        """Reforço em lote (Step 8 / Opção B) — SÓ atualiza arestas
+        `co_activation` que já existem; criar aresta nova é trabalho do Step 4,
+        e reforçar temporal/contradicts/updates por co-ativação seria tratar
+        correção como associação. `pairs_with_activation` =
+        [(id_a, id_b, activation)] com activation = ppr_rank[i] * ppr_rank[j].
+        Atualização: w += lr * (activation * w) * (1 - w). Uma transação."""
+        if not pairs_with_activation:
+            return 0
+        rows = [
+            (lr, act, now, min(a, b), max(a, b), act, min_activation)
+            for a, b, act in pairs_with_activation
+            if act >= min_activation
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(
+                    f"UPDATE {self.EDGE_TABLE} SET "
+                    f"weight = MIN(1.0, weight + ? * (? * weight) * (1.0 - weight)), "
+                    f"coactivation_count = coactivation_count + 1, "
+                    f"last_coactivated = ? "
+                    f"WHERE memory_id_a = ? AND memory_id_b = ? AND edge_type = 'co_activation' "
+                    f"AND ? >= ?",
+                    rows,
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
+    def decay_and_prune_edges(self, half_life_days: float, prune_threshold: float) -> int:
+        """Decay das arestas (mesma matemática de apply_decay) e poda das que
+        caem abaixo de prune_threshold. Tipos em EDGE_TYPES_NO_DECAY ficam de
+        fora dos dois passos. Retorna quantas foram podadas."""
+        now = time.time()
+        T = self.EDGE_TABLE
+        skip = tuple(EDGE_TYPES_NO_DECAY)
+        ph = ",".join("?" * len(skip)) or "''"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT memory_id_a, memory_id_b, edge_type, weight, last_coactivated "
+                f"FROM {T} WHERE edge_type NOT IN ({ph})", skip,
+            ).fetchall()
+            updates = []
+            for row in rows:
+                days_idle    = (now - row["last_coactivated"]) / 86400.0
+                decay_factor = 0.5 ** (days_idle / half_life_days)
+                updates.append((
+                    row["weight"] * decay_factor,
+                    row["memory_id_a"], row["memory_id_b"], row["edge_type"],
+                ))
+            if updates:
+                self._conn.executemany(
+                    f"UPDATE {T} SET weight = ? "
+                    f"WHERE memory_id_a = ? AND memory_id_b = ? AND edge_type = ?",
+                    updates,
+                )
+            cur = self._conn.execute(
+                f"DELETE FROM {T} WHERE weight < ? AND edge_type NOT IN ({ph})",
+                (prune_threshold, *skip),
+            )
+            return cur.rowcount
+
+    def delete_edges_for_memory(self, memory_id: int):
+        """Remove todas as arestas de um nó (de qualquer tipo) — o grafo nunca
+        mantém aresta apontando pra linha inexistente."""
+        with self._lock:
+            self._conn.execute(
+                f"DELETE FROM {self.EDGE_TABLE} WHERE memory_id_a = ? OR memory_id_b = ?",
+                (memory_id, memory_id),
+            )
+
+    def count_edges(self) -> int:
+        return self._conn.execute(f"SELECT COUNT(*) FROM {self.EDGE_TABLE}").fetchone()[0]
+
+
 # ── Banco de dados de longo prazo ──────────────────────────────────────────────
 
-class MemoryDB:
+class MemoryDB(EdgeGraphMixin):
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -554,22 +1094,9 @@ class MemoryDB:
             );
             CREATE INDEX IF NOT EXISTS idx_confidence    ON memories(confidence);
             CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed);
-
-            -- ── NEW (Hebbian graph): co-ativação entre memórias LT ──
-            -- Grafo NÃO-direcionado: o par é sempre armazenado com
-            -- memory_id_a = min(id1,id2), memory_id_b = max(id1,id2) —
-            -- nunca existe linha duplicada na ordem inversa.
-            CREATE TABLE IF NOT EXISTS memory_edges (
-                memory_id_a        INTEGER NOT NULL,
-                memory_id_b        INTEGER NOT NULL,
-                weight             REAL    NOT NULL DEFAULT 0.0,
-                coactivation_count INTEGER NOT NULL DEFAULT 0,
-                last_coactivated   REAL    NOT NULL,
-                PRIMARY KEY (memory_id_a, memory_id_b)
-            );
-            CREATE INDEX IF NOT EXISTS idx_edges_a ON memory_edges(memory_id_a);
-            CREATE INDEX IF NOT EXISTS idx_edges_b ON memory_edges(memory_id_b);
         """)
+        # ── NEW: grafo Hebbiano com arestas tipadas (cria/migra memory_edges)
+        self._create_edge_table()
         # Migração leve: bancos criados antes do campo "esquecível?" existir
         # não têm a coluna — adiciona com default 1 (esquecível, comportamento
         # anterior) sem quebrar instalações já em uso.
@@ -640,138 +1167,6 @@ class MemoryDB:
                 )
         except sqlite3.OperationalError:
             pass
-
-    # ── NEW (Hebbian graph): operações sobre memory_edges ─────────────────
-
-    def get_neighbors(self, memory_id: int, limit: int) -> list[sqlite3.Row]:
-        """Vizinhos de um nó, dos dois lados da aresta (grafo não-direcionado),
-        ordenados por peso. Usa idx_edges_a + idx_edges_b."""
-        return self._conn.execute(
-            "SELECT * FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ? "
-            "ORDER BY weight DESC LIMIT ?",
-            (memory_id, memory_id, limit),
-        ).fetchall()
-
-    def get_edges_for_ids(self, ids: list[int]) -> list[sqlite3.Row]:
-        """Todas as arestas com QUALQUER extremidade em `ids` — constrói a
-        adjacência local pro PPR sem carregar o grafo inteiro."""
-        if not ids:
-            return []
-        ph = ",".join("?" * len(ids))
-        return self._conn.execute(
-            f"SELECT * FROM memory_edges WHERE memory_id_a IN ({ph}) OR memory_id_b IN ({ph})",
-            ids + ids,
-        ).fetchall()
-
-    def upsert_edge(self, id_a: int, id_b: int, lr: float, now: float):
-        """Cria ou reforça a aresta (id_a, id_b). Ordem normalizada
-        (min/max). Crescimento saturante: w_new = w_old + lr * (1 - w_old) —
-        nunca ultrapassa 1.0."""
-        if id_a == id_b:
-            return
-        a, b = min(id_a, id_b), max(id_a, id_b)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT weight FROM memory_edges WHERE memory_id_a = ? AND memory_id_b = ?",
-                (a, b),
-            ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO memory_edges "
-                    "(memory_id_a, memory_id_b, weight, coactivation_count, last_coactivated) "
-                    "VALUES (?, ?, ?, 1, ?)",
-                    (a, b, lr, now),
-                )
-            else:
-                w_old = row["weight"]
-                w_new = w_old + lr * (1.0 - w_old)
-                self._conn.execute(
-                    "UPDATE memory_edges SET weight = ?, "
-                    "coactivation_count = coactivation_count + 1, last_coactivated = ? "
-                    "WHERE memory_id_a = ? AND memory_id_b = ?",
-                    (w_new, now, a, b),
-                )
-
-    def reinforce_edges_batch(
-        self,
-        pairs_with_activation: list[tuple[int, int, float]],
-        lr: float,
-        min_activation: float,
-        now: float,
-    ) -> int:
-        """Reforço em lote (Step 8 / Opção B) — SÓ atualiza arestas que já
-        existem; criar aresta nova é trabalho exclusivo do Step 4.
-        `pairs_with_activation` = [(id_a, id_b, activation)] com
-        activation = ppr_rank[i] * ppr_rank[j]. A elegibilidade por rank
-        (ambos > PPR_MIN_ACTIVATION_REINFORCE) é checada pelo chamador; aqui
-        há um piso extra de força de co-ativação (activation >= min_activation).
-        Atualização: w += lr * (activation * w) * (1 - w)  [reinforcement inclui w_ij]
-        Tudo numa única transação."""
-        if not pairs_with_activation:
-            return 0
-        rows = [
-            (lr, act, now, min(a, b), max(a, b), act, min_activation)
-            for a, b, act in pairs_with_activation
-            if act >= min_activation
-        ]
-        if not rows:
-            return 0
-        with self._lock:
-            self._conn.execute("BEGIN")
-            try:
-                self._conn.executemany(
-                    "UPDATE memory_edges SET "
-                    "weight = MIN(1.0, weight + ? * (? * weight) * (1.0 - weight)), "
-                    "coactivation_count = coactivation_count + 1, "
-                    "last_coactivated = ? "
-                    "WHERE memory_id_a = ? AND memory_id_b = ? AND ? >= ?",
-                    rows,
-                )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-        return len(rows)
-
-    def decay_and_prune_edges(self, half_life_days: float, prune_threshold: float) -> int:
-        """Decay das arestas com a MESMA matemática de apply_decay
-        (fator = 0.5 ** (dias_idle / half_life)), depois DELETE das arestas
-        abaixo de prune_threshold. Retorna quantas foram podadas."""
-        now = time.time()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT memory_id_a, memory_id_b, weight, last_coactivated FROM memory_edges"
-            ).fetchall()
-            updates = []
-            for row in rows:
-                days_idle    = (now - row["last_coactivated"]) / 86400.0
-                decay_factor = 0.5 ** (days_idle / half_life_days)
-                updates.append((
-                    row["weight"] * decay_factor,
-                    row["memory_id_a"], row["memory_id_b"],
-                ))
-            if updates:
-                self._conn.executemany(
-                    "UPDATE memory_edges SET weight = ? WHERE memory_id_a = ? AND memory_id_b = ?",
-                    updates,
-                )
-            cur = self._conn.execute(
-                "DELETE FROM memory_edges WHERE weight < ?", (prune_threshold,)
-            )
-            return cur.rowcount
-
-    def delete_edges_for_memory(self, memory_id: int):
-        """Remove todas as arestas de um nó — chamado sempre que memórias são
-        apagadas (branch de expiry dentro de apply_decay e deletes explícitos),
-        pra o grafo nunca manter aresta apontando pra linha inexistente."""
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
-                (memory_id, memory_id),
-            )
-
-    def count_edges(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0]
 
     def update(
         self,
@@ -1312,10 +1707,11 @@ class FaceDictDB:
     tem N embeddings de exemplo (um por rosto registrado — permite
     reconhecer o mesmo rosto em ângulos/luz diferentes).
 
-    Os embeddings em si moram no FAISS (`fd_index`); aqui só ficam o nome
-    e o mapeamento embedding_id → person_id. Estrutura idêntica à
-    VisualDictDB, só que sem `description`/`memory_id` — reconhecimento
-    facial não precisa de "significado" textual gravado na memória geral.
+    Os embeddings em si moram no LanceDB (`fd_index`); aqui só ficam o nome
+    e o mapeamento embedding_id → person_id. `memory_id` é OPCIONAL (default
+    NULL): só é preenchido quando o cadastro pede link_to_memory — reconhecimento
+    facial não precisa, por padrão, de descrição gravada na memória geral, mas o
+    link dá ao rosto um nó no grafo Hebbiano.
     """
 
     def __init__(self, path: str):
@@ -1357,6 +1753,9 @@ class FaceDictDB:
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(face_people)")}
         if "description" not in cols:
             self._conn.execute("ALTER TABLE face_people ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        # NEW: link opcional com a memória de longo prazo (nó no grafo Hebbiano)
+        if "memory_id" not in cols:
+            self._conn.execute("ALTER TABLE face_people ADD COLUMN memory_id INTEGER DEFAULT NULL")
 
     @staticmethod
     def _normalize_key(name: str) -> str:
@@ -1364,16 +1763,26 @@ class FaceDictDB:
 
     # ── Person operations ──
 
-    def insert_person(self, person_name: str, description: str, source: str, confidence: float) -> int:
+    def insert_person(
+        self, person_name: str, description: str, source: str, confidence: float,
+        memory_id: Optional[int] = None,
+    ) -> int:
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO face_people "
-                "(person_name, person_key, description, source, confidence, created_at, last_accessed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (person_name, self._normalize_key(person_name), description, source, confidence, now, now),
+                "(person_name, person_key, description, source, confidence, memory_id, "
+                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (person_name, self._normalize_key(person_name), description, source,
+                 confidence, memory_id, now, now),
             )
             return cur.lastrowid
+
+    def set_memory_id(self, person_id: int, memory_id: Optional[int]):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE face_people SET memory_id = ? WHERE id = ?", (memory_id, person_id)
+            )
 
     def get_by_name(self, person_name: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
@@ -1451,6 +1860,312 @@ class FaceDictDB:
         return self._conn.execute(
             "SELECT COUNT(*) FROM face_embeddings WHERE person_id = ?",
             (person_id,),
+        ).fetchone()[0]
+
+
+# ── NEW: Dicionário de Voz ─────────────────────────────────────────────────────
+
+class VoiceDictDB:
+    """
+    Persiste as pessoas cadastradas pela identificação de locutor: uma
+    pessoa tem N embeddings de exemplo (um por frase falada registrada —
+    permite reconhecer a mesma voz em condições de captação diferentes).
+
+    Os embeddings em si moram no FAISS (`vo_index`); aqui ficam o nome, a
+    descrição, o `memory_id` (link para a memória de longo prazo onde a
+    descrição também foi gravada) e o mapeamento embedding_id → person_id.
+    Estrutura idêntica à FaceDictDB, com a coluna extra `memory_id`.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS voice_people (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_name   TEXT    NOT NULL,
+                person_key    TEXT    NOT NULL UNIQUE,   -- nome normalizado (lower/strip)
+                description   TEXT    NOT NULL DEFAULT '',  -- quem é a pessoa (relação/contexto)
+                source        TEXT    NOT NULL DEFAULT 'voice_pipeline',
+                confidence    REAL    NOT NULL DEFAULT 1.0,
+                memory_id     INTEGER,                    -- FK lógica p/ memories.id
+                created_at    REAL    NOT NULL,
+                last_accessed REAL    NOT NULL,
+                access_count  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_vp_key ON voice_people(person_key);
+
+            CREATE TABLE IF NOT EXISTS voice_embeddings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id  INTEGER NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES voice_people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_ve_person ON voice_embeddings(person_id);
+        """)
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    # ── Person operations ──
+
+    def insert_person(self, person_name: str, description: str, source: str,
+                      confidence: float, memory_id: Optional[int]) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO voice_people "
+                "(person_name, person_key, description, source, confidence, memory_id, "
+                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (person_name, self._normalize_key(person_name), description, source,
+                 confidence, memory_id, now, now),
+            )
+            return cur.lastrowid
+
+    def get_by_name(self, person_name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM voice_people WHERE person_key = ?",
+            (self._normalize_key(person_name),),
+        ).fetchone()
+
+    def get_person_by_id(self, person_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM voice_people WHERE id = ?", (person_id,)
+        ).fetchone()
+
+    def update_description(self, person_id: int, description: str):
+        """Atualiza/edita a descrição de uma pessoa já cadastrada."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE voice_people SET description = ? WHERE id = ?",
+                (description, person_id),
+            )
+
+    def update_access(self, person_id: int):
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE voice_people SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), person_id),
+                )
+        except sqlite3.OperationalError:
+            pass
+
+    def delete_person(self, person_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM voice_people WHERE id = ?", (person_id,))
+            return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM voice_people").fetchone()[0]
+
+    def list_people(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT p.*, "
+            "(SELECT COUNT(*) FROM voice_embeddings e WHERE e.person_id = p.id) "
+            "AS examples_count "
+            "FROM voice_people p ORDER BY p.last_accessed DESC"
+        ).fetchall()
+
+    # ── Embedding-row operations (mapeamento embedding_id → person_id) ──
+
+    def insert_embedding(self, person_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO voice_embeddings (person_id, created_at) VALUES (?, ?)",
+                (person_id, time.time()),
+            )
+            return cur.lastrowid
+
+    def get_person_id_by_embedding(self, embedding_id: int) -> Optional[int]:
+        row = self._conn.execute(
+            "SELECT person_id FROM voice_embeddings WHERE id = ?",
+            (embedding_id,),
+        ).fetchone()
+        return row["person_id"] if row else None
+
+    def get_embedding_ids_by_person(self, person_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM voice_embeddings WHERE person_id = ?", (person_id,)
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def count_examples(self, person_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM voice_embeddings WHERE person_id = ?",
+            (person_id,),
+        ).fetchone()[0]
+
+
+# ── NEW: Banco de tools (RAG de tool selection) ────────────────────────────────
+
+class ToolsDB(EdgeGraphMixin):
+    """
+    Registro das tools expostas ao LLM. Cada tool tem N vetores no LanceDB
+    (`tl_index`, memory_type="tool"): 1 do "documento" (nome + descrição), 1 por
+    exemplo de query fornecido no cadastro (kind="example") e 1 por query real
+    aprendida com o uso (kind="learned"). A busca faz max-pooling por tool.
+
+    O grafo de co-uso vive aqui mesmo (tabela `tool_edges`, mesma lógica de
+    arestas tipadas do grafo Hebbiano de memórias): temporal_precedence captura
+    sequências (listar → ler → editar) e co_activation, tools usadas juntas.
+    """
+    EDGE_TABLE = "tool_edges"
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tools (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL,
+                name_key    TEXT    NOT NULL UNIQUE,
+                description TEXT    NOT NULL,
+                is_core     INTEGER NOT NULL DEFAULT 0,
+                doc_hash    TEXT    NOT NULL,
+                created_at  REAL    NOT NULL,
+                last_used   REAL,
+                use_count   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS tool_vectors (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id    INTEGER NOT NULL,
+                kind       TEXT    NOT NULL,      -- doc | example | learned
+                text       TEXT    NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tv_tool ON tool_vectors(tool_id);
+        """)
+        self._create_edge_table()
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    # ── Tools ──
+    def insert_tool(self, name: str, description: str, is_core: bool, doc_hash: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tools (name, name_key, description, is_core, doc_hash, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, self._normalize_key(name), description, int(is_core), doc_hash, time.time()),
+            )
+            return cur.lastrowid
+
+    def update_tool(self, tool_id: int, description: str, is_core: bool, doc_hash: str):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tools SET description = ?, is_core = ?, doc_hash = ? WHERE id = ?",
+                (description, int(is_core), doc_hash, tool_id),
+            )
+
+    def set_core(self, tool_id: int, is_core: bool):
+        with self._lock:
+            self._conn.execute("UPDATE tools SET is_core = ? WHERE id = ?", (int(is_core), tool_id))
+
+    def get_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM tools WHERE name_key = ?", (self._normalize_key(name),)
+        ).fetchone()
+
+    def get_by_ids(self, ids: list[int]) -> list[sqlite3.Row]:
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        return self._conn.execute(f"SELECT * FROM tools WHERE id IN ({ph})", list(ids)).fetchall()
+
+    def list_tools(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT t.*, (SELECT COUNT(*) FROM tool_vectors v WHERE v.tool_id = t.id) "
+            "AS vectors_count FROM tools t ORDER BY t.name"
+        ).fetchall()
+
+    def list_core(self) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM tools WHERE is_core = 1").fetchall()
+
+    def mark_used(self, tool_ids: list[int]):
+        if not tool_ids:
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE tools SET use_count = use_count + 1, last_used = ? WHERE id = ?",
+                [(now, tid) for tid in tool_ids],
+            )
+
+    def delete_tool(self, tool_id: int) -> int:
+        """Apaga a tool (vetores em cascata) e todas as arestas dela."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM tools WHERE id = ?", (tool_id,))
+            self._conn.execute(
+                "DELETE FROM tool_edges WHERE memory_id_a = ? OR memory_id_b = ?",
+                (tool_id, tool_id),
+            )
+            return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0]
+
+    # ── Vetores (mapeamento vector_id → tool_id) ──
+    def insert_vector(self, tool_id: int, kind: str, text: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tool_vectors (tool_id, kind, text, created_at) VALUES (?, ?, ?, ?)",
+                (tool_id, kind, text, time.time()),
+            )
+            return cur.lastrowid
+
+    def get_vector_ids(self, tool_id: int, kinds: Optional[tuple[str, ...]] = None) -> list[int]:
+        if kinds:
+            ph = ",".join("?" * len(kinds))
+            rows = self._conn.execute(
+                f"SELECT id FROM tool_vectors WHERE tool_id = ? AND kind IN ({ph})",
+                (tool_id, *kinds),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id FROM tool_vectors WHERE tool_id = ?", (tool_id,)
+            ).fetchall()
+        return [r["id"] for r in rows]
+
+    def get_tool_ids_by_vectors(self, vector_ids: list[int]) -> dict[int, int]:
+        if not vector_ids:
+            return {}
+        ph = ",".join("?" * len(vector_ids))
+        rows = self._conn.execute(
+            f"SELECT id, tool_id FROM tool_vectors WHERE id IN ({ph})", list(vector_ids)
+        ).fetchall()
+        return {r["id"]: r["tool_id"] for r in rows}
+
+    def delete_vectors(self, vector_ids: list[int]):
+        if not vector_ids:
+            return
+        ph = ",".join("?" * len(vector_ids))
+        with self._lock:
+            self._conn.execute(f"DELETE FROM tool_vectors WHERE id IN ({ph})", list(vector_ids))
+
+    def count_learned(self, tool_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM tool_vectors WHERE tool_id = ? AND kind = 'learned'", (tool_id,)
         ).fetchone()[0]
 
 
@@ -1536,94 +2251,161 @@ def _chunk_text(
     return chunks
 
 
-# ── Índice FAISS genérico ──────────────────────────────────────────────────────
+# ── Índice vetorial (LanceDB) ──────────────────────────────────────────────────
 
-# Intervalo do job de persistência periódica dos índices (ver index_flush_job).
-# Trocamos "salvar a cada escrita" por "marcar sujo + descarregar em lote" —
-# evita reescrever o índice inteiro em disco a cada add() (ver ITEM 1 da
-# revisão).
+# Intervalo do job de manutenção periódica dos índices (ver index_flush_job).
+# No LanceDB cada add() já é durável; o "flush" passou a ser a COMPACTAÇÃO dos
+# fragmentos pequenos que os adds unitários geram (table.optimize()).
 INDEX_FLUSH_INTERVAL_S = 60
+
+
+class LanceStore:
+    """Conexão única com o LanceDB + uma tabela por dimensão de embedding.
+
+    Schema de cada tabela `vectors_<dim>`:
+        memory_type : string          — qual store (long_term, short_term, tool…)
+        id          : int64           — id do registro DENTRO do store
+        vector      : fixed_size_list<float32>[dim]
+    A chave lógica é (memory_type, id): os ids vêm de sequências SQLite
+    independentes por store, então repetem entre stores."""
+
+    def __init__(self, path: str):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        self._path   = path
+        self._db     = lancedb.connect(path)
+        self.lock    = threading.RLock()
+        self._tables: dict[int, object] = {}
+        self._writes: dict[int, int]    = {}
+
+    def schema(self, dim: int) -> "pa.Schema":
+        return pa.schema([
+            pa.field("memory_type", pa.string()),
+            pa.field("id", pa.int64()),
+            pa.field("vector", pa.list_(pa.float32(), dim)),
+        ])
+
+    def table(self, dim: int):
+        with self.lock:
+            tbl = self._tables.get(dim)
+            if tbl is None:
+                tbl = self._db.create_table(
+                    f"{LANCE_TABLE_PREFIX}_{dim}", schema=self.schema(dim), exist_ok=True
+                )
+                self._tables[dim] = tbl
+            return tbl
+
+    def note_write(self, dim: int, n: int = 1):
+        with self.lock:
+            self._writes[dim] = self._writes.get(dim, 0) + n
+
+    def compact(self, dim: int):
+        with self.lock:
+            if not self._writes.get(dim):
+                return
+            try:
+                self.table(dim).optimize()
+            except Exception as e:
+                log.error(f"LanceDB: falha ao compactar vectors_{dim}: {e}")
+                return
+            self._writes[dim] = 0
 
 
 class MemoryIndex:
     """
-    FAISS IndexIDMap2(IndexFlatIP) — inner product em vetores L2-normalizados
-    = cosine similarity. Usar IndexIDMap2 (em vez de IndexFlatIP + lista
-    paralela `_id_map` mantida à mão em Python) resolve dois problemas do
-    design anterior:
+    Visão de UM store (`memory_type`) sobre a tabela LanceDB da sua dimensão.
+    Mantém a mesma interface do antigo índice FAISS (add, add_batch,
+    remove_ids, reset, search, search_batch, search_similar, search_subset,
+    flush, total), então o resto do arquivo não muda — e ganha:
 
-      1. `remove_ids` deixa de precisar reconstruir o índice inteiro
-         (reconstruct_n + rebuild em Python) — quem faz a remoção agora é o
-         próprio FAISS, em C++, via IDSelectorBatch.
-      2. O mapeamento id→vetor é interno ao índice e persiste junto no
-         arquivo .index — elimina a possibilidade de `_id_map` e o índice
-         ficarem fora de sincronia (ex.: se o processo morrer entre os dois
-         `np.save`/`write_index`).
+      * sem .npy de id-map e sem IndexIDMap2: o id vive na própria linha;
+      * remove_ids = DELETE com filtro (sem reconstruir nada);
+      * search_subset com filtro nativo `id IN (...)` (antes: reconstruct em
+        loop Python);
+      * get_vectors(ids), usado pelo fallback de cosine do MMR.
 
-    Todas as mutações (add/add_batch/remove_ids/reset) e leituras (search/
-    search_subset) são protegidas por um lock — os métodos podem ser chamados
-    tanto do event loop quanto de threads do executor (ver ITEM 3/4 da
-    revisão: FAISS não garante thread-safety para add/search concorrentes).
+    Métrica: cosine (score = 1 - distância cosine), equivalente ao produto
+    interno do FAISS para vetores L2-normalizados — e correta se algum não for.
+
+    Migração: se `legacy_index_path` existir e o store ainda estiver vazio no
+    LanceDB, o índice FAISS antigo (IndexIDMap2, ou IndexFlatIP + .npy) é
+    importado uma vez e renomeado para `<path>.migrated` (backup).
     """
 
     def __init__(
         self,
-        index_path: str,
-        id_map_path: str,
-        persist: bool = True,
+        store: LanceStore,
+        memory_type: str,
         embed_dim: int = EMBED_DIM,
+        legacy_index_path: Optional[str] = None,
+        legacy_id_map_path: Optional[str] = None,
     ):
-        self._index_path  = index_path
-        self._id_map_path = id_map_path  # mantido só para migrar índices antigos
-        self._persist      = persist
-        self._embed_dim    = embed_dim
-        self._lock         = threading.Lock()
-        self._dirty        = False
-        Path(index_path).parent.mkdir(parents=True, exist_ok=True)
+        self._store       = store
+        self._memory_type = memory_type
+        self._embed_dim   = embed_dim
+        self._table       = store.table(embed_dim)
+        self._filter      = f"memory_type = '{memory_type}'"
+        if legacy_index_path:
+            self._migrate_from_faiss(legacy_index_path, legacy_id_map_path)
+        log.info(f"Índice LanceDB [{memory_type}] pronto — {self.total} vetores (dim={embed_dim})")
 
-        if persist and Path(index_path).exists():
-            loaded = faiss.read_index(index_path)
-            if isinstance(loaded, faiss.IndexIDMap2):
-                self._index = loaded
-                log.info(f"Índice FAISS carregado [{index_path}] — {self._index.ntotal} vetores")
-            else:
-                # Migração de índice no formato antigo (IndexFlatIP + .npy
-                # externo) — lê os ids do id_map legado, se existir, e
-                # reconstrói como IndexIDMap2.
-                self._index = self._migrate_legacy_index(loaded, id_map_path)
-        else:
-            self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(embed_dim))
-            log.info(f"Novo índice FAISS criado [{index_path}] (dim={embed_dim})")
-
-    def _migrate_legacy_index(self, flat_index, id_map_path: str) -> "faiss.IndexIDMap2":
-        n = flat_index.ntotal
-        ids: list[int] = []
-        if Path(id_map_path).exists():
-            ids = list(np.load(id_map_path).tolist())
-        if len(ids) != n:
-            log.warning(
-                f"Migração [{self._index_path}]: id_map legado tem {len(ids)} "
-                f"entradas mas o índice tem {n} vetores — usando posição como id"
-            )
-            ids = list(range(n))
-        new_index = faiss.IndexIDMap2(faiss.IndexFlatIP(self._embed_dim))
+    # ── migração one-shot FAISS → LanceDB ──
+    def _migrate_from_faiss(self, index_path: str, id_map_path: Optional[str]):
+        p = Path(index_path)
+        if not p.exists():
+            return
+        with self._store.lock:
+            if self._table.count_rows(self._filter) > 0:
+                log.warning(
+                    f"[{self._memory_type}] {index_path} existe mas o LanceDB já tem dados "
+                    f"desse store — migração ignorada (apague/renomeie o arquivo legado)"
+                )
+                return
+        try:
+            import faiss  # só necessário para migrar índices antigos
+        except ImportError:
+            log.warning(f"[{self._memory_type}] faiss não instalado — não foi possível migrar {index_path}")
+            return
+        loaded = faiss.read_index(str(p))
+        n = loaded.ntotal
         if n > 0:
-            vecs = flat_index.reconstruct_n(0, n)
-            new_index.add_with_ids(vecs, np.array(ids, dtype=np.int64))
-        log.info(f"Índice migrado para IndexIDMap2 [{self._index_path}] — {n} vetores")
-        self._dirty = True
-        return new_index
+            if isinstance(loaded, faiss.IndexIDMap2) or hasattr(loaded, "id_map"):
+                ids  = faiss.vector_to_array(loaded.id_map).astype(np.int64)
+                vecs = faiss.downcast_index(loaded.index).reconstruct_n(0, n)
+            else:
+                # formato antigo: IndexFlatIP + .npy externo com os ids
+                ids = np.load(id_map_path).astype(np.int64) if id_map_path and Path(id_map_path).exists() \
+                      else np.arange(n, dtype=np.int64)
+                if len(ids) != n:
+                    log.warning(f"[{self._memory_type}] id_map legado com {len(ids)} ids p/ {n} vetores — usando posição")
+                    ids = np.arange(n, dtype=np.int64)
+                vecs = loaded.reconstruct_n(0, n)
+            self.add_batch(np.asarray(vecs, dtype=np.float32), [int(i) for i in ids])
+            if self.total != n:
+                raise RuntimeError(
+                    f"[{self._memory_type}] migração FAISS→LanceDB inconsistente "
+                    f"({self.total} != {n}) — arquivo legado mantido"
+                )
+        p.rename(str(p) + ".migrated")
+        log.info(f"[{self._memory_type}] {n} vetores migrados de {index_path} (backup: .migrated)")
+
+    def _arrow(self, ids: list[int], embeddings: np.ndarray):
+        emb = np.ascontiguousarray(embeddings, dtype=np.float32).reshape(len(ids), self._embed_dim)
+        return pa.table(
+            {
+                "memory_type": pa.array([self._memory_type] * len(ids), pa.string()),
+                "id":          pa.array(ids, pa.int64()),
+                "vector":      pa.FixedSizeListArray.from_arrays(
+                                   pa.array(emb.ravel(), pa.float32()), self._embed_dim),
+            },
+            schema=self._store.schema(self._embed_dim),
+        )
 
     def add(self, embedding: np.ndarray, record_id: int):
-        with self._lock:
-            self._index.add_with_ids(
-                embedding.reshape(1, -1).astype(np.float32),
-                np.array([record_id], dtype=np.int64),
-            )
-            self._dirty = True
+        self.add_batch(np.asarray(embedding, dtype=np.float32).reshape(1, -1), [record_id])
 
     def add_batch(self, embeddings: np.ndarray, record_ids: list[int]):
-        """Adiciona múltiplos vetores de uma vez — mais eficiente que add() individual."""
+        """Adiciona múltiplos vetores de uma vez — bem mais barato que add()
+        individual (cada chamada gera um fragmento novo no LanceDB)."""
         if embeddings.shape[0] != len(record_ids):
             raise ValueError(
                 f"embeddings ({embeddings.shape[0]}) e record_ids ({len(record_ids)}) "
@@ -1631,77 +2413,50 @@ class MemoryIndex:
             )
         if embeddings.shape[0] == 0:
             return
-        with self._lock:
-            self._index.add_with_ids(
-                embeddings.astype(np.float32),
-                np.array(record_ids, dtype=np.int64),
-            )
-            self._dirty = True
+        data = self._arrow([int(i) for i in record_ids], embeddings)
+        with self._store.lock:
+            self._table.add(data)
+            self._store.note_write(self._embed_dim, len(record_ids))
 
     def remove_ids(self, record_ids: set[int]):
         if not record_ids:
             return
-        with self._lock:
-            if self._index.ntotal == 0:
-                return
-            # Construtor "cru" (n + ponteiro) em vez do atalho
-            # `IDSelectorBatch(array)` — compatível com um leque maior de
-            # versões do faiss-cpu/faiss-gpu.
-            ids_arr  = np.ascontiguousarray(list(record_ids), dtype=np.int64)
-            selector = faiss.IDSelectorBatch(ids_arr.size, faiss.swig_ptr(ids_arr))
-            n_removed = self._index.remove_ids(selector)
-            self._dirty = True
-        log.info(f"FAISS: {n_removed} vetores removidos [{self._index_path}]")
+        id_list = ",".join(str(int(i)) for i in record_ids)
+        with self._store.lock:
+            self._table.delete(f"{self._filter} AND id IN ({id_list})")
+            self._store.note_write(self._embed_dim)
+        log.info(f"LanceDB: remoção de até {len(record_ids)} vetores [{self._memory_type}]")
 
     def reset(self):
-        with self._lock:
-            self._index.reset()
-            self._dirty = True
+        with self._store.lock:
+            self._table.delete(self._filter)
+            self._store.note_write(self._embed_dim)
+
+    def _query(self, q: np.ndarray, where: str, k: int) -> list[tuple[int, float]]:
+        with self._store.lock:
+            rows = (
+                self._table.search(q)
+                .distance_type("cosine")
+                .where(where, prefilter=True)
+                .select(["id", "_distance"])
+                .limit(k)
+                .to_list()
+            )
+        return [(int(r["id"]), 1.0 - float(r["_distance"])) for r in rows]
 
     def search(self, query_embedding: np.ndarray, top_k: int) -> list[tuple[int, float]]:
-        with self._lock:
-            ntotal = self._index.ntotal
-            if ntotal == 0:
-                return []
-            k = min(top_k, ntotal)
-            scores, indices = self._index.search(
-                query_embedding.reshape(1, -1).astype(np.float32), k
-            )
-        # Com IndexIDMap2 os `indices` retornados já SÃO os record_id — não
-        # há mais tradução via `_id_map`. -1 indica slot vazio (padding).
-        return [
-            (int(idx), float(score))
-            for score, idx in zip(scores[0], indices[0])
-            if idx != -1
-        ]
+        if top_k <= 0:
+            return []
+        q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        return self._query(q, self._filter, top_k)
 
-    # ── NEW: busca em lote — N queries de uma vez em UMA chamada ao FAISS ──
     def search_batch(
         self, query_embeddings: np.ndarray, top_k: int
     ) -> list[list[tuple[int, float]]]:
-        """
-        Mesma lógica de search(), mas para várias queries simultâneas
-        (ex.: os N segmentos de uma pergunta composta). O FAISS já faz
-        busca em lote nativamente — uma única chamada, sem loop em Python —
-        então isso é praticamente tão rápido quanto uma busca única.
-        """
+        """N queries (ex.: os segmentos de uma pergunta composta). N é pequeno
+        (SEGMENT_MAX_COUNT), então é um loop simples sobre search()."""
         n = query_embeddings.shape[0] if query_embeddings.ndim == 2 else 0
-        with self._lock:
-            ntotal = self._index.ntotal
-            if ntotal == 0 or n == 0:
-                return [[] for _ in range(n)]
-            k = min(top_k, ntotal)
-            scores, indices = self._index.search(
-                query_embeddings.astype(np.float32), k
-            )
-        return [
-            [
-                (int(idx), float(score))
-                for score, idx in zip(row_scores, row_indices)
-                if idx != -1
-            ]
-            for row_scores, row_indices in zip(scores, indices)
-        ]
+        return [self.search(query_embeddings[i], top_k) for i in range(n)]
 
     def search_similar(self, embedding: np.ndarray) -> float:
         results = self.search(embedding, top_k=1)
@@ -1711,41 +2466,41 @@ class MemoryIndex:
         self, query_embedding: np.ndarray, record_ids: list[int], top_k: int
     ) -> list[tuple[int, float]]:
         """Ranqueia `record_ids` por similaridade com `query_embedding`, SEM
-        comparar com o restante do índice. Usado para restringir a busca às
-        chunks de um único arquivo (ex.: leitura de um arquivo específico
-        com top_k de chunks) em vez do índice inteiro.
-        """
-        if not record_ids:
+        comparar com o restante do store (filtro nativo `id IN (...)`)."""
+        if not record_ids or top_k <= 0:
             return []
-        q = query_embedding.reshape(-1).astype(np.float32)
-        scored: list[tuple[int, float]] = []
-        with self._lock:
-            if self._index.ntotal == 0:
-                return []
-            for rid in record_ids:
-                try:
-                    vec = self._index.reconstruct(int(rid))
-                except RuntimeError:
-                    continue  # id não presente no índice
-                scored.append((rid, float(np.dot(vec, q))))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:top_k]
+        id_list = ",".join(str(int(i)) for i in record_ids)
+        q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        return self._query(q, f"{self._filter} AND id IN ({id_list})", min(top_k, len(record_ids)))
+
+    def get_vectors(self, record_ids: list[int]) -> dict[int, np.ndarray]:
+        """Vetores armazenados dos ids pedidos (ids ausentes ficam de fora)."""
+        if not record_ids:
+            return {}
+        id_list = ",".join(str(int(i)) for i in record_ids)
+        with self._store.lock:
+            rows = (
+                self._table.search()
+                .where(f"{self._filter} AND id IN ({id_list})")
+                .select(["id", "vector"])
+                .limit(len(record_ids) * 2)
+                .to_list()
+            )
+        out: dict[int, np.ndarray] = {}
+        for r in rows:
+            out.setdefault(int(r["id"]), np.asarray(r["vector"], dtype=np.float32))
+        return out
 
     def flush(self):
-        """Persiste o índice em disco SE houver mudanças pendentes desde o
-        último flush. Chamado periodicamente pelo `index_flush_job` e uma
-        última vez, de forma síncrona, no `shutdown()` — em vez de escrever o
-        índice inteiro a cada add()/remove_ids() (ver ITEM 1 da revisão)."""
-        with self._lock:
-            if not self._persist or not self._dirty:
-                return
-            faiss.write_index(self._index, self._index_path)
-            self._dirty = False
+        """Compacta os fragmentos gerados por adds/deletes desde a última
+        compactação (no-op se não houve escrita). Chamado pelo
+        `index_flush_job` e no `shutdown()`. A durabilidade em si é imediata."""
+        self._store.compact(self._embed_dim)
 
     @property
     def total(self) -> int:
-        with self._lock:
-            return self._index.ntotal
+        with self._store.lock:
+            return int(self._table.count_rows(self._filter))
 
 
 # ── Estado global ──────────────────────────────────────────────────────────────
@@ -1753,6 +2508,8 @@ class MemoryIndex:
 @dataclass
 class AppState:
     embed_engine: EmbeddingEngine = field(default=None)
+    rerank_engine: RerankEngine   = field(default=None)
+    lance:        LanceStore      = field(default=None)   # NEW: LanceDB (todos os índices vetoriais)
     lt_db:        MemoryDB        = field(default=None)
     lt_index:     MemoryIndex     = field(default=None)
     st_db:        ShortTermDB     = field(default=None)
@@ -1767,6 +2524,12 @@ class AppState:
     # ── NEW: Dicionário de Rostos ──
     fd_db:        FaceDictDB      = field(default=None)
     fd_index:     MemoryIndex     = field(default=None)
+    # ── NEW: Dicionário de Voz ──
+    vo_db:        VoiceDictDB     = field(default=None)
+    vo_index:     MemoryIndex     = field(default=None)
+    # ── NEW: RAG de tools ──
+    tl_db:        ToolsDB         = field(default=None)
+    tl_index:     MemoryIndex     = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
@@ -1775,12 +2538,13 @@ state = AppState()
 
 
 def _all_indices() -> list["MemoryIndex"]:
-    """Todos os índices FAISS do processo — usado pelo job de flush periódico
-    e pelo shutdown para persistir tudo de uma vez."""
+    """Todos os índices vetoriais (LanceDB) do processo — usado pelo job de
+    manutenção periódica e pelo shutdown para compactar tudo de uma vez."""
     return [
         idx for idx in (
             state.lt_index, state.st_index,
-            state.if_index, state.vd_index, state.fd_index,
+            state.if_index, state.vd_index, state.fd_index, state.vo_index,
+            state.tl_index,
         )
         if idx is not None
     ]
@@ -1810,8 +2574,8 @@ async def decay_job():
 
 
 async def index_flush_job():
-    """Persiste em disco os índices FAISS marcados como 'sujos' desde o
-    último ciclo. Substitui o antigo `_save()` a cada escrita (ver ITEM 1 da
+    """Compacta os índices LanceDB que receberam escritas desde o último ciclo
+    (cada add() já é durável; isto só junta os fragmentos pequenos). Substitui o antigo `_save()` a cada escrita (ver ITEM 1 da
     revisão) — o custo de I/O passa a ser amortizado em vez de pago a cada
     add()/remove_ids()."""
     while True:
@@ -1821,7 +2585,7 @@ async def index_flush_job():
             try:
                 await loop.run_in_executor(None, index.flush)
             except Exception as e:
-                log.error(f"Erro ao persistir índice FAISS: {e}")
+                log.error(f"Erro ao compactar índice LanceDB: {e}")
 
 
 async def st_cleanup_job():
@@ -1872,24 +2636,42 @@ async def startup():
         log.warning("Memory API will start but embedding calls will fail until ONNX serving is available.")
 
     state.embed_engine = EmbeddingEngine(base_url=ONNX_SERVING_URL)
+    state.rerank_engine = RerankEngine(base_url=ONNX_SERVING_URL)
+
+    # ── NEW: LanceDB — um diretório só; FAISS_*_PATH viram fontes de migração ──
+    state.lance = LanceStore(LANCE_DIR)
 
     state.lt_db    = MemoryDB(DB_PATH)
-    state.lt_index = MemoryIndex(FAISS_INDEX_PATH, FAISS_ID_MAP_PATH)
+    state.lt_index = MemoryIndex(state.lance, MT_LONG_TERM, EMBED_DIM,
+                                 FAISS_INDEX_PATH, FAISS_ID_MAP_PATH)
 
     state.st_db    = ShortTermDB(ST_DB_PATH)
-    state.st_index = MemoryIndex(ST_FAISS_INDEX_PATH, ST_FAISS_ID_MAP_PATH)
+    state.st_index = MemoryIndex(state.lance, MT_SHORT_TERM, EMBED_DIM,
+                                 ST_FAISS_INDEX_PATH, ST_FAISS_ID_MAP_PATH)
 
     # ── NEW: Indexed files ──
     state.if_db    = IndexedFilesDB(IF_DB_PATH)
-    state.if_index = MemoryIndex(IF_FAISS_INDEX_PATH, IF_FAISS_ID_MAP_PATH)
+    state.if_index = MemoryIndex(state.lance, MT_INDEXED_FILE, EMBED_DIM,
+                                 IF_FAISS_INDEX_PATH, IF_FAISS_ID_MAP_PATH)
 
     # ── NEW: Dicionário Visual ──
     state.vd_db    = VisualDictDB(VD_DB_PATH)
-    state.vd_index = MemoryIndex(VD_FAISS_INDEX_PATH, VD_FAISS_ID_MAP_PATH, embed_dim=VD_EMBED_DIM)
+    state.vd_index = MemoryIndex(state.lance, MT_VISUAL_DICT, VD_EMBED_DIM,
+                                 VD_FAISS_INDEX_PATH, VD_FAISS_ID_MAP_PATH)
 
     # ── NEW: Dicionário de Rostos ──
     state.fd_db    = FaceDictDB(FD_DB_PATH)
-    state.fd_index = MemoryIndex(FD_FAISS_INDEX_PATH, FD_FAISS_ID_MAP_PATH, embed_dim=FD_EMBED_DIM)
+    state.fd_index = MemoryIndex(state.lance, MT_FACE_DICT, FD_EMBED_DIM,
+                                 FD_FAISS_INDEX_PATH, FD_FAISS_ID_MAP_PATH)
+
+    # ── NEW: Dicionário de Voz ──
+    state.vo_db    = VoiceDictDB(VO_DB_PATH)
+    state.vo_index = MemoryIndex(state.lance, MT_VOICE_DICT, VO_EMBED_DIM,
+                                 VO_FAISS_INDEX_PATH, VO_FAISS_ID_MAP_PATH)
+
+    # ── NEW: RAG de tools (índice novo — sem legado FAISS) ──
+    state.tl_db    = ToolsDB(TOOLS_DB_PATH)
+    state.tl_index = MemoryIndex(state.lance, MT_TOOL, EMBED_DIM)
 
     if _VS_AVAILABLE:
         try:
@@ -1918,7 +2700,9 @@ async def startup():
         f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
         f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks) | "
         f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings) | "
-        f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto)"
+        f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto) | "
+        f"{state.vo_db.count()} pessoas com voz cadastrada ({state.vo_index.total} embeddings de voz) | "
+        f"{state.tl_db.count()} tools indexadas ({state.tl_index.total} vetores)"
     )
 
 
@@ -1941,7 +2725,7 @@ async def shutdown():
         try:
             index.flush()
         except Exception as e:
-            log.error(f"Erro ao persistir índice FAISS no shutdown: {e}")
+            log.error(f"Erro ao compactar índice LanceDB no shutdown: {e}")
 
     log.info("AVA Memory (MCP) encerrada")
 
@@ -2092,7 +2876,7 @@ async def _search_segmented(
     max-score. Determinístico, sem LLM — apenas cosine similarity aplicado
     a cada pedaço da pergunta em vez da pergunta inteira.
     """
-    embeddings = await state.embed_engine.embed(segments)  # shape (N, dim)
+    embeddings = await state.embed_engine.embed_queries(segments)  # shape (N, dim)
     loop = asyncio.get_event_loop()
     lt_batches, st_batches = await asyncio.gather(
         loop.run_in_executor(None, state.lt_index.search_batch, embeddings, top_k),
@@ -2153,7 +2937,7 @@ async def _search_expanded(
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     expanded = f"{context_block}\n\nquery atual: {query}" if context_block else query
-    emb = await state.embed_engine.embed_one(expanded)
+    emb = await state.embed_engine.embed_query_one(expanded)
     loop = asyncio.get_event_loop()
     lt_raw, st_raw = await asyncio.gather(
         loop.run_in_executor(None, state.lt_index.search, emb, top_k * 2),
@@ -2167,7 +2951,7 @@ async def _search_dual(
     context_block: str,
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    emb_query, emb_ctx = await state.embed_engine.embed_batch_two(query, context_block)
+    emb_query, emb_ctx = await state.embed_engine.embed_query_two(query, context_block)
     loop = asyncio.get_event_loop()
     lt_q, st_q, lt_c, st_c = await asyncio.gather(
         loop.run_in_executor(None, state.lt_index.search, emb_query, top_k * 2),
@@ -2190,82 +2974,198 @@ def personalized_pagerank(
     max_iter: int,
     eps: float,
 ) -> dict[int, float]:
-    """Personalized PageRank por power iteration esparsa — síncrono, rode via
-    run_in_executor. Só dicts, sem networkx: nesse tamanho de grafo é mais
-    que suficiente e o damping cuida da propagação multi-hop (sem travessia
-    manual de 2+ hops)."""
-    nodes = set(adjacency) | set(personalization)
+    """Personalized PageRank por power iteration VETORIZADA (scipy.sparse) —
+    síncrono, rode via run_in_executor.
+
+    `adjacency[a][b]` = peso da transição a → b (pode ser assimétrico: arestas
+    dirigidas/tipadas já chegam aqui modulados por _build_adjacency). Cada linha
+    é normalizada pela soma de saída; nó sem saída (dangling) simplesmente não
+    propaga — mesma semântica da implementação anterior em dicts Python.
+    A iteração é r ← (1-d)·p + d·Pᵀ·r, com Pᵀ em CSR."""
+    # nós = origens ∪ DESTINOS ∪ sementes: com arestas dirigidas um destino pode
+    # não aparecer como chave de `adjacency` (nó sem saída).
+    node_set = set(adjacency) | set(personalization)
+    for nbs in adjacency.values():
+        node_set.update(nbs)
+    nodes = sorted(node_set)
     if not nodes:
         return {}
-    rank = {n: personalization.get(n, 0.0) for n in nodes}
+    index = {n: i for i, n in enumerate(nodes)}
+    size = len(nodes)
+    p = np.fromiter((personalization.get(n, 0.0) for n in nodes), dtype=np.float64, count=size)
+
+    rows, cols, vals = [], [], []
+    for a, nbs in adjacency.items():
+        ia = index[a]
+        for b, w in nbs.items():
+            if w > 0:
+                rows.append(ia); cols.append(index[b]); vals.append(w)
+
+    pt = None
+    if vals:
+        w_mat = sp.csr_matrix((vals, (rows, cols)), shape=(size, size), dtype=np.float64)
+        out_sum = np.asarray(w_mat.sum(axis=1)).ravel()
+        inv = np.divide(1.0, out_sum, out=np.zeros_like(out_sum), where=out_sum > 0)
+        pt = (sp.diags(inv) @ w_mat).T.tocsr()
+
+    rank = p.copy()
     for _ in range(max_iter):
-        new_rank = {n: (1 - damping) * personalization.get(n, 0.0) for n in nodes}
-        for n in nodes:
-            neighbors = adjacency.get(n, {})
-            total_w = sum(neighbors.values())
-            if total_w <= 0:
-                continue
-            for nb, w in neighbors.items():
-                new_rank[nb] = new_rank.get(nb, 0.0) + damping * rank[n] * (w / total_w)
-        delta = sum(abs(new_rank[n] - rank[n]) for n in nodes)
+        new_rank = (1.0 - damping) * p
+        if pt is not None:
+            new_rank = new_rank + damping * (pt @ rank)
+        delta = float(np.abs(new_rank - rank).sum())
         rank = new_rank
         if delta < eps:
             break
-    return rank
+    return {n: float(rank[i]) for n, i in index.items()}
 
 
 def _edge_key(id_a: int, id_b: int) -> tuple[int, int]:
-    """Chave canônica de uma aresta não-direcionada (min, max)."""
+    """Chave canônica de um par não-direcionado (min, max)."""
     return (min(id_a, id_b), max(id_a, id_b))
 
 
-async def _ppr_spread(
-    lt_raw: list[tuple[int, float]],
+def _edge_traversal_weights(row) -> tuple[float, float]:
+    """(peso a→b, peso b→a) de uma linha de aresta, já com o fator do tipo
+    (EDGE_PPR_FACTORS) aplicado."""
+    f_ab, f_ba = EDGE_PPR_FACTORS.get(row["edge_type"], (1.0, 1.0))
+    w = row["weight"]
+    return w * f_ab, w * f_ba
+
+
+def _build_adjacency(
+    edge_rows, node_filter: Optional[set[int]] = None,
+) -> dict[int, dict[int, float]]:
+    """Adjacência dirigida p/ o PPR a partir das linhas de aresta tipadas.
+    Várias arestas de tipos diferentes entre o mesmo par somam. Teto de
+    vizinhos por nó (PPR_MIN_NEIGHBORS_PER_HOP) preserva os de maior peso."""
+    adjacency: dict[int, dict[int, float]] = {}
+    for row in edge_rows:
+        a, b = row["memory_id_a"], row["memory_id_b"]
+        if a == b or row["weight"] <= 0:
+            continue
+        if node_filter is not None and (a not in node_filter or b not in node_filter):
+            continue
+        w_ab, w_ba = _edge_traversal_weights(row)
+        if w_ab > 0:
+            nb = adjacency.setdefault(a, {})
+            nb[b] = nb.get(b, 0.0) + w_ab
+        if w_ba > 0:
+            nb = adjacency.setdefault(b, {})
+            nb[a] = nb.get(a, 0.0) + w_ba
+    for node, nbs in adjacency.items():
+        if len(nbs) > PPR_MIN_NEIGHBORS_PER_HOP:
+            top = sorted(nbs.items(), key=lambda kv: kv[1], reverse=True)[:PPR_MIN_NEIGHBORS_PER_HOP]
+            adjacency[node] = dict(top)
+    return adjacency
+
+
+def _expand_graph_sync(
+    db, seed_ids: list[int], max_nodes: int, min_path_weight: float, neighbor_cap: int,
+) -> tuple[list, set[int]]:
+    """Expansão ADAPTATIVA do subgrafo: BFS priorizado por peso acumulado.
+
+    O "peso acumulado" de um nó é o produto dos pesos efetivos de aresta (com
+    fator de tipo/direção) ao longo do MELHOR caminho conhecido desde uma
+    semente (sementes = 1.0). Uma fila de prioridade sempre expande o nó de
+    maior peso primeiro; para quando o número de nós carregados chega a
+    `max_nodes` (nós novos deixam de ser admitidos) ou quando o melhor nó
+    restante tem peso < `min_path_weight`. Substitui o teto fixo de hops:
+    memórias fortemente conectadas a 3+ hops entram; ramos fracos param cedo.
+
+    Retorna (linhas de aresta coletadas, conjunto de nós carregados).
+    Síncrono (uma query por nó expandido) — rode via run_in_executor."""
+    best: dict[int, float] = {int(s): 1.0 for s in seed_ids}
+    heap: list[tuple[float, int]] = [(-1.0, s) for s in best]
+    heapq.heapify(heap)
+    expanded: set[int] = set()
+    edge_rows: dict[tuple[int, int, str], object] = {}
+
+    while heap:
+        neg_acc, node = heapq.heappop(heap)
+        acc = -neg_acc
+        if node in expanded or acc < best.get(node, 0.0) - 1e-12:
+            continue                      # entrada obsoleta (achou-se caminho melhor)
+        if acc < min_path_weight:
+            break                         # heap é max-first: o resto é ainda mais fraco
+        expanded.add(node)
+        for row in db.get_neighbors(node, neighbor_cap):
+            a, b = row["memory_id_a"], row["memory_id_b"]
+            other = b if a == node else a
+            w_ab, w_ba = _edge_traversal_weights(row)
+            w_out = w_ab if node == a else w_ba
+            edge_rows[(a, b, row["edge_type"])] = row
+            if w_out <= 0 or other in expanded:
+                continue
+            new_acc = acc * w_out
+            if new_acc < min_path_weight:
+                continue                  # nunca seria expandido: nem admite no subgrafo
+            known = best.get(other)
+            if known is None:
+                if len(best) >= max_nodes:
+                    continue              # orçamento de nós esgotado
+                best[other] = new_acc
+                heapq.heappush(heap, (-new_acc, other))
+            elif new_acc > known:
+                best[other] = new_acc
+                heapq.heappush(heap, (-new_acc, other))
+    return list(edge_rows.values()), set(best)
+
+
+def _log_activation_sync(seed_ids: list[int], rank: dict[int, float], elapsed_ms: float):
+    """Grava um evento de ativação PPR no log JSONL, consumido por
+    live_activation_server.py p/ visualização em tempo real. Best-effort:
+    qualquer falha de IO aqui NUNCA deve derrubar uma leitura de memória."""
+    try:
+        top = sorted(rank.items(), key=lambda kv: kv[1], reverse=True)[:ACTIVATION_LOG_MAX_IDS]
+        line = json.dumps({
+            "ts": time.time(),
+            "seeds": seed_ids,
+            "rank": {str(k): round(v, 4) for k, v in top},
+            "elapsed_ms": round(elapsed_ms, 2),
+        }, ensure_ascii=False)
+        Path(ACTIVATION_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(ACTIVATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        log.debug("activation log: falha ao gravar (ignorado)", exc_info=True)
+
+
+async def _ppr_spread_on(
+    db,
+    seeds: list[tuple[int, float]],
     loop: asyncio.AbstractEventLoop,
 ) -> dict:
-    """Step 6 — propagação PPR no grafo Hebbiano, com sementes nos hits LT.
-
-    Roda DEPOIS que `lt_raw` está finalizado (todas as estratégias convergem
-    nele) e ANTES de converter em MemoryEntry. Retorna:
-      related_raw  — [(memory_id, score)] dos ids alcançados SÓ pelo grafo
+    """Propagação PPR num grafo de arestas tipadas (`db` = MemoryDB ou ToolsDB),
+    com sementes em `seeds` = [(id, score)]. Retorna:
+      related_raw  — [(id, score)] dos ids alcançados SÓ pelo grafo
       ppr_rank     — {id: rank} completo (sementes + vizinhos), p/ Step 8
       adjacency    — {id: {vizinho: weight}} do subgrafo local, p/ Step 8
-      edge_rows    — linhas brutas de memory_edges do subgrafo
-      elapsed_ms   — tempo da propagação (profiling, mesma linha do /read)
+      edge_rows    — linhas brutas de aresta do subgrafo
+      elapsed_ms   — tempo da propagação (profiling)
     """
     result: dict = {
         "related_raw": [], "ppr_rank": {}, "adjacency": {}, "edge_rows": [],
         "elapsed_ms": 0.0,
     }
-    seed_ids = [mid for mid, _ in lt_raw]
+    scores: dict[int, float] = {}
+    for mid, score in seeds:
+        scores[mid] = max(score, scores.get(mid, 0.0))
+    seed_ids = list(scores)
     if not seed_ids:
         return result
     t0 = time.perf_counter()
-    edges = state.lt_db.get_edges_for_ids(seed_ids)
+    edges, discovered = await loop.run_in_executor(
+        None, _expand_graph_sync, db, seed_ids,
+        PPR_EXPAND_MAX_NODES, PPR_EXPAND_MIN_PATH_WEIGHT, PPR_MIN_NEIGHBORS_PER_HOP,
+    )
     if not edges:
         return result
-    # Expansão de 1 hop: busca arestas dos vizinhos alcançados (2ª query,
-    # barata — NÃO carrega a tabela inteira). O PPR em si propaga quantos
-    # hops forem necessários via damping.
-    neighbor_ids = (
-        {row["memory_id_a"] for row in edges} | {row["memory_id_b"] for row in edges}
-    ) - set(seed_ids)
-    if neighbor_ids:
-        edges += state.lt_db.get_edges_for_ids(list(neighbor_ids))
-    # Adjacência simétrica, com teto de vizinhos por nó (SQLite barato).
-    adjacency: dict[int, dict[int, float]] = {}
-    for row in edges:
-        a, b, w = row["memory_id_a"], row["memory_id_b"], row["weight"]
-        if a == b or w <= 0:
-            continue
-        adjacency.setdefault(a, {})[b] = w
-        adjacency.setdefault(b, {})[a] = w
-    for node, nbs in adjacency.items():
-        if len(nbs) > PPR_MIN_NEIGHBORS_PER_HOP:
-            top = sorted(nbs.items(), key=lambda kv: kv[1], reverse=True)[:PPR_MIN_NEIGHBORS_PER_HOP]
-            adjacency[node] = dict(top)
-    # Vetor de personalização: scores FAISS clipados (>= 0) e normalizados.
-    clipped = {mid: max(score, 0.0) for mid, score in lt_raw}
+    adjacency = _build_adjacency(edges, discovered)
+    if not adjacency:
+        return result
+    # Vetor de personalização: scores clipados (>= 0) e normalizados.
+    clipped = {mid: max(score, 0.0) for mid, score in scores.items()}
     total = sum(clipped.values())
     if total <= 0:
         return result
@@ -2273,6 +3173,12 @@ async def _ppr_spread(
     rank = await loop.run_in_executor(
         None, personalized_pagerank,
         adjacency, personalization, PPR_DAMPING, PPR_MAX_ITER, PPR_CONVERGENCE_EPS,
+    )
+    # ── NEW: dispara log de ativação p/ visualização em tempo real, sem bloquear ──
+    asyncio.ensure_future(
+        loop.run_in_executor(
+            None, _log_activation_sync, seed_ids, rank, (time.perf_counter() - t0) * 1000.0
+        )
     )
     seed_set = set(seed_ids)
     related_raw = [
@@ -2289,26 +3195,99 @@ async def _ppr_spread(
     return result
 
 
+async def _ppr_spread(
+    lt_raw: list[tuple[int, float]],
+    loop: asyncio.AbstractEventLoop,
+) -> dict:
+    """Step 6 — propagação PPR no grafo Hebbiano de memórias LT, com sementes
+    nos hits LT. Roda DEPOIS que `lt_raw` está finalizado e ANTES de converter
+    em MemoryEntry."""
+    return await _ppr_spread_on(state.lt_db, lt_raw, loop)
+
+
+async def _dict_graph_related(
+    seeds: list[tuple[Optional[int], float]],
+    loop: asyncio.AbstractEventLoop,
+) -> list[RelatedMemory]:
+    """Busca por grafo a partir de hits de dicionário (objeto/rosto/voz): usa o
+    `memory_id` de cada candidato como semente (score = similaridade do hit)
+    e devolve as memórias LT alcançadas SÓ pelas arestas. Só leitura — não
+    cria nem reforça arestas (leituras de dicionário são frequentes/por-frame
+    e não devem fortalecer o grafo sozinhas). Candidatos sem memory_id não
+    têm nó no grafo e são ignorados."""
+    real = [(mid, s) for mid, s in seeds if mid is not None]
+    if not real:
+        return []
+    ctx = await _ppr_spread(real, loop)
+    related_raw = ctx["related_raw"][:DICT_GRAPH_MAX_RELATED]
+    if not related_raw:
+        return []
+    rows = await loop.run_in_executor(
+        None, state.lt_db.get_by_ids, [mid for mid, _ in related_raw]
+    )
+    by_id = {r["id"]: r for r in rows}
+    return [
+        RelatedMemory(
+            memory_id=mid,
+            text=_truncate_text(by_id[mid]["text"], READ_LT_MAX_CHARS),
+            score=round(score, 4),
+        )
+        for mid, score in related_raw if mid in by_id
+    ]
+
+
 def _lateral_inhibition_filter(results: list[MemoryEntry]) -> list[MemoryEntry]:
     """Step 7 — MMR (inibição lateral) restrito às entradas "related".
 
-    "Similaridade" entre candidatos = PESO DE ARESTA entre elas no grafo
-    (aproximação por peso de aresta, conforme o design doc): suprimir hub
-    genérico é redundância GRÁFICA, não de embedding — e evita um reconstruct
-    por candidato no FAISS. Entradas "primary" passam intactas (foram
-    explicitamente pedidas pela query; é o contexto espalhado pelo grafo que
-    precisa de pressão de diversidade)."""
+    "Similaridade" entre dois candidatos:
+      * se existe aresta entre eles → peso da aresta × EDGE_MMR_FACTORS[tipo]
+        (o maior entre as arestas do par). Suprimir hub genérico é redundância
+        GRÁFICA; contradicts/updates contam como redundância máxima (mesmo
+        assunto, versões conflitantes); temporal_precedence conta pouco;
+      * se NÃO existe aresta → cosine direta entre os embeddings (antes: 0.0,
+        "totalmente diverso" mesmo p/ candidatos quase idênticos que nunca
+        co-ativaram), descontada por MMR_COSINE_FLOOR.
+    Entradas "primary" passam intactas."""
     primary = [r for r in results if r.match_type != "related"]
     related = [r for r in results if r.match_type == "related"]
     if len(related) <= 1:
         return results
-    edge_rows = state.lt_db.get_edges_for_ids([r.id for r in related])
-    wmap = {
-        (row["memory_id_a"], row["memory_id_b"]): row["weight"] for row in edge_rows
-    }
+    ids = [r.id for r in related]
 
-    def edge_w(i: int, j: int) -> float:
-        return wmap.get(_edge_key(i, j), 0.0)
+    edge_sim: dict[tuple[int, int], float] = {}
+    for row in state.lt_db.get_edges_for_ids(ids):
+        sim = row["weight"] * EDGE_MMR_FACTORS.get(row["edge_type"], 1.0)
+        key = _edge_key(row["memory_id_a"], row["memory_id_b"])
+        edge_sim[key] = max(edge_sim.get(key, 0.0), sim)
+
+    try:
+        vecs = state.lt_index.get_vectors(ids)
+    except Exception as e:
+        log.warning(f"MMR: não foi possível buscar vetores p/ o fallback de cosine: {e}")
+        vecs = {}
+    unit: dict[int, np.ndarray] = {}
+    for mid, v in vecs.items():
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            unit[mid] = v / n
+
+    pair_cache: dict[tuple[int, int], float] = {}
+
+    def pair_sim(i: int, j: int) -> float:
+        key = _edge_key(i, j)
+        cached = pair_cache.get(key)
+        if cached is not None:
+            return cached
+        sim = edge_sim.get(key)
+        if sim is None:                      # sem aresta → cosine direta
+            vi, vj = unit.get(i), unit.get(j)
+            if vi is None or vj is None:
+                sim = 0.0
+            else:
+                cos = float(np.dot(vi, vj))
+                sim = max(0.0, (cos - MMR_COSINE_FLOOR) / (1.0 - MMR_COSINE_FLOOR))
+        pair_cache[key] = sim
+        return sim
 
     selected: list[MemoryEntry] = []
     pool = list(related)
@@ -2317,16 +3296,22 @@ def _lateral_inhibition_filter(results: list[MemoryEntry]) -> list[MemoryEntry]:
             relevance = c.score * c.confidence
             if not selected:
                 return relevance
-            max_sim = max(edge_w(c.id, s.id) for s in selected)
+            max_sim = max(pair_sim(c.id, s.id) for s in selected)
             return MMR_LAMBDA * relevance - (1.0 - MMR_LAMBDA) * max_sim
 
         best = max(pool, key=mmr_score)
         selected.append(best)
         pool.remove(best)
 
-    merged = primary + selected
-    merged.sort(key=lambda r: r.score * r.confidence, reverse=True)
-    return merged
+    # ATENÇÃO: NÃO reordenar por score aqui. O laço acima seleciona TODOS os
+    # "related" (até esvaziar o pool), então um sort por relevância depois
+    # descartava exatamente a ordem que o MMR acabou de calcular — o filtro
+    # virava no-op e o corte do orçamento de tokens (entries[:top_k]) pegava os
+    # mais relevantes, não os mais diversos. Os "related" sempre têm score PPR
+    # (<= PPR_SPREAD_WEIGHT) abaixo dos "primary" (>= READ_MIN_SCORE_STRICT), então
+    # primary (já ordenado por score) + related (ordem MMR) preserva a ordem
+    # global e deixa o MMR decidir QUEM sobrevive ao corte.
+    return primary + selected
 
 
 def _upsert_edges_sync(pairs: list[tuple[int, int]], now: float) -> int:
@@ -2611,6 +3596,8 @@ _lt_write_lock = asyncio.Lock()
 _st_write_lock = asyncio.Lock()
 _vd_write_lock = asyncio.Lock()
 _fd_write_lock = asyncio.Lock()
+_vo_write_lock = asyncio.Lock()
+_tl_write_lock = asyncio.Lock()
 
 
 async def _store_long_term_text(
@@ -2623,6 +3610,10 @@ async def _store_long_term_text(
     # ── NEW (solução 2) ──
     action: Literal["create", "update"] = "create",
     memory_id: Optional[int] = None,
+    # ── NEW (arestas tipadas): True → o chamador já declarou (link_to +
+    # link_type) que este texto é um fato DISTINTO relacionado a outro; a faixa
+    # "possible_update" não bloqueia o write.
+    allow_near: bool = False,
 ) -> tuple[bool, str, Optional[int], Optional[dict]]:
     """
     Lógica compartilhada de gravação em memória de longo prazo — usada tanto
@@ -2651,10 +3642,26 @@ async def _store_long_term_text(
                 # a similaridade seja alta o bastante para termos certeza
                 # de que é "a mesma coisa, dita de outro jeito" — não
                 # queremos "atualizar" um fato não relacionado por engano.
-                embedding = await state.embed_engine.embed_one(text)
+                #
+                # O cosine do bi-encoder aqui é só RECALL (candidato a
+                # checar); quem confirma é o reranker cross-encoder, que
+                # não sofre do mesmo problema de anisotropia (ver
+                # RERANK_UPDATE_SCORE / comentário perto de UPDATE_SIM_THRESHOLD).
+                embedding = await state.embed_engine.embed_passage_one(text)
                 hits = state.lt_index.search(embedding, top_k=1)
                 if hits and hits[0][1] >= UPDATE_SIM_THRESHOLD:
-                    target_id = hits[0][0]
+                    candidate_id, candidate_sim = hits[0]
+                    candidate_row = state.lt_db.get_by_id(candidate_id)
+                    if candidate_row is not None:
+                        cross_score = await state.rerank_engine.score_one(text, candidate_row["text"])
+                        if cross_score >= RERANK_UPDATE_SCORE:
+                            target_id = candidate_id
+                        else:
+                            log.info(
+                                f"update sem memory_id: bi-encoder achou candidata #{candidate_id} "
+                                f"(cosine={candidate_sim:.3f}) mas reranker discordou "
+                                f"(cross_score={cross_score:.3f} < {RERANK_UPDATE_SCORE}) — ignorando"
+                            )
 
             if target_id is None:
                 return False, "update_target_not_found", None, None
@@ -2675,7 +3682,7 @@ async def _store_long_term_text(
             # O vetor antigo aponta pro texto anterior — remove e adiciona
             # de novo com o mesmo id, pra busca semântica continuar
             # refletindo o texto atual em vez do corrigido.
-            new_embedding = await state.embed_engine.embed_one(text)
+            new_embedding = await state.embed_engine.embed_passage_one(text)
             await loop.run_in_executor(None, state.lt_index.remove_ids, {target_id})
             await loop.run_in_executor(None, state.lt_index.add, new_embedding, target_id)
 
@@ -2687,27 +3694,43 @@ async def _store_long_term_text(
         if state.lt_db.exists_exact(text):
             return False, "duplicate_exact", None, None
 
-        embedding = await state.embed_engine.embed_one(text)
+        embedding = await state.embed_engine.embed_passage_one(text)
 
         hits = state.lt_index.search(embedding, top_k=1)
         max_sim, nearest_id = (hits[0][1], hits[0][0]) if hits else (0.0, None)
 
-        if max_sim >= DEDUP_THRESHOLD:
-            return False, f"duplicate_semantic:{max_sim:.3f}", None, None
-
-        # ── NEW (solução 2): faixa "provável correção" — nem duplicata
-        # clara nem claramente um fato novo. Não decide sozinho: devolve
-        # a candidata pro chamador decidir (reenviar com action="update").
-        if max_sim >= UPDATE_SIM_THRESHOLD and nearest_id is not None:
+        # ── Bi-encoder = recall (achar candidato), reranker = decisão ────────
+        # Só vale a pena checar o cross-encoder se existe um candidato
+        # plausível pelo cosine; abaixo de UPDATE_SIM_THRESHOLD nem chega
+        # perto do piso de ruído do modelo, então é claramente um fato novo
+        # e pulamos a chamada extra de rerank (mais rápido).
+        if not allow_near and max_sim >= UPDATE_SIM_THRESHOLD and nearest_id is not None:
             candidate_row = state.lt_db.get_by_id(nearest_id)
-            candidate = None
+            cross_score = None
             if candidate_row is not None:
+                cross_score = await state.rerank_engine.score_one(text, candidate_row["text"])
+
+            if cross_score is not None and cross_score >= RERANK_DUPLICATE_SCORE:
+                return False, f"duplicate_semantic:{max_sim:.3f}:rerank={cross_score:.3f}", None, None
+
+            if cross_score is not None and cross_score >= RERANK_UPDATE_SCORE:
                 candidate = {
                     "id":    candidate_row["id"],
                     "text":  candidate_row["text"],
                     "score": round(max_sim, 4),
+                    "rerank_score": round(cross_score, 4),
                 }
-            return False, f"possible_update:{max_sim:.3f}", None, candidate
+                return False, f"possible_update:{max_sim:.3f}:rerank={cross_score:.3f}", None, candidate
+
+            # cross_score baixo (ou candidate_row sumiu) → bi-encoder deu
+            # falso positivo (anisotropia/domínio compartilhado); segue como
+            # fato novo mesmo com cosine alto.
+            if cross_score is not None:
+                log.info(
+                    f"LT: candidato #{nearest_id} descartado pelo reranker "
+                    f"(cosine={max_sim:.3f} mas cross_score={cross_score:.3f} < {RERANK_UPDATE_SCORE}) "
+                    f"— gravando como fato novo: {text[:60]}"
+                )
 
         try:
             memory_id = state.lt_db.insert(text, source, confidence, forgettable, ttl_days)
@@ -2726,19 +3749,43 @@ async def _store_long_term_text(
     return True, "ok", memory_id, None
 
 
+async def _link_new_memory(new_id: int, target_id: int, link_type: str) -> None:
+    """Cria a aresta tipada entre uma memória recém-gravada e `target_id`.
+    Direção: updates = nova → antiga; temporal_precedence = `target_id` (veio
+    antes) → nova; contradicts/co_activation são simétricas."""
+    loop = asyncio.get_event_loop()
+    try:
+        if await loop.run_in_executor(None, state.lt_db.get_by_id, target_id) is None:
+            log.warning(f"link_to #{target_id} não existe — aresta {link_type} não criada")
+            return
+        src, dst = (target_id, new_id) if link_type == EDGE_TEMPORAL else (new_id, target_id)
+        await loop.run_in_executor(
+            None, state.lt_db.upsert_edge, src, dst, EDGE_LEARNING_RATE, time.time(), link_type,
+        )
+    except Exception as e:
+        log.error(f"Grafo: falha ao criar aresta {link_type} #{new_id}→#{target_id}: {e}")
+
+
 async def _process_write_request(req: WriteRequest) -> WriteResponse:
     """Ponto único usado tanto por /write quanto por /write_batch (solução 1),
     pra garantir que os dois caminhos tenham exatamente a mesma lógica de
     dedup/update/ttl."""
+    if (req.link_to is None) != (req.link_type is None):
+        log.warning("write: link_to e link_type devem vir juntos — ligação ignorada")
+    linking = req.link_to is not None and req.link_type is not None
     stored, reason, memory_id, candidate = await _store_long_term_text(
         req.text, req.source, req.confidence, req.forgettable,
         ttl_days=req.ttl_days, action=req.action, memory_id=req.memory_id,
+        allow_near=linking,
     )
+    if linking and stored and reason == "ok" and memory_id is not None:
+        await _link_new_memory(memory_id, req.link_to, req.link_type)
     resp = WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
     if candidate is not None:
         resp.candidate_id    = candidate["id"]
         resp.candidate_text  = candidate["text"]
         resp.candidate_score = candidate["score"]
+        resp.candidate_rerank_score = candidate.get("rerank_score")
     return resp
 
 
@@ -2754,8 +3801,19 @@ async def write_memory(req: WriteRequest):
 
 async def write_memory_batch(req: WriteBatchRequest):
     results: list[WriteResponse] = []
+    loop = asyncio.get_event_loop()
+    prev_id: Optional[int] = None
     for item in req.items:
-        results.append(await _process_write_request(item))
+        resp = await _process_write_request(item)
+        results.append(resp)
+        # ── NEW: batch sequencial → aresta temporal_precedence (anterior → seguinte)
+        if req.sequential and resp.stored and resp.memory_id is not None:
+            if prev_id is not None and prev_id != resp.memory_id:
+                await loop.run_in_executor(
+                    None, state.lt_db.upsert_edge, prev_id, resp.memory_id,
+                    EDGE_LEARNING_RATE, time.time(), EDGE_TEMPORAL,
+                )
+            prev_id = resp.memory_id
     stored_count = sum(1 for r in results if r.stored)
     log.info(f"write_batch: {stored_count}/{len(results)} memórias gravadas")
     return WriteBatchResponse(
@@ -2777,7 +3835,7 @@ async def write_short_term(req: WriteSTRequest):
     loop = asyncio.get_event_loop()
 
     async with _st_write_lock:
-        embedding = await state.embed_engine.embed_one(embed_text)
+        embedding = await state.embed_engine.embed_passage_one(embed_text)
 
         max_sim = state.st_index.search_similar(embedding)
         if max_sim >= DEDUP_THRESHOLD:
@@ -2821,7 +3879,7 @@ async def read_memory(req: ReadRequest):
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
 
-    query_emb = await state.embed_engine.embed_one(query)
+    query_emb = await state.embed_engine.embed_query_one(query)
 
     # Start VS search in background
     vs_future = None
@@ -2939,7 +3997,7 @@ async def read_memory(req: ReadRequest):
 
     # ── NEW (Step 7): inibição lateral (MMR) SÓ no subconjunto "related",
     # antes do orçamento de tokens — primary não é penalizado. ──
-    results = _lateral_inhibition_filter(results)
+    results = await loop.run_in_executor(None, _lateral_inhibition_filter, results)
 
     # ── Orçamento global de tokens ─────────────────────────────────────────────
     # Limita o total de caracteres retornados, cortando entradas de menor score.
@@ -3051,7 +4109,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     for batch_start in range(0, len(chunk_texts), IF_EMBED_BATCH_SIZE):
         batch = chunk_texts[batch_start:batch_start + IF_EMBED_BATCH_SIZE]
         try:
-            batch_embs = await state.embed_engine.embed(batch)
+            batch_embs = await state.embed_engine.embed_passages(batch)
             all_embeddings.append(batch_embs)
         except Exception as e:
             log.error(f"Embedding batch failed for {req.file_path}: {e}")
@@ -3197,7 +4255,7 @@ async def indexed_file_read(req: IndexedFileReadRequest):
         if not chunk_ids:
             return IndexedFileReadResponse(results=[], file_path=file_path, query=query)
 
-        query_emb = await state.embed_engine.embed_one(query)
+        query_emb = await state.embed_engine.embed_query_one(query)
         ranked = await loop.run_in_executor(
             None, state.if_index.search_subset, query_emb, chunk_ids, req.top_k
         )
@@ -3244,7 +4302,7 @@ async def indexed_file_read(req: IndexedFileReadRequest):
         return IndexedFileReadResponse(results=[], query=query)
 
     loop = asyncio.get_event_loop()
-    query_emb = await state.embed_engine.embed_one(query)
+    query_emb = await state.embed_engine.embed_query_one(query)
 
     if_raw = await loop.run_in_executor(
         None, state.if_index.search, query_emb, req.top_k * 2
@@ -3558,7 +4616,14 @@ async def visual_dict_read(req: VisualDictReadRequest):
         or (len(results) > 1 and (results[0].score - results[1].score) < VD_AMBIGUOUS_MARGIN)
     )
 
-    return VisualDictReadResponse(results=results, ambiguous=ambiguous)
+    # ── NEW: busca por grafo a partir dos hits (memory_id = nó no grafo Hebbiano)
+    related: list[RelatedMemory] = []
+    if req.include_related:
+        related = await _dict_graph_related(
+            [(c.memory_id, c.score) for c in results], asyncio.get_event_loop()
+        )
+
+    return VisualDictReadResponse(results=results, ambiguous=ambiguous, related=related)
 
 
 async def visual_dict_list():
@@ -3640,24 +4705,42 @@ async def face_dict_write(req: FaceDictWriteRequest):
         existing = state.fd_db.get_by_name(person_name)
         new_person = existing is None
 
+        memory_id: Optional[int] = None
         if existing is not None:
             person_id = existing["id"]
+            memory_id = existing["memory_id"]
             # se veio uma descrição não-vazia num cadastro de exemplo adicional,
             # atualiza/completa a descrição já salva (permite corrigir depois)
             if description:
                 state.fd_db.update_description(person_id, description)
+                # NEW: pessoa já cadastrada SEM link + link pedido → "promove"
+                if req.link_to_memory and memory_id is None:
+                    stored, _, memory_id, _ = await _store_long_term_text(
+                        f"{person_name}: {description}", "face_dict", req.confidence,
+                    )
+                    if stored:
+                        state.fd_db.set_memory_id(person_id, memory_id)
+                    else:
+                        memory_id = None
         else:
+            # NEW (opt-in): descrição também vira memória LT → nó no grafo Hebbiano
+            if req.link_to_memory and description:
+                stored, _, memory_id, _ = await _store_long_term_text(
+                    f"{person_name}: {description}", "face_dict", req.confidence,
+                )
+                if not stored:
+                    memory_id = None  # dedup/erro — pessoa cadastrada mesmo assim, sem link
             try:
                 person_id = state.fd_db.insert_person(
                     person_name=person_name, description=description,
-                    source=req.source, confidence=req.confidence,
+                    source=req.source, confidence=req.confidence, memory_id=memory_id,
                 )
             except sqlite3.IntegrityError:
                 # Corrida: outro write criou a mesma person_key nesse meio-tempo.
                 existing = state.fd_db.get_by_name(person_name)
                 if existing is None:
                     raise
-                person_id, new_person = existing["id"], False
+                person_id, memory_id, new_person = existing["id"], existing["memory_id"], False
 
         embedding_id = state.fd_db.insert_embedding(person_id)
         await loop.run_in_executor(None, state.fd_index.add, vec, embedding_id)
@@ -3669,7 +4752,7 @@ async def face_dict_write(req: FaceDictWriteRequest):
 
     return FaceDictWriteResponse(
         stored=True, reason="ok", person_id=person_id,
-        embedding_id=embedding_id, new_person=new_person,
+        embedding_id=embedding_id, memory_id=memory_id, new_person=new_person,
     )
 
 
@@ -3711,6 +4794,7 @@ async def face_dict_read(req: FaceDictReadRequest):
             score=score,
             confidence=row["confidence"],
             access_count=row["access_count"] + 1,
+            memory_id=row["memory_id"],
         ))
 
     # ambíguo quando: ninguém bateu com confiança suficiente, OU os dois
@@ -3720,7 +4804,14 @@ async def face_dict_read(req: FaceDictReadRequest):
         or (len(results) > 1 and (results[0].score - results[1].score) < FD_AMBIGUOUS_MARGIN)
     )
 
-    return FaceDictReadResponse(results=results, ambiguous=ambiguous)
+    # ── NEW: busca por grafo a partir dos hits (só rostos com memory_id)
+    related: list[RelatedMemory] = []
+    if req.include_related:
+        related = await _dict_graph_related(
+            [(c.memory_id, c.score) for c in results], asyncio.get_event_loop()
+        )
+
+    return FaceDictReadResponse(results=results, ambiguous=ambiguous, related=related)
 
 
 async def face_dict_list():
@@ -3732,6 +4823,7 @@ async def face_dict_list():
             description=row["description"],
             source=row["source"],
             confidence=row["confidence"],
+            memory_id=row["memory_id"],
             examples_count=row["examples_count"],
             created_at=row["created_at"],
             access_count=row["access_count"],
@@ -3751,6 +4843,7 @@ async def face_dict_get(person_id: int):
         description=row["description"],
         source=row["source"],
         confidence=row["confidence"],
+        memory_id=row["memory_id"],
         examples_count=state.fd_db.count_examples(person_id),
         created_at=row["created_at"],
         access_count=row["access_count"],
@@ -3774,6 +4867,7 @@ async def face_dict_update(person_id: int, req: FaceDictUpdateRequest):
         description=row["description"],
         source=row["source"],
         confidence=row["confidence"],
+        memory_id=row["memory_id"],
         examples_count=state.fd_db.count_examples(person_id),
         created_at=row["created_at"],
         access_count=row["access_count"],
@@ -3796,6 +4890,455 @@ async def face_dict_delete(person_id: int):
     return {"deleted": deleted, "person_id": person_id, "embeddings_removed": len(embedding_ids)}
 
 
+# ── NEW: Dicionário de Voz — endpoints usados pelo pipeline de áudio ────────────
+#
+# Mesma lógica do dicionário de rostos, adaptada pra identificação de locutor:
+# o pipeline de áudio extrai o embedding da frase falada (CAM++ etc.) e manda
+# pra cá. Aqui decide-se se é uma pessoa nova ou mais um exemplo de uma pessoa
+# já cadastrada. DIFERENÇA em relação ao face-dict: a descrição de quem é a
+# pessoa também é gravada na memória de longo prazo (source="voice_dict"),
+# então ela é pesquisável pela leitura normal (/read) — igual ao link_to_memory
+# do dicionário visual.
+
+async def voice_dict_write(req: VoiceDictWriteRequest):
+    person_name = req.person_name.strip()
+    description = req.description.strip()
+    if not person_name:
+        return VoiceDictWriteResponse(stored=False, reason="empty_person_name")
+
+    if len(req.embedding) != VO_EMBED_DIM:
+        raise MemoryToolError(f"embedding deve ter dimensão {VO_EMBED_DIM}, recebido {len(req.embedding)}")
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    loop = asyncio.get_event_loop()
+
+    async with _vo_write_lock:
+        existing = state.vo_db.get_by_name(person_name)
+        new_person = existing is None
+
+        if existing is not None:
+            person_id = existing["id"]
+            memory_id = existing["memory_id"]
+            # se veio uma descrição não-vazia num cadastro de exemplo adicional,
+            # atualiza/completa a descrição já salva
+            if description:
+                state.vo_db.update_description(person_id, description)
+        else:
+            memory_id = None
+            if description:
+                # ── descrição replicada na memória de longo prazo — mesma
+                # política do visual-dict: só na criação do conceito/pessoa,
+                # exemplos adicionais não duplicam a entrada de texto.
+                stored, _, memory_id, _ = await _store_long_term_text(
+                    f"{person_name}: {description}", "voice_dict", req.confidence,
+                )
+                if not stored:
+                    memory_id = None  # dedup/erro — a pessoa ainda é cadastrada,
+                                        # só sem o link pra memória
+            try:
+                person_id = state.vo_db.insert_person(
+                    person_name=person_name, description=description,
+                    source=req.source, confidence=req.confidence, memory_id=memory_id,
+                )
+            except sqlite3.IntegrityError:
+                # Corrida: outro write criou a mesma person_key nesse meio-tempo.
+                existing = state.vo_db.get_by_name(person_name)
+                if existing is None:
+                    raise
+                person_id, memory_id, new_person = existing["id"], existing["memory_id"], False
+
+        embedding_id = state.vo_db.insert_embedding(person_id)
+        await loop.run_in_executor(None, state.vo_index.add, vec, embedding_id)
+
+    log.info(
+        f"Voice-dict: {'nova pessoa' if new_person else 'novo exemplo'} "
+        f"'{person_name}' (person_id={person_id}, embedding_id={embedding_id}, memory_id={memory_id})"
+    )
+
+    return VoiceDictWriteResponse(
+        stored=True, reason="ok", person_id=person_id,
+        embedding_id=embedding_id, memory_id=memory_id, new_person=new_person,
+    )
+
+
+async def voice_dict_read(req: VoiceDictReadRequest):
+    if len(req.embedding) != VO_EMBED_DIM:
+        raise MemoryToolError(f"embedding deve ter dimensão {VO_EMBED_DIM}, recebido {len(req.embedding)}")
+
+    vec = np.asarray(req.embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    # sobre-amostra o kNN porque vários embeddings podem apontar pra mesma
+    # pessoa (múltiplos exemplos) — precisamos deduplicar por person_id
+    hits = state.vo_index.search(vec, max(req.top_k * 4, 20))
+
+    best_score_by_person: dict[int, float] = {}
+    for embedding_id, score in hits:
+        person_id = state.vo_db.get_person_id_by_embedding(embedding_id)
+        if person_id is None:
+            continue
+        if person_id not in best_score_by_person or score > best_score_by_person[person_id]:
+            best_score_by_person[person_id] = score
+
+    ranked = sorted(best_score_by_person.items(), key=lambda kv: kv[1], reverse=True)[:req.top_k]
+
+    results: list[VoiceCandidate] = []
+    for person_id, score in ranked:
+        if score < req.min_score:
+            continue
+        row = state.vo_db.get_person_by_id(person_id)
+        if row is None:
+            continue
+        state.vo_db.update_access(person_id)
+        results.append(VoiceCandidate(
+            person_id=row["id"],
+            person_name=row["person_name"],
+            description=row["description"],
+            score=score,
+            confidence=row["confidence"],
+            access_count=row["access_count"] + 1,
+            memory_id=row["memory_id"],
+        ))
+
+    # ambíguo quando: ninguém bateu com confiança suficiente, OU os dois
+    # melhores candidatos estão muito próximos (pode ser qualquer um dos dois)
+    ambiguous = (
+        len(results) == 0
+        or (len(results) > 1 and (results[0].score - results[1].score) < VO_AMBIGUOUS_MARGIN)
+    )
+
+    # ── NEW: busca por grafo a partir dos hits
+    related: list[RelatedMemory] = []
+    if req.include_related:
+        related = await _dict_graph_related(
+            [(c.memory_id, c.score) for c in results], asyncio.get_event_loop()
+        )
+
+    return VoiceDictReadResponse(results=results, ambiguous=ambiguous, related=related)
+
+
+async def voice_dict_list():
+    rows = state.vo_db.list_people()
+    people = [
+        VoiceDictEntry(
+            person_id=row["id"],
+            person_name=row["person_name"],
+            description=row["description"],
+            source=row["source"],
+            confidence=row["confidence"],
+            memory_id=row["memory_id"],
+            examples_count=row["examples_count"],
+            created_at=row["created_at"],
+            access_count=row["access_count"],
+        ).model_dump()
+        for row in rows
+    ]
+    return {"total": len(people), "people": people}
+
+
+async def voice_dict_get(person_id: int):
+    row = state.vo_db.get_person_by_id(person_id)
+    if row is None:
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
+    return VoiceDictEntry(
+        person_id=row["id"],
+        person_name=row["person_name"],
+        description=row["description"],
+        source=row["source"],
+        confidence=row["confidence"],
+        memory_id=row["memory_id"],
+        examples_count=state.vo_db.count_examples(person_id),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+async def voice_dict_update(person_id: int, req: VoiceDictUpdateRequest):
+    """Edita só a descrição de uma pessoa já cadastrada, sem precisar
+    mandar um novo embedding junto."""
+    row = state.vo_db.get_person_by_id(person_id)
+    if row is None:
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
+    state.vo_db.update_description(person_id, req.description.strip())
+    row = state.vo_db.get_person_by_id(person_id)
+    return VoiceDictEntry(
+        person_id=row["id"],
+        person_name=row["person_name"],
+        description=row["description"],
+        source=row["source"],
+        confidence=row["confidence"],
+        memory_id=row["memory_id"],
+        examples_count=state.vo_db.count_examples(person_id),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+async def voice_dict_delete(person_id: int):
+    """Remove uma pessoa e todos os seus embeddings de voz (DB + FAISS).
+
+    A memória de longo prazo linkada (descrição gravada na criação) NÃO é
+    removida — a remoção explícita lá continua sendo responsabilidade de
+    quem gerencia `memories` (mesma política do visual-dict)."""
+    row = state.vo_db.get_person_by_id(person_id)
+    if row is None:
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
+
+    embedding_ids = state.vo_db.get_embedding_ids_by_person(person_id)
+    if embedding_ids:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, state.vo_index.remove_ids, set(embedding_ids))
+
+    deleted = state.vo_db.delete_person(person_id)
+    log.info(f"Voice-dict: pessoa #{person_id} removida ({len(embedding_ids)} embeddings)")
+    return {"deleted": deleted, "person_id": person_id, "embeddings_removed": len(embedding_ids)}
+
+
+# ── NEW: RAG de tools — seleção dinâmica das tools expostas ao LLM ────────────
+#
+# Fluxo esperado no orquestrador:
+#   1. no startup: tools_register_batch(todas as tools, prune_missing=True) —
+#      idempotente (tool inalterada não é re-embedada);
+#   2. a cada turno, ANTES de montar o campo `tools` da chamada ao LLM:
+#      tools_select(query) → só as tools devolvidas vão no payload;
+#   3. depois do turno: tools_record_usage(tools realmente chamadas, em ordem,
+#      + a query) → alimenta o grafo de co-uso/sequência e os exemplos aprendidos.
+#
+# Seleção = kNN em vetores (doc + exemplos + queries aprendidas) com max-pooling
+# por tool, threshold permissivo, expansão por PPR no grafo de co-uso, e tools
+# "core" sempre presentes. Confiança baixa no top-1 → rede mais larga.
+
+def _tool_doc_text(name: str, description: str) -> str:
+    return f"{name.replace('_', ' ')}: {description.strip()}"
+
+
+async def _delete_tool_row(row: sqlite3.Row) -> None:
+    loop = asyncio.get_event_loop()
+    vids = state.tl_db.get_vector_ids(row["id"])
+    if vids:
+        await loop.run_in_executor(None, state.tl_index.remove_ids, set(vids))
+    await loop.run_in_executor(None, state.tl_db.delete_tool, row["id"])
+
+
+async def _register_tool_locked(req: ToolRegisterRequest) -> ToolRegisterResponse:
+    name        = req.name.strip()
+    description = req.description.strip()
+    if not name or not description:
+        raise MemoryToolError("tool precisa de name e description não vazios")
+    examples: list[str] = []
+    for ex in req.examples:
+        ex = ex.strip()
+        if ex and ex not in examples:
+            examples.append(ex)
+    examples = examples[:TOOLS_MAX_EXAMPLES]
+
+    doc_text = _tool_doc_text(name, description)
+    doc_hash = hashlib.sha256("\n".join([doc_text, *examples]).encode()).hexdigest()
+    loop = asyncio.get_event_loop()
+
+    existing = state.tl_db.get_by_name(name)
+    if existing is not None and existing["doc_hash"] == doc_hash:
+        if bool(existing["is_core"]) != req.core:
+            state.tl_db.set_core(existing["id"], req.core)
+        return ToolRegisterResponse(
+            name=name, tool_id=existing["id"], status="unchanged",
+            vectors=len(state.tl_db.get_vector_ids(existing["id"])),
+        )
+
+    texts = [doc_text, *examples]
+    embeddings = await state.embed_engine.embed_passages(texts)   # antes de mutar qualquer coisa
+
+    if existing is not None:
+        tool_id = existing["id"]
+        # troca doc + exemplos; queries "learned" (uso real) são preservadas
+        old_ids = state.tl_db.get_vector_ids(tool_id, kinds=("doc", "example"))
+        if old_ids:
+            await loop.run_in_executor(None, state.tl_index.remove_ids, set(old_ids))
+            state.tl_db.delete_vectors(old_ids)
+        state.tl_db.update_tool(tool_id, description, req.core, doc_hash)
+        status = "updated"
+    else:
+        tool_id = state.tl_db.insert_tool(name, description, req.core, doc_hash)
+        status = "created"
+
+    vids = [
+        state.tl_db.insert_vector(tool_id, "doc" if i == 0 else "example", t)
+        for i, t in enumerate(texts)
+    ]
+    await loop.run_in_executor(None, state.tl_index.add_batch, embeddings, vids)
+    log.info(f"Tools: '{name}' {status} ({len(vids)} vetores, core={req.core})")
+    return ToolRegisterResponse(name=name, tool_id=tool_id, status=status, vectors=len(vids))
+
+
+async def tools_register(req: ToolRegisterRequest):
+    async with _tl_write_lock:
+        return await _register_tool_locked(req)
+
+
+async def tools_register_batch(req: ToolRegisterBatchRequest):
+    results: list[ToolRegisterResponse] = []
+    pruned: list[str] = []
+    async with _tl_write_lock:
+        for item in req.tools:
+            results.append(await _register_tool_locked(item))
+        if req.prune_missing:
+            keep = {ToolsDB._normalize_key(t.name) for t in req.tools}
+            for row in state.tl_db.list_tools():
+                if row["name_key"] not in keep:
+                    await _delete_tool_row(row)
+                    pruned.append(row["name"])
+    if pruned:
+        log.info(f"Tools: {len(pruned)} tools removidas do índice (prune_missing): {pruned}")
+    return ToolRegisterBatchResponse(results=results, pruned=pruned)
+
+
+async def tools_select(req: ToolSelectRequest):
+    query = req.query.strip()
+    if not query:
+        raise MemoryToolError("query vazia")
+    loop = asyncio.get_event_loop()
+
+    query_emb = await state.embed_engine.embed_query_one(query)
+    # sobre-amostra: vários vetores (doc + exemplos) apontam pra mesma tool
+    hits = await loop.run_in_executor(
+        None, state.tl_index.search, query_emb, max(req.top_k * 6, 30)
+    )
+    vec_to_tool = state.tl_db.get_tool_ids_by_vectors([v for v, _ in hits])
+    best: dict[int, float] = {}
+    for vid, score in hits:
+        tid = vec_to_tool.get(vid)
+        if tid is not None and score > best.get(tid, -1.0):
+            best[tid] = score
+    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+
+    top1 = ranked[0][1] if ranked else 0.0
+    low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
+    if low_confidence:
+        # confiança baixa: recall > precisão — rede mais larga, sem threshold
+        primary = ranked[:TOOLS_FALLBACK_TOP_K]
+    else:
+        primary = [(t, s) for t, s in ranked if s >= req.min_score][:req.top_k]
+
+    # tools alcançadas SÓ pelo grafo de co-uso/sequência (listar → ler → editar)
+    related: list[tuple[int, float]] = []
+    if req.include_related and primary:
+        ctx = await _ppr_spread_on(state.tl_db, primary, loop)
+        taken = {t for t, _ in primary}
+        related = [(t, s) for t, s in ctx["related_raw"] if t not in taken][:TOOLS_MAX_RELATED]
+
+    core_rows = state.tl_db.list_core()
+    core_ids = {r["id"] for r in core_rows}
+
+    rows = {r["id"]: r for r in state.tl_db.get_by_ids(
+        [t for t, _ in primary] + [t for t, _ in related] + list(core_ids)
+    )}
+    out: list[ToolMatch] = []
+    seen: set[int] = set()
+
+    def push(tid: int, score: float, match_type: str):
+        row = rows.get(tid)
+        if row is None or tid in seen:
+            return
+        seen.add(tid)
+        out.append(ToolMatch(
+            name=row["name"], description=row["description"],
+            score=round(score, 4), match_type=match_type,
+        ))
+
+    for tid, s in primary:
+        push(tid, s, "primary")
+    for tid, s in related:
+        push(tid, s, "related")
+    for tid in core_ids:
+        push(tid, best.get(tid, 0.0), "core")
+
+    log.info(
+        f"tools_select query='{query[:50]}' top1={top1:.3f} low_conf={low_confidence} "
+        f"primary={len(primary)} related={len(related)} core={len(core_ids)} -> {len(out)} tools"
+    )
+    return ToolSelectResponse(tools=out, top1_score=round(top1, 4), low_confidence=low_confidence)
+
+
+def _record_tool_edges_sync(tool_ids: list[int]) -> None:
+    now = time.time()
+    for i in range(len(tool_ids)):
+        for j in range(i + 1, len(tool_ids)):
+            state.tl_db.upsert_edge(tool_ids[i], tool_ids[j], EDGE_LEARNING_RATE, now, EDGE_CO_ACTIVATION)
+    for prev, nxt in zip(tool_ids, tool_ids[1:]):
+        state.tl_db.upsert_edge(prev, nxt, EDGE_LEARNING_RATE, now, EDGE_TEMPORAL)
+
+
+async def tools_record_usage(req: ToolUsageRequest):
+    """Registra o uso real: (1) arestas de co-uso e de sequência no grafo de
+    tools, (2) a query vira exemplo aprendido das tools usadas."""
+    loop = asyncio.get_event_loop()
+    ordered: list[int] = []
+    for name in req.tools_used[:TOOLS_USAGE_MAX_SEQUENCE]:
+        row = state.tl_db.get_by_name(name)
+        if row is not None and (not ordered or ordered[-1] != row["id"]):
+            ordered.append(row["id"])
+    if not ordered:
+        return {"recorded": False, "reason": "no_known_tools", "tools": 0, "learned": 0}
+
+    await loop.run_in_executor(None, state.tl_db.mark_used, ordered)
+    if len(ordered) > 1:
+        await loop.run_in_executor(None, _record_tool_edges_sync, ordered)
+
+    learned = 0
+    query = req.query.strip()
+    if query:
+        async with _tl_write_lock:
+            # `query` aqui vira um EXEMPLO ARMAZENADO no índice de tools
+            # (insert_vector abaixo + tl_index.add), pra ser encontrado
+            # depois por outras queries em tools_select — por isso é
+            # embedado como passage, não como query, apesar do nome da
+            # variável.
+            emb = await state.embed_engine.embed_passage_one(query)
+            for tid in dict.fromkeys(ordered):
+                if state.tl_db.count_learned(tid) >= TOOLS_MAX_LEARNED_EXAMPLES:
+                    continue
+                existing_vids = state.tl_db.get_vector_ids(tid)
+                near = await loop.run_in_executor(
+                    None, state.tl_index.search_subset, emb, existing_vids, 1
+                )
+                if near and near[0][1] >= TOOLS_LEARN_DEDUP_SCORE:
+                    continue
+                vid = state.tl_db.insert_vector(tid, "learned", query)
+                await loop.run_in_executor(None, state.tl_index.add, emb, vid)
+                learned += 1
+    return {"recorded": True, "tools": len(ordered), "learned": learned}
+
+
+async def tools_list():
+    rows = state.tl_db.list_tools()
+    return {
+        "total": len(rows),
+        "tools": [
+            {
+                "name": r["name"], "description": r["description"],
+                "core": bool(r["is_core"]), "vectors": r["vectors_count"],
+                "use_count": r["use_count"], "last_used": r["last_used"],
+            }
+            for r in rows
+        ],
+    }
+
+
+async def tools_delete(name: str):
+    row = state.tl_db.get_by_name(name)
+    if row is None:
+        raise MemoryToolError(f"Tool '{name}' não encontrada")
+    async with _tl_write_lock:
+        await _delete_tool_row(row)
+    return {"deleted": True, "name": row["name"]}
+
+
 # ── GET /status ────────────────────────────────────────────────────────────────
 
 def _gather_status_sync() -> dict:
@@ -3816,6 +5359,8 @@ def _gather_status_sync() -> dict:
             "decay_half_life_days": DECAY_HALF_LIFE_DAYS,
             "dedup_threshold":      DEDUP_THRESHOLD,
             "update_sim_threshold": UPDATE_SIM_THRESHOLD,
+            "rerank_duplicate_score": RERANK_DUPLICATE_SCORE,
+            "rerank_update_score":    RERANK_UPDATE_SCORE,
         },
         # ── NEW: grafo Hebbiano de co-ativação ──
         "hebbian_graph": {
@@ -3828,6 +5373,25 @@ def _gather_status_sync() -> dict:
             "ppr_damping":              PPR_DAMPING,
             "ppr_spread_weight":        PPR_SPREAD_WEIGHT,
             "mmr_lambda":               MMR_LAMBDA,
+            "ppr_expand_max_nodes":     PPR_EXPAND_MAX_NODES,
+            "ppr_expand_min_path_w":    PPR_EXPAND_MIN_PATH_WEIGHT,
+            "mmr_cosine_floor":         MMR_COSINE_FLOOR,
+            "edge_types":               list(EDGE_TYPES),
+        },
+        # ── NEW: LanceDB ──
+        "vector_store": {
+            "backend": "lancedb",
+            "path":    LANCE_DIR,
+        },
+        # ── NEW: RAG de tools ──
+        "tools": {
+            "tools_total":        state.tl_db.count(),
+            "vectors_total":      state.tl_index.total,
+            "edges_total":        state.tl_db.count_edges(),
+            "top_k":              TOOLS_TOP_K,
+            "min_score":          TOOLS_MIN_SCORE,
+            "low_confidence":     TOOLS_LOW_CONFIDENCE_SCORE,
+            "fallback_top_k":     TOOLS_FALLBACK_TOP_K,
         },
         "short_term": {
             "turn_groups_total":  state.st_db.count(),
@@ -3885,6 +5449,15 @@ def _gather_status_sync() -> dict:
             "min_score":        FD_MIN_SCORE,
             "top_k":            FD_TOP_K,
             "ambiguous_margin": FD_AMBIGUOUS_MARGIN,
+        },
+        # ── NEW: Voice dictionary status ──
+        "voice_dict": {
+            "people_total":     state.vo_db.count(),
+            "embeddings_total": state.vo_index.total,
+            "embed_dim":        VO_EMBED_DIM,
+            "min_score":        VO_MIN_SCORE,
+            "top_k":            VO_TOP_K,
+            "ambiguous_margin": VO_AMBIGUOUS_MARGIN,
         },
     }
     if state.vs is not None:

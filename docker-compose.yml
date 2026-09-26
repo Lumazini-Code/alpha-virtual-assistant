@@ -20,6 +20,7 @@ services:
       - ./scraping_client.py:/app/scraping_client.py
       - ava-cache:/root/.cache
       - ava-logs:/app/logs
+      - ./live_activation_server.py:/app/live_activation_server.py
 
     environment:
       AVA_DEBUG: ""

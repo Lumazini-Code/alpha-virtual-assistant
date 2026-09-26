@@ -45,3 +45,5 @@ node_modules/
 cache/
 
 Modules/transcribe/build
+
+Modules/memory/*

@@ -153,32 +153,6 @@ class MCPSkill:
     url: Optional[str] = None
 
 MCP_SKILLS: dict[str, MCPSkill] = {
-    "memory": MCPSkill(
-        skill_summary="Grava e busca fatos/contexto salvos na memória de longo/curto prazo.",
-        # HTTP, não stdio: o memory_server.py roda como processo único e
-        # compartilhado (ver seu docstring) — LLM.py conecta na MESMA
-        # instância para que SQLite/FAISS fiquem consistentes entre os dois
-        # consumidores. Suba-o separadamente (ex.: via start.sh) ANTES do
-        # orchestrator ou do LLM.py tentarem usar a skill "memory".
-        transport="http", url=MEMORY_MCP_URL,
-    ),
-    "playwright": MCPSkill(
-        skill_summary=(
-        "Controla um navegador de verdade (Chrome/Chromium) para acessar sites, clicar em "
-        "botões/links, preencher formulários, rolar a página, tirar screenshot e ler o "
-        "conteúdo real de uma página depois de carregada — inclusive sites que mudam "
-        "dinamicamente (JavaScript, login, resultados de busca renderizados no navegador). "
-        "Use sempre que o pedido envolver ABRIR, NAVEGAR, VISITAR ou INTERAGIR com um site "
-        "específico (ex: 'abra o YouTube', 'entra no meu email', 'clica no primeiro "
-        "resultado', 'tira um print da página', 'preenche esse formulário'). "
-        "Diferente de busca simples: isso não é pra pesquisar um termo na web, é pra "
-        "efetivamente controlar um navegador e ver/interagir com uma página real."
-    ),  command="npx", args=["-y", "@playwright/mcp@latest"],
-        pre_connect=lambda: _ensure_chrome_debug(),
-    ),
-    # Novos MCPs (ex.: sandbox, telegram, tts) entram aqui — só precisam de
-    # um `skill_summary` e dos parâmetros de conexão, nada no loop principal
-    # muda pra suportar um servidor a mais.
 }
 
 # "memory" removido daqui — não é mais um serviço HTTP com endpoint de

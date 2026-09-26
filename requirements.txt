@@ -65,4 +65,10 @@ scipy
 
 pytest-playwright
 
-mcp<2
+iceoryx2
+
+msgpack
+
+lancedb
+
+mcp

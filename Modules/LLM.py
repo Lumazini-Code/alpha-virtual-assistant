@@ -33,10 +33,8 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Optional
-from contextlib import AsyncExitStack
 import re
 import httpx
-import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -46,8 +44,8 @@ import logging
 from dotenv import load_dotenv
 import os
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from iceoryx2_rpc import call_memory_tool as _iceoryx2_call_memory_tool
+from iceoryx2_rpc import close as _close_memory_rpc
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM] %(message)s")
@@ -62,23 +60,10 @@ load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 
 BASEFOLDER = Path(__file__).parent.parent
 
-# URLs das APIs satélite
-# MEMORY_MCP_URL aponta pro endpoint MCP (streamable-http) de
-# mcp_servers/memory_server.py — processo compartilhado, rodado à parte
-# (default MCP_TRANSPORT=streamable-http nele mesmo). orchestrator.py usa a
-# MESMA env var/default (ver MEMORY_MCP_URL em orchestrator.py) para
-# conectar à mesma instância — os dois processos precisam enxergar o mesmo
-# estado (SQLite/FAISS), então NENHUM dos dois deve spawnar sua própria
-# cópia do servidor de memória. Path "/mcp" é o default do MCPServer/
-# FastMCP quando montado via mcp.run(transport="streamable-http").
-MEMORY_MCP_URL = os.getenv("MEMORY_MCP_URL", "http://localhost:3001/mcp")
-# Timeout para abrir a sessão MCP com a memória (handshake completo:
-# streamable-http + initialize()). Sem isso, uma memória lenta/travada
-# deixava _get_memory_session() pendurado indefinidamente até algo
-# externo (timeout de supervisor, healthcheck, etc.) cancelar a task —
-# e um CancelledError nesse ponto derrubava o startup inteiro (ver
-# comentário em _get_memory_session).
-MEMORY_MCP_CONNECT_TIMEOUT_S = float(os.getenv("MEMORY_MCP_CONNECT_TIMEOUT_S", "10"))
+# Memória agora é acessada via RPC local zero-copy (iceoryx2), não mais MCP/
+# streamable-http — ver iceoryx2_rpc.py. Não há mais URL/porta: o transporte
+# é IPC via shared memory, aberto automaticamente na primeira chamada
+# (call_memory_tool) e persistente pelo resto do processo, sem handshake.
 TTS_URL    = "http://localhost:3004"
 
 # OpenRouter API
@@ -104,15 +89,9 @@ ST_CONTEXT_PAIRS = 5
 _openrouter_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
 
-# ── Sessão MCP persistente (memória) ──
-# Substitui o antigo _memory_client (httpx.AsyncClient). Uma conexão MCP
-# não é um simples request/response — é um handshake (initialize()) sobre
-# um transporte (aqui, streamable-http) que precisa ficar aberto durante
-# toda a vida do processo, daí o AsyncExitStack guardando os context
-# managers abertos em vez de um "with" de escopo curto.
-_memory_session:    ClientSession   | None = None
-_memory_exit_stack: AsyncExitStack  | None = None
-_memory_session_lock = asyncio.Lock()
+# ── Memória via iceoryx2 (ver iceoryx2_rpc.py) ──
+# Sem estado de sessão aqui: call_memory_tool() do iceoryx2_rpc já mantém
+# seu próprio client/Node persistentes por processo (lazy, thread-safe).
 
 
 async def _get_openrouter_client() -> httpx.AsyncClient:
@@ -143,107 +122,20 @@ async def _get_openrouter_client() -> httpx.AsyncClient:
     return _openrouter_client
 
 
-async def _get_memory_session() -> ClientSession:
-    """Sessão MCP persistente com o servidor de memória — substitui o
-    antigo _get_memory_client() (httpx). Reaberta automaticamente se cair
-    (ver _call_memory_tool)."""
-    global _memory_session, _memory_exit_stack
-    if _memory_session is not None:
-        return _memory_session
-
-    async with _memory_session_lock:
-        if _memory_session is not None:   # outra task já abriu enquanto esperávamos o lock
-            return _memory_session
-
-        exit_stack = AsyncExitStack()
-        try:
-            # anyio.fail_after (não asyncio.wait_for!) — o cliente MCP usa
-            # cancel scopes/task groups do anyio por baixo dos panos.
-            # Misturar isso com o timeout do asyncio quebra a contabilidade
-            # de qual task "possui" cada cancel scope; o fail_after do
-            # próprio anyio é estruturado corretamente para esse aninhamento
-            # e propaga como TimeoutError comum (Exception, não BaseException).
-            with anyio.fail_after(MEMORY_MCP_CONNECT_TIMEOUT_S):
-                read, write, _ = await exit_stack.enter_async_context(
-                    streamablehttp_client(MEMORY_MCP_URL)
-                )
-                session = await exit_stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-        except BaseException:
-            # BaseException (não só Exception!) de propósito: desde o
-            # Python 3.8, asyncio.CancelledError herda de BaseException, não
-            # de Exception. Se algo cancelar esta task no meio do handshake
-            # (ex.: um supervisor externo derrubando um startup lento) e a
-            # gente só capturasse Exception, o aclose() abaixo seria pulado
-            # — deixando o cancel scope interno do anyio aberto na task
-            # atual. Ele só seria finalizado depois, via GC/athrow, em OUTRA
-            # task (ex.: no shutdown do asyncio.run()), e o anyio lançaria
-            # "Attempted to exit cancel scope in a different task than it
-            # was entered in". Fechar aqui, na mesma task, evita isso.
-            await exit_stack.aclose()
-            raise
-
-        _memory_exit_stack = exit_stack
-        _memory_session    = session
-        log.info(f"[MEMORY] Sessão MCP conectada em {MEMORY_MCP_URL}")
-        return _memory_session
+async def _call_memory_tool(name: str, arguments: dict) -> dict:
+    """Chama uma tool do servidor de memória via RPC local iceoryx2 (ver
+    iceoryx2_rpc.py) e devolve o payload já desserializado. Mantém a MESMA
+    assinatura (name, arguments) do antigo `_call_memory_tool` baseado em
+    MCP — nenhum call site precisou mudar. Erros de negócio (levantados
+    pelas tools em memory_server.py) chegam como RuntimeError, igual antes
+    (MemoryToolError/isError do MCP)."""
+    return await _iceoryx2_call_memory_tool(name, **arguments)
 
 
 async def _close_memory_session():
-    """Encerra a sessão MCP da memória, se houver uma aberta."""
-    global _memory_session, _memory_exit_stack
-    if _memory_exit_stack is not None:
-        try:
-            await _memory_exit_stack.aclose()
-        except Exception as e:
-            log.info(f"[MEMORY] Erro ao fechar sessão MCP: {e}")
-    _memory_session    = None
-    _memory_exit_stack = None
-
-
-def _unwrap_tool_result(result) -> dict:
-    """Extrai o payload estruturado do resultado de uma tool MCP.
-
-    As tools de memory_mcp.py têm tipo de retorno anotado (Pydantic model
-    ou dict), então o FastMCP popula `structuredContent` automaticamente
-    — preferimos isso. Fallback: tenta decodificar o primeiro content
-    block como JSON (compatibilidade com tools sem output schema)."""
-    if getattr(result, "structuredContent", None) is not None:
-        return result.structuredContent
-    if result.content:
-        text = getattr(result.content[0], "text", None)
-        if text:
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"text": text}
-    return {}
-
-
-async def _call_memory_tool(name: str, arguments: dict) -> dict:
-    """Chama uma tool do servidor MCP de memória e devolve o payload já
-    desserializado. Erros de negócio (MemoryToolError, em memory_mcp.py)
-    chegam como isError=True — viram RuntimeError aqui. Erros de
-    transporte invalidam a sessão em cache, para a próxima chamada
-    reconectar do zero em vez de reusar um transporte morto."""
-    try:
-        session = await _get_memory_session()
-        result = await session.call_tool(name, arguments)
-    except BaseException:
-        # BaseException por causa do CancelledError (ver _get_memory_session)
-        # — sem isso, uma chamada cancelada no meio do call_tool deixaria a
-        # sessão morta em cache, e a PRÓXIMA chamada reusaria um transporte
-        # inválido em vez de reconectar do zero.
-        global _memory_session, _memory_exit_stack
-        _memory_session    = None
-        _memory_exit_stack = None
-        raise
-
-    if result.isError:
-        msg = result.content[0].text if result.content else "erro desconhecido na tool de memória"
-        raise RuntimeError(msg)
-
-    return _unwrap_tool_result(result)
+    """Encerra o client RPC iceoryx2 da memória. Mantido com esse nome por
+    compatibilidade com o startup/shutdown existentes."""
+    _close_memory_rpc()
 
 
 def _get_tts_client() -> httpx.AsyncClient:
@@ -1193,8 +1085,10 @@ class ToolUseResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    """Verifica a OPENROUTER_API_KEY e abre a sessão MCP persistente com o
-    servidor de memória (memory_mcp.py)."""
+    """Verifica a OPENROUTER_API_KEY e faz uma chamada de teste (memory_status)
+    pro servidor de memória via RPC iceoryx2, só pra logar conectividade —
+    o client em si é lazy (ver iceoryx2_rpc.py) e reconecta sozinho a
+    qualquer momento, então uma falha aqui não impede a API de subir."""
     if not OPENROUTER_API_KEY:
         log.warning(
             "[STARTUP] OPENROUTER_API_KEY não configurada — inferência vai falhar "
@@ -1204,20 +1098,16 @@ async def startup():
         log.info(f"[STARTUP] OpenRouter configurado. Modelo principal: {MAIN_MODEL}")
 
     try:
-        await _get_memory_session()
+        await _call_memory_tool("memory_status", {})
+        log.info("[MEMORY] RPC iceoryx2 com o servidor de memória OK.")
     except asyncio.CancelledError as e:
-        # Ver comentário em _get_memory_session: sem o fix de lá, isso
-        # DERRUBAVA o startup inteiro ("Application startup failed. Exiting.")
-        # porque CancelledError não é capturado por "except Exception".
-        # Mantido aqui como rede de segurança extra — o objetivo declarado
-        # já era "a API sobe mesmo assim".
         log.warning(
-            f"[STARTUP] Conexão com a memória MCP cancelada durante o startup "
-            f"({MEMORY_MCP_URL}): {e}. A API sobe mesmo assim."
+            f"[STARTUP] Checagem da memória via iceoryx2 cancelada durante o "
+            f"startup: {e}. A API sobe mesmo assim."
         )
     except Exception as e:
         log.warning(
-            f"[STARTUP] Memory MCP não acessível em {MEMORY_MCP_URL}: {e}. "
+            f"[STARTUP] Memória (iceoryx2) não acessível: {e}. "
             "A API sobe mesmo assim — chamadas de memória vão falhar (e "
             "tentar reconectar sozinhas) até o servidor de memória subir."
         )
@@ -1225,7 +1115,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Fecha HTTP clients e a sessão MCP persistentes graciosamente."""
+    """Fecha HTTP clients e o client RPC iceoryx2 da memória graciosamente."""
     global _openrouter_client, _tts_http
     if _openrouter_client and not _openrouter_client.is_closed:
         await _openrouter_client.aclose()
