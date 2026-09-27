@@ -5,14 +5,19 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
-RUN chmod +x /app/start.sh
-
 RUN apt update
 
-RUN apt install -y pulseaudio-utils alsa-utils 
+RUN apt install -y pulseaudio-utils alsa-utils portaudio19-dev libc++1 libvulkan1 mesa-vulkan-drivers
 
 RUN apt-get install -y ripgrep
+
+
+RUN apt-get install -y curl && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs
+
+COPY package.json package-lock.json* ./
+
+RUN npm ci
 
 CMD ["/bin/bash", "/app/start.sh"]

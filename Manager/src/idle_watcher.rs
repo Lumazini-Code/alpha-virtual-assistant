@@ -1,22 +1,18 @@
 //! Monitor de inatividade.
 //!
 //! Roda em background (task tokio separada) e verifica periodicamente
-//! há quanto tempo cada processo está sem atividade. Se passar do limite,
+//! há quanto tempo o docker está sem atividade. Se passar do limite,
 //! derruba o processo automaticamente.
 //!
-//!   - llama-server: 15 minutos sem atividade -> stop
-//!   - docker:       45 minutos sem atividade -> stop
+//!   - docker: 45 minutos sem atividade -> stop
 //!
-//! "Atividade" é atualizada via `touch_llama_activity` / `touch_docker_activity`
-//! em process_manager.rs, que deve ser chamado pelo proxy de requisições da
-//! API (toda vez que uma chamada de inferência passar pelo llama-server)
-//! e/ou por ações manuais do usuário na GUI.
+//! "Atividade" é atualizada via `touch_docker_activity` em
+//! process_manager.rs e/ou por ações manuais do usuário na GUI.
 
 use crate::process_manager;
 use crate::state::{ProcStatus, SharedState};
 use std::time::{Duration, Instant};
 
-const LLAMA_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DOCKER_IDLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
 /// Intervalo de checagem. Não precisa ser fino — checar a cada 30s é
@@ -31,22 +27,7 @@ pub async fn run(state: SharedState) {
     loop {
         interval.tick().await;
 
-        check_llama_idle(&state).await;
         check_docker_idle(&state).await;
-    }
-}
-
-async fn check_llama_idle(state: &SharedState) {
-    let should_stop = {
-        let llama = state.llama.lock().await;
-        is_idle(llama.status.clone(), llama.last_activity, LLAMA_IDLE_TIMEOUT)
-    };
-
-    if should_stop {
-        tracing::info!("llama-server inativo há mais de 15 min — encerrando automaticamente.");
-        if let Err(e) = process_manager::stop_llama(state).await {
-            tracing::error!("Falha ao encerrar llama-server por inatividade: {e}");
-        }
     }
 }
 

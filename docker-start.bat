@@ -1,7 +1,6 @@
 @echo off
 REM start.bat — Windows
-REM Uso: start.bat --profile <cpu^|cuda^|vulkan> up [-d]
-REM Exemplo: start.bat --profile vulkan up -d
+REM Uso: start.bat up [-d]
 
 docker compose ^
   -f docker-compose.yml ^

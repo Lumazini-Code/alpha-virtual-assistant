@@ -11,6 +11,11 @@
 # ─────────────────────────────────────────
 _shutting_down=0
 export ALPHA_ENABLE_GIT=0
+
+# cwd fixo do Memory Server — isolado do resto do script (nenhum outro `cd`
+# depende dele nem é afetado por ele; ver uso em `restart_on_fail` abaixo).
+MEMORY_API_CWD="/app/Modules/memory"
+
 _cleanup() {
     if [ "$_shutting_down" -eq 1 ]; then return; fi
     _shutting_down=1
@@ -48,13 +53,15 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
+restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py" &
+sleep 1
+
+
+
 cd /app/Modules
 
 echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
-
-echo "  • CoT Generator..."
-restart_on_fail "CoT" "python3 'CoT generator.py'" &
 
 echo "  • Deep Search..."
 restart_on_fail "Deep Search" "python3 deep_search.py" &
@@ -62,25 +69,16 @@ restart_on_fail "Deep Search" "python3 deep_search.py" &
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &
 
-echo "  • Memory API..."
-restart_on_fail "Memory" "python3 memory.py" &
-
-echo "  • Search API..."
-restart_on_fail "Search" "python3 Search_api.py" &
-
 echo "  • TTS API..."
 restart_on_fail "TTS" "python3 TTS.py" &
 
-echo "  • VQA..."
-restart_on_fail "VQA" "python3 VQA.py" &
+echo "  • Vision API..."
+restart_on_fail "Vision" "python3 vision.py" &
 
-echo "  • Local Scraping & Client..."
-restart_on_fail "Local Scraping" "python3 local_scraping.py" &
 
-echo "  • Alpha-code Agent..."
-# Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports
-# relativos), então roda igual aos outros serviços em /app/Modules.
-restart_on_fail "alpha_code" "python3 alpha_code.py" &
+echo "  • Memory Server..."
+restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
+
 
 echo "✓ Todos os serviços iniciados"
 echo ""

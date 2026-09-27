@@ -52,3 +52,25 @@ psutil
 pyfiglet
 
 textual
+
+opencv-python-headless
+
+scikit-learn
+
+pillow
+
+scikit-image
+
+scipy
+
+pytest-playwright
+
+iceoryx2
+
+msgpack
+
+lancedb
+
+mcp
+
+regex

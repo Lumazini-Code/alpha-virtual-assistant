@@ -7,8 +7,6 @@ Modules/Models/*
 
 semanticSearch_onnx/*
 
-Modules/llama-cpp/*
-
 resource/Vosk_Model/*
 
 test/*
@@ -28,9 +26,24 @@ Manager/incremental/**
 Manager/.fingerprint/**
 Manager/ava-tray
 
+.opencode
+
+Modules/llama-cpp
+
+graphify-out
 
 .venv/**
 
 .env
 
 *.pyc
+
+*.cpython-311.pyc
+
+node_modules/
+
+cache/
+
+Modules/transcribe/build
+
+Modules/memory/db/*

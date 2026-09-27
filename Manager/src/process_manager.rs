@@ -1,424 +1,19 @@
-//! Gerenciamento dos processos filhos: llama-server e docker-start.
+//! Gerenciamento do processo filho: docker-start.
 //!
-//! Substitui a lógica do `llamaManager.py` (start/stop/status do llama-server)
-//! diretamente em Rust. O docker continua sendo chamado via subprocess,
-//! exatamente como no script original (docker-start.bat / docker-start.sh).
+//! O docker continua sendo chamado via subprocess, exatamente como no
+//! script original (docker-start.bat / docker-start.sh).
 
 use crate::state::{ProcStatus, SharedState};
 use anyhow::{bail, Context, Result};
-use std::collections::VecDeque;
-use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::fs::OpenOptions;
-/// Porta fixa do llama-server, igual ao script Python original.
-const LLAMA_PORT: u16 = 2001;
-const LLAMA_HOST: &str = "127.0.0.1";
-
-// ════════════════════════════════════════════════════════════════════════
-// Ringbuffer de log do llama-server
-// ════════════════════════════════════════════════════════════════════════
-
-/// Ringbuffer em memória para as últimas N linhas do log do llama-server.
-/// Acessível via API ou GUI sem precisar ler arquivos.
-#[derive(Debug)]
-pub struct LlamaLog {
-    /// Capacidade máxima do ringbuffer.
-    capacity: usize,
-    /// Linhas armazenadas (ordem de inserção).
-    lines: VecDeque<String>,
-}
-
-impl Default for LlamaLog {
-    fn default() -> Self {
-        Self::new(2000)
-    }
-}
-
-impl LlamaLog {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            lines: VecDeque::with_capacity(capacity),
-        }
-    }
-
-    /// Insere uma linha, descartando a mais antiga se necessário.
-    pub fn push(&mut self, line: String) {
-        if self.lines.len() >= self.capacity {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(line);
-    }
-
-    pub fn clear(&mut self) {
-        self.lines.clear();
-    }
-
-}
-
-/// Handle compartilhado do log — adicione ao `SharedState`.
-pub type SharedLlamaLog = Arc<TokioMutex<LlamaLog>>;
-
-/// Cria um novo handle de log com capacidade padrão de 2000 linhas.
-pub fn new_llama_log() -> SharedLlamaLog {
-    Arc::new(TokioMutex::new(LlamaLog::new(2000)))
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Tarefa interna: drena um pipe linha a linha e loga via tracing
-// ════════════════════════════════════════════════════════════════════════
-
-/// Drena `reader` linha a linha, emitindo cada linha via `tracing` e
-/// acumulando no ringbuffer `log`.
-///
-/// `stream_label` diferencia stdout de stderr no log:
-///   - `"llama-server[out]"` para stdout
-///   - `"llama-server[err]"` para stderr
-async fn drain_pipe<R>(
-    mut reader: BufReader<R>,
-    stream_label: &'static str,
-    log: SharedLlamaLog,
-    file_writer: Option<Arc<TokioMutex<tokio::fs::File>>>,
-)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
-                tracing::debug!(target: "llama-server", "[{}] {}", stream_label, trimmed);
-
-                // Escreve no arquivo de log, se disponível
-                if let Some(ref fw) = file_writer {
-                    let log_line = format!("[{stream_label}] {trimmed}\n");
-                    let _ = fw.lock().await.write_all(log_line.as_bytes()).await;
-                }
-
-                log.lock().await.push(trimmed);
-            }
-            Err(e) => {
-                tracing::warn!(target: "llama-server", "[{}] Erro ao ler pipe: {e}", stream_label);
-                break;
-            }
-        }
-    }
-    tracing::debug!(target: "llama-server", "[{}] <pipe fechado>", stream_label);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Parâmetros do llama-server (equivalentes a TEXT_PARAMS / VISION_PARAMS)
-// ════════════════════════════════════════════════════════════════════════
-
-/// Monta a lista de argumentos de linha de comando para o llama-server,
-/// espelhando TEXT_PARAMS / VISION_PARAMS do script Python.
-
-/// Procura um modelo draft MTP na mesma pasta do modelo principal.
-/// Convenção: arquivos .gguf cujo nome contenha "mtp" ou "draft"
-/// (case-insensitive), excluindo o próprio modelo e arquivos de mmproj.
-async fn find_mtp_draft_model(model_path: &str) -> Option<String> {
-    let model_path = Path::new(model_path);
-    let dir = model_path.parent()?;
-    let model_file_name = model_path.file_name()?.to_string_lossy().to_lowercase();
-
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    let mut candidates: Vec<String> = Vec::new();
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-            continue;
-        }
-
-        let file_name = path.file_name()?.to_string_lossy().to_lowercase();
-
-        // Ignora o próprio modelo e arquivos de mmproj
-        if file_name == model_file_name || file_name.contains("mmproj") {
-            continue;
-        }
-
-        if file_name.contains("mtp") || file_name.contains("draft") {
-            candidates.push(path.to_string_lossy().to_string());
-        }
-    }
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Prioriza candidatos cujo nome compartilha prefixo com o modelo principal
-    let base_stem = model_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-
-    candidates.sort_by_key(|c| {
-        let c_lower = c.to_lowercase();
-        // menor valor = melhor: nomes que compartilham o stem do modelo vêm primeiro
-        if !base_stem.is_empty() && c_lower.contains(&base_stem) {
-            0
-        } else {
-            1
-        }
-    });
-
-    tracing::info!("Draft MTP encontrado automaticamente: {}", candidates[0]);
-    Some(candidates.remove(0))
-}
-
-
-
-/// Monta os argumentos do llama-server.
-///
-/// REESCRITO (2026-08-05) com base no comando manual que o usuário confirmou
-/// rodar a ~35t/s, contra o máximo de ~12t/s da config antiga abaixo. O
-/// comando de referência era essencialmente minimalista:
-///
-///   llama-server -m <modelo> --cache-type-k q8_0 --cache-type-v q8_0
-///                -c 32000 -ngl 99 --top-k 80 --repeat-penalty 1.05 --jinja
-///
-/// A config antiga divergia dele em vários pontos ao mesmo tempo, então não
-/// dá pra apontar com 100% de certeza QUAL flag isolada causava a queda de
-/// ~3x — mas as suspeitas fortes, por ordem de probabilidade, são:
-///
-///   1. `--spec-type draft-mtp` + `--spec-draft-*` eram enviados SEMPRE,
-///      mesmo sem um modelo draft (`-md`) de fato presente — e mesmo quando
-///      presente, um draft mal casado com LFM2.5-8B-A1B (que já é um MoE de
-///      ~1B de parâmetros ativos, ou seja, muito barato de rodar sozinho)
-///      tende a gerar mais overhead de verificação/rejeição do que ganho.
-///      Especulação decoding ajuda modelos "densos e caros"; com um modelo
-///      já ultraleve o custo do draft pode superar o benefício.
-///   2. `--fit off` — em builds recentes do llama.cpp isso pode mudar como
-///      o servidor decide quantas camadas cabem na VRAM; combinado com
-///      `--gpu-layers 999` pode ter empurrado parte do modelo pra CPU sem
-///      isso ficar óbvio no log. O comando validado usa `-ngl 99` sem
-///      `--fit`.
-///   3. `--prio 2` + `--poll 50` fazem a thread de rede fazer busy-wait —
-///      combinado com `--threads`/`--threads-batch` = todos os núcleos da
-///      CPU, isso pode competir por ciclos de CPU com a submissão de
-///      trabalho pra GPU num cenário de offload quase total (`-ngl 99`).
-///   4. DRY sampler (`--dry-*`) adiciona varredura de repetição por token —
-///      overhead pequeno individualmente, mas soma.
-///
-/// Em vez de tentar isolar cada variável, a decisão foi: adotar a config
-/// mínima comprovada como baseline e só reintroduzir o que é claramente
-/// ortogonal ao throughput (cache de prompt, flash-attn, cont-batching —
-/// nenhum desses estava sendo trocado entre as duas versões testadas).
-/// Se quiser isolar a causa exata depois, reintroduza uma flag suspeita
-/// por vez e meça t/s.
-fn build_llama_args(
-    model_path: &str,
-    mmproj_path: Option<&str>,
-    mtp_draft_path: Option<&str>,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec!["--model".into(), model_path.into()];
-
-    let is_vision = mmproj_path.is_some();
-    if let Some(mmproj) = mmproj_path {
-        args.push("--mmproj".into());
-        args.push(mmproj.into());
-    }
-
-    // ── Flags do comando validado a ~35t/s (baseline, não mexer sem medir) ──
-    args.extend(str_pairs(&[
-        ("--ctx-size", "32000"),
-        ("--gpu-layers", "99"),
-        ("--cache-type-k", "q8_0"),
-        ("--cache-type-v", "q8_0"),
-        ("--top-k", "80"),
-        ("--repeat-penalty", "1.05"),
-        ("--host", "0.0.0.0"),
-        ("--port", &LLAMA_PORT.to_string()),
-    ]));
-    args.push("--jinja".into());
-
-    // ── Extras considerados seguros/ortogonais ao throughput medido ────────
-    // Nenhum destes estava sendo alterado entre a config lenta e a rápida,
-    // e --cache-prompt em particular é essencial pro esquema de cache de
-    // prefixo do system prompt usado pelo LLM.py.
-    args.push("--flash-attn".into());
-    args.push("on".into());
-    args.push("--cont-batching".into());
-    args.push("--cache-prompt".into());
-    args.push("--mmap".into());
-
-    if is_vision {
-        args.push("--mmproj-offload".into());
-        args.push("--image-max-tokens".into());
-        args.push("1024".into());
-    }
-
-    // ── Especulação (draft MTP): OFF por padrão ─────────────────────────────
-    // Suspeito #1 da regressão (ver doc da função). Só ativa se um draft
-    // for explicitamente resolvido (auto-descoberta em find_mtp_draft_model
-    // ou passado pelo caller) — e mesmo assim avisa no log, porque não foi
-    // validado que ajuda com este modelo. Se quiser desativar de vez,
-    // remova a chamada a find_mtp_draft_model no call-site de start_llama.
-    if let Some(draft) = mtp_draft_path {
-        tracing::warn!(
-            "Draft MTP '{}' será usado com speculative decoding — isso NÃO \
-             fazia parte do comando validado a ~35t/s e é suspeito de ter \
-             causado a regressão anterior (~12t/s) com LFM2.5-8B-A1B. \
-             Monitore t/s; se piorar, remova o arquivo draft da pasta do \
-             modelo ou passe mtp_draft_path=None.",
-            draft
-        );
-        args.push("-md".into());
-        args.push(draft.into());
-        args.extend(str_pairs(&[
-            ("--spec-type", "draft-mtp"),
-            ("--spec-draft-n-max", "3"),
-            ("--spec-draft-n-min", "1"),
-            ("--spec-draft-p-min", "0.75"),
-        ]));
-    }
-
-    args
-}
-
-fn str_pairs(pairs: &[(&str, &str)]) -> Vec<String> {
-    pairs
-        .iter()
-        .flat_map(|(k, v)| vec![k.to_string(), v.to_string()])
-        .collect()
-}
 
 // ════════════════════════════════════════════════════════════════════════
 // DESCOBERTA: detecta processos que já estão rodando
 // ════════════════════════════════════════════════════════════════════════
 
-/// Verifica se algo está escutando na porta do llama-server.
-async fn is_port_listening(host: &str, port: u16) -> bool {
-    let addr = format!("{host}:{port}");
-    TcpStream::connect(&addr).await.is_ok()
-}
-
-/// Tenta obter informações do modelo carregado via API do llama-server.
-/// Retorna o caminho do modelo se conseguir, ou None se falhar.
-async fn query_llama_model_info() -> Option<String> {
-    let url = format!("http://{LLAMA_HOST}:{LLAMA_PORT}/props");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .ok()?;
-
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let body: serde_json::Value = resp.json().await.ok()?;
-
-    // A API do llama-server retorna algo como:
-    // { "model": "/path/to/model.gguf", "mmproj": "/path/to/mmproj.gguf", ... }
-    let model_path = body.get("model")?.as_str()?.to_string();
-
-    // Tenta pegar mmproj também (pode não existir)
-    let _mmproj = body
-        .get("mmproj")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    Some(model_path)
-}
-
-/// Tenta descobrir o PID de um processo pelo nome (multiplataforma).
-/// Retorna o primeiro PID encontrado ou None.
-async fn find_pid_by_name(name: &str) -> Option<u32> {
-    let output = if cfg!(target_os = "windows") {
-        Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .await
-            .ok()?
-    } else {
-        Command::new("pgrep")
-            .args(["-x", name])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .await
-            .ok()?
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if cfg!(target_os = "windows") {
-        // Formato CSV: "nome.exe","PID","..."
-        stdout.lines().next().and_then(|line| {
-            let parts: Vec<&str> = line.split(',').collect();
-            parts.get(1)?.trim_matches('"').parse().ok()
-        })
-    } else {
-        // pgrep retorna apenas o PID (um por linha)
-        stdout.lines().next()?.trim().parse().ok()
-    }
-}
-
-/// Descobre se o llama-server já está rodando e atualiza o estado.
-async fn discover_llama_server(state: &SharedState) {
-    tracing::info!("Verificando se llama-server já está em execução...");
-
-    if !is_port_listening(LLAMA_HOST, LLAMA_PORT).await {
-        tracing::info!(
-            "Porta {} não está em uso, llama-server não está rodando.",
-            LLAMA_PORT
-        );
-        return;
-    }
-
-    tracing::info!(
-        "Porta {} está em uso, tentando identificar o modelo...",
-        LLAMA_PORT
-    );
-
-    // Tenta obter info do modelo via API
-    let model_path = query_llama_model_info().await;
-
-    // Evita closure assíncrono usando um `if` direto
-    let pid = find_pid_by_name("llama-server").await;
-    let pid = if pid.is_some() {
-        pid
-    } else if cfg!(windows) {
-        find_pid_by_name("llama-server.exe").await
-    } else {
-        None
-    };
-
-    let mut llama = state.llama.lock().await;
-    llama.status = ProcStatus::Running;
-    llama.pid = pid;
-    llama.model_path = model_path;
-    llama.port = LLAMA_PORT;
-    llama.last_activity = Some(Instant::now());
-
-    if let Some(ref model) = llama.model_path {
-        tracing::info!(
-            "llama-server detectado! PID: {:?}, Modelo: {}",
-            llama.pid,
-            model
-        );
-    } else {
-        tracing::info!(
-            "llama-server detectado na porta {} (não foi possível identificar o modelo)",
-            LLAMA_PORT
-        );
-    }
-}
-
-/// Descobre se o Docker (ambiente vulkan) já está rodando.
+/// Descobre se o Docker já está rodando.
 async fn discover_docker(state: &SharedState) {
     tracing::info!("Verificando se Docker já está em execução...");
 
@@ -442,8 +37,6 @@ async fn discover_docker(state: &SharedState) {
             "compose",
             "-f",
             compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile",
-            "vulkan",
             "ps",
             "--status",
             "running",
@@ -494,189 +87,11 @@ async fn discover_docker(state: &SharedState) {
 pub async fn discover_running_processes(state: &SharedState) {
     tracing::info!("═══ Descobrindo processos em execução... ═══");
 
-    discover_llama_server(state).await;
     discover_docker(state).await;
 
-    let llama = state.llama.lock().await;
     let docker = state.docker.lock().await;
 
-    tracing::info!(
-        "═══ Estado descoberto: llama-server={}, docker={} ═══",
-        llama.status.label(),
-        docker.status.label()
-    );
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// llama-server: start / stop / swap
-// ════════════════════════════════════════════════════════════════════════
-
-/// Inicia o llama-server para o modelo informado.
-///
-/// `log` é o ringbuffer compartilhado onde stdout/stderr do processo serão
-/// acumulados linha a linha. Passe `state.llama_log.clone()` no call-site.
-pub async fn start_llama(
-    state: &SharedState,
-    model_path: &str,
-    mmproj_path: Option<&str>,
-    mtp_draft_path: Option<&str>,
-    log: SharedLlamaLog,
-) -> Result<()> {
-    {
-        let llama = state.llama.lock().await;
-        if llama.status == ProcStatus::Running {
-            if llama.model_path.as_deref() == Some(model_path) {
-                tracing::info!("llama-server já está rodando com este modelo, ignorando pedido.");
-                return Ok(());
-            }
-        }
-    }
-
-    stop_llama(state).await.ok();
-
-    if !Path::new(model_path).exists() {
-        bail!("Modelo não encontrado: {model_path}");
-    }
-
-    {
-        let mut llama = state.llama.lock().await;
-        llama.status = ProcStatus::Starting;
-    }
-
-    // Limpa o log anterior antes de iniciar nova instância.
-    log.lock().await.clear();
-
-        let mtp_draft_owned: Option<String> = match mtp_draft_path {
-        Some(p) => Some(p.to_string()),
-        None => find_mtp_draft_model(model_path).await,
-    };
-    let mtp_draft_ref = mtp_draft_owned.as_deref();
-
-
-    let args = build_llama_args(model_path, mmproj_path, mtp_draft_ref);
-
-    tracing::info!(
-        "Iniciando llama-server: {} {}",
-        state.llama_server_bin.display(),
-        args.join(" ")
-    );
-
-    // Cria o comando
-    let mut cmd = Command::new(&state.llama_server_bin);
-
-    // Faz o spawn com os pipes e argumentos
-    let mut child = cmd
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(false)
-        .spawn()
-        .context("Falha ao iniciar llama-server. Verifique o caminho do binário.")?;
-
-    let pid = child.id();
-
-    // Drena stdout em task independente.
-    let log_file_path = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("llama-server.log");
-
-    let file_writer: Option<Arc<TokioMutex<tokio::fs::File>>> =
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_file_path)
-            .await
-        {
-            Ok(f) => {
-                tracing::info!("Log do llama-server será gravado em: {}", log_file_path.display());
-                Some(Arc::new(TokioMutex::new(f)))
-            }
-            Err(e) => {
-                tracing::warn!("Não foi possível criar arquivo de log '{}': {e}", log_file_path.display());
-                None
-            }
-        };
-
-    // Drena stdout em task independente.
-    if let Some(stdout) = child.stdout.take() {
-        let log_clone = log.clone();
-        let fw = file_writer.clone();
-        tokio::spawn(drain_pipe(
-            BufReader::new(stdout),
-            "llama-server[out]",
-            log_clone,
-            fw,
-        ));
-    }
-
-    // Drena stderr em task independente.
-    if let Some(stderr) = child.stderr.take() {
-        let log_clone = log.clone();
-        let fw = file_writer.clone();
-        tokio::spawn(drain_pipe(
-            BufReader::new(stderr),
-            "llama-server[err]",
-            log_clone,
-            fw,
-        ));
-    }
-
-    // Abandona o child sem derrubá-lo ao fazer drop — igual ao original.
-    std::mem::forget(child);
-
-    let mut llama = state.llama.lock().await;
-    llama.status = ProcStatus::Running;
-    llama.pid = pid;
-    llama.model_path = Some(model_path.to_string());
-    llama.mmproj_path = mmproj_path.map(|s| s.to_string());
-    llama.mtp_draft_path = mtp_draft_owned;
-    llama.port = LLAMA_PORT;
-    llama.last_activity = Some(Instant::now());
-
-    tracing::info!("llama-server iniciado (PID: {:?}), log ativo.", pid);
-    Ok(())
-}
-
-/// Encerra o llama-server, se estiver rodando.
-pub async fn stop_llama(state: &SharedState) -> Result<()> {
-    let pid = {
-        let mut llama = state.llama.lock().await;
-        if llama.status != ProcStatus::Running {
-            return Ok(());
-        }
-        llama.status = ProcStatus::Stopping;
-        llama.pid.take()
-    };
-
-    if let Some(pid) = pid {
-        kill_process(pid).await?;
-    } else {
-        // Se não temos PID (processo descoberto, não iniciado por nós),
-        // tentamos matar pelo nome.
-        kill_process_by_name("llama-server").await;
-        #[cfg(windows)]
-        kill_process_by_name("llama-server.exe").await;
-    }
-
-    let mut llama = state.llama.lock().await;
-    llama.status = ProcStatus::Stopped;
-    llama.pid = None;
-    llama.model_path = None;
-    llama.mmproj_path = None;
-    llama.last_activity = None;
-
-    tracing::info!("llama-server encerrado.");
-    Ok(())
-}
-
-/// Atualiza o timestamp de última atividade do llama-server.
-#[allow(dead_code)]
-pub async fn touch_llama_activity(state: &SharedState) {
-    let mut llama = state.llama.lock().await;
-    if llama.status == ProcStatus::Running {
-        llama.last_activity = Some(Instant::now());
-    }
+    tracing::info!("═══ Estado descoberto: docker={} ═══", docker.status.label());
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -708,7 +123,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
 
     let child = if cfg!(target_os = "windows") {
         Command::new(script)
-            .args(["--profile", "vulkan", "up"])
+            .args(["up"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -717,7 +132,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     } else {
         Command::new("bash")
             .arg(script)
-            .args(["--profile", "vulkan", "up"])
+            .args(["up"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -733,7 +148,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     docker.pid = pid;
     docker.last_activity = Some(Instant::now());
 
-    tracing::info!("Docker iniciado (perfil vulkan).");
+    tracing::info!("Docker iniciado.");
     Ok(())
 }
 
@@ -757,7 +172,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
     let result = if script.exists() {
         if cfg!(target_os = "windows") {
             Command::new(script)
-                .args(["--profile", "vulkan", "down"])
+                .args(["down"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
@@ -766,7 +181,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
         } else {
             Command::new("bash")
                 .arg(script)
-                .args(["--profile", "vulkan", "down"])
+                .args(["down"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
@@ -777,7 +192,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
         // Fallback: chama docker compose diretamente.
         tracing::warn!("Script não encontrado, usando docker compose diretamente...");
         Command::new("docker")
-            .args(["compose", "--profile", "vulkan", "down"])
+            .args(["compose", "down"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -807,90 +222,8 @@ pub async fn touch_docker_activity(state: &SharedState) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Util: matar processo por PID ou nome, multiplataforma
-// ════════════════════════════════════════════════════════════════════════
-
-#[cfg(unix)]
-async fn kill_process(pid: u32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
-    let nix_pid = Pid::from_raw(pid as i32);
-    let _ = kill(nix_pid, Signal::SIGTERM);
-
-    for _ in 0..10 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if kill(nix_pid, None).is_err() {
-            return Ok(());
-        }
-    }
-
-    tracing::warn!("Encerramento gracioso falhou, forçando kill -9 no PID {pid}");
-    let _ = kill(nix_pid, Signal::SIGKILL);
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn kill_process_by_name(name: &str) {
-    let _ = Command::new("pkill")
-        .args(["-x", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
-#[cfg(windows)]
-async fn kill_process(pid: u32) -> Result<()> {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    Ok(())
-}
-
-#[cfg(windows)]
-async fn kill_process_by_name(name: &str) {
-    let _ = Command::new("taskkill")
-        .args(["/IM", name, "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
-// ════════════════════════════════════════════════════════════════════════
 // Health check: verifica periodicamente se os processos ainda estão vivos
 // ════════════════════════════════════════════════════════════════════════
-
-/// Verifica se o llama-server ainda está respondendo.
-/// Se não estiver, atualiza o estado para Stopped.
-/// Retorna true se ainda está vivo, false se morreu.
-pub async fn health_check_llama(state: &SharedState) -> bool {
-    let is_running = {
-        let llama = state.llama.lock().await;
-        llama.status == ProcStatus::Running
-    };
-
-    if !is_running {
-        return false;
-    }
-
-    // Verifica se a porta ainda está aberta
-    if !is_port_listening(LLAMA_HOST, LLAMA_PORT).await {
-        tracing::warn!("llama-server parou de responder (porta fechada)!");
-        let mut llama = state.llama.lock().await;
-        llama.status = ProcStatus::Stopped;
-        llama.pid = None;
-        llama.model_path = None;
-        llama.last_activity = None;
-        return false;
-    }
-
-    true
-}
 
 /// Verifica se os containers Docker ainda estão rodando.
 /// Retorna true se ainda estão vivos, false se morreram.
@@ -920,8 +253,6 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
             "compose",
             "-f",
             compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "--profile",
-            "vulkan",
             "ps",
             "--status",
             "running",
