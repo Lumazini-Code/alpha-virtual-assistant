@@ -42,18 +42,14 @@ Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
   usando só os resumos em MCP_SKILLS (~1 linha cada, barato em tokens),
   e SÓ ENTÃO conecta e lista as tools reais daquele servidor.
 
-  Memory deixou de falar REST e virou MCP (`mcp_servers/memory_server.py`,
-  que importa a lógica de `Modules/memory.py` diretamente) — mas continua
-  sendo um processo HTTP compartilhado (streamable-http, porta 3001,
-  MEMORY_MCP_URL), porque LLM.py também precisa enxergar o MESMO estado
-  (SQLite/FAISS). Diferente das demais skills MCP (playwright etc.), que
-  este orchestrator spawna como subprocesso stdio sob demanda, "memory" é
-  um processo externo que precisa estar de pé antes do primeiro uso (ver
-  MCP_SKILLS["memory"], transport="http"). Tanto as leituras/escritas que o
+  Memory voltou a falar REST puro (`memory_api.py`, FastAPI sobre
+  `Modules/memory.py`) em vez de MCP — continua sendo um processo HTTP
+  compartilhado (porta 3000, MEMORY_API_URL), porque LLM.py também precisa
+  enxergar o MESMO estado (SQLite/LanceDB). Não é mais descoberta em duas
+  etapas nem sessão MCP: é um httpx.AsyncClient comum (`state.memory_client`),
+  igual aos demais microserviços HTTP. Tanto as leituras/escritas que o
   modelo decide chamar quanto o bookkeeping interno do orchestrator (turnos
-  de curto prazo, limpeza de sessão) passam pela mesma sessão MCP — ver
-  `_get_mcp_session("memory")`
-  e o helper `_call_memory_tool(...)`.
+  de curto prazo, limpeza de sessão) passam pelo helper `_memory_request(...)`.
 
 Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
@@ -80,7 +76,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
-
+import regex as re
 # ── MCP (Model Context Protocol) — cliente usado pelas tools externas ──
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -90,15 +86,13 @@ from mcp.client.streamable_http import streamable_http_client
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
-# MEMORY_URL (REST, porta 3001) removido — a memória não é mais um serviço
-# REST. Ela agora é o servidor MCP "memory" (ver MCP_SKILLS), rodando como
-# processo HTTP COMPARTILHADO (mcp_servers/memory_server.py, streamable-http)
-# — não é mais spawnado como subprocesso stdio por este orchestrator, porque
-# LLM.py também precisa falar com o MESMO processo/estado (SQLite/FAISS).
-# Acessado via _get_mcp_session("memory") / _call_memory_tool(...). Mesma env
-# var (mesmo default) usada por LLM.py — os dois processos devem apontar
-# para a mesma instância do memory_server.py.
-MEMORY_MCP_URL       = os.getenv("MEMORY_MCP_URL", "http://localhost:3001/mcp")
+# Memória volta a ser REST puro (memory_api.py, FastAPI sobre memory.py),
+# processo HTTP COMPARTILHADO — não é mais MCP nem spawnado por este
+# orchestrator, porque LLM.py também precisa falar com o MESMO
+# processo/estado (SQLite/LanceDB). Acessado via state.memory_client /
+# _memory_request(...). Mesma env var usada por LLM.py — os dois processos
+# devem apontar para a mesma instância do memory_api.py.
+MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://localhost:3000")
 TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
@@ -127,10 +121,12 @@ PROCESS_MANAGER_URL  = "http://localhost:9001"
 # Etapa 2: SÓ ENTÃO conectamos (stdio) e chamamos list_tools() nos
 # servidores escolhidos, carregando o schema completo das tools reais.
 #
-# Substitui os antigos executores hardcoded (_tool_memory_read,
-# _tool_memory_write, _tool_search, _tool_read_url,
+# Substitui os antigos executores hardcoded (_tool_search, _tool_read_url,
 # _tool_alpha_code) — cada um vira, em vez de uma função Python fixa, um
 # servidor MCP que expõe sua própria lista de tools dinamicamente.
+# "memory" NÃO entra aqui — voltou a ser REST puro (memory_api.py), acessado
+# diretamente via state.memory_client / _memory_request(...), sem passar
+# pela descoberta de skills MCP.
 @dataclass
 class MCPSkill:
     skill_summary: str                 # descrição curta, usada na etapa 1
@@ -155,19 +151,15 @@ class MCPSkill:
 MCP_SKILLS: dict[str, MCPSkill] = {
 }
 
-# "memory" removido daqui — não é mais um serviço HTTP com endpoint de
-# health próprio; sua saúde é checada via MCP (ver /status).
 HEALTH_PATHS: dict[str, str] = {
-    "search": "/status", "tts": "/status",
+    "search": "/status", "tts": "/status", "memory": "/status",
     "llm": "/health", "vision": "/vision/status", "deep_search": "/health", "alpha_code": "/health",
     "process_manager": "/status",
 }
 
 # Timeout por tool (usado tanto para chamadas de tool quanto pro loop de seleção)
-# memory_read/memory_write saíram daqui — agora são tools MCP, com timeout
-# controlado pela própria sessão MCP, não por este dict de tools nativas.
 EXECUTOR_TIMEOUTS: dict[str, float] = {
-    "llm": 9999999.0, "search": 60.0,
+    "llm": 9999999.0, "search": 60.0, "memory": 30.0, "memory_search": 30.0,
     "read_url": 30.0, "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
     "alpha_code": 9999999.0,
 }
@@ -176,6 +168,17 @@ MAX_CONTEXT_CHARS = 3000
 DEFAULT_TOP_K     = 5
 DEFAULT_MIN_SCORE = 0.30
 # Sem limite de rodadas: o loop só termina quando a tool "finish" é chamada.
+
+# ── Recall de memória (pré-loop + tool memory_search) ─────────────────────────
+# Antes de montar o histórico do tool loop, o orchestrator lê a memória em
+# paralelo: /read (LT semântico + knowledge KG-RAG + arquivos indexados) e
+# /read-short-term (histórico cru da sessão). Overrides de orçamento vão
+# clamped server-side (ReadRequest.top_k_final/total_max_chars).
+ORCH_RECALL_TOP_K       = int(os.getenv("ORCH_RECALL_TOP_K", "6"))
+ORCH_RECALL_TOP_K_FINAL = int(os.getenv("ORCH_RECALL_TOP_K_FINAL", "5"))
+ORCH_RECALL_MAX_CHARS   = int(os.getenv("ORCH_RECALL_MAX_CHARS", "3000"))
+ORCH_ST_PAIRS           = int(os.getenv("ORCH_ST_PAIRS", "5"))
+ORCH_ST_MAX_CHARS       = int(os.getenv("ORCH_ST_MAX_CHARS", "2400"))
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. Respond naturally and briefly. No reasoning needed.",
@@ -255,8 +258,9 @@ class AlphaCodeRequest(BaseModel):
 
 @dataclass
 class AppState:
-    # memory_client (httpx REST) removido — memória agora é MCP, ver
-    # mcp_sessions["memory"] / _call_memory_tool().
+    # memory_client (httpx REST) — fala com memory_api.py (FastAPI sobre
+    # memory.py), porta 3000, processo compartilhado com LLM.py.
+    memory_client: httpx.AsyncClient = field(default=None)
     search_client: httpx.AsyncClient = field(default=None)
     tts_client: httpx.AsyncClient = field(default=None)
     llm_client: httpx.AsyncClient = field(default=None)
@@ -328,8 +332,8 @@ async def _get_mcp_session(skill_name: str) -> ClientSession:
     `skill.transport`:
       - "stdio" (default): spawna um subprocesso próprio para esta skill.
       - "http": conecta via streamable-http a um processo MCP que já está
-        rodando de forma independente (ex.: "memory" — precisa ser o MESMO
-        processo que LLM.py também usa, não uma cópia spawnada aqui)."""
+        rodando de forma independente. ("memory" não usa mais este caminho —
+        voltou a ser REST puro, ver _memory_request.)"""
     if skill_name in state.mcp_sessions:
         log.debug(f"[_get_mcp_session] '{skill_name}' já conectado, reusando sessão")
         return state.mcp_sessions[skill_name]
@@ -376,37 +380,27 @@ async def _get_mcp_session(skill_name: str) -> ClientSession:
     return session
 
 
-async def _call_memory_tool(tool_name: str, arguments: dict) -> Any:
-    """Chama uma tool do servidor MCP "memory" (mcp_servers/memory_server.py,
-    processo HTTP compartilhado — ver MCP_SKILLS["memory"]) e devolve o
-    resultado já desserializado (dict/list/str). Substitui as antigas
-    chamadas REST `state.memory_client.post(...)`.
+async def _memory_request(method: str, path: str, json_body: Optional[dict] = None,
+                           params: Optional[dict] = None) -> Any:
+    """Chama a API REST de memória (memory_api.py, FastAPI sobre memory.py,
+    processo HTTP compartilhado — ver MEMORY_API_URL) e devolve o corpo já
+    desserializado (dict/list/None). Substitui o antigo `_call_memory_tool`
+    via MCP: memória voltou a falar REST puro, então isto é só um wrapper
+    fino sobre `state.memory_client`, igual aos demais microserviços.
 
-    Prefere `structuredContent` (populado automaticamente pelo FastMCP/
-    MCPServer para tools com retorno tipado) e cai para parsing do primeiro
-    content-block como JSON quando ausente — mesma lógica de
-    `_unwrap_tool_result` em LLM.py, para os dois consumidores tratarem a
-    resposta do mesmo jeito.
-
-    Levanta a exceção original se a tool reportar erro (isError=True) ou se
-    a conexão MCP falhar — quem chama decide como tratar (fallback,
-    HTTPException, log-and-ignore, etc.).
+    Levanta `httpx.HTTPStatusError` se a resposta não for 2xx — o handler
+    global `MemoryToolError -> 400` do memory_api.py já traduz erros de
+    domínio em corpo JSON `{"error": ...}`, então quem chama pode inspecionar
+    `exc.response.json()["error"]` quando quiser a mensagem original.
     """
-    session = await _get_mcp_session("memory")
-    result = await session.call_tool(tool_name, arguments)
-    if getattr(result, "isError", False):
-        detail = result.content[0].text if result.content else "erro desconhecido"
-        raise RuntimeError(f"memory tool '{tool_name}' falhou: {detail}")
-    structured = getattr(result, "structuredContent", None)
-    if structured is not None:
-        return structured
-    if not result.content:
+    r = await state.memory_client.request(
+        method, path, json=json_body, params=params,
+        timeout=EXECUTOR_TIMEOUTS["memory"],
+    )
+    r.raise_for_status()
+    if r.status_code == 204 or not r.content:
         return None
-    text = result.content[0].text
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return text
+    return r.json()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -415,7 +409,7 @@ async def lifespan(app: FastAPI):
     service_urls = {
         "tts": TTS_URL, "llm": LLM_URL, "vision": VISION_URL,
         "deep_search": DEEP_SEARCH_URL, "alpha_code": ALPHA_CODE_URL,
-        "process_manager": PROCESS_MANAGER_URL,
+        "process_manager": PROCESS_MANAGER_URL, "memory": MEMORY_API_URL,
     }
     async with httpx.AsyncClient(timeout=5.0) as probe:
         for name, url in service_urls.items():
@@ -424,19 +418,14 @@ async def lifespan(app: FastAPI):
                 log.info(f"  ✓ {name:16s} OK" if r.status_code == 200 else f"  ⚠ {name:16s} {r.status_code}")
             except httpx.ConnectError:
                 log.warning(f"  ✗ {name:16s} OFFLINE")
-    # "memory" não entra no probe HTTP simples acima (é MCP, não REST puro),
-    # mas AGORA é um processo externo de longa duração que precisa estar de
-    # pé ANTES do primeiro uso — diferente das demais skills MCP (stdio),
-    # que este orchestrator spawna sozinho sob demanda. Sua conexão é lazy
-    # (ver _get_mcp_session) e só é testada quando a skill "memory" é
-    # escolhida pela primeira vez; se o processo não estiver rodando em
-    # MEMORY_MCP_URL, essa primeira chamada falhará com erro de conexão.
-    log.info(f"  ℹ memory           serviço MCP compartilhado esperado em {MEMORY_MCP_URL} "
-             f"(suba mcp_servers/memory_server.py separadamente antes do primeiro uso)")
+    # "memory" é um processo externo de longa duração (memory_api.py) que
+    # precisa estar de pé antes do primeiro uso — assim como os demais
+    # microserviços HTTP acima, já entra no probe de health normal.
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
 
+    state.memory_client = _make_client(MEMORY_API_URL, 30.0)
     state.tts_client = _make_client(TTS_URL, 9999999.0)
     state.llm_client = _make_client(LLM_URL, 9999999.0)
     state.vision_client = _make_client(VISION_URL, 9999999.0)
@@ -456,7 +445,7 @@ async def lifespan(app: FastAPI):
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
-    for c in (state.tts_client, state.llm_client,
+    for c in (state.memory_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client,
               state.alpha_code_client, state.process_manager_client):
         await c.aclose()
@@ -519,18 +508,199 @@ async def _fire_tts(text, req):
 
 async def _save_turn(u, a, sid):
     try:
-        await _call_memory_tool("memory_write_short_term", {
+        await _memory_request("POST", "/write-short-term", {
             "session_id": sid,
             "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
         })
     except Exception:
         pass
 
-async def _save_lt(text, src="chat"):
+# ══════════════════════════════════════════════════════════════════════════════
+# Recall de memória pré-loop (A) — LT semântico + ST cru, em paralelo
+# ══════════════════════════════════════════════════════════════════════════════
+# Antes deste bloco o orchestrator montava o histórico do zero ([system, user])
+# e NUNCA lia memória: o /chat/tools do LLM.py não lê no modo tools, e não
+# havia nenhuma leitura do lado do orchestrator — só escritas pós-turno.
+
+async def _memory_read_semantic(query: str, sid: str,
+                                 top_k: int, top_k_final: int, max_chars: int) -> Optional[dict]:
+    """POST /read — LT semântico + ST + knowledge store + arquivos indexados,
+    com a estratégia auto do próprio memory.py (dual/expanded, segmentação,
+    PPR, MMR, rerank cross-encoder)."""
     try:
-        await _call_memory_tool("memory_write", {"text": text[:500], "source": src, "confidence": 0.8})
-    except Exception:
-        pass
+        return await _memory_request("POST", "/read", {
+            "query": query,
+            "top_k": top_k,
+            "min_score": 0.3,
+            "session_id": sid,
+            "strategy": "auto",
+            "top_k_final": top_k_final,
+            "total_max_chars": max_chars,
+        })
+    except Exception as e:
+        log.warning(f"Recall LT (/read) falhou (seguindo sem memória): {type(e).__name__}: {e}")
+        return None
+
+
+async def _memory_read_st_raw(sid: str, n_pairs: int) -> list[dict]:
+    """POST /read-short-term — histórico cru (últimas N duplas user/assistant
+    da sessão), para dar continuidade conversacional ao tool loop."""
+    if not sid:
+        return []
+    try:
+        resp = await _memory_request("POST", "/read-short-term", {
+            "session_id": sid, "n_pairs": n_pairs,
+        })
+        return resp.get("turns", []) or []
+    except Exception as e:
+        log.warning(f"Recall ST (/read-short-term) falhou (seguindo sem histórico): {type(e).__name__}: {e}")
+        return []
+
+
+def _norm_st_fragments(text: str) -> list[str]:
+    """Fragmentos normalizados (lowercase, sem prefixos [role]) da
+    representação compacta de um hit de ST — p/ dedup contra os turnos
+    crus do /read-short-term (mesma técnica do _build_memory_recall do
+    LLM.py)."""
+    frags: list[str] = []
+    for p in re.split(r"\s*\|\s*", text):
+        p = re.sub(r"^\[(?:user|assistant)\]\s*", "", p.strip(), flags=re.I)
+        p = p.lower().strip()
+        if p:
+            frags.append(p)
+    return frags
+
+
+def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]] = None) -> str:
+    """Formata os resultados do /read como bloco de contexto type-aware.
+
+    Mesma filosofia do _build_memory_recall do LLM.py, em inglês (língua do
+    system prompt do tool loop):
+      * long_term primary  → fatos/episódios conhecidos;
+      * long_term related  → associação indireta do grafo (evidência fraca);
+      * knowledge/indexed_file → material de referência, com fonte;
+      * short_term         → episódios de conversa; os que sobrepõem os
+        turnos crus (`st_turns`, quando passados) são descartados — já
+        entram como histórico literal, repetir no bloco é token desperdiçado.
+        Sem `st_turns` (ex.: tool memory_search), episódios ST passam direto.
+    Retorna "" quando não há nada útil.
+    """
+    if not read_res:
+        return ""
+    results = read_res.get("results") or []
+
+    recent_blob = ""
+    if st_turns:
+        recent_blob = " ".join(
+            (t.get("content") or "").lower() for t in st_turns if t.get("content")
+        )
+
+    lt_primary: list[str] = []
+    lt_related: list[str] = []
+    references: list[str] = []
+    for m in results:
+        text = (m.get("text") or m.get("content") or "").strip()
+        if not text:
+            continue
+        mtype = m.get("memory_type") or "long_term"
+        match = m.get("match_type") or "primary"
+        if mtype in ("knowledge", "indexed_file"):
+            src = m.get("file_name") or m.get("source")
+            references.append(text + (f" (source: {src})" if src else ""))
+        elif mtype == "short_term":
+            if recent_blob and any(
+                f in recent_blob for f in _norm_st_fragments(text) if len(f) >= 12
+            ):
+                continue
+            lt_primary.append(text)
+        elif match == "related":
+            lt_related.append(text)
+        else:
+            lt_primary.append(text)
+
+    sections: list[str] = []
+    if lt_primary:
+        sections.append("Known facts and episodes (long-term memory):\n"
+                        + "\n".join(f"- {t}" for t in lt_primary))
+    if lt_related:
+        sections.append("Graph associations (indirect context — may be relevant):\n"
+                        + "\n".join(f"- {t}" for t in lt_related))
+    if references:
+        sections.append("Reference material (knowledge base / indexed files):\n"
+                        + "\n".join(f"- {t}" for t in references))
+    return "\n\n".join(sections)
+
+
+def _sanitize_st_turns(turns: list[dict], max_chars: int) -> list[dict]:
+    """Turnos crus do /read-short-term → mensagens user/assistant alternadas
+    e válidas para a alternância estrita do chat template:
+      * descarta roles desconhecidos e conteúdos vazios;
+      * mescla mensagens consecutivas do MESMO role (grupos episódicos do ST
+        só têm assistant, o que quebraria user/assistant/user);
+      * corta as MAIS ANTIGAS até caber no orçamento de chars.
+    """
+    cleaned: list[dict] = []
+    for t in turns:
+        role = t.get("role")
+        content = (t.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if cleaned and cleaned[-1]["role"] == role:
+            cleaned[-1]["content"] += "\n" + content
+        else:
+            cleaned.append({"role": role, "content": content})
+    while len(cleaned) > 1 and sum(len(m["content"]) for m in cleaned) > max_chars:
+        cleaned.pop(0)
+    return cleaned
+
+
+async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
+    """Recall pré-loop: /read e /read-short-term EM PARALELO. Retorna
+    (bloco de recall formatado, turnos ST saneados). Qualquer falha degrada
+    para vazio — nunca derruba o tool loop."""
+    read_res, st_turns = await asyncio.gather(
+        _memory_read_semantic(
+            query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
+        ),
+        _memory_read_st_raw(sid, ORCH_ST_PAIRS),
+    )
+    clean_turns = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
+    return _format_recall_block(read_res, clean_turns), clean_turns
+
+
+async def _extract_memories_via_llm(u: str, a: str, sid: str):
+    """Extração de memórias pós-turno via o modelo extrator DEDICADO do LLM.py
+    (endpoint /memories/extract). Substitui o antigo _save_lt('Usuário disse:
+    ...') ingênuo, que gravava QUALQUER input como fato permanente de LT —
+    poluindo exatamente o recall que agora roda pré-loop. O extrator classifica
+    semantic (→ LT, com dedup/possible_update do memory.py) vs episodic
+    (→ ST) e só grava o que merece. Fire-and-forget."""
+    try:
+        r = await state.llm_client.post(
+            "/memories/extract",
+            json={"user_input": u, "assistant_response": a, "session_id": sid},
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
+        if r.status_code == 200:
+            # Observabilidade: antes o resultado era invisível (sucesso ou
+            # falha silenciosa — o bug do content vazio passou semanas sem
+            # ser notado). Logamos count + distribuição por tipo.
+            data = r.json()
+            saved = data.get("memories") or []
+            by_type: dict[str, int] = {}
+            for m in saved:
+                t = str(m.get("type") or "?")
+                by_type[t] = by_type.get(t, 0) + 1
+            log.info(
+                f"Extração de memórias pós-turno: {len(saved)} gravada(s) "
+                f"{by_type or '(nada a gravar)'} (session={sid})"
+            )
+        else:
+            log.warning(
+                f"Extração de memórias pós-turno: HTTP {r.status_code} — {r.text[:200]}"
+            )
+    except Exception as e:
+        log.warning(f"Extração de memórias pós-turno falhou (não-bloqueante): {type(e).__name__}: {e}")
 
 def _sse(event: str, data: Any) -> str:
     payload = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
@@ -727,7 +897,7 @@ async def _answer_vision_with_llm(objects: list[dict], user_prompt: str, history
     raise RuntimeError(f"LLM.py /chat/tools falhou com 503 após {ORCHESTRATOR_LLM_RETRIES + 1} tentativas em _answer_vision_with_llm")
 
 
-async def _tool_vision_objects(args: dict, req: ExecuteRequest):
+async def _tool_vision_objects(args: dict, req: ExecuteRequest, sid: str = ""):
     """
     Roda o pipeline de visão (vision.py /vision/process) na imagem anexada
     ao request: rostos primeiro (resolvidos direto contra o face-dict),
@@ -735,6 +905,9 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
     dicionário visual. Em seguida manda os crops, numa única chamada
     multi-imagem, para o LLM multimodal RESPONDER a pergunta do usuário
     diretamente — ver _answer_vision_with_llm.
+
+    `sid` não é usado aqui — a assinatura unificada (args, req, sid) é
+    exigida pelo call site único do loop (ver TOOLS[...]["executor"]).
     """
     if not req.image_base64:
         return "[vision_objects: no image was provided with this request]"
@@ -808,12 +981,59 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest):
 # _tool_alpha_code foi REMOVIDO — virou servidor MCP (alpha_code em
 # MCP_SKILLS).
 
+# ── B: tool nativa de recall ATIVO ────────────────────────────────────────────
+# A antiga _tool_memory_read foi removida quando memory virou REST puro, e o
+# modelo perdeu a capacidade de consultar memória DURANTE o tool loop. Esta
+# tool a restabelece por cima do /read (mesma rota usada no recall pré-loop),
+# devolvendo o bloco type-aware já formatado — o resultado vira mensagem
+# role="tool" no histórico via _result_to_text (str passa direto).
+async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return ("[memory_search: empty query — pass a focused natural-language "
+                "query about what you need to recall]")
+    try:
+        top_k = max(1, min(int(float(args.get("top_k") or ORCH_RECALL_TOP_K)), 10))
+    except (TypeError, ValueError):
+        top_k = ORCH_RECALL_TOP_K
+    effective_sid = sid or req.session_id or "default"
+    try:
+        read_res = await _memory_request("POST", "/read", {
+            "query": query,
+            "top_k": top_k,
+            "min_score": 0.3,
+            "session_id": effective_sid,
+            "strategy": "auto",
+            "top_k_final": ORCH_RECALL_TOP_K_FINAL,
+            "total_max_chars": ORCH_RECALL_MAX_CHARS,
+        })
+    except Exception as e:
+        return f"ERROR: memory_search failed: {type(e).__name__}: {e}"
+    block = _format_recall_block(read_res)
+    if not block:
+        return ("(memory_search: nothing relevant found — do NOT repeat the same query "
+                "worded differently; work with what you have, or try a materially "
+                "different angle once)")
+    return block
+
+
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
 # search e alpha_code saíram daqui: são descobertas
 # dinamicamente via MCP_SKILLS (ver _run_tool_loop).
 TOOLS: dict[str, dict[str, Any]] = {
+    "memory_search": {
+        "description": (
+            "Search your persistent memory for information the user told you before "
+            "(long-term facts, preferences, past events), plus your indexed knowledge "
+            "base and files. Use it BEFORE claiming you don't know something about the "
+            "user or inventing personal details — this is your own recollection. Pass a "
+            "focused natural-language `query` (optionally `top_k`, default 6)."
+        ),
+        "fields": [("query", "string", True), ("top_k", "number", False)],
+        "executor": _tool_memory_search,
+    },
     "vision_objects": {
         "description": (
             "Looks at the image attached to the current request (face recognition + object "
@@ -1011,6 +1231,118 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
     raise last_error  # type: ignore
 
 
+class _LLMNoRetryError(RuntimeError):
+    """Falha do /chat/stream que NÃO vale retry (status != 503, contexto grande)."""
+
+
+async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = None,
+                           temperature: float = 0.0, max_tokens: Optional[int] = None,
+                           on_delta=None) -> dict:
+    """
+    Variante STREAMING de _llm_chat: fala com o /chat/stream do LLM.py no modo
+    TOOLS (messages + tools) e consome o SSE devolvido. Cada fragmento de
+    content é repassado IMEDIATAMENTE via on_delta(texto) — é isso que dá
+    streaming de verdade no /execute (o /chat/tools síncrono só devolve a
+    mensagem completa no FIM da geração, e era por isso que a resposta chegava
+    na UI de uma vez).
+
+    As tool_calls do backend só ficam completas no fim da geração — o LLM.py
+    as acumula e emite UMA vez no evento {"tool_calls": [...]}, logo antes do
+    done. Por isso o retorno é o MESMO contrato do _llm_chat:
+    {"content": ..., "tool_calls": [...]}.
+
+    Retry: erro de conexão/timeout/503 usa o mesmo backoff do _llm_chat. Se o
+    stream quebrar no MEIO (deltas parciais já repassados), as retentativas
+    seguem SEM on_delta — reemitir duplicaria texto na UI; o texto visível é
+    curado no fim pelo `done` (final_response) do /execute. Se os retries do
+    stream se esgotarem, cai EM UM fallback para o /chat/tools síncrono.
+    """
+    payload: dict = {"messages": messages, "temperature": temperature,
+                     "stream_reasoning": False}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    last_error: Optional[Exception] = None
+    for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
+        content_acc: list[str] = []
+        tool_calls_final: list = []
+        try:
+            async with state.llm_client.stream("POST", "/chat/stream", json=payload) as resp:
+                if resp.status_code == 503:
+                    wait = ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1)
+                    log.warning(
+                        f"LLM.py retornou 503 no /chat/stream, "
+                        f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}, "
+                        f"aguardando {wait:.0f}s antes de retentar..."
+                    )
+                    if attempt < ORCHESTRATOR_LLM_RETRIES:
+                        await asyncio.sleep(wait)
+                        continue
+                    raise httpx.HTTPStatusError(
+                        "503 Service Unavailable", request=resp.request, response=resp,
+                    )
+                if resp.status_code != 200:
+                    body = ""
+                    async for chunk in resp.aiter_text():
+                        body += chunk
+                    raise _LLMNoRetryError(
+                        f"LLM.py /chat/stream HTTP {resp.status_code}: {body[:300]}"
+                    )
+
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    try:
+                        evt = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "delta" in evt:
+                        piece = evt.get("delta") or ""
+                        if piece:
+                            content_acc.append(piece)
+                            if on_delta is not None and attempt == 0:
+                                await on_delta(piece)
+                    elif "tool_calls" in evt:
+                        tool_calls_final = evt.get("tool_calls") or []
+                    elif "error" in evt:
+                        if evt.get("too_large"):
+                            raise _LLMNoRetryError(
+                                f"Contexto excede o limite do modelo: {evt.get('error')}"
+                            )
+                        raise RuntimeError(f"LLM.py /chat/stream: {evt.get('error')}")
+
+                return {
+                    "role": "assistant",
+                    "content": "".join(content_acc),
+                    "tool_calls": tool_calls_final,
+                    # True se algum delta chegou a ser repassado via on_delta
+                    # (tentativa 0 do stream). Usado pra deduplicar o delta
+                    # único do finish/vision quando o modelo já streamou o
+                    # mesmo texto como content.
+                    "streamed": on_delta is not None and attempt == 0 and bool(content_acc),
+                }
+        except _LLMNoRetryError:
+            raise
+        except (httpx.HTTPError, RuntimeError) as e:
+            last_error = e
+            log.warning(
+                f"LLM.py /chat/stream: erro ({type(e).__name__}: {e}), "
+                f"tentativa {attempt + 1}/{ORCHESTRATOR_LLM_RETRIES + 1}."
+            )
+            if attempt < ORCHESTRATOR_LLM_RETRIES:
+                await asyncio.sleep(ORCHESTRATOR_LLM_BACKOFF_S * (attempt + 1))
+                continue
+
+    # Stream esgotado após os retries — UM fallback síncrono (o _llm_chat tem
+    # o próprio ciclo de retry; sem streaming, a resposta sai em bloco único).
+    log.warning("LLM.py /chat/stream falhou após retries — caindo para /chat/tools síncrono")
+    return await _llm_chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+
+
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
                           mcp_tool_names: Optional[dict[str, str]] = None) -> str:
     """`mcp_tool_names`: nome da tool MCP -> descrição, já carregadas pela
@@ -1023,7 +1355,7 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     }
     reply_lang = lang_names.get((lang_hint or "").lower(), None)
     lines = [
-        "You are AVA, a helpful assistant. You have access to a set of tools/functions.",
+        "You are Alpha, a helpful assistant. You have access to a set of tools/functions.",
         "",
         "Always reply in the same language the user wrote their message in"
         + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
@@ -1069,8 +1401,12 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "event names) in the original language to avoid mistranslation. If unsure about a date or "
         "temporal relation in the source, omit it rather than guessing.",
 
-        "To deliver your final answer to the user, call the `finish` tool with the complete "
-        "response text as its `response` argument. The task is not done until you call `finish`.",
+        "Always deliver your final answer as plain text in your normal reply (message "
+        "content) — write the COMPLETE response there: this text streams to the user live "
+        "as you generate it, so never hold it back or bury it in tool arguments. Call the "
+        "`finish` tool only to signal the end; when you do, `response` may repeat the same "
+        "final answer for the record. Ending your turn with plain text and no tool call "
+        "also completes the task (that counts as done).",
         "",
         f"Today is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
         "",
@@ -1148,6 +1484,13 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     """
     depth, think_instruction = await _think_instruction(req.input)
 
+    # ── A: Recall de memória em background ──────────────────────────────────
+    # Dispara JÁ, em paralelo com a descoberta de tools — o custo do recall
+    # (2 round-trips HTTP para a memory_api) fica escondido atrás do handshake
+    # MCP. Antes deste bloco o loop montava o histórico do zero e nunca lia
+    # memória (só escrevia pós-turno) — a memória gravada nunca voltava.
+    recall_task = asyncio.ensure_future(_recall_for_turn(req.input, sid)) if req.input else None
+
     # ── Descoberta de tools em duas etapas ──
     # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
     # usando só os resumos leves — sem conectar em nada ainda.
@@ -1158,7 +1501,23 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     mcp_descriptions = {name: spec["function"]["description"] for spec in mcp_schema
                          for name in [spec["function"]["name"]]}
 
+    # Coleta o recall disparado acima (já deve ter terminado — o MCP costuma
+    # levar mais; se não, esperamos aqui mesmo).
+    recall_block, st_turns = ("", []) if recall_task is None else await recall_task
+
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang, mcp_tool_names=mcp_descriptions)
+    if recall_block:
+        # Recall entra no system prompt (não como mensagem user/assistant) —
+        # preserva a alternância estrita do chat template e mantém o bloco
+        # fixo durante o loop inteiro. O modelo deve tratar como memória
+        # própria, sem citar o mecanismo.
+        system_prompt += (
+            "\n\n## Recovered memory (your own recollection — use it naturally, "
+            "never mention this retrieval mechanism)\n"
+            + recall_block
+        )
+        log.info(f"[{eid[:8]}] Recall pré-loop: {len(recall_block)} chars de memória LT/knowledge, "
+                 f"{len(st_turns)} turno(s) ST injetados")
     tools_schema = _build_native_tools_schema() + mcp_schema
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
@@ -1178,8 +1537,17 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             "it again.]"
         )
 
+    # ── Histórico: system (com recall) + turnos ST crus + user atual ────────
+    # Os turnos ST dão continuidade conversacional literal (mesmo contrato do
+    # modo CHAT do LLM.py). Ajuste de alternância: turnos user pendentes no
+    # FIM do ST (grupo episódico sem resposta) são descartados — o novo user
+    # emenda neles e dois user consecutivos violam o chat template.
+    while st_turns and st_turns[-1]["role"] == "user":
+        st_turns.pop()
+
     history: list[dict] = [
         {"role": "system", "content": system_prompt},
+        *[{"role": t["role"], "content": t["content"]} for t in st_turns],
         {"role": "user", "content": user_content},
     ]
 
@@ -1213,9 +1581,25 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # só pronto pro PRÓXIMO turno, sem gerar resposta pra este.
     AUTO_FINISH_TOOLS = {"vision_objects"}
 
+    # ── Streaming de verdade pro /execute ──────────────────────────────────
+    # Quando há on_event (modo SSE do /execute), cada fragmento de content
+    # gerado pelo LLM vira um evento "delta" NA HORA — em vez do bloco único
+    # que só existia depois do fim da geração (a resposta chegava inteira na
+    # UI). Texto intermediário de turnos com tool_call também aparece ao
+    # vivo; o TTS continua conservador (só a resposta final é falada).
+    if on_event is not None:
+        async def on_delta(piece: str) -> None:
+            await on_event("delta", piece)
+    else:
+        on_delta = None
+
     while True:
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
-        message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
+        if on_delta is not None:
+            message = await _llm_chat_stream(history, tools=tools_schema,
+                                             temperature=0.3, on_delta=on_delta)
+        else:
+            message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
         tool_calls = message.get("tool_calls") or []
         log.debug(
             f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "
@@ -1275,6 +1659,14 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # ── Se a tool for "finish", extrai a resposta final dos argumentos ──
             if tool_name == "finish":
                 final_response = args.get("response", "") or "(sem resposta)"
+                # O texto do finish vem nos ARGUMENTOS da tool_call (não passa
+                # pelo content streamado) — sai como delta único. EXCETO quando
+                # o modelo acabou de streamar esse MESMO texto como content
+                # (padrão comum: responde no content e repete no finish) —
+                # reemitir duplicaria o texto na UI até o done curar.
+                if on_event and not (message.get("streamed")
+                                     and message.get("content") == final_response):
+                    await on_event("delta", final_response)
                 step_results.append(StepResult(
                     step=turn, executor="finish",
                     action=json.dumps(args, ensure_ascii=False),
@@ -1290,7 +1682,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             try:
                 if is_native:
                     result = await asyncio.wait_for(
-                        TOOLS[tool_name]["executor"](args, req),
+                        TOOLS[tool_name]["executor"](args, req, sid),
                         timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
                     )
                 else:
@@ -1345,6 +1737,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # direto, sem gerar nada agora.
             if tool_name in AUTO_FINISH_TOOLS and success and isinstance(result, dict) and result.get("answer"):
                 final_response = result["answer"]
+                # Resposta vem da tool (modelo multimodal), não do content
+                # streamado — delta único (com a mesma dedup do finish).
+                if on_event and not (message.get("streamed")
+                                     and message.get("content") == final_response):
+                    await on_event("delta", final_response)
                 finished = True
                 break
 
@@ -1378,6 +1775,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 )
                 finished = True
                 final_response = await _force_finish(history, eid)
+                # Chamada de fechamento é síncrona (_llm_chat) — delta único.
+                if on_event:
+                    await on_event("delta", final_response)
                 step_results.append(StepResult(
                     step=turn, executor="orchestrator",
                     action="anti-loop hard stop", success=True, result=final_response,
@@ -1431,7 +1831,12 @@ async def _execute_stream_generator(req: ExecuteRequest):
             error_msg = data
             yield _sse("error", {"error": error_msg})
             break
-        if name == "tool_call":
+        if name == "delta":
+            # Fragmento incremental do content do LLM (streaming real, vem do
+            # _llm_chat_stream durante o tool loop). A UI concatena; o `done`
+            # final cura o texto visível com final_response.
+            yield _sse("delta", data)
+        elif name == "tool_call":
             yield _sse("tool_call", data)
         elif name == "tool_result":
             yield _sse("step_done", data)
@@ -1441,15 +1846,20 @@ async def _execute_stream_generator(req: ExecuteRequest):
 
     await task
 
-    if final_response:
-        yield _sse("delta", final_response)
+    # NOTA: não há mais yield de "delta" único aqui com a resposta inteira —
+    # os deltas agora chegam incrementalmente DURANTE o loop (via on_event),
+    # e os paths que não passam pelo content (finish/vision/force_finish)
+    # emitem o próprio delta único dentro do _run_tool_loop.
 
     if req.tts and final_response:
         asyncio.create_task(_fire_tts(final_response, req))
 
     if final_response:
         asyncio.create_task(_save_turn(req.input, final_response, sid))
-        asyncio.create_task(_save_lt(f"Usuário disse: {req.input[:200]}"))
+        # B+: extração real (modelo extrator do LLM.py, roteando semantic→LT /
+        # episodic→ST) no lugar do antigo "_save_lt('Usuário disse: ...')" —
+        # que gravava qualquer input como fato permanente de LT.
+        asyncio.create_task(_extract_memories_via_llm(req.input, final_response, sid))
 
     lat = round((time.perf_counter() - t0) * 1000, 2)
     errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
@@ -1645,7 +2055,7 @@ async def deep_search(req: DeepSearchRequest):
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):
     try:
-        return await _call_memory_tool("memory_read", {
+        return await _memory_request("POST", "/read", {
             "query": req.query, "top_k": req.top_k, "min_score": req.min_score,
             "session_id": req.session_id, "strategy": "auto",
         })
@@ -1655,7 +2065,7 @@ async def memory_read(req: MemoryReadRequest):
 @app.post("/memory/write")
 async def memory_write(req: MemoryWriteRequest):
     try:
-        return await _call_memory_tool("memory_write", {
+        return await _memory_request("POST", "/write", {
             "text": req.text, "source": req.source, "confidence": req.confidence,
             "forgettable": req.forgettable, "ttl_days": req.ttl_days,
             "action": req.action, "memory_id": req.memory_id,
@@ -1666,7 +2076,7 @@ async def memory_write(req: MemoryWriteRequest):
 @app.post("/memory/write-batch")
 async def memory_write_batch(reqs: list[MemoryWriteRequest]):
     try:
-        return await _call_memory_tool("memory_write_batch", {
+        return await _memory_request("POST", "/write/batch", {
             "items": [
                 {
                     "text": r.text, "source": r.source, "confidence": r.confidence,
@@ -1718,6 +2128,7 @@ async def status():
     cfg = {
         "search": (state.search_client, HEALTH_PATHS["search"]),
         "tts": (state.tts_client, HEALTH_PATHS["tts"]),
+        "memory": (state.memory_client, HEALTH_PATHS["memory"]),
         "llm": (state.llm_client, HEALTH_PATHS["llm"]),
         "vision": (state.vision_client, HEALTH_PATHS["vision"]),
         "deep_search": (state.deep_search_client, HEALTH_PATHS["deep_search"]),
@@ -1731,14 +2142,6 @@ async def status():
         except Exception:
             checks[n] = {"healthy": False, "status_code": None}
 
-    # "memory" não tem endpoint HTTP — sua saúde é checada chamando a
-    # própria tool MCP `memory_status` (conecta lazily se ainda não conectado).
-    try:
-        mem_status = await _call_memory_tool("memory_status", {})
-        checks["memory"] = {"healthy": mem_status is not None, "status_code": None, "mcp": True}
-    except Exception as e:
-        checks["memory"] = {"healthy": False, "status_code": None, "mcp": True, "error": str(e)}
-
     return {
         "orchestrator": "ok", "architecture": "tool-calling + MCP (two-stage discovery)",
         "services": checks,
@@ -1750,7 +2153,7 @@ async def status():
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     try:
-        return await _call_memory_tool("memory_clear_session", {"session_id": session_id})
+        return await _memory_request("DELETE", f"/session/{session_id}")
     except Exception as e:
         raise HTTPException(502, f"Session clear falhou: {e}")
 

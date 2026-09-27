@@ -4,7 +4,7 @@ AVA — LLM Inference API (OpenRouter Edition)
 REST API para inferência conversacional com:
   - Backend 100% via OpenRouter (sem llama-server local)
   - Modelo principal: z-ai/glm-5.3-flash
-  - Modelo extrator de memórias: google/gemma-4-26b-a4b-it:free
+  - Modelo extrator de memórias: env MEMORY_EXTRACTOR_MODEL (com fallback p/ MAIN_MODEL)
   - Integração com API de Memória via MCP (LT + ST via session_id)
   - Integração com API de TTS (localhost:3004)
   - Streaming de texto + disparo paralelo de áudio
@@ -31,6 +31,8 @@ import json
 import datetime
 import asyncio
 import time
+import math
+import difflib
 from pathlib import Path
 from typing import Optional
 import re
@@ -44,8 +46,6 @@ import logging
 from dotenv import load_dotenv
 import os
 
-from iceoryx2_rpc import call_memory_tool as _iceoryx2_call_memory_tool
-from iceoryx2_rpc import close as _close_memory_rpc
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM] %(message)s")
@@ -60,10 +60,10 @@ load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 
 BASEFOLDER = Path(__file__).parent.parent
 
-# Memória agora é acessada via RPC local zero-copy (iceoryx2), não mais MCP/
-# streamable-http — ver iceoryx2_rpc.py. Não há mais URL/porta: o transporte
-# é IPC via shared memory, aberto automaticamente na primeira chamada
-# (call_memory_tool) e persistente pelo resto do processo, sem handshake.
+# Memória agora é acessada via API REST (memory_api.py — FastAPI sobre
+# memory.py), não mais via iceoryx2/MCP. Client httpx persistente, criado
+# lazy na primeira chamada e reutilizado pelo resto do processo.
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:3000")
 TTS_URL    = "http://localhost:3004"
 
 # OpenRouter API
@@ -71,12 +71,228 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 
 # Modelos (fixos — não há mais servido local via llama-server)
-MAIN_MODEL              = "z-ai/glm-5.3-flash"
-MEMORY_EXTRACTOR_MODEL  = "google/gemma-4-26b-a4b-it:free"
+MAIN_MODEL  = "z-ai/glm-5.3-flash"
+# Extrator de memórias pós-turno. Env-configurável: modelos free/pequenos
+# frequentemente NÃO suportam o `response_format: json_schema` do OpenRouter
+# e retornam 200 com `content` vazio — a cadeia de tentativas do extrator
+# (ver _extract_and_save_memories) cai para: (1) extrator sem response_format,
+# (2) modelo de fallback (default = MAIN_MODEL).
+MEMORY_EXTRACTOR_MODEL = os.getenv(
+    "MEMORY_EXTRACTOR_MODEL", "meta-llama/llama-3.1-8b-instruct",
+)
+# "" (default) = usa MAIN_MODEL como último recurso da cadeia.
+MEMORY_EXTRACTOR_FALLBACK_MODEL = os.getenv("MEMORY_EXTRACTOR_FALLBACK_MODEL", "")
 
 # Contexto de curto prazo: quantas duplas pergunta-resposta (turn groups)
 # são lidas cruas do /read_st a cada turno, em paralelo com o /read semântico.
 ST_CONTEXT_PAIRS = 5
+
+# Recall de chat: overrides de orçamento enviados ao /read (ReadRequest do
+# memory_api). O default server-side é conservador (3 entradas / 2400 chars) —
+# o recall de conversação pede um pouco mais de contexto, clampeado server-side.
+CHAT_RECALL_TOP_K_FINAL     = int(os.getenv("CHAT_RECALL_TOP_K_FINAL", "6"))
+CHAT_RECALL_TOTAL_MAX_CHARS = int(os.getenv("CHAT_RECALL_TOTAL_MAX_CHARS", "3200"))
+
+# ─────────────────────────────────────────────────────────────
+#   RECUPERAÇÃO CONTÍNUA DE MEMÓRIA (confidence-watch + prefill)
+# ─────────────────────────────────────────────────────────────
+# Ideia: durante o streaming, acompanhamos o logprob médio dos tokens dentro
+# de uma "janela de frase" (do início da frase até o próximo `.`/`!`/`?`/`\n`).
+# Se a confiança média da janela cair abaixo de um limiar, a geração é
+# INTERROMPIDA (fechamos a conexão de streaming atual), o texto da janela +
+# algumas linhas anteriores de contexto são enviados como query para
+# `memory_read` (mesma API de memória usada no resto do arquivo). Se vier
+# alguma evidência relevante o suficiente, um modelo pequeno classifica a
+# relação evidência↔frase interrompida (confirmação/complementação/correção
+# pequena/contradição forte/erro factual/mudança de raciocínio) e essa
+# classificação escolhe o prefill de retomada. A retomada é uma NOVA
+# requisição a /chat/completions cuja última mensagem é role="assistant"
+# com o texto já gerado + o bloco <MEMORY_CORRECTION> (evidência embutida) +
+# o prefill escolhido — o modelo "continua" a própria fala a partir dali
+# (o bloco de correção nunca é emitido ao usuário via SSE; só o prefill e o
+# texto gerado depois dele são).
+#
+# Ativado por request via `watch_confidence=true` no ChatRequest — é opt-in
+# porque adiciona latência (round-trips extras de memory_read/classificação)
+# e só funciona no modo CHAT (precisa de session_id e de uma query semântica
+# com sentido; no modo TOOLS o caller já gerencia seu próprio histórico).
+
+CONFIDENCE_THRESHOLD        = float(os.getenv("CONFIDENCE_THRESHOLD", "0.55"))
+CONFIDENCE_MIN_TOKENS       = int(os.getenv("CONFIDENCE_MIN_TOKENS", "6"))
+CONFIDENCE_MAX_CORRECTIONS  = int(os.getenv("CONFIDENCE_MAX_CORRECTIONS", "2"))
+CONFIDENCE_CONTEXT_CHARS    = int(os.getenv("CONFIDENCE_CONTEXT_CHARS", "400"))
+MEMORY_MATCH_MIN_SIMILARITY = float(os.getenv("MEMORY_MATCH_MIN_SIMILARITY", "0.28"))
+# Probe do vigia: após N chunks de conteúdo sem NENHUM logprob, assume que o
+# provedor não suporta logprobs e desativa/avisa (o vigia antes falhava em
+# silêncio — window nunca acumulava e o memory_read de correção nunca rodava).
+WATCH_LP_PROBE_CHUNKS       = int(os.getenv("WATCH_LP_PROBE_CHUNKS", "30"))
+
+_SENTENCE_END_RE = re.compile(r'[.!?…]["\')\]]?\s*$|\n\s*$')
+
+# Tipo de recuperação → prefill de retomada.
+_CORRECTION_PREFILL: dict[str, str] = {
+    "confirmacao":        "",                          # nada — apenas confirma, segue normalmente
+    "complementacao":     "",                           # nada — soma informação, segue normalmente
+    "correcao_pequena":   "Na verdade, ",
+    "contradicao_forte":  "Espera, na verdade, ",
+    "erro_factual":       "Corrigindo o que eu disse: ",
+    "mudanca_raciocinio": "Pensando melhor, ",
+}
+
+# Injetado (só no payload enviado ao modelo, nunca no SSE) para dar ao
+# modelo o mesmo protocolo de interpretação descrito no prompt original.
+_MEMORY_CORRECTION_TEMPLATE = (
+    "<MEMORY_CORRECTION>\n"
+    "Sua geração foi interrompida porque surgiu evidência relevante.\n\n"
+    "A evidência pode:\n"
+    "1. confirmar sua hipótese;\n"
+    "2. adicionar informação;\n"
+    "3. contradizer sua hipótese.\n\n"
+    "Evidência recuperada da memória:\n{evidencia}\n\n"
+    "Classificação automática: {classificacao}.\n\n"
+    "Revise o trecho que você estava produzindo.\n"
+    "Se necessário, reconheça a correção naturalmente antes de continuar.\n"
+    "</MEMORY_CORRECTION>"
+)
+
+_CORRECTION_CLASSIFICATION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": list(_CORRECTION_PREFILL.keys()),
+            "description": (
+                "confirmacao: a evidência só confirma o que já estava sendo dito. "
+                "complementacao: adiciona informação nova, sem conflito. "
+                "correcao_pequena: corrige um detalhe menor. "
+                "contradicao_forte: contradiz diretamente a frase. "
+                "erro_factual: a frase contém um erro factual importante. "
+                "mudanca_raciocinio: exige mudar toda a linha de raciocínio."
+            ),
+        },
+    },
+    "required": ["classification"],
+    "additionalProperties": False,
+}
+
+_MEMORY_CORRECTION_CLASSIFIER_SYSTEM = (
+    "Você classifica a relação entre uma frase que um assistente estava "
+    "gerando (foi interrompida no meio) e uma evidência recuperada da "
+    "memória de longo prazo dele. Responda apenas com a classificação, "
+    "usando EXATAMENTE uma destas categorias:\n"
+    "- confirmacao: a evidência só confirma o que já estava sendo dito;\n"
+    "- complementacao: a evidência adiciona informação nova, sem conflito;\n"
+    "- correcao_pequena: a evidência corrige um detalhe menor (data, número, nome);\n"
+    "- contradicao_forte: a evidência contradiz diretamente a frase;\n"
+    "- erro_factual: a frase contém um erro factual importante segundo a evidência;\n"
+    "- mudanca_raciocinio: a evidência exige mudar toda a linha de raciocínio, "
+    "não só um detalhe."
+)
+
+
+class _ConfidenceWindow:
+    """Acumula tokens + logprobs desde o início da frase atual até o
+    próximo terminador de frase (`.`, `!`, `?`, `…`, quebra de linha).
+    `avg_confidence()` converte cada logprob em probabilidade (exp(logprob))
+    e tira a média — uma proxy simples de "quão confiante o modelo estava,
+    em média, gerando esta frase"."""
+
+    __slots__ = ("text", "logprobs")
+
+    def __init__(self):
+        self.text = ""
+        self.logprobs: list[float] = []
+
+    def add(self, token_text: str, logprob: Optional[float]) -> None:
+        self.text += token_text or ""
+        if logprob is not None:
+            self.logprobs.append(logprob)
+
+    def sentence_ready(self) -> bool:
+        """True quando a janela já acumulou tokens suficientes E terminou
+        numa fronteira de frase — só então vale a pena calcular a média
+        (janelas muito curtas têm confiança ruidosa)."""
+        return len(self.logprobs) >= CONFIDENCE_MIN_TOKENS and bool(_SENTENCE_END_RE.search(self.text))
+
+    def avg_confidence(self) -> float:
+        if not self.logprobs:
+            return 1.0
+        probs = [math.exp(lp) for lp in self.logprobs]
+        return sum(probs) / len(probs)
+
+    def reset(self) -> None:
+        self.text = ""
+        self.logprobs = []
+
+
+def _best_matching_memory(window_text: str, results: list[dict]) -> Optional[dict]:
+    """Entre os resultados de `memory_read` (já rankeados semanticamente
+    por memory.py — embeddings + PPR/MMR), escolhe qual melhor corresponde
+    ao trecho que estava sendo gerado. Usa o `score` semântico devolvido
+    pela própria memória como sinal primário, e um SequenceMatcher
+    (difflib, leve e sem dependência nova) como sinal secundário de
+    sobreposição lexical — evita agir sobre matches semânticos fracos que
+    não têm nenhuma relação textual perceptível com a frase interrompida.
+    Retorna None se nada bater um limiar mínimo de confiança combinada."""
+    if not results:
+        return None
+    best, best_val = None, -1.0
+    for item in results:
+        text = item.get("text") or item.get("content") or ""
+        if not text:
+            continue
+        score = float(item.get("score") or item.get("relevance") or 0.0)
+        overlap = difflib.SequenceMatcher(None, window_text.lower(), text.lower()).ratio()
+        combined = 0.7 * score + 0.3 * overlap
+        if combined > best_val:
+            best_val, best = combined, {**item, "_match_score": combined}
+    if best is None or best_val < MEMORY_MATCH_MIN_SIMILARITY:
+        return None
+    return best
+
+
+async def _classify_memory_correction(previous_context: str, window_text: str, evidence_text: str) -> str:
+    """Chama um modelo pequeno (mesmo MEMORY_EXTRACTOR_MODEL usado na
+    extração pós-resposta) forçado por JSON schema a classificar a relação
+    entre a frase interrompida e a evidência recuperada. Em qualquer falha
+    (sem API key, timeout, resposta inválida), cai em "complementacao" —
+    o fallback mais seguro (prefill vazio, geração só é enriquecida com o
+    contexto extra, sem afirmar uma correção que não foi confirmada)."""
+    if not OPENROUTER_API_KEY:
+        return "complementacao"
+    payload = {
+        "model": MEMORY_EXTRACTOR_MODEL,
+        "messages": [
+            {"role": "system", "content": _MEMORY_CORRECTION_CLASSIFIER_SYSTEM},
+            {"role": "user", "content": (
+                f"Contexto anterior: {previous_context}\n\n"
+                f"Frase sendo gerada (interrompida): {window_text}\n\n"
+                f"Evidência recuperada: {evidence_text}"
+            )},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 40,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name":   "memory_correction_classification",
+                "strict": True,
+                "schema": _CORRECTION_CLASSIFICATION_SCHEMA,
+            },
+        },
+    }
+    try:
+        client = await _get_openrouter_client()
+        r = await client.post("/chat/completions", json=payload, timeout=httpx.Timeout(8.0, connect=5.0))
+        if r.status_code != 200:
+            log.info(f"[MEMORY-WATCH] Classificador: {r.status_code} — {r.text[:200]}")
+            return "complementacao"
+        content = r.json()["choices"][0]["message"]["content"]
+        cls = json.loads(content).get("classification", "complementacao")
+        return cls if cls in _CORRECTION_PREFILL else "complementacao"
+    except Exception as e:
+        log.info(f"[MEMORY-WATCH] Falha na classificação da correção: {e}")
+        return "complementacao"
 
 # ─────────────────────────────────────────────────────────────
 #          OPTIMIZATION 1: PERSISTENT HTTP CLIENTS
@@ -88,10 +304,11 @@ ST_CONTEXT_PAIRS = 5
 
 _openrouter_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
+_memory_http: httpx.AsyncClient | None = None
 
-# ── Memória via iceoryx2 (ver iceoryx2_rpc.py) ──
-# Sem estado de sessão aqui: call_memory_tool() do iceoryx2_rpc já mantém
-# seu próprio client/Node persistentes por processo (lazy, thread-safe).
+# ── Memória via memory_api.py (REST) ──
+# Client httpx persistente e lazy, com pooling/keep-alive, igual ao padrão
+# usado para OpenRouter/TTS. Ver _get_memory_client().
 
 
 async def _get_openrouter_client() -> httpx.AsyncClient:
@@ -122,20 +339,76 @@ async def _get_openrouter_client() -> httpx.AsyncClient:
     return _openrouter_client
 
 
+def _get_memory_client() -> httpx.AsyncClient:
+    """Persistent client para a API REST de memória (memory_api.py) —
+    connection pooling + keep-alive, mesmo padrão do client OpenRouter/TTS."""
+    global _memory_http
+    if _memory_http is None or _memory_http.is_closed:
+        _memory_http = httpx.AsyncClient(
+            base_url=MEMORY_API_URL,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        )
+    return _memory_http
+
+
+# Mapeia o antigo nome de "tool" (era usado no protocolo MCP/iceoryx2) para
+# (método HTTP, rota) das rotas REST expostas em memory_api.py. Rotas com
+# parâmetro de path (ex.: /session/{session_id}) usam esse nome de argumento
+# como placeholder — o valor é retirado de `arguments` e removido do body.
+_MEMORY_TOOL_ROUTES: dict[str, tuple[str, str]] = {
+    "memory_read":               ("POST",   "/read"),
+    "memory_read_short_term":    ("POST",   "/read-short-term"),
+    "memory_write_short_term":   ("POST",   "/write-short-term"),
+    "memory_write":               ("POST",   "/write"),
+    "memory_write_batch":        ("POST",   "/write/batch"),
+    "memory_status":             ("GET",    "/status"),
+    "memory_clear_session":      ("DELETE", "/session/{session_id}"),
+}
+
+
 async def _call_memory_tool(name: str, arguments: dict) -> dict:
-    """Chama uma tool do servidor de memória via RPC local iceoryx2 (ver
-    iceoryx2_rpc.py) e devolve o payload já desserializado. Mantém a MESMA
-    assinatura (name, arguments) do antigo `_call_memory_tool` baseado em
-    MCP — nenhum call site precisou mudar. Erros de negócio (levantados
-    pelas tools em memory_server.py) chegam como RuntimeError, igual antes
-    (MemoryToolError/isError do MCP)."""
-    return await _iceoryx2_call_memory_tool(name, **arguments)
+    """Chama uma "tool" de memória via a API REST exposta por memory_api.py
+    (que por sua vez delega 100% para memory.py). Mantém a MESMA assinatura
+    (name, arguments) do antigo `_call_memory_tool` baseado em iceoryx2/MCP —
+    nenhum call site precisou mudar. Erros de negócio (HTTP 400, mapeados de
+    MemoryToolError pelo exception handler de memory_api.py) chegam como
+    RuntimeError, igual antes."""
+    if name not in _MEMORY_TOOL_ROUTES:
+        raise RuntimeError(f"Tool de memória desconhecida: {name!r}")
+    method, route = _MEMORY_TOOL_ROUTES[name]
+
+    body = dict(arguments)
+    if "{" in route:
+        route = route.format(**{k: body.pop(k) for k in list(body) if f"{{{k}}}" in route})
+
+    client = _get_memory_client()
+    try:
+        if method == "GET":
+            r = await client.get(route, params=body or None)
+        elif method == "DELETE":
+            r = await client.delete(route, params=body or None)
+        else:
+            r = await client.post(route, json=body)
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+        raise RuntimeError(f"API de memória inacessível ({MEMORY_API_URL}): {e}") from e
+
+    if r.status_code == 400:
+        try:
+            detail = r.json().get("error", r.text)
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"memory_api: {detail}")
+    r.raise_for_status()
+    return r.json() if r.content else {}
 
 
 async def _close_memory_session():
-    """Encerra o client RPC iceoryx2 da memória. Mantido com esse nome por
-    compatibilidade com o startup/shutdown existentes."""
-    _close_memory_rpc()
+    """Encerra o client HTTP persistente da memória. Mantido com esse nome
+    por compatibilidade com o startup/shutdown existentes."""
+    global _memory_http
+    if _memory_http and not _memory_http.is_closed:
+        await _memory_http.aclose()
 
 
 def _get_tts_client() -> httpx.AsyncClient:
@@ -196,7 +469,7 @@ context    = _read(BASEFOLDER / f"ctxBin/{ctxUsed}.bin")
 
 # ════════════════════════════════════════════════════════════════════════════
 # Inferência 100% via OpenRouter — modelo principal fixo (z-ai/glm-5.3-flash).
-# Para o extractor de memórias, modelo dedicado (google/gemma-4-26b-a4b-it:free).
+# Para o extractor de memórias, modelo dedicado (env MEMORY_EXTRACTOR_MODEL).
 #
 # /chat/stream é o endpoint UNIFICADO: streaming (SSE) + tool calling nativo
 # no mesmo request. Dois modos:
@@ -354,23 +627,34 @@ _SYSTEM_PROMPT_BASE = (
 #                     INTEGRAÇÃO: MEMÓRIA
 # ─────────────────────────────────────────────────────────────
 
-async def memory_read(query: str, session_id: Optional[str] = None, top_k: int = 10) -> list[dict]:
+async def memory_read(
+    query: str,
+    session_id: Optional[str] = None,
+    top_k: int = 10,
+    top_k_final: Optional[int] = None,
+    total_max_chars: Optional[int] = None,
+) -> list[dict]:
     """
-    Busca memórias relevantes (Long-Term e Short-Term) para o contexto da conversa.
-    Usa a sessão MCP persistente — sem handshake de transporte por chamada
-    (só a chamada JSON-RPC em cima da conexão já aberta).
+    Busca memórias relevantes (LT semântico + ST + knowledge + arquivos
+    indexados) para o contexto da conversa, via a API REST de memória.
+
+    `top_k_final`/`total_max_chars` são overrides de orçamento (server-side
+    ReadRequest) — o default do /read é conservador (3 entradas / 2400 chars);
+    o recall de chat pede um pouco mais. Server clampa aos tetos globais.
     """
     try:
-        resp = await _call_memory_tool(
-            "memory_read",
-            {
-                "query": query,
-                "top_k": top_k,
-                "min_score": 0.3,
-                "session_id": session_id,
-                "strategy": "auto",
-            },
-        )
+        payload = {
+            "query": query,
+            "top_k": top_k,
+            "min_score": 0.3,
+            "session_id": session_id,
+            "strategy": "auto",
+        }
+        if top_k_final:
+            payload["top_k_final"] = top_k_final
+        if total_max_chars:
+            payload["total_max_chars"] = total_max_chars
+        resp = await _call_memory_tool("memory_read", payload)
         return resp.get("results", [])
     except Exception as e:
         log.info(f"[MEMORY] Falha na leitura: {e}")
@@ -546,7 +830,14 @@ async def memory_write_facts_batch(items: list[dict]) -> list[dict]:
     if not items:
         return []
     try:
-        resp = await _call_memory_tool("memory_write_batch", {"items": items})
+        # sequential=True: fatos extraídos da MESMA dupla pergunta-resposta
+        # chegam em ordem narrativa — o servidor cria a cadeia de arestas
+        # temporal_precedence (anterior → seguinte) entre eles, então o
+        # PPR consegue propagar contexto entre memórias do mesmo episódio
+        # mesmo sem co-ativação futura.
+        resp = await _call_memory_tool(
+            "memory_write_batch", {"items": items, "sequential": True},
+        )
     except Exception as e:
         log.info(f"[MEMORY] Falha na escrita LT em lote: {e}")
         return []
@@ -632,7 +923,7 @@ _MEMORY_EXTRACTION_SCHEMA: dict = {
 
 
 _MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
-    "Você é um extrator de memórias para um assistente conversacional chamado AVA. "
+    "Você é um extrator de memórias para um assistente conversacional chamado alfa. "
     "Com base na dupla PERGUNTA-RESPOSTA fornecida, identifique TODAS as informações "
     "presentes (tanto na pergunta do usuário quanto na resposta do assistente) que "
     "seriam úteis de serem gravadas sobre o usuário, o contexto da conversa, ou o "
@@ -663,7 +954,7 @@ async def _extract_and_save_memories(
     session_id: Optional[str] = None,
 ) -> list[dict]:
     """
-    Roda o modelo extractor (google/gemma-4-26b-a4b-it:free) sobre a dupla
+    Roda o modelo extractor (MEMORY_EXTRACTOR_MODEL) sobre a dupla
     pergunta-resposta, força a saída em JSON schema estruturado, e roteia
     cada memória identificada:
       - semantic  → LT (memória de longo prazo, via /write)
@@ -685,7 +976,7 @@ async def _extract_and_save_memories(
         log.info("[MEMORY-EXTRACT] OPENROUTER_API_KEY ausente — extração pulada.")
         return []
 
-    messages = [
+    messages_base = [
         {"role": "system", "content": _MEMORY_EXTRACTOR_SYSTEM_PROMPT},
         {
             "role": "user",
@@ -702,119 +993,175 @@ async def _extract_and_save_memories(
         },
     ]
 
-    payload: dict = {
-        "model":       MEMORY_EXTRACTOR_MODEL,
-        "messages":    messages,
-        "temperature": 0.2,
-        "max_tokens":  1024,
-        # Força saída estruturada em JSON — o provedor valida o schema.
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name":   "memory_extraction",
-                "strict": True,
-                "schema": _MEMORY_EXTRACTION_SCHEMA,
-            },
+    # ── Cadeia de tentativas ────────────────────────────────────────────────
+    # BUG corrigido: o fluxo antigo só caía para o fallback quando o status
+    # NÃO era 200. Modelos free/pequenos (liquid/lfm-2.5-2.6b:free etc.)
+    # frequentemente retornam 200 com `message.content` VAZIO quando não
+    # suportam `response_format: json_schema` — e o retorno silencioso
+    # `return []` descartava o turno sem logar NADA (o bug visto em produção:
+    # /memories/extract → 200, zero memórias, zero logs).
+    # Cadeia atual: (1) extrator + json_schema; (2) extrator SEM response_format
+    # (instrução JSON explícita no prompt); (3) modelo de fallback (default =
+    # MAIN_MODEL) + json_schema. Cada passo loga; só os três vazios/falhos
+    # desistem — e desistindo, desiste COM log.
+    json_schema_fmt: dict = {
+        "type": "json_schema",
+        "json_schema": {
+            "name":   "memory_extraction",
+            "strict": True,
+            "schema": _MEMORY_EXTRACTION_SCHEMA,
         },
     }
+    _plain_json_instruction = (
+        "\n\nFORMATO OBRIGATÓRIO — responda APENAS com um objeto JSON válido, "
+        "sem texto antes ou depois e sem markdown:\n"
+        '{"memories": [{"content": "<fato em 3ª pessoa>", '
+        '"forgettable": true|false, "type": "semantic"|"episodic"}]}\n'
+        "Se nada merecer ser gravado, responda exatamente: {\"memories\": []}"
+    )
+    fallback_model = MEMORY_EXTRACTOR_FALLBACK_MODEL or MAIN_MODEL
+    attempts: list[tuple[str, Optional[dict], str]] = [
+        (MEMORY_EXTRACTOR_MODEL, json_schema_fmt, ""),
+        (MEMORY_EXTRACTOR_MODEL, None, _plain_json_instruction),
+        (fallback_model, json_schema_fmt, ""),
+    ]
 
-    try:
-        client = await _get_openrouter_client()
-        r = await client.post("/chat/completions", json=payload)
-        if r.status_code != 200:
-            # Alguns modelos :free podem não suportar json_schema estrito.
-            # Tentamos fallback para json_object (sem validação de schema).
-            log.info(
-                f"[MEMORY-EXTRACT] {r.status_code} com json_schema — "
-                f"tentando fallback json_object. Body: {r.text[:200]}"
-            )
-            payload["response_format"] = {"type": "json_object"}
+    client = await _get_openrouter_client()
+    content = ""
+    last_err = ""
+    for attempt_i, (model, fmt, suffix) in enumerate(attempts, start=1):
+        fmt_label = fmt.get("type") if fmt else "sem response_format"
+        msg_user = messages_base[-1]["content"] + suffix if suffix else messages_base[-1]["content"]
+        payload: dict = {
+            "model":       model,
+            "messages":    messages_base[:-1] + [{"role": "user", "content": msg_user}],
+            "temperature": 0.2,
+            "max_tokens":  1024,
+        }
+        if fmt:
+            payload["response_format"] = fmt
+        try:
             r = await client.post("/chat/completions", json=payload)
-            if r.status_code != 200:
-                log.info(
-                    f"[MEMORY-EXTRACT] Fallback falhou: {r.status_code} — {r.text[:300]}"
-                )
-                return []
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            log.warning(
+                f"[MEMORY-EXTRACT] tentativa {attempt_i}/{len(attempts)} "
+                f"({model}, {fmt_label}) erro de rede: {last_err}"
+            )
+            continue
+
+        if r.status_code != 200:
+            last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+            log.warning(
+                f"[MEMORY-EXTRACT] tentativa {attempt_i}/{len(attempts)} "
+                f"({model}, {fmt_label}) não-200: {last_err}"
+            )
+            continue
 
         data = r.json()
-        content = data["choices"][0]["message"].get("content") or ""
-        if not content.strip():
+        try:
+            choice = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            last_err = f"resposta malformada: {str(data)[:300]}"
+            log.warning(
+                f"[MEMORY-EXTRACT] tentativa {attempt_i}/{len(attempts)} "
+                f"({model}, {fmt_label}) {last_err}"
+            )
+            continue
+        content = choice.get("content") or ""
+        if content.strip():
+            break  # tentativa bem-sucedida — content preenchido
+
+        # 200 com content vazio — NÃO descartar em silêncio. Logar com
+        # diagnóstico e tentar o próximo elo da cadeia.
+        finish_reason = data["choices"][0].get("finish_reason")
+        usage = json.dumps(data.get("usage", {}), ensure_ascii=False)[:200]
+        last_err = "content vazio"
+        log.warning(
+            f"[MEMORY-EXTRACT] tentativa {attempt_i}/{len(attempts)} "
+            f"({model}, {fmt_label}) 200 com content VAZIO "
+            f"(finish_reason={finish_reason!r}, usage={usage}, "
+            f"raw={r.text[:300]!r}) — tentando próximo fallback"
+        )
+        content = ""
+    else:
+        log.warning(
+            f"[MEMORY-EXTRACT] todas as {len(attempts)} tentativas falharam "
+            f"(último erro: {last_err or 'desconhecido'}) — memórias deste turno "
+            "NÃO gravadas."
+        )
+        return []
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as je:
+        # Tenta recuperar extraindo o primeiro bloco JSON da string.
+        match = re.search(r"\{[\s\S]*\}", content)
+        if not match:
+            log.info(f"[MEMORY-EXTRACT] JSON inválido: {je}. Raw: {content[:200]}")
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            log.info(f"[MEMORY-EXTRACT] Recovery falhou. Raw: {content[:200]}")
             return []
 
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as je:
-            # Tenta recuperar extraindo o primeiro bloco JSON da string.
-            match = re.search(r"\{[\s\S]*\}", content)
-            if not match:
-                log.info(f"[MEMORY-EXTRACT] JSON inválido: {je}. Raw: {content[:200]}")
-                return []
-            try:
-                parsed = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                log.info(f"[MEMORY-EXTRACT] Recovery falhou. Raw: {content[:200]}")
-                return []
+    memories_raw = parsed.get("memories", []) if isinstance(parsed, dict) else []
 
-        memories_raw = parsed.get("memories", []) if isinstance(parsed, dict) else []
+    # Roteia cada memória identificada:
+    #   semantic  → LT (memória de longo prazo) — TODAS de uma vez via
+    #               memory_write_batch (1 round-trip MCP em vez de N).
+    #   episodic  → ST (memória de curto prazo, via /write_st) —
+    #               continua individual (não existe write_st em lote).
+    saved: list[dict] = []
+    semantic_payloads: list[dict] = []
+    for mem in memories_raw:
+        if not isinstance(mem, dict):
+            continue
+        text = (mem.get("content") or "").strip()
+        if not text:
+            continue
+        mem_type = mem.get("type") or "semantic"
+        if mem_type not in ("episodic", "semantic"):
+            mem_type = "semantic"
+        forgettable = bool(mem.get("forgettable", True))
 
-        # Roteia cada memória identificada:
-        #   semantic  → LT (memória de longo prazo) — TODAS de uma vez via
-        #               memory_write_batch (1 round-trip MCP em vez de N).
-        #   episodic  → ST (memória de curto prazo, via /write_st) —
-        #               continua individual (não existe write_st em lote).
-        saved: list[dict] = []
-        semantic_payloads: list[dict] = []
-        for mem in memories_raw:
-            if not isinstance(mem, dict):
-                continue
-            text = (mem.get("content") or "").strip()
-            if not text:
-                continue
-            mem_type = mem.get("type") or "semantic"
-            if mem_type not in ("episodic", "semantic"):
-                mem_type = "semantic"
-            forgetable = bool(mem.get("forgettable", True))
-
-            if mem_type == "semantic":
-                # LT: confidence mais alta para memórias não-esquecíveis —
-                # elas tendem a ser fatos estáveis sobre o usuário e
-                # merecem prioridade na busca.
-                confidence = 0.9 if not forgetable else 0.6
-                semantic_payloads.append({
-                    "text":        text,
-                    "source":      "chat:semantic",
-                    "confidence":  confidence,
-                    "forgettable": forgetable,
-                    "ttl_days":    None,
-                })
-            else:
-                # episodic → ST (curto prazo). ST é efêmera por natureza,
-                # então o forgetable do extractor é ignorado neste caso.
-                asyncio.create_task(
-                    memory_write_st_episodic(session_id=session_id, text=text)
-                )
-
-            saved.append({
-                "content":    text,
-                "type":       mem_type,
-                "target":     "LT" if mem_type == "semantic" else "ST",
-                "forgettable": forgetable,
+        if mem_type == "semantic":
+            # LT: confidence mais alta para memórias não-esquecíveis —
+            # elas tendem a ser fatos estáveis sobre o usuário e
+            # merecem prioridade na busca.
+            confidence = 0.9 if not forgettable else 0.6
+            semantic_payloads.append({
+                "text":        text,
+                "source":      "chat:semantic",
+                "confidence":  confidence,
+                "forgettable": forgettable,
+                "ttl_days":    None,
             })
+        else:
+            # episodic → ST (curto prazo). ST é efêmera por natureza,
+            # então o forgetable do extractor é ignorado neste caso.
+            asyncio.create_task(
+                memory_write_st_episodic(session_id=session_id, text=text)
+            )
 
-        if semantic_payloads:
-            # fire-and-forget: o /chat não espera a gravação terminar para
-            # responder, mas as N memórias semânticas viram 1 chamada MCP.
-            asyncio.create_task(memory_write_facts_batch(semantic_payloads))
+        saved.append({
+            "content":    text,
+            "type":       mem_type,
+            "target":     "LT" if mem_type == "semantic" else "ST",
+            "forgettable": forgettable,
+        })
 
-        log.info(
-            f"[MEMORY-EXTRACT] {len(saved)} memória(s) extraída(s) "
-            f"(session={session_id})."
-        )
-        return saved
+    if semantic_payloads:
+        # fire-and-forget: o /chat não espera a gravação terminar para
+        # responder, mas as N memórias semânticas viram 1 chamada MCP.
+        asyncio.create_task(memory_write_facts_batch(semantic_payloads))
 
-    except Exception as e:
-        log.info(f"[MEMORY-EXTRACT] Falha: {type(e).__name__}: {e}")
-        return []
+    log.info(
+        f"[MEMORY-EXTRACT] {len(saved)} memória(s) extraída(s) "
+        f"(session={session_id}, modelo={model})."
+    )
+    return saved
 
 
 # ─────────────────────────────────────────────────────────────
@@ -860,7 +1207,29 @@ async def tts_speak(text: str, voice: str, lang: str):
 #          OPTIMIZATION 2 (cont): PROMPT CONSTRUCTION
 # ─────────────────────────────────────────────────────────────
 
-def _build_memory_recall(memories: list[dict]) -> str | None:
+# Tamanho mínimo de fragmento de ST p/ o dedup contra o histórico cru —
+# substrings curtos demais causariam falsos positivos (saudações genéricas).
+_ST_DEDUP_MIN_CHARS = 12
+
+
+def _norm_fragments(text: str) -> list[str]:
+    """Extrai fragmentos normalizados (lowercase, sem os prefixos [role]) da
+    representação compacta de um hit de ST ('[user] xxx | [assistant] yyy'),
+    para o dedup contra os turnos recentes do /read_st."""
+    parts = re.split(r"\s*\|\s*", text)
+    frags = []
+    for p in parts:
+        p = re.sub(r"^\[(?:user|assistant)\]\s*", "", p.strip(), flags=re.I)
+        p = p.lower().strip()
+        if p:
+            frags.append(p)
+    return frags
+
+
+def _build_memory_recall(
+    memories: list[dict],
+    recent_turns: Optional[list[dict]] = None,
+) -> str | None:
     """
     Formata o bloco de memórias como texto de recall em primeira pessoa.
     Retorna None se não houver memórias válidas.
@@ -870,28 +1239,89 @@ def _build_memory_recall(memories: list[dict]) -> str | None:
       primeira pessoa) em vez de USER (injeção de dados externos). Assim
       o modelo trata a informação como conhecimento próprio que está
       recuperando, e não como instrução ou dado fornecido pelo usuário.
-      A frase usa verbos de recall ("Lembro que", "Sei que") para
-      reforçar a propriedade epistêmica, e a linha final sinaliza
-      prontidão — ancorando a postura do modelo antes da mensagem real
-      do usuário chegar.
+
+    NEW (type-aware): as entradas do /read vêm de 4 fontes com naturezas
+    epistêmicas DIFERENTES — tratá-las como um bolo só faz o modelo citar
+    documentos como se fossem memória pessoal. O bloco separa:
+      * long_term primary  → autoconhecimento ("Lembro que...", 1ª pessoa);
+      * long_term related  → associação indireta do grafo Hebbiano (PPR) —
+        evidência mais fraca, marcada como "pode ser relevante";
+      * short_term         → episódios de conversa; os que sobrepõem os
+        turnos recentes do /read_st são DESCARTADOS (dedup — já entram
+        como histórico literal, repetir no recall é token jogado fora);
+      * knowledge/indexed_file → material de referência (chunks de KG-RAG e
+        arquivos indexados) — apresentado como acervo consultado, não como
+        memória vivida, com a fonte quando disponível.
     """
     if not memories:
         return None
 
-    lines = [
-        f"- {m.get('text', m.get('content', ''))}"
-        for m in memories
-        if m.get("text") or m.get("content")
-    ]
-    if not lines:
-        return None
+    # Blob dos conteúdos dos turnos recentes (lowercase) para o dedup de ST.
+    recent_blob = ""
+    if recent_turns:
+        recent_blob = " ".join(
+            (t.get("content") or "").lower() for t in recent_turns if t.get("content")
+        )
 
-    mem_block = "\n".join(lines)
+    lt_primary: list[str] = []
+    lt_related: list[str] = []
+    references: list[str] = []
+
+    for m in memories:
+        text = (m.get("text") or m.get("content") or "").strip()
+        if not text:
+            continue
+        mtype = m.get("memory_type") or "long_term"
+        match = m.get("match_type") or "primary"
+
+        if mtype == "short_term":
+            # Dedup contra o histórico cru: se QUALQUER fragmento com peso
+            # suficiente (>= _ST_DEDUP_MIN_CHARS) do hit já aparece nos turnos
+            # recentes, é o mesmo episódio chegando duas vezes (recall
+            # semântico + /read_st). Hits de sessões antigas não têm os
+            # fragmentos no blob e passam normalmente.
+            frags = _norm_fragments(text)
+            if recent_blob and any(
+                f in recent_blob for f in frags if len(f) >= _ST_DEDUP_MIN_CHARS
+            ):
+                continue
+            lt_primary.append(text)
+            continue
+
+        if mtype in ("knowledge", "indexed_file"):
+            src = m.get("file_name") or m.get("source")
+            references.append(text + (f" (fonte: {src})" if src else ""))
+            continue
+
+        if match == "related":
+            lt_related.append(text)
+        else:
+            lt_primary.append(text)
+
+    sections: list[str] = []
+    if lt_primary:
+        sections.append(
+            "Memória (fatos e episódios que conheço):\n"
+            + "\n".join(f"- {t}" for t in lt_primary)
+        )
+    if lt_related:
+        sections.append(
+            "Associações do grafo de memória (contexto indireto, pode ser relevante):\n"
+            + "\n".join(f"- {t}" for t in lt_related)
+        )
+    if references:
+        sections.append(
+            "Material de referência no meu acervo:\n"
+            + "\n".join(f"- {t}" for t in references)
+        )
+
+    if not sections:
+        return None
 
     return (
         "Resgatando contexto relevante da minha memória antes de responder:\n\n"
-        f"{mem_block}\n\n"
-        "Tenho isso em mente e vou usar esse conhecimento de forma natural na conversa."
+        + "\n\n".join(sections)
+        + "\n\nTenho isso em mente e vou usar esse conhecimento de forma natural na conversa."
     )
 
 
@@ -926,7 +1356,9 @@ def _build_messages(
 
     # DINÂMICO: recall de memória em voz do próprio assistant.
     # role=assistant para o modelo tratar como autoconhecimento.
-    recall_text = _build_memory_recall(memories)
+    # recent_turns entra para o dedup: hits de ST que sobrepõem o histórico
+    # cru não são repetidos dentro do recall.
+    recall_text = _build_memory_recall(memories, recent_turns)
     if recall_text:
         messages.append({
             "role": "assistant",
@@ -997,7 +1429,7 @@ class ChatRequest(BaseModel):
         default=True,
         description=(
             "Se True, após gerar a resposta final, dispara em background o "
-            "modelo extractor de memórias (google/gemma-4-26b-a4b-it:free) "
+            "modelo extractor de memórias (MEMORY_EXTRACTOR_MODEL) "
             "para identificar informações úteis a serem gravadas em LT, "
             "rotulando-as como esquecíveis/permanentes e episódicas/semânticas."
         ),
@@ -1040,6 +1472,20 @@ class ChatRequest(BaseModel):
         description=(
             "Override direto de reasoning.effort no OpenRouter (low|medium|high|"
             "none). Tem precedência sobre `thinking_depth` quando definido."
+        ),
+    )
+    watch_confidence: bool = Field(
+        default=False,
+        description=(
+            "Se True (só no modo CHAT), ativa logprobs no OpenRouter e monitora "
+            "a confiança média dos tokens por janela de frase. Quando a "
+            "confiança cai abaixo de CONFIDENCE_THRESHOLD, a geração é "
+            "interrompida, o trecho + contexto recente é enviado a memory_read, "
+            "e — havendo evidência relevante o suficiente — um modelo pequeno "
+            "classifica a relação (confirmação/complementação/correção "
+            "pequena/contradição forte/erro factual/mudança de raciocínio) e "
+            "a resposta é retomada via prefill de assistant apropriado. Opt-in: "
+            "adiciona latência (memory_read + classificação a cada interrupção)."
         ),
     )
 
@@ -1086,8 +1532,8 @@ class ToolUseResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     """Verifica a OPENROUTER_API_KEY e faz uma chamada de teste (memory_status)
-    pro servidor de memória via RPC iceoryx2, só pra logar conectividade —
-    o client em si é lazy (ver iceoryx2_rpc.py) e reconecta sozinho a
+    pra API REST de memória (memory_api.py), só pra logar conectividade —
+    o client em si é lazy (ver _get_memory_client) e reconecta sozinho a
     qualquer momento, então uma falha aqui não impede a API de subir."""
     if not OPENROUTER_API_KEY:
         log.warning(
@@ -1099,15 +1545,15 @@ async def startup():
 
     try:
         await _call_memory_tool("memory_status", {})
-        log.info("[MEMORY] RPC iceoryx2 com o servidor de memória OK.")
+        log.info(f"[MEMORY] API REST de memória OK ({MEMORY_API_URL}).")
     except asyncio.CancelledError as e:
         log.warning(
-            f"[STARTUP] Checagem da memória via iceoryx2 cancelada durante o "
+            f"[STARTUP] Checagem da memory_api cancelada durante o "
             f"startup: {e}. A API sobe mesmo assim."
         )
     except Exception as e:
         log.warning(
-            f"[STARTUP] Memória (iceoryx2) não acessível: {e}. "
+            f"[STARTUP] Memória (memory_api em {MEMORY_API_URL}) não acessível: {e}. "
             "A API sobe mesmo assim — chamadas de memória vão falhar (e "
             "tentar reconectar sozinhas) até o servidor de memória subir."
         )
@@ -1115,7 +1561,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Fecha HTTP clients e o client RPC iceoryx2 da memória graciosamente."""
+    """Fecha HTTP clients (OpenRouter, TTS e memória) graciosamente."""
     global _openrouter_client, _tts_http
     if _openrouter_client and not _openrouter_client.is_closed:
         await _openrouter_client.aclose()
@@ -1156,7 +1602,13 @@ async def chat(req: ChatRequest):
         asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
     )
     memory_task = asyncio.ensure_future(
-        memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
+        memory_read(
+            user_input,
+            session_id=req.session_id,
+            top_k=req.max_turns,
+            top_k_final=CHAT_RECALL_TOP_K_FINAL,
+            total_max_chars=CHAT_RECALL_TOTAL_MAX_CHARS,
+        )
     )
     memory_st_task = asyncio.ensure_future(
         memory_read_st(req.session_id)
@@ -1263,6 +1715,12 @@ async def chat_stream(req: ChatRequest):
     Eventos SSE:
       {"reasoning": "..."}   — raciocínio (se stream_reasoning)
       {"delta": "..."}       — texto do content
+      {"memory_correction": {"classification": ..., "evidence": "..."}}
+                              — emitido quando `watch_confidence=true` e a
+                                confiança média de uma janela de frase caiu
+                                abaixo do limiar, disparando releitura da
+                                memória e retomada com prefill (ver
+                                CONFIDENCE_* no topo do arquivo)
       {"tool_calls": [...]}  — tool_calls completas (ao final, se houver)
       {"done": true, "elapsed": ..., "prompt_cached_tokens": ..., "had_tool_calls": bool}
       {"error": "...", "too_large": bool}  — aborta o stream
@@ -1295,7 +1753,13 @@ async def chat_stream(req: ChatRequest):
             asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
         )
         memory_task = asyncio.ensure_future(
-            memory_read(user_input, session_id=req.session_id, top_k=req.max_turns)
+            memory_read(
+                user_input,
+                session_id=req.session_id,
+                top_k=req.max_turns,
+                top_k_final=CHAT_RECALL_TOP_K_FINAL,
+                total_max_chars=CHAT_RECALL_TOTAL_MAX_CHARS,
+            )
         )
         memory_st_task = asyncio.ensure_future(
             memory_read_st(req.session_id)
@@ -1325,6 +1789,13 @@ async def chat_stream(req: ChatRequest):
         payload["tools"] = req.tools
         payload["tool_choice"] = req.tool_choice or "auto"
 
+    # ── Confidence-watch: pede logprobs por token ao OpenRouter ────────────
+    # Só faz sentido no modo CHAT (precisa de session_id + query semântica
+    # com sentido de conversa; no modo TOOLS o caller já gerencia o histórico).
+    watch_confidence = req.watch_confidence and not tool_mode
+    if watch_confidence:
+        payload["logprobs"] = True
+
     # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
     voice = req.voice or voiceModel
     use_tts = (not tool_mode) and bool(req.tts and voice)
@@ -1351,130 +1822,252 @@ async def chat_stream(req: ChatRequest):
 
     async def generator():
         nonlocal _tts_buf
-        full_response = ""
+        full_response = ""       # texto exposto ao usuário (sem os blocos <MEMORY_CORRECTION>)
         full_reasoning = ""
         tool_calls_acc: dict[int, dict] = {}   # index -> tool_call em montagem
         t0 = time.perf_counter()
         cached_tokens = 0
 
-        # Retry simples para falhas transitórias (5xx/rede/429) do OpenRouter
-        for attempt in range(OPENROUTER_MAX_RETRIES + 1):
-            client_used, model_used, r_ctx = await _execute_inference(
-                json_payload=payload,
-                stream=True,
-                model=MAIN_MODEL,
-            )
+        # ── Confidence-watch: estado entre passes ──────────────────────────
+        window = _ConfidenceWindow() if watch_confidence else None
+        watch_events_used = 0   # conta interrupções (com ou sem correção efetiva)
+        # ── Diagnóstico do vigia: um vigia sem logprobs é silenciosamente
+        # inútil. Contamos se o provedor de fato devolve logprobs e avisamos
+        # (probe + resumo final) quando não devolve.
+        watch_lp_seen = 0       # total de logprobs recebidos
+        watch_chunks_no_lp = 0  # chunks de conteúdo observados sem nenhum logprob
+        current_messages = list(messages)   # cresce a cada correção (novo request)
+
+        while True:
+            interrupted_for_correction = False
+
+            # Retry simples para falhas transitórias (5xx/rede/429) do OpenRouter
+            for attempt in range(OPENROUTER_MAX_RETRIES + 1):
+                client_used, model_used, r_ctx = await _execute_inference(
+                    json_payload={**payload, "messages": current_messages},
+                    stream=True,
+                    model=MAIN_MODEL,
+                )
+
+                try:
+                    async with r_ctx as r:
+                        if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
+                            retry_after = r.headers.get("Retry-After")
+                            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
+                            log.warning(
+                                f"OpenRouter stream: 429. Aguardando {wait_s}s "
+                                f"(tentativa {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1})."
+                            )
+                            await asyncio.sleep(wait_s)
+                            continue
+                        if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
+                            log.warning(
+                                f"OpenRouter stream: {r.status_code} "
+                                f"(tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
+                            )
+                            await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
+                            continue
+
+                        if r.status_code >= 400:
+                            # Erro definitivo (retries esgotados ou 4xx): reporta no
+                            # stream — com a marcação too_large (mesmo contrato do
+                            # /chat/tools) para o caller reduzir o contexto.
+                            try:
+                                err_body = (await r.aread()).decode("utf-8", errors="replace")
+                            except Exception:
+                                err_body = ""
+                            log.warning(
+                                f"OpenRouter stream: {r.status_code} — {err_body[:200]}"
+                            )
+                            yield f"data: {json.dumps({'error': f'openrouter {r.status_code}: {err_body[:400]}', 'too_large': _is_request_too_large_error(err_body)})}\n\n"
+                            return
+
+                        # Conexão aceita. Processa as linhas SSE:
+                        async for line in r.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[len("data:"):].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                                choices = chunk.get("choices") or []
+                                if not choices:
+                                    # Chunk final só com usage (sem choices)
+                                    usage = chunk.get("usage", {})
+                                    if usage:
+                                        cached_tokens = usage.get("prompt_tokens_cached", 0) or \
+                                                         usage.get("cached_tokens", 0)
+                                    continue
+                                delta_obj = choices[0].get("delta", {}) or {}
+
+                                if req.stream_reasoning:
+                                    reasoning = delta_obj.get("reasoning_content", "") or delta_obj.get("reasoning", "")
+                                    if reasoning:
+                                        full_reasoning += reasoning
+                                        yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
+
+                                # ── Fragments de tool_calls: apenas ACUMULA aqui.
+                                # A "ativação" das tools acontece ao FINAL da
+                                # resposta, num único evento — os deltas de text
+                                # continuam fluindo normalmente durante a geração.
+                                for tc in (delta_obj.get("tool_calls") or []):
+                                    idx = tc.get("index", 0)
+                                    entry = tool_calls_acc.setdefault(idx, {
+                                        "id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    })
+                                    if tc.get("id"):
+                                        entry["id"] = tc["id"]
+                                    if tc.get("type"):
+                                        entry["type"] = tc["type"]
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        entry["function"]["name"] += fn["name"]
+                                    if fn.get("arguments"):
+                                        entry["function"]["arguments"] += fn["arguments"]
+
+                                content = delta_obj.get("content", "") or ""
+                                if not content:
+                                    # Alguns provedores enviam usage na última chunk
+                                    usage = chunk.get("usage", {})
+                                    if usage:
+                                        cached_tokens = usage.get("prompt_tokens_cached", 0) or \
+                                                         usage.get("cached_tokens", 0)
+                                    continue
+
+                                full_response += content
+                                yield f"data: {json.dumps({'delta': content})}\n\n"
+
+                                # TTS incremental apenas quando não há tools na
+                                # jogada — com tools, o content pode ser texto
+                                # intermediário (a tool_call vem no fim), então
+                                # bufferizamos e só falamos se o turno for final.
+                                if use_tts:
+                                    _tts_buf += content
+                                    if not req.tools:
+                                        buf_rstrip = _tts_buf.rstrip()
+                                        if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
+                                           or len(_tts_buf) > 150:
+                                            _flush_tts_buf()
+
+                                # ── VIGIA DE CONFIANÇA (logprobs) ───────────
+                                # OpenRouter/OpenAI: choices[0].logprobs.content
+                                # é uma lista de {token, logprob, ...} — 1 item
+                                # por token do delta (normalmente 1 por chunk).
+                                # Alguns provedores aninham em delta.logprobs —
+                                # checamos os dois. Se NENHUM logprob chegar
+                                # (provedor sem suporte), o vigia é desativado
+                                # com aviso explícito — sem isso, ele falhava
+                                # silenciosamente para sempre (window nunca
+                                # acumula, sentence_ready nunca dispara).
+                                if watch_confidence and window is not None \
+                                   and watch_events_used < CONFIDENCE_MAX_CORRECTIONS:
+                                    lp_obj = choices[0].get("logprobs") \
+                                             or delta_obj.get("logprobs") or {}
+                                    lp_content = lp_obj.get("content") or []
+                                    if lp_content:
+                                        watch_lp_seen += len(lp_content)
+                                        for lp_item in lp_content:
+                                            window.add(lp_item.get("token", ""), lp_item.get("logprob"))
+                                    else:
+                                        watch_chunks_no_lp += 1
+                                        if watch_chunks_no_lp == WATCH_LP_PROBE_CHUNKS and not watch_lp_seen:
+                                            log.warning(
+                                                "[MEMORY-WATCH] "
+                                                f"{WATCH_LP_PROBE_CHUNKS} chunks de conteúdo e nenhum "
+                                                "logprob recebido — o provedor/modelo não devolve "
+                                                "logprobs. Vigia de confiança desativado nesta "
+                                                "resposta (memory_read de correção não vai disparar)."
+                                            )
+                                    if window.sentence_ready():
+                                        conf = window.avg_confidence()
+                                        if conf < CONFIDENCE_THRESHOLD:
+                                            log.info(
+                                                f"[MEMORY-WATCH] Confiança baixa ({conf:.2f} < "
+                                                f"{CONFIDENCE_THRESHOLD}) na janela: {window.text!r}"
+                                            )
+                                            interrupted_for_correction = True
+                                            break
+                                        window.reset()
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+
+                            if interrupted_for_correction:
+                                break
+
+                        # Se saiu do `async for line` por causa da interrupção,
+                        # fechar o `async with r_ctx` aqui já encerra a conexão
+                        # de streaming atual (é o "interromper a geração").
+                        break   # sai do loop de retry — sucesso (interrompido ou não)
+
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+
+            if not interrupted_for_correction:
+                break   # resposta terminou normalmente — sai do while de passes
+
+            # ── CORREÇÃO EM ANDAMENTO ────────────────────────────────────────
+            # A conexão de streaming atual já foi fechada (saímos do `async
+            # with`). Busca evidência, classifica, e monta um novo request
+            # cuja última mensagem é role="assistant" com o texto já gerado +
+            # o bloco <MEMORY_CORRECTION> (não emitido ao usuário) + o
+            # prefill escolhido — o modelo "continua" a partir dali.
+            watch_events_used += 1
+            window_text = window.text
+            prev_context = full_response[:-len(window_text)] if window_text and full_response.endswith(window_text) else full_response
+            prev_context = prev_context[-CONFIDENCE_CONTEXT_CHARS:]
+            query = f"{prev_context} {window_text}".strip()
 
             try:
-                async with r_ctx as r:
-                    if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
-                        retry_after = r.headers.get("Retry-After")
-                        wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
-                        log.warning(
-                            f"OpenRouter stream: 429. Aguardando {wait_s}s "
-                            f"(tentativa {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1})."
-                        )
-                        await asyncio.sleep(wait_s)
-                        continue
-                    if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
-                        log.warning(
-                            f"OpenRouter stream: {r.status_code} "
-                            f"(tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
-                        )
-                        await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
-                        continue
-
-                    if r.status_code >= 400:
-                        # Erro definitivo (retries esgotados ou 4xx): reporta no
-                        # stream — com a marcação too_large (mesmo contrato do
-                        # /chat/tools) para o caller reduzir o contexto.
-                        try:
-                            err_body = (await r.aread()).decode("utf-8", errors="replace")
-                        except Exception:
-                            err_body = ""
-                        log.warning(
-                            f"OpenRouter stream: {r.status_code} — {err_body[:200]}"
-                        )
-                        yield f"data: {json.dumps({'error': f'openrouter {r.status_code}: {err_body[:400]}', 'too_large': _is_request_too_large_error(err_body)})}\n\n"
-                        return
-
-                    # Conexão aceita. Processa as linhas SSE:
-                    async for line in r.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            choices = chunk.get("choices") or []
-                            if not choices:
-                                # Chunk final só com usage (sem choices)
-                                usage = chunk.get("usage", {})
-                                if usage:
-                                    cached_tokens = usage.get("prompt_tokens_cached", 0) or \
-                                                     usage.get("cached_tokens", 0)
-                                continue
-                            delta_obj = choices[0].get("delta", {}) or {}
-
-                            if req.stream_reasoning:
-                                reasoning = delta_obj.get("reasoning_content", "") or delta_obj.get("reasoning", "")
-                                if reasoning:
-                                    full_reasoning += reasoning
-                                    yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
-
-                            # ── Fragments de tool_calls: apenas ACUMULA aqui.
-                            # A "ativação" das tools acontece ao FINAL da
-                            # resposta, num único evento — os deltas de text
-                            # continuam fluindo normalmente durante a geração.
-                            for tc in (delta_obj.get("tool_calls") or []):
-                                idx = tc.get("index", 0)
-                                entry = tool_calls_acc.setdefault(idx, {
-                                    "id": "", "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                })
-                                if tc.get("id"):
-                                    entry["id"] = tc["id"]
-                                if tc.get("type"):
-                                    entry["type"] = tc["type"]
-                                fn = tc.get("function") or {}
-                                if fn.get("name"):
-                                    entry["function"]["name"] += fn["name"]
-                                if fn.get("arguments"):
-                                    entry["function"]["arguments"] += fn["arguments"]
-
-                            content = delta_obj.get("content", "") or ""
-                            if not content:
-                                # Alguns provedores enviam usage na última chunk
-                                usage = chunk.get("usage", {})
-                                if usage:
-                                    cached_tokens = usage.get("prompt_tokens_cached", 0) or \
-                                                     usage.get("cached_tokens", 0)
-                                continue
-
-                            full_response += content
-                            yield f"data: {json.dumps({'delta': content})}\n\n"
-
-                            # TTS incremental apenas quando não há tools na
-                            # jogada — com tools, o content pode ser texto
-                            # intermediário (a tool_call vem no fim), então
-                            # bufferizamos e só falamos se o turno for final.
-                            if use_tts:
-                                _tts_buf += content
-                                if not req.tools:
-                                    buf_rstrip = _tts_buf.rstrip()
-                                    if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
-                                       or len(_tts_buf) > 150:
-                                        _flush_tts_buf()
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
-
-                    # Se o stream terminou com sucesso, quebra o loop de retry
-                    break
-
+                results = await memory_read(query, session_id=req.session_id, top_k=5)
             except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                return
+                log.info(f"[MEMORY-WATCH] Falha no memory_read de correção: {e}")
+                results = []
+
+            match = _best_matching_memory(window_text, results)
+            window.reset()
+
+            if match is None:
+                # Nenhuma evidência relevante o suficiente — falso alarme.
+                # Não há correção real: apenas reabre o streaming de onde
+                # parou (prefill puro, sem bloco de correção), consumindo
+                # o orçamento de watch_events_used para não repetir sem fim
+                # sobre a mesma frase difícil.
+                current_messages = messages + [{"role": "assistant", "content": full_response}]
+                continue
+
+            evidence_text = match.get("text") or match.get("content") or ""
+            classification = await _classify_memory_correction(prev_context, window_text, evidence_text)
+            prefill = _CORRECTION_PREFILL.get(classification, "")
+
+            log.info(
+                f"[MEMORY-WATCH] Correção: classificação={classification!r} "
+                f"evidência={evidence_text[:120]!r}"
+            )
+            yield f"data: {json.dumps({'memory_correction': {'classification': classification, 'evidence': evidence_text[:300]}})}\n\n"
+
+            correction_block = _MEMORY_CORRECTION_TEMPLATE.format(
+                evidencia=evidence_text, classificacao=classification,
+            )
+            # O bloco <MEMORY_CORRECTION> só entra no payload enviado ao
+            # modelo (dá contexto/instrução pra retomada) — nunca é
+            # streamado ao usuário. Só o prefill (se houver) e o que vier
+            # depois dele são emitidos como deltas normais.
+            assistant_with_correction = f"{full_response}\n\n{correction_block}\n{prefill}"
+            current_messages = messages + [{"role": "assistant", "content": assistant_with_correction}]
+
+            if prefill:
+                full_response += prefill
+                yield f"data: {json.dumps({'delta': prefill})}\n\n"
+                if use_tts:
+                    _tts_buf += prefill
+            # "confirmacao"/"complementacao": prefill vazio — a geração só
+            # segue, agora com a evidência já incorporada ao contexto do
+            # próximo pass (sem alegar uma correção que não houve).
+
+            # volta ao topo do while: nova requisição de streaming, continuando
 
         # ── FINALIZAÇÃO: monta as tool_calls acumuladas ──────────────────────
         tool_calls_final = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
@@ -1490,7 +2083,16 @@ async def chat_stream(req: ChatRequest):
             f"reasoning: {len(full_reasoning)} chars | "
             f"tool_calls: {[tc['function']['name'] for tc in tool_calls_final] or 'nenhuma'} | "
             f"cached: {cached_tokens} tokens"
+            + (f" | memory_corrections: {watch_events_used}" if watch_confidence else "")
+            + (f" | watch_logprobs: {watch_lp_seen}" if watch_confidence else "")
         )
+        if watch_confidence and watch_lp_seen == 0:
+            log.warning(
+                "[MEMORY-WATCH] Nenhum logprob na resposta inteira — o vigia de "
+                "confiança não pôde atuar (provedor provavelmente não suporta "
+                f"logprobs para {MAIN_MODEL}). Considere desligar watch_confidence "
+                "ou trocar de provedor/modelo."
+            )
 
         if tool_calls_final:
             # ── ATIVAÇÃO DAS TOOLS: evento único ao final da resposta ──

@@ -72,3 +72,5 @@ msgpack
 lancedb
 
 mcp
+
+regex

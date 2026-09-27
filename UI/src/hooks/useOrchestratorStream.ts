@@ -252,7 +252,9 @@ export function useOrchestratorStream() {
  *   step_done   JSON  {step, executor, success, ...}    StepDonePayload
  *   result      texto puro (saída intermediária de uma tool)
  *   reasoning   texto puro (só /code)
- *   delta       texto puro — a resposta final INTEIRA (não incremental)
+ *   delta       texto puro — fragmento INCREMENTAL do content do LLM
+ *               (concatenar); pode vir em chunk único nos paths que não
+ *               passam pelo content streamado (finish/vision/force_finish)
  *   error       JSON  {error, fatal?}
  *   done        JSON  ExecuteDonePayload | CodeDonePayload
  */
@@ -388,9 +390,12 @@ function handleFrame(
       break;
     }
 
-    // A resposta final inteira, mandada de uma vez só (apesar do nome).
+    // Fragmento incremental do content do LLM — chega DURANTE a geração
+    // (streaming real: _llm_chat_stream no orchestrator repassa cada pedaço
+    // via SSE). Concatena no texto da mensagem. Chunks únicos (finish,
+    // vision, force_finish) também passam aqui, só que de uma vez.
     case "delta": {
-      updateLast((m) => ({ ...m, text: frame.raw }));
+      updateLast((m) => ({ ...m, text: (m.text ?? "") + frame.raw }));
       break;
     }
 
@@ -402,7 +407,13 @@ function handleFrame(
     }
 
     case "done": {
-      updateLast((m) => ({ ...m, streaming: false }));
+      // O payload traz a resposta final completa — cura o texto visível:
+      // remove pré-ambulos intermediários de turnos com tool_call e repara
+      // frames SSE perdidos no meio do streaming.
+      const data = tryParseJson<{ final_response?: string }>(frame.raw);
+      const finalText =
+        typeof data === "object" && data.final_response ? data.final_response : null;
+      updateLast((m) => ({ ...m, streaming: false, text: finalText ?? m.text }));
       break;
     }
 

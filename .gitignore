@@ -46,4 +46,4 @@ cache/
 
 Modules/transcribe/build
 
-Modules/memory/*
+Modules/memory/db/*

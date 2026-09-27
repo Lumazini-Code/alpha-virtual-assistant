@@ -11,6 +11,11 @@
 # ─────────────────────────────────────────
 _shutting_down=0
 export ALPHA_ENABLE_GIT=0
+
+# cwd fixo do Memory Server — isolado do resto do script (nenhum outro `cd`
+# depende dele nem é afetado por ele; ver uso em `restart_on_fail` abaixo).
+MEMORY_API_CWD="/app/Modules/memory"
+
 _cleanup() {
     if [ "$_shutting_down" -eq 1 ]; then return; fi
     _shutting_down=1
@@ -70,14 +75,9 @@ restart_on_fail "TTS" "python3 TTS.py" &
 echo "  • Vision API..."
 restart_on_fail "Vision" "python3 vision.py" &
 
+
 echo "  • Memory Server..."
-restart_on_fail "Memory Server" "python3 memory_api.py" &
-
-echo "  • Alpha-code Agent..."
-# Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports
-# relativos), então roda igual aos outros serviços em /app/Modules.
-restart_on_fail "alpha_code" "python3 alpha_code.py" &
-
+restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
 
 
 echo "✓ Todos os serviços iniciados"
