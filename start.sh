@@ -79,6 +79,9 @@ restart_on_fail "Vision" "python3 vision.py" &
 echo "  • Memory Server..."
 restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
 
+echo "  • MCP Manager..."
+restart_on_fail "MCP Manager" "python3 mcp_manager.py" &
+
 
 echo "✓ Todos os serviços iniciados"
 echo ""

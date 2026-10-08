@@ -31,16 +31,17 @@ Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
-Tools via MCP (descoberta em duas etapas — ver MCP_SKILLS):
-  memory (read/write), search, read_url, alpha_code,
-  playwright (automação de navegador — microsoft/playwright-mcp, via npx,
-  conectado ao Chrome REAL do usuário via CDP — ver _ensure_chrome_debug —
-  em vez de um Chromium automatizado isolado, pra evitar detecção antibot).
-  Em vez de um executor Python hardcoded por tool + conversão manual pro
-  schema OpenAI, cada um desses agora é um servidor MCP separado. O loop
-  primeiro escolhe a "skill" (servidor) relevante pra pergunta do usuário
-  usando só os resumos em MCP_SKILLS (~1 linha cada, barato em tokens),
-  e SÓ ENTÃO conecta e lista as tools reais daquele servidor.
+Tools via MCP (descoberta em duas etapas — ver Modules/mcp_manager.py):
+  Quaisquer servidores MCP que o usuário registrar via API REST no
+  mcp_manager (porta 4008 — registro, sync e EXECUÇÃO ficam todos lá; este
+  orchestrator é só um cliente REST dele). Cada tool tem um snippet (o
+  "skill.md" da tool: o que ela realmente faz e como usar) gravado na
+  memória de grafos de tools (ToolsDB, via memory_api). O loop primeiro
+  escolhe os servidores relevantes pelo GRAFO de tools (kNN + PPR no
+  co-uso, via /skills/select — barato, sem conectar em nada) e SÓ ENTÃO
+  carrega as tools reais dos servidores escolhidos (/servers/{name}/tools,
+  schemas + snippets do cache do manager); a execução vira
+  POST /servers/{name}/call.
 
   Memory voltou a falar REST puro (`memory_api.py`, FastAPI sobre
   `Modules/memory.py`) em vez de MCP — continua sendo um processo HTTP
@@ -55,6 +56,7 @@ Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
   - LLM Chat        (port 4003)  — conversational inference (OpenRouter)
   - Vision / VQA    (port 4002)  — image understanding (tool nativa)
+  - MCP Manager     (port 4008)  — registro + executor de servidores MCP
 Process manager (port 9001) segue controlando o ambiente Docker.
 """
 from __future__ import annotations
@@ -66,21 +68,19 @@ import logging
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager, AsyncExitStack
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Literal, Optional
 import datetime
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 import regex as re
-# ── MCP (Model Context Protocol) — cliente usado pelas tools externas ──
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamable_http_client
+# MCP é consumido VIA mcp_manager (REST, porta 4008) — este processo nunca
+# spawna servidores MCP nem segura sessões; o manager é o único executante.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -98,63 +98,41 @@ LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
 DEEP_SEARCH_URL      = "http://localhost:4005"
 ALPHA_CODE_URL       = "http://localhost:4006"
-# shell_command_api.py — abre/derruba o Chrome real do usuário (debugging
-# remoto via CDP), usado para dar ao playwright-mcp um navegador com
-# fingerprint/cookies/sessão genuínos em vez do Chromium automatizado que
-# ele lançaria sozinho (ver MCP_SKILLS["playwright"] e _ensure_chrome_debug).
-#
-# ATENÇÃO — CONFLITO DE PORTA: o default de shell_command_api.py
-# (AGENT_SHELL_API_PORT) também é 4005, igual ao DEEP_SEARCH_URL acima.
-# Suba o shell_command_api.py com `AGENT_SHELL_API_PORT=4007` (env var) ou
-# ajuste SHELL_COMMAND_URL/CHROME_DEBUG_PORT abaixo para combinar com a
-# porta que você realmente usar.
-SHELL_COMMAND_URL    = "http://localhost:4007"
-CHROME_DEBUG_PORT    = 9222  # mesmo default de COMMAND_REGISTRY["launch_chrome_debug"]
+# mcp_manager.py — registro REST + executor de servidores MCP (stdio/http).
+# É o ÚNICO processo que spawna servidores MCP e mantém sessões; este
+# orchestrator fala com ele via REST na descoberta em duas etapas (ver
+# MCP via mcp_manager, abaixo, e _select_skills/_load_mcp_tools).
+MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://localhost:4008")
+# Teto default de execução para tools MCP — o EXECUTOR_TIMEOUTS não tem
+# entradas por tool MCP (nomes dinâmicos `servidor__tool`), então toda tool
+# externa que não tiver override usa este valor (também enviado ao manager,
+# que repassa ao call_tool do SDK).
+MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 PROCESS_MANAGER_URL  = "http://localhost:9001"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MCP Skills Registry — descoberta em duas etapas
+# MCP via mcp_manager — descoberta em duas etapas (registry DINÂMICO)
 # ══════════════════════════════════════════════════════════════════════════════
-# Etapa 1: o modelo vê só `skill_summary` (barato, ~10-20 tokens cada) e
-# escolhe quais servidores são relevantes pro pedido do usuário.
-# Etapa 2: SÓ ENTÃO conectamos (stdio) e chamamos list_tools() nos
-# servidores escolhidos, carregando o schema completo das tools reais.
+# O registry não é mais um dict hardcoded (MCPSkill/MCP_SKILLS) — os
+# servidores são cadastrados pelo USUÁRIO via API REST no mcp_manager
+# (porta 4008), que também é o único EXECUTANTE (spawns stdio, sessões,
+# proxy de call_tool). Este processo só fala REST com o manager:
 #
-# Substitui os antigos executores hardcoded (_tool_search, _tool_read_url,
-# _tool_alpha_code) — cada um vira, em vez de uma função Python fixa, um
-# servidor MCP que expõe sua própria lista de tools dinamicamente.
-# "memory" NÃO entra aqui — voltou a ser REST puro (memory_api.py), acessado
-# diretamente via state.memory_client / _memory_request(...), sem passar
-# pela descoberta de skills MCP.
-@dataclass
-class MCPSkill:
-    skill_summary: str                 # descrição curta, usada na etapa 1
-    # ── stdio (default): subimos um subprocesso próprio por skill ──
-    command: Optional[str] = None      # executável do servidor MCP (stdio)
-    args: list[str] = field(default_factory=list)
-    env: Optional[dict[str, str]] = None
-    # Hook opcional, chamado (awaited) uma única vez, ANTES de subir o
-    # processo stdio, na primeira conexão da skill. Devolve uma lista de
-    # args extras a concatenar em `args` — usado pelo "playwright" pra
-    # resolver dinamicamente o --cdp-endpoint do Chrome real (só se sabe a
-    # porta depois de perguntar pro shell_command_api). None = nenhum extra.
-    pre_connect: Optional[Callable[[], "asyncio.Future[list[str]]"]] = None
-    # ── http: conecta a um processo MCP JÁ RODANDO (streamable-http) em vez
-    # de spawnar um subprocesso — necessário para skills com estado que
-    # precisa ser compartilhado com OUTROS processos além deste orchestrator
-    # (ex.: "memory", também consumido por LLM.py). Quando transport="http",
-    # `url` é obrigatório e `command`/`args`/`pre_connect` são ignorados.
-    transport: Literal["stdio", "http"] = "stdio"
-    url: Optional[str] = None
-
-MCP_SKILLS: dict[str, MCPSkill] = {
-}
+# Etapa 1 (_select_skills): o grafo de tools (ToolsDB, na memory_api)
+# escolhe os servidores relevantes pro pedido — kNN semântico + PPR no
+# co-uso sobre os snippets das tools. Barato: nenhuma conexão MCP.
+# Etapa 2 (_load_mcp_tools): schemas reais + snippets das tools dos
+# servidores escolhidos (cache do manager) viram o payload OpenAI; cada
+# execução vira POST /servers/{name}/call.
+#
+# As tools + snippets vivem no grafo de tools (gravadas pelo /sync do
+# manager via /tools/register da memory_api) — é o que a etapa 1 consulta.
 
 HEALTH_PATHS: dict[str, str] = {
     "search": "/status", "tts": "/status", "memory": "/status",
     "llm": "/health", "vision": "/vision/status", "deep_search": "/health", "alpha_code": "/health",
-    "process_manager": "/status",
+    "mcp_manager": "/health", "process_manager": "/status",
 }
 
 # Timeout por tool (usado tanto para chamadas de tool quanto pro loop de seleção)
@@ -268,116 +246,13 @@ class AppState:
     deep_search_client: httpx.AsyncClient = field(default=None)
     alpha_code_client: httpx.AsyncClient = field(default=None)
     process_manager_client: httpx.AsyncClient = field(default=None)
-    # shell_command_api.py — abre/derruba o Chrome real (debug CDP), usado
-    # pela skill "playwright" via _ensure_chrome_debug.
-    shell_client: httpx.AsyncClient = field(default=None)
-    # ── MCP: pilha de contexto que mantém os processos stdio vivos, e um
-    # cache de sessões já conectadas (lazy — só conecta na primeira vez que
-    # uma skill é escolhida, não em todas as MCP_SKILLS no boot) ──
-    mcp_stack: AsyncExitStack = field(default=None)
-    mcp_sessions: dict[str, ClientSession] = field(default_factory=dict)
+    # mcp_manager (REST) — registro/executor de servidores MCP. Este
+    # processo NUNCA conecta MCP direto: etapa 1 (/skills/select), etapa 2
+    # (/servers/{name}/tools) e execução (/servers/{name}/call) vão todos
+    # por este client (ver _select_skills/_load_mcp_tools/_run_tool_loop).
+    mcp_client: httpx.AsyncClient = field(default=None)
 
 state = AppState()
-
-
-async def _ensure_chrome_debug() -> list[str]:
-    """`pre_connect` da skill "playwright": garante que existe um Chrome de
-    verdade (com o profile REAL do usuário — cookies, sessões logadas,
-    extensões) escutando debugging remoto via CDP, pedindo isso ao
-    shell_command_api.py (mesmo padrão de client HTTP do resto do
-    orchestrator — ver alpha_code.py). Devolve os args extras
-    (`--cdp-endpoint ...`) que fazem o playwright-mcp conectar NELE em vez
-    de lançar seu próprio Chromium automatizado — é isso que evita o
-    antibot: aos olhos do site, é o mesmo Chrome que o usuário já usa
-    normalmente, não um navegador headless/isolado recém-criado.
-
-    `launch_chrome_debug` é idempotente (o próprio shell_command_api
-    devolve `already_running: True` se a porta já estiver de pé), então
-    chamar isso toda vez que a skill "playwright" conecta é seguro — não
-    abre um Chrome novo a cada conversa.
-    """
-    if state.shell_client is None:
-        state.shell_client = httpx.AsyncClient(
-            base_url=SHELL_COMMAND_URL, timeout=httpx.Timeout(30.0, connect=5.0),
-        )
-    try:
-        r = await state.shell_client.post("/command", json={
-            "command": "launch_chrome_debug",
-            "params": {"port": CHROME_DEBUG_PORT},
-        })
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("success"):
-            raise RuntimeError(data.get("error") or "launch_chrome_debug falhou")
-        port = (data.get("result") or {}).get("port", CHROME_DEBUG_PORT)
-    except Exception as e:
-        # Falha aqui não deveria travar o resto do orchestrator — só a
-        # skill "playwright" fica indisponível até o shell_command_api
-        # voltar. Propaga pra _get_mcp_session logar e devolver erro à
-        # tool call, em vez de silenciosamente conectar num Chrome que não
-        # existe.
-        raise RuntimeError(
-            f"Não consegui garantir o Chrome debug via shell_command_api "
-            f"({SHELL_COMMAND_URL}): {e}"
-        ) from e
-
-    log.info(f"Chrome debug pronto na porta {port} (via shell_command_api) — playwright-mcp vai conectar via CDP")
-    return ["--cdp-endpoint", f"http://localhost:{port}"]
-
-
-async def _get_mcp_session(skill_name: str) -> ClientSession:
-    """Retorna a ClientSession do servidor MCP daquela skill, conectando
-    (e mantendo viva pro resto do processo, via state.mcp_stack) na
-    primeira vez que a skill é usada. Duas topologias, conforme
-    `skill.transport`:
-      - "stdio" (default): spawna um subprocesso próprio para esta skill.
-      - "http": conecta via streamable-http a um processo MCP que já está
-        rodando de forma independente. ("memory" não usa mais este caminho —
-        voltou a ser REST puro, ver _memory_request.)"""
-    if skill_name in state.mcp_sessions:
-        log.debug(f"[_get_mcp_session] '{skill_name}' já conectado, reusando sessão")
-        return state.mcp_sessions[skill_name]
-    skill = MCP_SKILLS[skill_name]
-    t0 = time.perf_counter()
-
-    if skill.transport == "http":
-        if not skill.url:
-            raise RuntimeError(f"MCP skill '{skill_name}': transport='http' sem `url` configurado")
-        log.debug(f"[_get_mcp_session] '{skill_name}': conectando via streamable-http em {skill.url}")
-        try:
-            read, write, _ = await state.mcp_stack.enter_async_context(streamable_http_client(skill.url))
-        except Exception as e:
-            log.error(
-                f"[_get_mcp_session] '{skill_name}': falha ao conectar em {skill.url} — "
-                f"o processo do servidor MCP está rodando? ({type(e).__name__}: {e})"
-            )
-            raise
-        session = await state.mcp_stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        state.mcp_sessions[skill_name] = session
-        log.info(f"MCP: conectado à skill '{skill_name}' (http, {skill.url}) em {(time.perf_counter()-t0)*1000:.0f}ms")
-        return session
-
-    # ── stdio: comportamento original (subprocesso próprio) ──
-    args = list(skill.args)
-    if skill.pre_connect is not None:
-        log.debug(f"[_get_mcp_session] '{skill_name}': rodando pre_connect...")
-        try:
-            extra_args = await skill.pre_connect()
-        except Exception as e:
-            log.error(f"[_get_mcp_session] '{skill_name}': pre_connect FALHOU — skill "
-                      f"ficará indisponível nesta rodada: {type(e).__name__}: {e}")
-            raise
-        log.debug(f"[_get_mcp_session] '{skill_name}': pre_connect ok, args extras: {extra_args}")
-        args.extend(extra_args)
-    log.debug(f"[_get_mcp_session] '{skill_name}': lançando `{skill.command} {' '.join(args)}`")
-    server_params = StdioServerParameters(command=skill.command, args=args, env=skill.env)
-    read, write = await state.mcp_stack.enter_async_context(stdio_client(server_params))
-    session = await state.mcp_stack.enter_async_context(ClientSession(read, write))
-    await session.initialize()
-    state.mcp_sessions[skill_name] = session
-    log.info(f"MCP: conectado à skill '{skill_name}' (stdio) em {(time.perf_counter()-t0)*1000:.0f}ms")
-    return session
 
 
 async def _memory_request(method: str, path: str, json_body: Optional[dict] = None,
@@ -409,7 +284,8 @@ async def lifespan(app: FastAPI):
     service_urls = {
         "tts": TTS_URL, "llm": LLM_URL, "vision": VISION_URL,
         "deep_search": DEEP_SEARCH_URL, "alpha_code": ALPHA_CODE_URL,
-        "process_manager": PROCESS_MANAGER_URL, "memory": MEMORY_API_URL,
+        "mcp_manager": MCP_MANAGER_URL, "memory": MEMORY_API_URL,
+        "process_manager": PROCESS_MANAGER_URL,
     }
     async with httpx.AsyncClient(timeout=5.0) as probe:
         for name, url in service_urls.items():
@@ -435,23 +311,17 @@ async def lifespan(app: FastAPI):
     # processos (status) devem falhar rápido se ele estiver
     # offline, em vez de travar o loop de tools esperando para sempre.
     state.process_manager_client = _make_client(PROCESS_MANAGER_URL, 15.0)
-
-    # MCP: só prepara a pilha de contexto — conexão real é lazy (ver
-    # _get_mcp_session), disparada quando o loop escolhe uma skill pela
-    # primeira vez. Conectar tudo aqui no boot atrasaria a inicialização
-    # à toa com servidores que talvez nunca sejam usados nesta sessão.
-    state.mcp_stack = AsyncExitStack()
-    log.info(f"MCP: {len(MCP_SKILLS)} skills registradas (conexão lazy): {list(MCP_SKILLS.keys())}")
+    # mcp_manager: timeout LONGO (a execução de tools MCP pode demorar — o
+    # teto real por tool é o asyncio.wait_for do loop, EXECUTOR_TIMEOUTS).
+    state.mcp_client = _make_client(MCP_MANAGER_URL, 9999999.0)
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
     for c in (state.memory_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client,
-              state.alpha_code_client, state.process_manager_client):
+              state.alpha_code_client, state.process_manager_client,
+              state.mcp_client):
         await c.aclose()
-    if state.shell_client is not None:
-        await state.shell_client.aclose()
-    await state.mcp_stack.aclose()
     log.info("AVA Orchestrator encerrado")
 
 
@@ -747,8 +617,8 @@ async def _think_instruction(text: str) -> tuple[int, str]:
 _WRITE_HINT = "Use this when the user asks you to remember/record/save something."
 
 # _tool_memory_read, _tool_memory_write, _tool_search, _tool_read_url e
-# _tool_deep_search foram REMOVIDOS — memory e search agora são servidores
-# MCP (ver MCP_SKILLS + _get_mcp_session), descobertos e despachados
+# _tool_deep_search foram REMOVIDOS — hoje qualquer servidor MCP é
+# cadastrado pelo usuário no mcp_manager e descoberto/despachado
 # dinamicamente pelo loop em vez de uma função Python fixa por tool.
 
 # ── Tradução de Objetos: vision.py (crops) -> LLM.py (multi-imagem) ──
@@ -978,8 +848,8 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest, sid: str = ""):
         "answer": answer,
     }
 
-# _tool_alpha_code foi REMOVIDO — virou servidor MCP (alpha_code em
-# MCP_SKILLS).
+# _tool_alpha_code foi REMOVIDO — hoje vira um servidor MCP comum
+# cadastrado no mcp_manager (ou o endpoint direto /code, ver abaixo).
 
 # ── B: tool nativa de recall ATIVO ────────────────────────────────────────────
 # A antiga _tool_memory_read foi removida quando memory virou REST puro, e o
@@ -1020,8 +890,8 @@ async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
-# search e alpha_code saíram daqui: são descobertas
-# dinamicamente via MCP_SKILLS (ver _run_tool_loop).
+# search e alpha_code saíram daqui: servidores MCP são descobertos
+# dinamicamente via mcp_manager (ver _select_skills/_load_mcp_tools).
 TOOLS: dict[str, dict[str, Any]] = {
     "memory_search": {
         "description": (
@@ -1083,72 +953,81 @@ def _build_native_tools_schema() -> list[dict]:
     return schema
 
 
-def _mcp_tool_to_openai_schema(tool) -> dict:
-    """Converte uma Tool do MCP (name, description, inputSchema) direto
-    pro formato OpenAI function-calling — substitui a conversão manual de
-    campo-por-campo que o _build_native_tools_schema fazia, já que aqui o
-    schema já vem pronto (JSON Schema) do próprio servidor MCP."""
+def _mcp_tool_to_openai_schema(tool: dict) -> dict:
+    """Converte um registro de tool do mcp_manager (GET /servers/{name}/tools)
+    pro formato OpenAI function-calling. O nome pro modelo é o GRAPH_NAME
+    (`servidor__tool` — único entre servidores); a descrição é o SNIPPET (o
+    "skill.md" gravado no grafo de tools — o que a tool realmente faz e como
+    usar). O schema JSON de input vem do próprio servidor MCP, via /sync."""
     return {
         "type": "function",
         "function": {
-            "name": tool.name,
-            "description": tool.description or "",
-            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            "name": tool["graph_name"],
+            "description": tool.get("snippet") or tool.get("description") or "",
+            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
         },
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Seleção de skill (etapa 1 da descoberta em duas etapas) — escolhe quais
-# servidores MCP são relevantes pro pedido, usando só os resumos leves de
-# MCP_SKILLS, ANTES de conectar em qualquer servidor ou carregar tools reais.
+# Descoberta em duas etapas via mcp_manager (registry dinâmico do usuário)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _select_skills(user_input: str) -> list[str]:
-    """Pergunta ao LLM local quais skills (servidores MCP) parecem
-    relevantes pro pedido do usuário, usando só ~1 linha de resumo por
-    skill (barato em tokens). Retorna a lista de nomes escolhidos — pode
-    ser vazia (pedido não precisa de nenhuma tool MCP, só vision/finish).
-    """
-    if not MCP_SKILLS:
-        return []
-    skills_list = "\n".join(f"- {name}: {s.skill_summary}" for name, s in MCP_SKILLS.items())
-    log.debug(f"[_select_skills] skills disponíveis: {list(MCP_SKILLS.keys())}")
-    log.debug(f"[_select_skills] input do usuário: {user_input!r}")
+    """ETAPA 1 (grafo de tools): pergunta ao ToolsDB (via mcp_manager →
+    memory /tools/select) quais servidores MCP têm tools relevantes pro
+    pedido do usuário. Barato: kNN semântico + PPR no grafo de co-uso,
+    NENHUMA conexão MCP. Retorna nomes de servidores — pode ser vazia
+    (pedido não precisa de nenhuma tool MCP, só vision/finish).
+
+    Fallback: se o manager ou o grafo estiverem indisponíveis, libera TODOS
+    os servidores habilitados (mesma postura conservadora do registry
+    estático — melhor oferecer demais do que cair sem tools)."""
     try:
-        raise NotImplementedError(
-            "Seleção de skills sem backend (llama-server removido; aguardando substituição)."
-        )
+        r = await state.mcp_client.get("/skills", timeout=10.0)
+        r.raise_for_status()
+        enabled = r.json()["servers"]
     except Exception as e:
-        log.warning(f"_select_skills falhou, liberando todas as skills como fallback: {e}")
-        return list(MCP_SKILLS.keys())
+        log.warning(f"[_select_skills] mcp_manager offline ({type(e).__name__}: {e}) — seguindo sem tools MCP nesta rodada")
+        return []
+    if not enabled:
+        return []
+    try:
+        r = await state.mcp_client.post("/skills/select", json={"query": user_input}, timeout=90.0)
+        r.raise_for_status()
+        chosen = [s["name"] for s in r.json()["skills"]]
+        log.info(f"[_select_skills] grafo de tools escolheu: {chosen}")
+    except Exception as e:
+        chosen = [s["name"] for s in enabled]
+        log.warning(f"[_select_skills] seleção via grafo falhou ({type(e).__name__}: {e}) — "
+                    f"liberando todos os servidores habilitados: {chosen}")
+    return chosen
 
 
-async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[ClientSession, str]]]:
-    """Etapa 2: conecta (ou reusa) as sessões MCP das skills escolhidas,
-    lista as tools reais de cada uma, e devolve:
+async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[str, str]]]:
+    """ETAPA 2: carrega do mcp_manager (cache local dele — SEM conexão MCP)
+    o schema real das tools dos servidores escolhidos, com os snippets como
+    descrição. Devolve:
       - o schema combinado no formato OpenAI (pra somar com as tools nativas)
-      - um dispatch map: nome da tool -> (sessão MCP, nome original na sessão)
-        usado no loop pra saber pra qual sessão encaminhar cada tool_call.
+      - um dispatch map: graph_name (`servidor__tool`) -> (servidor, nome
+        real da tool), usado no loop pra encaminhar cada tool_call pro
+        /servers/{name}/call certo.
     """
     schema: list[dict] = []
-    dispatch: dict[str, tuple[ClientSession, str]] = {}
-    log.debug(f"[_load_mcp_tools] conectando nas skills: {skill_names}")
-    for skill_name in skill_names:
+    dispatch: dict[str, tuple[str, str]] = {}
+    log.debug(f"[_load_mcp_tools] carregando tools dos servidores: {skill_names}")
+    for server in skill_names:
         try:
-            t0 = time.perf_counter()
-            session = await _get_mcp_session(skill_name)
-            result = await session.list_tools()
-            log.debug(
-                f"[_load_mcp_tools] skill '{skill_name}': {len(result.tools)} tool(s) "
-                f"em {(time.perf_counter()-t0)*1000:.0f}ms -> {[t.name for t in result.tools]}"
-            )
+            r = await state.mcp_client.get(f"/servers/{server}/tools", timeout=15.0)
+            r.raise_for_status()
+            tools = r.json()["tools"]
         except Exception as e:
-            log.warning(f"MCP: falha ao carregar tools da skill '{skill_name}': {type(e).__name__}: {e}")
+            log.warning(f"MCP: falha ao carregar tools do servidor '{server}': {type(e).__name__}: {e}")
             continue
-        for tool in result.tools:
+        for tool in tools:
             schema.append(_mcp_tool_to_openai_schema(tool))
-            dispatch[tool.name] = (session, tool.name)
+            dispatch[tool["graph_name"]] = (server, tool["name"])
+        log.debug(f"[_load_mcp_tools] '{server}': {len(tools)} tool(s) -> {[t['graph_name'] for t in tools]}")
 
     log.debug(f"[_load_mcp_tools] tools MCP disponíveis nesta rodada: {list(dispatch.keys())}")
     return schema, dispatch
@@ -1686,18 +1565,31 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                         timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
                     )
                 else:
-                    session, mcp_tool_name = mcp_dispatch[tool_name]
-                    mcp_result = await asyncio.wait_for(
-                        session.call_tool(mcp_tool_name, arguments=args),
-                        timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                    # MCP: proxy via mcp_manager (o executante). O timeout
+                    # vai AMBOS no wait_for daqui (teto do round-trip HTTP)
+                    # e no corpo do request (teto do call_tool no manager —
+                    # com folga de 10s pra overhead de rede/spawn).
+                    server, mcp_tool_name = mcp_dispatch[tool_name]
+                    mcp_timeout = EXECUTOR_TIMEOUTS.get(tool_name, MCP_CALL_TIMEOUT)
+                    r = await asyncio.wait_for(
+                        state.mcp_client.post(
+                            f"/servers/{server}/call",
+                            json={"tool": mcp_tool_name, "arguments": args,
+                                  "timeout": mcp_timeout},
+                        ),
+                        timeout=mcp_timeout + 10.0,
                     )
-                    # Conteúdo MCP vem como lista de blocos (TextContent,
-                    # ImageContent, ...) — junta os textuais num único
-                    # texto, no formato que _result_to_text já sabe tratar.
-                    result = "\n".join(
-                        block.text for block in mcp_result.content
-                        if hasattr(block, "text")
-                    ) or str(mcp_result.content)
+                    r.raise_for_status()
+                    call_data = r.json()
+                    # Conteúdo MCP chega como texto joinado dos blocos
+                    # textuais (TextContent etc.) — formato que
+                    # _result_to_text já sabe tratar.
+                    result = call_data.get("result") or ""
+                    if call_data.get("is_error"):
+                        # A tool executou e REPORTOU erro — o modelo precisa
+                        # vê-lo pra reagir (reformular, desistir, finish).
+                        result = f"ERROR (MCP tool reportou falha): {result}"
+                    log.debug(f"[{eid[:8]}] MCP call via manager: server={server} tool={mcp_tool_name} is_error={call_data.get('is_error')}")
                 success, err = True, None
             except Exception as e:
                 result, success, err = None, False, f"{type(e).__name__}: {e}"
@@ -2133,6 +2025,7 @@ async def status():
         "vision": (state.vision_client, HEALTH_PATHS["vision"]),
         "deep_search": (state.deep_search_client, HEALTH_PATHS["deep_search"]),
         "alpha_code": (state.alpha_code_client, HEALTH_PATHS["alpha_code"]),
+        "mcp_manager": (state.mcp_client, HEALTH_PATHS["mcp_manager"]),
         "process_manager": (state.process_manager_client, HEALTH_PATHS["process_manager"]),
     }
     for n, (c, p) in cfg.items():
@@ -2142,12 +2035,26 @@ async def status():
         except Exception:
             checks[n] = {"healthy": False, "status_code": None}
 
+    # Servidores MCP (registry dinâmico do usuário, no mcp_manager) —
+    # se o manager estiver offline, reporta sem derrubar o /status.
+    try:
+        r = await state.mcp_client.get("/servers", timeout=3.0)
+        r.raise_for_status()
+        mcp_servers = {
+            s["name"]: {
+                "summary": s["skill_summary"], "transport": s["transport"],
+                "enabled": bool(s["enabled"]), "tools": s["tools"],
+            }
+            for s in r.json()["servers"]
+        }
+    except Exception as e:
+        mcp_servers = {"(erro)": f"mcp_manager offline: {type(e).__name__}: {e}"}
+
     return {
-        "orchestrator": "ok", "architecture": "tool-calling + MCP (two-stage discovery)",
+        "orchestrator": "ok", "architecture": "tool-calling + MCP manager (two-stage discovery)",
         "services": checks,
         "native_tools": list(TOOLS.keys()),
-        "mcp_skills": {name: skill.skill_summary for name, skill in MCP_SKILLS.items()},
-        "mcp_connected": list(state.mcp_sessions.keys()),
+        "mcp_servers": mcp_servers,
     }
 
 @app.delete("/session/{session_id}")

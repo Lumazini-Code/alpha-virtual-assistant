@@ -980,6 +980,7 @@ class ToolsDB(EdgeGraphMixin):
     sequências (listar → ler → editar) e co_activation, tools usadas juntas.
     """
     EDGE_TABLE = "tool_edges"
+    GRAPH_LABEL = "tools"
 
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)

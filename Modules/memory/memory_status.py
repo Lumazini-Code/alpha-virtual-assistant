@@ -81,8 +81,8 @@ def _gather_status_sync() -> dict:
     contenção com uma escrita concorrente seguranco o lock/transação
     SQLite (embedding batch, decay job, cleanup de short-term — todas via
     run_in_executor em outra thread), travavam o event loop inteiro
-    enquanto esperavam — inclusive impedindo o servidor de responder ao
-    handshake MCP de outros clientes (ver orchestrator._get_mcp_session)."""
+    enquanto esperavam — inclusive impedindo o servidor de responder a
+    outros clientes HTTP (orchestrator, LLM.py, mcp_manager)."""
     resp = {
         "long_term": {
             "memories_total":       state.lt_db.count(),

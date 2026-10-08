@@ -1,12 +1,7 @@
 // Teste de transcrição streaming: nemotron-3.5-asr-streaming-0.6b (GGUF Q4_K_M)
 // via C API nativa do transcribe.cpp, + embedding de locutor (CAM++ 3D-Speaker).
 //
-// O ASR só é ativado por palavra-chave (Porcupine, pt): "ei alfa", "ei, alta",
-// "alfa" ou "alpha". Enquanto ninguém chama, só o Porcupine escuta e o áudio
-// vai para um buffer circular; ao detectar, o ASR abre a frase já com o que
-// foi falado logo depois da palavra e segue até o silêncio de fim de frase.
-//
-// Depois de chamar, fale no microfone e o texto aparece no terminal:
+// Fale no microfone e o texto aparece no terminal:
 //   - texto já confirmado (committed) em branco
 //   - texto provisório (tentative) em cinza, muda enquanto você fala
 //   - ao detectar silêncio, a frase é finalizada e fica gravada na linha
@@ -15,7 +10,6 @@
 // Arquitetura:
 //   callback do PortAudio  ->  ring buffer lock-free  ->  thread principal
 //                                                     ->  thread de speaker ID
-//   thread principal: Porcupine (sempre) + buffer circular -> ASR (após a palavra-chave)
 // O callback de áudio só copia amostras (tempo real, sem inferência dentro
 // dele). VAD + transcribe_stream_* rodam todos na thread principal, então
 // não há corrida entre feed/finalize/begin e nenhum áudio se perde entre
@@ -31,8 +25,19 @@
 //     pré-computadas e buffers reaproveitados entre chamadas
 //   - uma única Ort::Session, criada no boot, com grafo otimizado
 //
+// Wake word (sherpa-onnx KeywordSpotter, zipformer streaming de ~3M params):
+//   - roda NA MESMA thread principal, mas SÓ dentro de segmentos que o TEN VAD
+//     já marcou como fala: em silêncio o custo é zero
+//   - reaproveita exatamente os frames que o ASR já recebia (preroll incluso)
+//     e a mesma conversão int16 -> float
+//   - WAKE_GATE_ASR = true: o ASR de 0.6B só é aberto quando a wake word
+//     dispara; o áudio acumulado da frase (incl. a wake word) é reenviado ao
+//     ASR de uma vez. Frases sem wake word não gastam nenhuma inferência de ASR
+//     nem de speaker embedding.
+//   - WAKE_GATE_ASR = false: o ASR roda como antes e a wake word só anota.
+//
 // Deps: PortAudio, TEN VAD (ten_vad.h + libten_vad), transcribe.cpp, ONNX Runtime,
-//       Porcupine (pv_porcupine.h + libpv_porcupine)
+//       sherpa-onnx (C API: sherpa-onnx/c-api/c-api.h)
 
 #include <transcribe.h>
 #include <parakeet.h>
@@ -40,7 +45,7 @@
 #include <portaudio.h>
 #include <ten_vad.h>
 #include <onnxruntime_cxx_api.h>
-#include <pv_porcupine.h>
+#include <sherpa-onnx/c-api/c-api.h>
 
 #include <algorithm>
 #include <array>
@@ -53,6 +58,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -84,32 +90,19 @@ static constexpr int SPK_MAX_MS = 6000;                  // recorte central pra 
 static constexpr int SPK_THREADS = 2;                    // threads intra-op do ONNX Runtime
 static constexpr size_t SPK_QUEUE_MAX = 4;               // frases pendentes antes de descartar as velhas
 
-// ---- Config do wake word (Porcupine) ----
-static constexpr bool USE_WAKE_WORD = true;              // false = comportamento antigo (o VAD abre a frase sozinho)
-static constexpr const char* PORCUPINE_ACCESS_KEY_ENV = "PICOVOICE_ACCESS_KEY";   // AccessKey lida do ambiente
-static constexpr const char* PORCUPINE_MODEL_PATH = "../Models/porcupine_params_pt.pv";   // modelo de idioma (pt)
-static constexpr const char* PORCUPINE_DEVICE = "best";
-
-// Um .ppn por frase, treinado no Picovoice Console (idioma Português, plataforma Linux).
-struct WakeKeyword { const char* label; const char* ppn; float sensitivity; };
-static constexpr WakeKeyword WAKE_KEYWORDS[] = {
-    {"ei alfa",  "../Models/wake/ei-alfa_pt_linux.ppn",  0.5f},
-    {"ei, alta", "../Models/wake/ei-alta_pt_linux.ppn",  0.5f},
-    {"alfa",     "../Models/wake/alfa_pt_linux.ppn",     0.5f},
-    {"alpha",    "../Models/wake/alpha_pt_linux.ppn",    0.5f},
-};
-static constexpr int N_WAKE_KEYWORDS = (int)(sizeof(WAKE_KEYWORDS) / sizeof(WAKE_KEYWORDS[0]));
-
-static constexpr int WAKE_BUFFER_MS = 2000;              // capacidade do buffer circular de áudio
-static constexpr int WAKE_BACKTRACK_MS = 150;            // quanto do buffer vai pro ASR na detecção (o Porcupine
-                                                         // dispara ~1-2 frames após o fim da palavra; suba p/ ~1500
-                                                         // se quiser que a própria palavra vá junto pro ASR)
-static constexpr int WAKE_SETTLE_MS = 300;               // após a detecção, ignora a cauda da palavra p/ o endpoint
-static constexpr int WAKE_TIMEOUT_MS = 6000;             // chamou e não falou nada: volta a dormir
-static constexpr int WAKE_BUFFER_FRAMES = WAKE_BUFFER_MS / FRAME_MS;
-static constexpr int WAKE_BACKTRACK_FRAMES = WAKE_BACKTRACK_MS / FRAME_MS;
-static_assert(WAKE_BACKTRACK_MS <= WAKE_BUFFER_MS, "WAKE_BACKTRACK_MS deve caber em WAKE_BUFFER_MS");
-
+// ---- Config da wake word (sherpa-onnx KWS) ----
+// Modelo: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (ajuste os nomes
+// dos arquivos conforme o que veio no .tar.bz2).
+static constexpr const char* KWS_ENCODER = "../Models/sherpa-onnx/encoder-epoch-13-avg-2-chunk-8-left-64.onnx";
+static constexpr const char* KWS_DECODER = "../Models/sherpa-onnx/decoder-epoch-13-avg-2-chunk-8-left-64.onnx";
+static constexpr const char* KWS_JOINER  = "../Models/sherpa-onnx/joiner-epoch-13-avg-2-chunk-8-left-64.onnx";
+static constexpr const char* KWS_TOKENS  = "../Models/sherpa-onnx/tokens.txt";
+static constexpr const char* KWS_KEYWORDS = "../Models/sherpa-onnx/keywords.txt";   // uma wake word por linha (já tokenizada)
+static constexpr bool  WAKE_GATE_ASR = true;             // true: ASR só abre depois da wake word
+static constexpr bool  DEBUG_WAKE = true;                // mostra frases ignoradas por falta de wake word
+static constexpr float KWS_THRESHOLD = 0.25f;            // maior = menos falsos positivos, mais misses
+static constexpr float KWS_SCORE = 1.0f;                 // boost global (cada linha pode ter o seu com :x.x)
+static constexpr int   KWS_THREADS = 1;                  // modelo minúsculo: 1 thread basta
 static std::atomic<bool> g_running{true};
 static void on_sigint(int) { g_running = false; }
 
@@ -447,103 +440,82 @@ static void submit_speaker(std::vector<int16_t>& utt, int silence_ms) {
 }
 
 // ---------------------------------------------------------------------
-// Histórico circular de áudio (frames de FRAME_SAMPLES) — alimenta o ASR
-// com o que foi dito logo antes/durante a detecção da palavra-chave
-// ---------------------------------------------------------------------
-class AudioHistory {
-public:
-    explicit AudioHistory(size_t frames)
-        : cap_(frames), buf_(frames * FRAME_SAMPLES) {}
-
-    void push(const int16_t* frame) {
-        std::copy(frame, frame + FRAME_SAMPLES, buf_.begin() + head_ * FRAME_SAMPLES);
-        head_ = (head_ + 1) % cap_;
-        if (count_ < cap_) count_++;
-    }
-
-    // Chama fn(const int16_t* frame) nos últimos n frames, do mais antigo ao mais novo.
-    template <class F>
-    size_t last(size_t n, F&& fn) const {
-        n = std::min(n, count_);
-        size_t idx = (head_ + cap_ - n) % cap_;
-        for (size_t i = 0; i < n; i++) {
-            fn(&buf_[idx * FRAME_SAMPLES]);
-            idx = (idx + 1) % cap_;
-        }
-        return n;
-    }
-
-private:
-    size_t cap_;
-    std::vector<int16_t> buf_;
-    size_t head_ = 0, count_ = 0;
-};
-
-// ---------------------------------------------------------------------
-// Wake word (Porcupine). O Porcupine consome frames de
-// pv_porcupine_frame_length() amostras (512 @16k); acumulamos os frames de
-// 256 do VAD até completar um.
+// Wake word (sherpa-onnx KeywordSpotter)
+// Um spotter criado no boot (modelo + grafo de keywords carregados uma vez);
+// um stream novo por frase (barato: só os estados iniciais do encoder).
+// Só a thread principal usa esta classe.
 // ---------------------------------------------------------------------
 class WakeWord {
 public:
-    WakeWord() = default;
-    WakeWord(const WakeWord&) = delete;
-    WakeWord& operator=(const WakeWord&) = delete;
-    ~WakeWord() { if (h_) pv_porcupine_delete(h_); }
-
-    bool init(const char* access_key) {
-        std::array<const char*, N_WAKE_KEYWORDS> paths{};
-        std::array<float, N_WAKE_KEYWORDS> sens{};
-        for (int i = 0; i < N_WAKE_KEYWORDS; i++) {
-            paths[i] = WAKE_KEYWORDS[i].ppn;
-            sens[i] = WAKE_KEYWORDS[i].sensitivity;
-        }
-        const pv_status_t st = pv_porcupine_init(access_key, PORCUPINE_MODEL_PATH, PORCUPINE_DEVICE,
-                                                 N_WAKE_KEYWORDS, paths.data(), sens.data(), &h_);
-        if (st != PV_STATUS_SUCCESS) {
-            std::fprintf(stderr, "pv_porcupine_init: %s\n"
-                                 "  (confira AccessKey, %s e os .ppn em WAKE_KEYWORDS)\n",
-                         pv_status_to_string(st), PORCUPINE_MODEL_PATH);
-            h_ = nullptr;
-            return false;
-        }
-        if (pv_sample_rate() != SAMPLE_RATE) {
-            std::fprintf(stderr, "Porcupine espera %d Hz, o app usa %d Hz\n", pv_sample_rate(), SAMPLE_RATE);
-            return false;
-        }
-        frame_len_ = (size_t)pv_porcupine_frame_length();
-        acc_.reserve(frame_len_);
-        return true;
+    bool init() {
+        SherpaOnnxKeywordSpotterConfig cfg;
+        std::memset(&cfg, 0, sizeof(cfg));
+        cfg.feat_config.sample_rate = SAMPLE_RATE;
+        cfg.feat_config.feature_dim = 80;
+        cfg.model_config.transducer.encoder = KWS_ENCODER;
+        cfg.model_config.transducer.decoder = KWS_DECODER;
+        cfg.model_config.transducer.joiner = KWS_JOINER;
+        cfg.model_config.tokens = KWS_TOKENS;
+        cfg.model_config.provider = "cpu";
+        cfg.model_config.num_threads = KWS_THREADS;
+        cfg.model_config.debug = 0;
+        cfg.max_active_paths = 4;
+        cfg.num_trailing_blanks = 1;
+        cfg.keywords_score = KWS_SCORE;
+        cfg.keywords_threshold = KWS_THRESHOLD;
+        cfg.keywords_file = KWS_KEYWORDS;
+        spotter_ = SherpaOnnxCreateKeywordSpotter(&cfg);
+        return spotter_ != nullptr;
     }
 
-    // Alimenta amostras (qualquer quantidade). Devolve o índice da palavra-chave
-    // detectada em WAKE_KEYWORDS, ou -1.
-    int process(const int16_t* pcm, size_t n) {
-        int hit = -1;
-        for (size_t i = 0; i < n; i++) {
-            acc_.push_back(pcm[i]);
-            if (acc_.size() < frame_len_) continue;
-            int32_t kw = -1;
-            const pv_status_t st = pv_porcupine_process(h_, acc_.data(), &kw);
-            acc_.clear();
-            if (st != PV_STATUS_SUCCESS) {
-                if (!warned_) {
-                    std::fprintf(stderr, "\npv_porcupine_process: %s\n", pv_status_to_string(st));
-                    warned_ = true;
-                }
-            } else if (kw >= 0 && hit < 0) {
-                hit = kw;
-            }
-        }
-        return hit;
+    // Início de uma frase: stream limpo.
+    void begin() {
+        end();
+        stream_ = SherpaOnnxCreateKeywordStream(spotter_);
+    }
+
+    // Alimenta um frame (float [-1,1]). true se alguma wake word disparou.
+    bool feed(const float* f32, int n, std::string& name) {
+        if (!stream_) return false;
+        SherpaOnnxOnlineStreamAcceptWaveform(stream_, SAMPLE_RATE, f32, n);
+        return drain(name);
+    }
+
+    // Fim da frase sem disparo: força o tail padding do modelo, pra pegar uma
+    // wake word dita no finalzinho (ex.: só "Ava", com pouco silêncio depois).
+    bool flush(std::string& name) {
+        if (!stream_) return false;
+        SherpaOnnxOnlineStreamInputFinished(stream_);
+        return drain(name);
+    }
+
+    void end() {
+        if (stream_) { SherpaOnnxDestroyOnlineStream(stream_); stream_ = nullptr; }
+    }
+
+    void shutdown() {
+        end();
+        if (spotter_) { SherpaOnnxDestroyKeywordSpotter(spotter_); spotter_ = nullptr; }
     }
 
 private:
-    pv_porcupine_t* h_ = nullptr;
-    size_t frame_len_ = 0;
-    std::vector<int16_t> acc_;
-    bool warned_ = false;
+    bool drain(std::string& name) {
+        while (SherpaOnnxIsKeywordStreamReady(spotter_, stream_)) {
+            SherpaOnnxDecodeKeywordStream(spotter_, stream_);
+            const SherpaOnnxKeywordResult* r = SherpaOnnxGetKeywordResult(spotter_, stream_);
+            const bool hit = r && r->keyword && r->keyword[0] != '\0';
+            if (hit) name = r->keyword;
+            if (r) SherpaOnnxDestroyKeywordResult(r);
+            if (hit) return true;
+        }
+        return false;
+    }
+
+    const SherpaOnnxKeywordSpotter* spotter_ = nullptr;
+    const SherpaOnnxOnlineStream* stream_ = nullptr;
 };
+
+static WakeWord g_wake;
 
 // ---------------------------------------------------------------------
 // Saída no terminal
@@ -607,20 +579,22 @@ static void begin_utterance(struct transcribe_session* session) {
           "transcribe_stream_begin");
 }
 
-static void feed_frame(struct transcribe_session* session,
-                       const int16_t* pcm16, std::vector<float>& f32) {
+static void to_f32(const int16_t* pcm16, std::vector<float>& f32) {
     f32.resize(FRAME_SAMPLES);
     for (int i = 0; i < FRAME_SAMPLES; i++) f32[i] = pcm16[i] / 32768.0f;
+}
 
+// `print=false` no replay do áudio acumulado (evita redesenhar a linha 60x).
+static void asr_feed(struct transcribe_session* session, const float* f32, bool print) {
     struct transcribe_stream_update update;
     transcribe_stream_update_init(&update);
     transcribe_status s =
-        transcribe_stream_feed(session, f32.data(), FRAME_SAMPLES, &update);
+        transcribe_stream_feed(session, f32, FRAME_SAMPLES, &update);
 
     if (s != TRANSCRIBE_OK) {
         std::fprintf(stderr, "\ntranscribe_stream_feed: %s\n",
                      transcribe_status_string(s));
-    } else if (update.result_changed) {
+    } else if (print && update.result_changed) {
         print_snapshot(session, false);
     }
 }
@@ -661,22 +635,17 @@ int main() {
         std::fprintf(stderr, "Seguindo sem speaker embedding.\n");
     }
 
+    std::printf("Carregando wake word (sherpa-onnx KWS)...\n");
+    const bool wake_ok = g_wake.init();
+    if (!wake_ok) {
+        std::fprintf(stderr, "Wake word indisponível (modelo/keywords). Seguindo sem gating.\n");
+    }
+    const bool gate = WAKE_GATE_ASR && wake_ok;   // sem KWS, cai pro comportamento antigo
+
     ten_vad_handle_t vad = nullptr;
     if (ten_vad_create(&vad, FRAME_SAMPLES, VAD_THRESHOLD) != 0) {
         std::fprintf(stderr, "ten_vad_create falhou\n");
         return 1;
-    }
-
-    WakeWord wake;
-    if (USE_WAKE_WORD) {
-        const char* access_key = std::getenv(PORCUPINE_ACCESS_KEY_ENV);
-        if (!access_key || !*access_key) {
-            std::fprintf(stderr, "Defina %s com a AccessKey do Picovoice Console.\n",
-                         PORCUPINE_ACCESS_KEY_ENV);
-            return 1;
-        }
-        std::printf("Carregando Porcupine (wake word)...\n");
-        if (!wake.init(access_key)) return 1;
     }
 
     // ---- Áudio ----
@@ -710,33 +679,57 @@ int main() {
     }
 
     std::printf("Microfone: %s\n", dev->name);
-    if (USE_WAKE_WORD) {
-        std::printf("Aguardando palavra-chave:");
-        for (int i = 0; i < N_WAKE_KEYWORDS; i++)
-            std::printf("%s \"%s\"", i ? " |" : "", WAKE_KEYWORDS[i].label);
-        std::printf("  (Ctrl+C pra sair)\n\n");
-    } else {
-        std::printf("Escutando... fale algo (Ctrl+C pra sair)\n\n");
-    }
+    std::printf("Escutando... fale algo (Ctrl+C pra sair)\n\n");
 
     // ---- Loop principal: VAD + transcrição ----
     std::vector<float> f32;
-    std::deque<std::vector<int16_t>> preroll;                // preroll do VAD (só sem wake word)
-    AudioHistory history(WAKE_BUFFER_FRAMES);                // buffer circular (com wake word)
+    std::deque<std::vector<int16_t>> preroll;
     std::vector<int16_t> frame(FRAME_SAMPLES);
 
-    // Áudio bruto da frase atual, alimentando o speaker embedding.
+    // Áudio bruto da frase atual: alimenta o speaker embedding e, no modo gate,
+    // é o que se reenvia ao ASR quando a wake word dispara.
     std::vector<int16_t> utt_pcm;
     utt_pcm.reserve((size_t)SAMPLE_RATE * MAX_UTTERANCE_MS / 1000);
 
-    bool active = false;
+    bool active = false;      // segmento de fala aberto (VAD)
+    bool asr_open = false;    // transcribe_stream_begin já foi chamado nesta frase
+    bool woke = false;        // wake word já disparou nesta frase
+    std::string wake_name;
     int speech_run = 0;
     int silence_ms = 0;
     int utterance_ms = 0;
     int speech_frames = 0;
     float max_prob = 0.0f;
-    int since_wake_ms = 0;          // tempo desde a detecção da palavra-chave
-    bool cmd_started = false;       // já começou a falar o comando depois da palavra-chave?
+
+    // Abre o ASR e reenvia tudo que já foi capturado da frase (inclui a wake word).
+    auto open_asr_replay = [&]() {
+        begin_utterance(session);
+        asr_open = true;
+        for (size_t off = 0; off + FRAME_SAMPLES <= utt_pcm.size(); off += FRAME_SAMPLES) {
+            to_f32(utt_pcm.data() + off, f32);
+            asr_feed(session, f32.data(), false);
+        }
+        print_snapshot(session, false);
+    };
+
+    auto on_wake = [&]() {
+        woke = true;
+        {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::printf("\r\033[K\033[1;32m[wake word: %s]\033[0m\n", wake_name.c_str());
+            std::fflush(stdout);
+        }
+        if (!asr_open) open_asr_replay();
+    };
+
+    // Um frame de uma frase aberta: converte UMA vez e distribui.
+    auto process_frame = [&](const int16_t* pcm) {
+        utt_pcm.insert(utt_pcm.end(), pcm, pcm + FRAME_SAMPLES);
+        to_f32(pcm, f32);
+        if (asr_open) asr_feed(session, f32.data(), true);
+        // depois do disparo o KWS para de ser alimentado (economiza CPU e evita repetição)
+        if (wake_ok && !woke && g_wake.feed(f32.data(), FRAME_SAMPLES, wake_name)) on_wake();
+    };
 
     while (g_running.load()) {
         if (!g_ring.pop(frame.data(), FRAME_SAMPLES)) {
@@ -751,94 +744,56 @@ int main() {
         }
         const bool is_speech = vad_flag == 1;
 
-        // O Porcupine vê TODO o áudio (também durante o ASR, pra manter o
-        // estado contínuo); o histórico guarda os últimos WAKE_BUFFER_MS.
-        int wake_kw = -1;
-        if (USE_WAKE_WORD) {
-            history.push(frame.data());
-            wake_kw = wake.process(frame.data(), FRAME_SAMPLES);
-        }
-
         if (!active) {
-            if (USE_WAKE_WORD) {
-                if (wake_kw >= 0) {
-                    {
-                        std::lock_guard<std::mutex> lk(g_print_mu);
-                        std::printf("\r\033[K\033[1;32m[palavra-chave: %s]\033[0m\n",
-                                    WAKE_KEYWORDS[wake_kw].label);
-                        std::fflush(stdout);
-                    }
-                    begin_utterance(session);
-                    utt_pcm.clear();
-                    // Entrega ao ASR o que está no buffer (inclui o frame atual)
-                    const size_t n = history.last(WAKE_BACKTRACK_FRAMES, [&](const int16_t* f) {
-                        feed_frame(session, f, f32);
-                        if (speaker_ok) utt_pcm.insert(utt_pcm.end(), f, f + FRAME_SAMPLES);
-                    });
-                    utterance_ms = (int)n * FRAME_MS;
-                    since_wake_ms = 0;
-                    cmd_started = false;
-                    active = true;
-                    speech_run = 0;
-                    silence_ms = 0;
-                    speech_frames = 0;
-                    max_prob = vad_prob;
-                }
-            } else {
-                preroll.push_back(frame);
-                while ((int)preroll.size() > PREROLL_FRAMES) preroll.pop_front();
+            preroll.push_back(frame);
+            while ((int)preroll.size() > PREROLL_FRAMES) preroll.pop_front();
 
-                speech_run = is_speech ? speech_run + 1 : 0;
-                if (speech_run >= ONSET_FRAMES) {
-                    begin_utterance(session);
-                    utterance_ms = (int)preroll.size() * FRAME_MS;
-                    utt_pcm.clear();
-                    for (auto& f : preroll) {
-                        feed_frame(session, f.data(), f32);
-                        if (speaker_ok) utt_pcm.insert(utt_pcm.end(), f.begin(), f.end());
-                    }
-                    preroll.clear();
-                    active = true;
-                    silence_ms = 0;
-                    speech_frames = ONSET_FRAMES;
-                    max_prob = vad_prob;
-                }
+            speech_run = is_speech ? speech_run + 1 : 0;
+            if (speech_run >= ONSET_FRAMES) {
+                utt_pcm.clear();
+                asr_open = false;
+                woke = false;
+                if (wake_ok) g_wake.begin();
+                if (!gate) { begin_utterance(session); asr_open = true; }   // modo antigo: ASR abre já no onset
+
+                utterance_ms = (int)preroll.size() * FRAME_MS;
+                for (auto& f : preroll) process_frame(f.data());
+                preroll.clear();
+                active = true;
+                silence_ms = 0;
+                speech_frames = ONSET_FRAMES;
+                max_prob = vad_prob;
             }
         } else {
-            feed_frame(session, frame.data(), f32);
-            if (speaker_ok) utt_pcm.insert(utt_pcm.end(), frame.begin(), frame.end());
+            process_frame(frame.data());
             utterance_ms += FRAME_MS;
             silence_ms = is_speech ? 0 : silence_ms + FRAME_MS;
             if (is_speech) speech_frames++;
             max_prob = std::max(max_prob, vad_prob);
 
-            bool endpoint;
-            if (USE_WAKE_WORD) {
-                // Só conta fala depois da "acomodação" (cauda da palavra-chave) e
-                // só fecha por silêncio depois que o comando começou. Se ninguém
-                // fala nada, o timeout devolve o app pro modo de espera.
-                since_wake_ms += FRAME_MS;
-                if (since_wake_ms > WAKE_SETTLE_MS) {
-                    speech_run = is_speech ? speech_run + 1 : 0;
-                    if (speech_run >= ONSET_FRAMES) cmd_started = true;
-                }
-                endpoint = cmd_started ? silence_ms >= SILENCE_MS_TO_ENDPOINT
-                                       : since_wake_ms >= WAKE_TIMEOUT_MS;
-            } else {
-                endpoint = silence_ms >= SILENCE_MS_TO_ENDPOINT;
-            }
+            if (silence_ms >= SILENCE_MS_TO_ENDPOINT || utterance_ms >= MAX_UTTERANCE_MS) {
+                // última chance da wake word (tail padding do KWS)
+                if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
 
-            if (endpoint || utterance_ms >= MAX_UTTERANCE_MS) {
-                const bool printed = finalize_utterance(session);
-                if (printed) {
-                    // só vale a pena extrair embedding de frase que virou texto
-                    if (speaker_ok) submit_speaker(utt_pcm, silence_ms);
-                } else if (DEBUG_EMPTY) {
+                if (asr_open) {
+                    const bool printed = finalize_utterance(session);
+                    if (printed) {
+                        // só vale a pena extrair embedding de frase que virou texto
+                        if (speaker_ok) submit_speaker(utt_pcm, silence_ms);
+                    } else if (DEBUG_EMPTY) {
+                        std::lock_guard<std::mutex> lk(g_print_mu);
+                        std::printf("\033[2m[descartado: %d ms, %d frames de fala, prob. max %.2f]\033[0m\n",
+                                    utterance_ms, speech_frames, max_prob);
+                        std::fflush(stdout);
+                    }
+                } else if (DEBUG_WAKE) {
                     std::lock_guard<std::mutex> lk(g_print_mu);
-                    std::printf("\033[2m[descartado: %d ms, %d frames de fala, prob. max %.2f]\033[0m\n",
-                                utterance_ms, speech_frames, max_prob);
+                    std::printf("\033[2m[sem wake word: %d ms, prob. max %.2f]\033[0m\n",
+                                utterance_ms, max_prob);
                     std::fflush(stdout);
                 }
+                if (wake_ok) g_wake.end();
+                asr_open = false;
                 active = false;
                 speech_run = 0;
             }
@@ -851,10 +806,12 @@ int main() {
     Pa_Terminate();
 
     if (active) {
-        if (finalize_utterance(session) && speaker_ok) {
+        if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
+        if (asr_open && finalize_utterance(session) && speaker_ok) {
             submit_speaker(utt_pcm, silence_ms);
         }
     }
+    if (wake_ok) g_wake.shutdown();
     if (speaker_ok) g_speaker.shutdown();   // drena a fila antes de sair
 
     if (g_dropped.load() > 0) {
