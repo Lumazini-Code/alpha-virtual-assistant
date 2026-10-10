@@ -1,0 +1,54 @@
+{
+  "searxng": {
+    "url": "http://127.0.0.1:8081",
+    "results": 15,
+    "timeout_s": 3.0,
+    "language": "pt-BR"
+  },
+  "crawl4ai": {
+    "url": "http://127.0.0.1:11235",
+    "concurrency": 5,
+    "timeout_s": 15.0
+  },
+  "static_fetch": {
+    "timeout_s": 8.0,
+    "min_chars": 400
+  },
+  "valkey": {
+    "url": "redis://127.0.0.1:6379/0",
+    "search_ttl_s": 21600,
+    "page_ttl_s": 86400
+  },
+  "filter": {
+    "top_urls": 5,
+    "max_per_domain": 1,
+    "block_domains": [
+      "pinterest.com",
+      "pinterest.com.br",
+      "quora.com",
+      "answers.com",
+      "ask.com",
+      "ehow.com",
+      "buzzfeed.com",
+      "slideshare.net",
+      "scribd.com",
+      "coursehero.com",
+      "studocu.com",
+      "brainly.com.br",
+      "brainly.com",
+      "wsj.com",
+      "ft.com",
+      "economist.com",
+      "medium.com"
+    ]
+  },
+  "chunks": {
+    "max_chunk_chars": 1200,
+    "min_chunk_chars": 80,
+    "max_per_page": 3,
+    "max_tokens_total": 4000
+  },
+  "fetch": {
+    "min_pages": 3
+  }
+}

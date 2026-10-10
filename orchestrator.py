@@ -7,27 +7,27 @@ Arquitetura (tool-calling nativo via chat template):
      (function-calling). As definições das tools são embutidas no prompt e o
      backend devolve `message.tool_calls` já estruturado (nome + argumentos
      JSON), sem precisarmos de uma segunda chamada com grammar manual.
-  2. Se a resposta NÃO tiver tool_calls, o texto é tratado como resposta
-     final direta (equivalente a um "finish" implícito) e o loop termina —
-     não há re-chamada com o histórico inalterado, pois isso violaria a
-     alternância estrita user/assistant/tool exigida pelo chat template.
+  2. Se a resposta NÃO tiver tool_calls, o texto É a resposta final e o
+     loop termina — não há re-chamada com o histórico inalterado, pois
+     isso violaria a alternância estrita user/assistant/tool exigida pelo
+     chat template.
   3. Se houver tool_calls, cada uma é executada; o resultado volta ao
      histórico como mensagem role="tool" (atrelada ao tool_call_id) e o
      ciclo reinicia.
-  4. O loop termina quando o modelo chama a tool "finish" (cujos
-     argumentos contêm a resposta final) ou quando responde sem chamar
-     nenhuma tool (resposta direta = finish implícito). Não há limite
-     artificial de rodadas além disso.
+  4. NÃO existe tool de encerramento (a antiga "finish" foi removida):
+     o ÚNICO jeito de encerrar o turno é responder em texto puro sem
+     chamar nenhuma tool. O system prompt instrui o modelo a nunca soltar
+     texto no meio do trabalho — qualquer comentário/observação deve ir
+     no `content` da mensagem em que ele chama a próxima tool. Não há
+     limite artificial de rodadas além disso.
 
 Resumo do fluxo:
-  pergunta → LLM (+ tools) → [sem tool_calls: continua o loop]
+  pergunta → LLM (+ tools) → [sem tool_calls: FIM — o texto é a resposta]
                             → [com tool_calls X: executa X
                                → resultado (role=tool) → repete]
-                            → [com tool_call finish: FIM]
 
 Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
   - vision_objects: reusa o histórico real da conversa. Auto-finish especial.
-  - finish: primitiva de controle do próprio loop, não uma capacidade externa.
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
@@ -145,7 +145,8 @@ EXECUTOR_TIMEOUTS: dict[str, float] = {
 MAX_CONTEXT_CHARS = 3000
 DEFAULT_TOP_K     = 5
 DEFAULT_MIN_SCORE = 0.30
-# Sem limite de rodadas: o loop só termina quando a tool "finish" é chamada.
+# Sem limite de rodadas: o loop só termina quando o modelo responde SEM chamar
+# nenhuma tool — esse texto puro é a resposta final (não existe tool "finish").
 
 # ── Recall de memória (pré-loop + tool memory_search) ─────────────────────────
 # Antes de montar o histórico do tool loop, o orchestrator lê a memória em
@@ -333,7 +334,8 @@ def _result_to_text(res) -> str:
     if not res:
         return ("(empty result — this tool returned nothing usable. Do NOT repeat the same "
                  "query worded differently; either try a materially different angle once, "
-                 "or call `finish` now and be upfront that you couldn't find the information.)")
+                 "or end the turn NOW with your final answer as plain text (no tool call) "
+                 "and be upfront that you couldn't find the information.)")
     if isinstance(res, str):
         return res[:MAX_CONTEXT_CHARS]
     if isinstance(res, dict):
@@ -348,7 +350,8 @@ def _result_to_text(res) -> str:
         if not res:
             return ("(empty result — this tool returned zero items. Do NOT repeat the same "
                      "query worded differently; either try a materially different angle once, "
-                     "or call `finish` now and be upfront that you couldn't find the information.)")
+                     "or end the turn NOW with your final answer as plain text (no tool call) "
+                     "and be upfront that you couldn't find the information.)")
         # Structured rendering (search-like items): keep title/url separate from
         # the snippet so the model can actually judge relevance/date/source
         # instead of an undifferentiated wall of text truncated mid-sentence.
@@ -915,11 +918,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "fields": [("prompt", "string", False)],
         "executor": _tool_vision_objects,
     },
-    "finish": {
-        "description": "Ends the cycle and delivers the final response to the user. Call this tool once you already have everything you need (or if no other tool is required).",
-        "fields": [("response", "string", True)],
-        "executor": None,
-    },
+    # NÃO há tool "finish": responder em texto puro sem chamar nenhuma tool É
+    # o encerramento do turno (ver docstring do módulo e _tools_system_prompt).
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -930,7 +930,7 @@ TOOLS: dict[str, dict[str, Any]] = {
 _JSON_SCHEMA_TYPES = {"string": "string", "number": "number"}
 
 def _build_native_tools_schema() -> list[dict]:
-    """Converte o TOOLS registry (só as nativas: vision_objects, finish)
+    """Converte o TOOLS registry (só as nativas: vision_objects, memory_search)
     para a lista `tools` no formato OpenAI."""
     schema = []
     for name, spec in TOOLS.items():
@@ -978,7 +978,7 @@ async def _select_skills(user_input: str) -> list[str]:
     memory /tools/select) quais servidores MCP têm tools relevantes pro
     pedido do usuário. Barato: kNN semântico + PPR no grafo de co-uso,
     NENHUMA conexão MCP. Retorna nomes de servidores — pode ser vazia
-    (pedido não precisa de nenhuma tool MCP, só vision/finish).
+    (pedido não precisa de nenhuma tool MCP, só vision/memory_search).
 
     Fallback: se o manager ou o grafo estiverem indisponíveis, libera TODOS
     os servidores habilitados (mesma postura conservadora do registry
@@ -1200,8 +1200,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                     "tool_calls": tool_calls_final,
                     # True se algum delta chegou a ser repassado via on_delta
                     # (tentativa 0 do stream). Usado pra deduplicar o delta
-                    # único do finish/vision quando o modelo já streamou o
-                    # mesmo texto como content.
+                    # único do auto-finish (vision) quando o modelo já
+                    # streamou o mesmo texto como content.
                     "streamed": on_delta is not None and attempt == 0 and bool(content_acc),
                 }
         except _LLMNoRetryError:
@@ -1250,10 +1250,13 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "links, not the actual headlines\") instead of falling back to a canned refusal that "
         "ignores what the tool actually returned.",
         "",
-        "Call a tool whenever you need information or need to take an action. You may also "
-        "respond with plain text — reasoning, a plan, a clarifying remark — without calling "
-        "a tool; in that case you will simply be prompted again on the next turn, so use it "
-        "to think out loud if needed.",
+        "Call a tool whenever you need information or need to take an action. Ending your "
+        "turn with plain text and NO tool call is how you deliver your FINAL answer to the "
+        "user — that text is sent to the user verbatim and the task is considered complete "
+        "immediately. Therefore NEVER emit plain text by itself while you still intend to do "
+        "more work: if you want to comment, think out loud, announce a plan or say anything "
+        "mid-task, put it in the `content` of the message where you call the next tool. "
+        "Plain text with no tool call means you are done — there is no undo.",
         "",
         "BEFORE calling a tool again, read the content of the most recent role=\"tool\" message "
         "in the conversation and check: does it already contain enough information to answer "
@@ -1261,10 +1264,10 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "from what you already have instead of chasing a more perfect result. If a result is "
         "irrelevant, empty, or off-topic, do NOT just reword the same query and try again — "
         "that rarely fixes an irrelevant result. Instead: (a) try a genuinely different angle "
-        "(different tool, different entity, different assumption) at most once, or (b) call "
-        "`finish` and tell the user honestly that you could not find reliable/current "
-        "information on this, rather than guessing or looping. Never call the same tool with "
-        "a near-identical query more than twice in a row.",
+        "(different tool, different entity, different assumption) at most once, or (b) end the "
+        "turn with a plain-text final answer (no tool call) telling the user honestly that you "
+        "could not find reliable/current information, rather than guessing or looping. Never "
+        "call the same tool with a near-identical query more than twice in a row.",
         "",
         "When a tool returns MULTIPLE results (e.g. `search` returns a list), do NOT pick just the "
         "first one. Synthesize across all of them: identify the 2–3 distinct items that best match "
@@ -1280,12 +1283,12 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "event names) in the original language to avoid mistranslation. If unsure about a date or "
         "temporal relation in the source, omit it rather than guessing.",
 
-        "Always deliver your final answer as plain text in your normal reply (message "
-        "content) — write the COMPLETE response there: this text streams to the user live "
-        "as you generate it, so never hold it back or bury it in tool arguments. Call the "
-        "`finish` tool only to signal the end; when you do, `response` may repeat the same "
-        "final answer for the record. Ending your turn with plain text and no tool call "
-        "also completes the task (that counts as done).",
+        "Deliver your final answer as plain text with NO tool call — write the COMPLETE "
+        "response there: this text streams to the user live as you generate it, so never "
+        "hold it back or bury it in tool arguments. There is no explicit \"finish\" tool: "
+        "replying in plain text without calling any tool IS the finish. Anything you want "
+        "to say before that (progress notes, findings so far, caveats) must ride along in "
+        "the same message where you call your next tool.",
         "",
         f"Today is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
         "",
@@ -1304,12 +1307,13 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
 async def _force_finish(history: list[dict], eid: str) -> str:
     """
     Rede de segurança do guarda-corpo anti-loop: chamada quando o modelo
-    insiste na mesma tool repetidas vezes sem nunca chamar `finish`. Faz
-    UMA última chamada ao LLM sem `tools` (nesse modo ele não tem como
-    devolver tool_calls, então é obrigado a responder em texto livre)
-    pedindo explicitamente uma resposta final com o que já foi coletado
-    no histórico. Se isso falhar por qualquer motivo, cai
-    num texto fixo — nunca deixamos o loop rodar indefinidamente.
+    insiste na mesma tool repetidas vezes sem nunca entregar a resposta
+    final (texto puro sem tool_calls). Faz UMA última chamada ao LLM sem
+    `tools` (nesse modo ele não tem como devolver tool_calls, então é
+    obrigado a responder em texto livre) pedindo explicitamente uma
+    resposta final com o que já foi coletado no histórico. Se isso falhar
+    por qualquer motivo, cai num texto fixo — nunca deixamos o loop rodar
+    indefinidamente.
     """
     nudge = {
         "role": "user",
@@ -1346,19 +1350,20 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
       1. LLM recebe o histórico + a lista `tools` (formato OpenAI). O servidor
          renderiza isso na chat template do modelo e devolve `message` com
          `content` (texto livre, opcional) e/ou `tool_calls` (já estruturado).
-      2. Se NÃO houver tool_calls: o texto é tratado como resposta final
-         direta (equivalente a um "finish" implícito) e o loop termina ali —
-         NÃO re-chamamos o LLM com o histórico inalterado, pois isso geraria
-         mensagens role="assistant" consecutivas, violando a alternância
-         estrita user/assistant/tool exigida pelo chat template do modelo.
+      2. Se NÃO houver tool_calls: o texto É a resposta final e o loop
+         termina ali — NÃO re-chamamos o LLM com o histórico inalterado,
+         pois isso geraria mensagens role="assistant" consecutivas,
+         violando a alternância estrita user/assistant/tool exigida pelo
+         chat template do modelo. Esta é a ÚNICA forma de encerrar o
+         turno (não existe tool "finish").
       3. Se houver tool_calls: cada uma é executada e o resultado volta ao
          histórico como mensagem role="tool" (tool_call_id correspondente).
-      4. O loop também termina quando a tool "finish" é chamada explicitamente.
-         Fora isso, não há limite de rodadas — EXCETO um guarda-corpo anti-loop:
-         se a mesma tool for chamada REPEAT_HARD_LIMIT vezes seguidas sem
-         `finish` (sinal de que o modelo não está "absorvendo" o resultado
-         retornado e só reformulando a mesma chamada), o orquestrador força
-         o encerramento via `_force_finish` em vez de deixar o loop rodar
+      4. Fora isso, não há limite de rodadas — EXCETO um guarda-corpo
+         anti-loop: se a mesma tool for chamada REPEAT_HARD_LIMIT vezes
+         seguidas sem o modelo nunca entregar a resposta final (sinal de
+         que ele não está "absorvendo" o resultado retornado e só
+         reformulando a mesma chamada), o orquestrador força o
+         encerramento via `_force_finish` em vez de deixar o loop rodar
          indefinidamente.
     """
     depth, think_instruction = await _think_instruction(req.input)
@@ -1438,7 +1443,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # O modelo às vezes não "entende" que um resultado de tool já é
     # suficiente (ou já é irrelevante e reformular a query não vai ajudar)
     # e fica preso chamando a mesma tool em loop (visto em produção: 7+
-    # chamadas seguidas de `search` sem nunca chamar `finish`). Em vez de
+    # chamadas seguidas de `search` sem nunca entregar a resposta final).
+    # Em vez de
     # só confiar em instrução de prompt, rastreamos a sequência de tools
     # chamadas e intervimos ativamente:
     #   - a partir de REPEAT_NUDGE_AT chamadas seguidas da MESMA tool,
@@ -1452,6 +1458,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     REPEAT_HARD_LIMIT = 5
     last_tool_name: Optional[str] = None
     same_tool_streak = 0
+
+    # MCP tools bem-sucedidas nesta execução, NA ORDEM — vai pro /tools/usage
+    # no fim do loop (arestas de co-uso + exemplos aprendidos na ToolsDB).
+    used_mcp_tools: list[str] = []
 
     # Tools cujo resultado já É a resposta final ao usuário — nenhuma
     # segunda chamada ao modelo de texto acontece depois delas. Hoje só
@@ -1491,8 +1501,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         history.append(assistant_msg)
 
         if not tool_calls:
-            # Modelo respondeu sem chamar nenhuma tool: tratamos como resposta
-            # final direta (equivalente a um "finish" implícito).
+            # Modelo respondeu sem chamar nenhuma tool: este texto É a resposta
+            # final do turno — a ÚNICA forma de encerramento (não existe tool
+            # "finish").
             #
             # Importante: NÃO dá para simplesmente re-chamar o LLM de novo com
             # o mesmo histórico (sem nova mensagem de user/tool no meio) —
@@ -1529,30 +1540,16 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                             f"que não está no schema desta rodada (tools_schema atual: "
                             f"{[t['function']['name'] for t in tools_schema]})")
                 history.append({"role": "tool", "tool_call_id": call_id,
-                                 "content": f"ERROR: tool '{tool_name}' não existe"})
+                                 "content": (
+                                     f"ERROR: tool '{tool_name}' does not exist in this session. "
+                                     "There is no `finish` tool either — to end the turn, reply "
+                                     "with plain text and NO tool call; that reply is delivered "
+                                     "to the user as the final answer."
+                                 )})
                 continue
 
             if on_event:
                 await on_event("tool_call", {"step": turn, "tool": tool_name})
-
-            # ── Se a tool for "finish", extrai a resposta final dos argumentos ──
-            if tool_name == "finish":
-                final_response = args.get("response", "") or "(sem resposta)"
-                # O texto do finish vem nos ARGUMENTOS da tool_call (não passa
-                # pelo content streamado) — sai como delta único. EXCETO quando
-                # o modelo acabou de streamar esse MESMO texto como content
-                # (padrão comum: responde no content e repete no finish) —
-                # reemitir duplicaria o texto na UI até o done curar.
-                if on_event and not (message.get("streamed")
-                                     and message.get("content") == final_response):
-                    await on_event("delta", final_response)
-                step_results.append(StepResult(
-                    step=turn, executor="finish",
-                    action=json.dumps(args, ensure_ascii=False),
-                    success=True, result=final_response,
-                ))
-                finished = True
-                break
 
             # ── Executa a tool: nativa (executor Python direto) ou MCP
             # (despachada pra sessão correspondente via call_tool) ──
@@ -1587,8 +1584,12 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     result = call_data.get("result") or ""
                     if call_data.get("is_error"):
                         # A tool executou e REPORTOU erro — o modelo precisa
-                        # vê-lo pra reagir (reformular, desistir, finish).
+                        # vê-lo pra reagir (reformular, desistir, encerrar).
                         result = f"ERROR (MCP tool reportou falha): {result}"
+                    else:
+                        # Sucesso real (sem is_error): entra no aprendizado
+                        # do grafo de tools (co-uso + exemplo aprendido).
+                        used_mcp_tools.append(tool_name)
                     log.debug(f"[{eid[:8]}] MCP call via manager: server={server} tool={mcp_tool_name} is_error={call_data.get('is_error')}")
                 success, err = True, None
             except Exception as e:
@@ -1630,7 +1631,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             if tool_name in AUTO_FINISH_TOOLS and success and isinstance(result, dict) and result.get("answer"):
                 final_response = result["answer"]
                 # Resposta vem da tool (modelo multimodal), não do content
-                # streamado — delta único (com a mesma dedup do finish).
+                # streamado — delta único (dedup contra o content já emitido).
                 if on_event and not (message.get("streamed")
                                      and message.get("content") == final_response):
                     await on_event("delta", final_response)
@@ -1647,17 +1648,18 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             if same_tool_streak == REPEAT_NUDGE_AT:
                 log.warning(
                     f"[{eid[:8]}] '{tool_name}' chamada {same_tool_streak}x seguidas "
-                    "sem finish — injetando lembrete anti-loop."
+                    "sem resposta final — injetando lembrete anti-loop."
                 )
                 history.append({
                     "role": "tool", "tool_call_id": call_id,
                     "content": (
                         f"SYSTEM NOTICE: you have called `{tool_name}` {same_tool_streak} times "
-                        "in a row without calling `finish`. Stop and re-read the results above "
-                        "carefully — either they already answer the question well enough to "
+                        "in a row without delivering a final answer. Stop and re-read the results "
+                        "above carefully — either they already answer the question well enough to "
                         "respond now, or repeating this tool is not going to fix it. Do not call "
-                        f"`{tool_name}` again with a reworded query; call `finish` with your best "
-                        "answer, being explicit about what you could and couldn't confirm."
+                        f"`{tool_name}` again with a reworded query; end the turn NOW with your "
+                        "best final answer as plain text with NO tool call, being explicit about "
+                        "what you could and couldn't confirm."
                     ),
                 })
             elif same_tool_streak >= REPEAT_HARD_LIMIT:
@@ -1680,7 +1682,28 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             break
         turn += 1
 
+    # ── Loop de aprendizado do grafo de tools ──
+    # Fogo-e-esquece: as MCP tools bem-sucedidas (em ordem) + o input original
+    # viram arestas de co-uso/sequência e exemplos aprendidos na ToolsDB —
+    # é isso que faz o kNN da _select_skills acertar nas próximas vezes
+    # ("anunciadas na última minecon" aprende que web_search resolve).
+    if used_mcp_tools:
+        asyncio.ensure_future(_record_tool_usage(req.input, used_mcp_tools))
+
     return step_results, final_response
+
+
+async def _record_tool_usage(query: str, tools_used: list[str]) -> None:
+    """POST /tools/usage na memory_api — nunca levanta (aprendizado não
+    pode derrubar o turno)."""
+    try:
+        await state.memory_client.post(
+            "/tools/record-usage",
+            json={"tools_used": tools_used, "query": query},
+            timeout=30.0,
+        )
+    except Exception as e:
+        log.debug(f"tools/usage falhou (ignorado): {type(e).__name__}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1740,7 +1763,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
 
     # NOTA: não há mais yield de "delta" único aqui com a resposta inteira —
     # os deltas agora chegam incrementalmente DURANTE o loop (via on_event),
-    # e os paths que não passam pelo content (finish/vision/force_finish)
+    # e os paths que não passam pelo content (vision auto-finish/force_finish)
     # emitem o próprio delta único dentro do _run_tool_loop.
 
     if req.tts and final_response:

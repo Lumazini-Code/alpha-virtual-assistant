@@ -156,6 +156,10 @@ TOOLS_MAX_EXAMPLES          = 10     # exemplos de query fornecidos no cadastro,
 TOOLS_MAX_LEARNED_EXAMPLES  = 20     # queries reais aprendidas via tools_record_usage, por tool
 TOOLS_LEARN_DEDUP_SCORE     = 0.95   # query aprendida ≥ isso de outra já existente → não duplica
 TOOLS_USAGE_MAX_SEQUENCE    = 12     # teto de tools por registro de uso (anti-O(n²))
+TOOLS_MAX_PER_SERVER        = 4      # cota de slots por servidor MCP no top_k — servidor com
+                                     # 24 tools não pode monopolizar o kNN contra um de 1
+                                     # (a seleção final é por SERVIDOR, então 1 hit já
+                                     # libera as 24; sem cota, o de 1 tool nunca entra)
 
 # ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
 DICT_GRAPH_MAX_RELATED = 3

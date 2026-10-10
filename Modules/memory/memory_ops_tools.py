@@ -23,6 +23,7 @@ from memory_config import (
     TOOLS_LOW_CONFIDENCE_SCORE,
     TOOLS_MAX_EXAMPLES,
     TOOLS_MAX_LEARNED_EXAMPLES,
+    TOOLS_MAX_PER_SERVER,
     TOOLS_MAX_RELATED,
     TOOLS_USAGE_MAX_SEQUENCE,
     log,
@@ -145,6 +146,37 @@ async def tools_register_batch(req: ToolRegisterBatchRequest):
     return ToolRegisterBatchResponse(results=results, pruned=pruned)
 
 
+def _server_group(tool_name: str) -> str:
+    """Grupo de cota do kNN: prefixo de servidor MCP do graph_name
+    ('playwright__browser_click' → 'playwright'). Tool sem prefixo é grupo
+    próprio — nunca compete por cota com ninguém."""
+    return tool_name.split("__", 1)[0] if "__" in tool_name else tool_name
+
+
+def _ranked_with_quota(ranked: list[tuple[int, float]], names: dict[int, str],
+                       limit: int, min_score: float | None) -> list[tuple[int, float]]:
+    """Corta `ranked` em `limit` slots com cota TOOLS_MAX_PER_SERVER por
+    servidor MCP. Sem a cota, um servidor de 24 tools (playwright) ocupa os
+    8 slots do kNN e um servidor de 1 tool (websearch) nunca entra — e como
+    a seleção final é por SERVIDOR (1 hit libera as 24), a competição por
+    tool é injusta por construção. Com a cota, servidores diversos dividem
+    os slots; slots não usados (servidor com poucas tools) caem pro próximo
+    do ranking. `min_score=None` = modo low-confidence (sem threshold)."""
+    quota: dict[str, int] = {}
+    out: list[tuple[int, float]] = []
+    for tid, score in ranked:
+        if min_score is not None and score < min_score:
+            continue
+        group = _server_group(names[tid]) if tid in names else str(tid)
+        if quota.get(group, 0) >= TOOLS_MAX_PER_SERVER:
+            continue
+        out.append((tid, score))
+        quota[group] = quota.get(group, 0) + 1
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def tools_select(req: ToolSelectRequest):
     query = req.query.strip()
     if not query:
@@ -166,11 +198,14 @@ async def tools_select(req: ToolSelectRequest):
 
     top1 = ranked[0][1] if ranked else 0.0
     low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
+    # nomes das tools rankeadas (pra cota por servidor) — um único get_by_ids
+    rank_names = {r["id"]: r["name"] for r in state.tl_db.get_by_ids(
+        [t for t, _ in ranked])}
     if low_confidence:
         # confiança baixa: recall > precisão — rede mais larga, sem threshold
-        primary = ranked[:TOOLS_FALLBACK_TOP_K]
+        primary = _ranked_with_quota(ranked, rank_names, TOOLS_FALLBACK_TOP_K, None)
     else:
-        primary = [(t, s) for t, s in ranked if s >= req.min_score][:req.top_k]
+        primary = _ranked_with_quota(ranked, rank_names, req.top_k, req.min_score)
 
     # tools alcançadas SÓ pelo grafo de co-uso/sequência (listar → ler → editar)
     related: list[tuple[int, float]] = []

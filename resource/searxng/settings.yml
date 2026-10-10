@@ -1,0 +1,55 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SearXNG — instância privada da pipeline websearch (AVA)
+# Uso interno: só a tool web_search consome a API JSON. Sem UI pública,
+# sem proxy de imagem, limiter desligado (consumidor único é o orchestrator;
+# o controle de ritmo fica na pipeline, não aqui).
+# ══════════════════════════════════════════════════════════════════════════════
+
+use_default_settings: true
+
+server:
+  # Instância privada em rede interna — chave fixa só pra assinar cookies.
+  secret_key: "ava-websearch-local"
+  limiter: false
+  image_proxy: false
+  base_url: ""
+
+ui:
+  static_use_hash: true
+  default_locale: "pt-BR"
+
+search:
+  safe_search: 0
+  autocomplete: "duckduckgo"
+  default_lang: "pt-BR"
+  formats:
+    - html
+    - json
+
+# Engines tolerantes e sem CAPTCHA agressivo. Timeouts curtos: engine lenta
+# é descartada da resposta, o SearXNG devolve o que teve a tempo.
+engines:
+  - name: brave
+    engine: brave
+    disabled: false
+    timeout: 3.0
+
+  - name: duckduckgo
+    engine: duckduckgo
+    disabled: false
+    timeout: 3.0
+
+  - name: mojeek
+    engine: mojeek
+    disabled: false
+    timeout: 3.0
+
+  - name: startpage
+    engine: startpage
+    disabled: false
+    timeout: 3.0
+
+  - name: wikipedia
+    engine: wikipedia
+    disabled: false
+    timeout: 3.0

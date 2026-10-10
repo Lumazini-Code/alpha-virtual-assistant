@@ -118,6 +118,11 @@ CONNECT_TIMEOUT = float(os.getenv("MCP_CONNECT_TIMEOUT", "45.0"))
 SYNC_TIMEOUT   = 90.0
 REGISTER_TIMEOUT = 180.0   # batch register na memory: cada tool é embedada
 DEFAULT_CALL_TIMEOUT = 120.0
+# Servidor cuja conexão/call falhou fica fora da /skills/select por este
+# tempo (oferecer 24 tools de um playwright sem CDP só distrai o modelo).
+# Expiração é automática — a próxima seleção volta a tentar. Servidores
+# always_on nunca são excluídos por isso.
+UNHEALTHY_TTL_S = float(os.getenv("MCP_UNHEALTHY_TTL_S", "300"))
 
 # Nome de servidor: sem "__" (é o separador do graph_name) e sem pontos.
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -157,6 +162,14 @@ class ServerRegisterRequest(BaseModel):
     # ── http: conecta a um servidor MCP JÁ RODANDO (streamable-http) ──
     url: Optional[str] = None
     enabled: bool = True
+    # ── capability de base: tools deste servidor entram no grafo como
+    # "core" (sempre oferecidas ao modelo, independentemente do kNN) e o
+    # servidor nunca é exclído da seleção por marcação de unhealthy ──
+    always_on: bool = False
+    # Exemplos de gatilho por tool (chave = nome da tool EXPOSTA pelo
+    # servidor, ex.: "web_search") — viram vetores próprios no grafo e
+    # melhoram o recall do kNN pra queries que não parecem com a descrição.
+    examples: dict[str, list[str]] = {}
 
 class ServerCallRequest(BaseModel):
     tool: str
@@ -201,8 +214,27 @@ class MCPState:
     # Keeper task vivo por servidor — aguardado no shutdown pra não matar
     # subprocessos stdio em estado indefinido.
     keeper_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    # Servidores com falha recente de conexão/call: name → até quando
+    # (time.time()+TTL) ficar fora da /skills/select.
+    unhealthy: dict[str, float] = field(default_factory=dict)
 
 state = MCPState()
+
+
+def _mark_unhealthy(name: str, cause: str) -> None:
+    until = time.time() + UNHEALTHY_TTL_S
+    state.unhealthy[name] = until
+    log.warning(f"MCP[{name}]: marcado UNHEALTHY por {UNHEALTHY_TTL_S:.0f}s ({cause})")
+
+
+def _clear_unhealthy(name: str) -> None:
+    if state.unhealthy.pop(name, None) is not None:
+        log.info(f"MCP[{name}]: recovered — unhealthy removido")
+
+
+def _is_unhealthy(name: str) -> bool:
+    until = state.unhealthy.get(name)
+    return until is not None and time.time() < until
 
 
 def _open_db() -> sqlite3.Connection:
@@ -222,6 +254,8 @@ def _open_db() -> sqlite3.Connection:
             env_json      TEXT NOT NULL DEFAULT '{}',
             url           TEXT,
             enabled       INTEGER NOT NULL DEFAULT 1,
+            always_on     INTEGER NOT NULL DEFAULT 0,
+            examples_json TEXT NOT NULL DEFAULT '{}',
             created_at    REAL NOT NULL,
             last_sync     REAL
         );
@@ -231,12 +265,23 @@ def _open_db() -> sqlite3.Connection:
             description_raw   TEXT NOT NULL DEFAULT '',
             snippet           TEXT NOT NULL DEFAULT '',
             input_schema_json TEXT NOT NULL DEFAULT '{}',
+            core              INTEGER NOT NULL DEFAULT 0,
             updated_at        REAL NOT NULL,
             PRIMARY KEY (name, server),
             FOREIGN KEY (server) REFERENCES mcp_servers(name) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_mcp_tools_server ON mcp_tools(server);
     """)
+    # Migração p/ DBs criados antes de always_on/core/examples (guardado por
+    # PRAGMA table_info — ALTER em coluna existente daria erro).
+    srv_cols = {r[1] for r in conn.execute("PRAGMA table_info(mcp_servers)").fetchall()}
+    if "always_on" not in srv_cols:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN always_on INTEGER NOT NULL DEFAULT 0")
+    if "examples_json" not in srv_cols:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN examples_json TEXT NOT NULL DEFAULT '{}'")
+    tool_cols = {r[1] for r in conn.execute("PRAGMA table_info(mcp_tools)").fetchall()}
+    if "core" not in tool_cols:
+        conn.execute("ALTER TABLE mcp_tools ADD COLUMN core INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
@@ -244,19 +289,24 @@ def _open_db() -> sqlite3.Connection:
 
 def _db_upsert_server(req: ServerRegisterRequest) -> sqlite3.Row:
     now = time.time()
+    examples = {k.strip(): [e.strip() for e in v if e.strip()]
+                for k, v in (req.examples or {}).items() if v}
     with state.db_lock:
         state.db.execute("BEGIN")
         try:
             state.db.execute(
                 "INSERT INTO mcp_servers (name, skill_summary, transport, command, "
-                "args_json, env_json, url, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "args_json, env_json, url, enabled, always_on, examples_json, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET skill_summary=excluded.skill_summary, "
                 "transport=excluded.transport, command=excluded.command, "
                 "args_json=excluded.args_json, env_json=excluded.env_json, "
-                "url=excluded.url, enabled=excluded.enabled",
+                "url=excluded.url, enabled=excluded.enabled, "
+                "always_on=excluded.always_on, examples_json=excluded.examples_json",
                 (req.name, req.skill_summary.strip(), req.transport, req.command,
                  json.dumps(req.args), json.dumps({k: str(v) for k, v in req.env.items()}),
-                 req.url, int(req.enabled), now),
+                 req.url, int(req.enabled), int(req.always_on),
+                 json.dumps(examples, ensure_ascii=False), now),
             )
             state.db.execute("COMMIT")
         except Exception:
@@ -288,16 +338,17 @@ def _db_set_skill_summary(name: str, summary: str):
     with state.db_lock:
         state.db.execute("UPDATE mcp_servers SET skill_summary = ? WHERE name = ?", (summary, name))
 
-def _db_upsert_tool(server: str, name: str, description_raw: str, snippet: str, input_schema: dict):
+def _db_upsert_tool(server: str, name: str, description_raw: str, snippet: str,
+                    input_schema: dict, core: bool = False):
     with state.db_lock:
         state.db.execute(
             "INSERT INTO mcp_tools (name, server, description_raw, snippet, "
-            "input_schema_json, updated_at) VALUES (?,?,?,?,?,?) "
+            "input_schema_json, core, updated_at) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(name, server) DO UPDATE SET description_raw=excluded.description_raw, "
             "snippet=excluded.snippet, input_schema_json=excluded.input_schema_json, "
-            "updated_at=excluded.updated_at",
+            "core=excluded.core, updated_at=excluded.updated_at",
             (name, server, description_raw, snippet,
-             json.dumps(input_schema or {}, ensure_ascii=False), time.time()),
+             json.dumps(input_schema or {}, ensure_ascii=False), int(core), time.time()),
         )
 
 def _db_tools_for_server(server: str) -> list[sqlite3.Row]:
@@ -433,6 +484,7 @@ async def _get_session(name: str, allow_disabled: bool = False) -> ClientSession
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+            _mark_unhealthy(name, f"timeout de conexão ({CONNECT_TIMEOUT:.0f}s)")
             raise HTTPException(
                 502, f"Timeout ao conectar no servidor MCP '{name}' "
                      f"({CONNECT_TIMEOUT:.0f}s) — spawn/handshake não completou"
@@ -441,12 +493,14 @@ async def _get_session(name: str, allow_disabled: bool = False) -> ClientSession
             stop.set()   # keeper falhou antes do ready — garante a limpeza
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+            _mark_unhealthy(name, f"falha de conexão: {err[0]}")
             raise HTTPException(502, f"Falha ao conectar no servidor MCP '{name}': {err[0]}") from None
         # Corrida re-register/delete × connect: a config mudou enquanto
         # conectávamos — a sessão recém-nascida já está obsoleta; descarta.
         if state.gens.get(name, 0) != gen:
             await _drop_session(name)
             raise HTTPException(409, f"Config do servidor '{name}' mudou durante a conexão — repita a chamada")
+        _clear_unhealthy(name)
         log.info(f"MCP[{name}]: conectado em {(time.perf_counter()-t0)*1000:.0f}ms")
         return state.sessions[name]
 
@@ -538,6 +592,9 @@ def _server_dict(row: sqlite3.Row) -> dict:
         "args": json.loads(row["args_json"] or "[]"),
         "env": json.loads(row["env_json"] or "{}"),
         "url": row["url"], "enabled": bool(row["enabled"]),
+        "always_on": bool(row["always_on"]),
+        "examples": json.loads(row["examples_json"] or "{}"),
+        "unhealthy": _is_unhealthy(row["name"]),
         "created_at": row["created_at"], "last_sync": row["last_sync"],
         "tools": state.db.execute(
             "SELECT COUNT(*) FROM mcp_tools WHERE server = ?", (row["name"],)
@@ -615,10 +672,16 @@ async def sync_server(name: str):
         result = await asyncio.wait_for(session.list_tools(), timeout=SYNC_TIMEOUT)
     except Exception as e:
         await _drop_session(name)
+        _mark_unhealthy(name, f"list_tools falhou: {type(e).__name__}")
         raise HTTPException(502, f"list_tools falhou no servidor '{name}': {type(e).__name__}: {e}") from e
 
     live = {t.name: t for t in result.tools}
     prev_rows = {t["name"]: t for t in _db_tools_for_server(name)}
+    always_on = bool(row["always_on"])
+    try:
+        examples_by_tool: dict[str, list[str]] = json.loads(row["examples_json"] or "{}")
+    except Exception:
+        examples_by_tool = {}
     tools_out: list[dict] = []
     to_register: list[dict] = []
     for tool in live.values():
@@ -632,22 +695,24 @@ async def sync_server(name: str):
             custom = (prev["snippet"] or "").strip() != (prev["description_raw"] or "").strip()
             if custom and (prev["snippet"] or "").strip():
                 snippet = prev["snippet"]
-            changed = custom or snippet != (prev["snippet"] or "").strip()
-        else:
-            changed = True
         # mcp 2.x: Tool.input_schema (alias camelCase "inputSchema" só na serialização)
         try:
-            _db_upsert_tool(name, tool.name, raw, snippet, tool.input_schema or {})
+            _db_upsert_tool(name, tool.name, raw, snippet, tool.input_schema or {}, core=always_on)
         except sqlite3.IntegrityError:
             # Corrida rara: o servidor foi DELETADO durante o await do
             # list_tools — as rows filhas já foram removidas (FK cascade).
             log.warning(f"MCP: sync de '{name}' interrompido — servidor removido durante o sync")
             raise HTTPException(409, f"Servidor '{name}' foi removido durante o sync")
         tools_out.append({"name": tool.name, "graph_name": _graph_name(name, tool.name), "snippet": snippet})
-        if changed:
-            # Só tools novas ou com snippet alterado vão pro grafo — tool
-            # inalterada não é re-embedada (economiza o batch de embeddings).
-            to_register.append({"name": _graph_name(name, tool.name), "description": snippet, "core": False})
+        # TODAS as tools vão no batch (não só as alteradas): o doc_hash na
+        # ToolsDB já evita re-embed de tool inalterada, e o caminho "unchanged"
+        # de lá aplica set_core — necessário quando o usuário flipa always_on
+        # e re-sincroniza. Enviar tudo é ~grátis e mantém core/exemplos vivos.
+        to_register.append({
+            "name": _graph_name(name, tool.name), "description": snippet,
+            "core": always_on,
+            "examples": examples_by_tool.get(tool.name, []),
+        })
 
     # Stale: tools que estavam no cache mas sumiram do servidor — saem do
     # grafo (DELETE) e do cache. 404 do memory = já não existia, ok.
@@ -767,9 +832,13 @@ async def update_snippet(graph_name: str, req: SnippetUpdateRequest):
     if not snippet:
         raise HTTPException(400, "snippet vazio")
     _db_update_snippet(server, tool, snippet)
+    # Preserva o core atual da tool (bug anterior: re-register forçava
+    # core=False e zerava o flag de capability de base).
+    srv = _db_get_server(server)
+    core = bool(row["core"]) if srv is None else bool(row["core"]) or bool(srv["always_on"])
     try:
         r = await state.memory.post("/tools/register", json={
-            "name": graph_name, "description": snippet, "core": False,
+            "name": graph_name, "description": snippet, "core": core,
         }, timeout=REGISTER_TIMEOUT)
         r.raise_for_status()
     except Exception as e:
@@ -817,7 +886,11 @@ async def skills_select(req: SkillsSelectRequest):
 
     matches = sel.get("tools", [])
     servers = _db_list_servers(enabled_only=True)
-    enabled = {row["name"] for row in servers}
+    # Unhealthy (falha de conexão recente) sai da seleção — oferecer 24 tools
+    # de um servidor morto distrai o modelo. EXCETO always_on: capacidade de
+    # base (busca web) melhor disponível e falhando do que sumida do schema.
+    enabled = {row["name"] for row in servers
+               if bool(row["always_on"]) or not _is_unhealthy(row["name"])}
     summaries = {row["name"]: row["skill_summary"] for row in servers}
     by_server: dict[str, list[str]] = {}
     for m in matches:
@@ -859,6 +932,8 @@ async def server_call(name: str, req: ServerCallRequest):
             timeout=req.timeout,
         )
     except Exception as e:
+        # Sem _mark_unhealthy aqui: timeout de tool longa não significa
+        # servidor morto — unhealthy é só pra falha de CONEXÃO (_get_session).
         await _drop_session(name)
         raise HTTPException(502, f"call_tool '{req.tool}' falhou no servidor '{name}': {type(e).__name__}: {e}") from e
     text = "\n".join(block.text for block in result.content if hasattr(block, "text"))

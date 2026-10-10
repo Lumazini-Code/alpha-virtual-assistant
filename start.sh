@@ -63,8 +63,8 @@ cd /app/Modules
 echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
 
-echo "  • Deep Search..."
-restart_on_fail "Deep Search" "python3 deep_search.py" &
+# Deep Search removido — busca web agora é um servidor MCP próprio
+# (mcp_servers/websearch, serviço websearch-mcp no docker-compose).
 
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &
