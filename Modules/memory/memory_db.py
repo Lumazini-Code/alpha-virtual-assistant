@@ -1129,10 +1129,120 @@ class ToolsDB(EdgeGraphMixin):
         ).fetchone()[0]
 
 
+
+# ── NEW: Banco de planos (macro/modelo) ────────────────────────────────────────
+
+class PlansDB:
+    """
+    Persiste planos de execução híbridos (steps "macro" rodados por script/
+    Playwright determinístico e steps "modelo" conduzidos pelo LLM).
+
+    Cada plano é versionado: qualquer update incrementa `version` e grava
+    `updated_at`. `corrections_json` acumula os seletores corrigidos pelo
+    modelo em recuperação de falha de macro (chave = índice do step).
+
+    Os steps e as correções ficam serializados em JSON — o formato completo
+    (PlanStep etc.) é validado na camada Pydantic (memory_models.py), aqui é
+    só storage. SQLite puro, mesmo padrão das demais DBs.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS plans (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT    NOT NULL,
+                name_key         TEXT    NOT NULL UNIQUE,  -- nome normalizado (lower/strip)
+                description      TEXT    NOT NULL DEFAULT '',
+                version          INTEGER NOT NULL DEFAULT 1,
+                steps_json       TEXT    NOT NULL,         -- lista de PlanStep serializada
+                corrections_json TEXT    NOT NULL DEFAULT '{}',  -- {step_index: seletor corrigido}
+                created_at       REAL    NOT NULL,
+                updated_at       REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_plans_key ON plans(name_key);
+        """)
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    def insert_plan(self, name: str, description: str, steps_json: str) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO plans (name, name_key, description, steps_json, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, self._normalize_key(name), description, steps_json, now, now),
+            )
+            return cur.lastrowid
+
+    def get_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM plans WHERE name_key = ?", (self._normalize_key(name),)
+        ).fetchone()
+
+    def get_by_id(self, plan_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM plans WHERE id = ?", (plan_id,)
+        ).fetchone()
+
+    def update_plan(self, plan_id: int, description: Optional[str],
+                    steps_json: Optional[str], corrections_json: Optional[str]) -> int:
+        """Atualiza o plano e incrementa a versão. Campos None preservam o
+        valor atual. Retorna a nova versão (0 se o plano não existe)."""
+        row = self._conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if row is None:
+            return 0
+        with self._lock:
+            new_version = row["version"] + 1
+            self._conn.execute(
+                "UPDATE plans SET "
+                "description      = ?, "
+                "steps_json       = ?, "
+                "corrections_json = ?, "
+                "version          = ?, "
+                "updated_at       = ? "
+                "WHERE id = ?",
+                (
+                    description if description is not None else row["description"],
+                    steps_json if steps_json is not None else row["steps_json"],
+                    corrections_json if corrections_json is not None else row["corrections_json"],
+                    new_version,
+                    time.time(),
+                    plan_id,
+                ),
+            )
+        return new_version
+
+    def delete_plan(self, plan_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+            return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0]
+
+    def list_plans(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, name, description, version, created_at, updated_at "
+            "FROM plans ORDER BY name"
+        ).fetchall()
+
+
 __all__ = [
     'FaceDictDB',
     'IndexedFilesDB',
     'MemoryDB',
+    'PlansDB',
     'ShortTermDB',
     'ToolsDB',
     'VisualDictDB',

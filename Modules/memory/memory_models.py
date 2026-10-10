@@ -10,9 +10,11 @@ MemoryToolError, a exceção de negócio agnóstica de transporte.
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from memory_config import (
+    PLANS_MAX_ACTIONS_MODEL,
+    PLANS_MAX_STEPS,
     FD_MIN_SCORE,
     FD_TOP_K,
     IF_MIN_SCORE,
@@ -487,6 +489,88 @@ class ToolUsageRequest(BaseModel):
     query:      str = ""
 
 
+# ── NEW: Modelos — planos de execução híbridos (macro + modelo) ────────────────
+#
+# Um plano é uma lista ordenada de passos, cada um marcado como "macro"
+# (roda no Playwright sem LLM — seletores fixos gravados com codegen) ou
+# "modelo" (o LLM lê/julga, com objetivo + escopo + schema de saída).
+# Persistido na memory (PlansDB) e versionado a cada update.
+
+class PlanStep(BaseModel):
+    # executor: "macro" = Playwright direto (sem LLM); "modelo" = LLM lê/julga
+    executor: Literal["macro", "modelo"]
+    # macro: tipo de ação do Playwright MCP ("navigate", "click", "snapshot", ...)
+    # modelo: ignorado (o modelo escolhe as ações)
+    action: Optional[str] = None
+    # macro: parâmetros fixos da ação (ex. {"url": "..."} / {"element": "...", "ref": "..."})
+    params: dict = {}
+    # macro: expectativa de sucesso — {"url_contains": "..."} e/ou {"selector_visible": "..."}
+    expect: Optional[dict] = None
+    # modelo: o que fazer neste passo, em linguagem natural
+    objective: Optional[str] = None
+    # modelo: limites do que pode ser feito (ex. "só a seção X, não navegar para fora")
+    scope: Optional[str] = None
+    # modelo: JSON Schema da saída estruturada esperada deste passo
+    output_schema: Optional[dict] = None
+    # modelo: limite de ações de browser neste passo
+    max_actions: int = Field(default=PLANS_MAX_ACTIONS_MODEL, ge=1, le=50)
+    # descrição humana do passo (log/plano legível)
+    description: str = ""
+
+class PlanCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    steps: list[PlanStep] = Field(min_length=1, max_length=PLANS_MAX_STEPS)
+
+class PlanCreateResponse(BaseModel):
+    plan_id: int
+    version: int
+    created: bool
+
+class PlanUpdateRequest(BaseModel):
+    # identificação: por id OU por name (name_key)
+    plan_id: Optional[int] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    steps: Optional[list[PlanStep]] = Field(default=None, max_length=PLANS_MAX_STEPS)
+    # merge ou replace das correções acumuladas ({step_index: seletor corrigido})
+    corrections: Optional[dict[str, str]] = None
+
+class PlanUpdateResponse(BaseModel):
+    plan_id: int
+    version: int
+    updated: bool
+
+class PlanEntry(BaseModel):
+    plan_id:    int
+    name:       str
+    description: str
+    version:    int
+    steps:      list[PlanStep]
+    corrections: dict[str, str] = {}
+    created_at: float
+    updated_at: float
+
+class PlanReadRequest(BaseModel):
+    plan_id: Optional[int] = None
+    name:    Optional[str] = None
+
+class PlanReadResponse(BaseModel):
+    plan: Optional[PlanEntry] = None
+
+class PlanListResponse(BaseModel):
+    total: int
+    plans: list[PlanEntry] = []
+
+class PlanDeleteRequest(BaseModel):
+    plan_id: Optional[int] = None
+    name:    Optional[str] = None
+
+class PlanDeleteResponse(BaseModel):
+    deleted: bool
+    plan_id: Optional[int] = None
+
+
 # ── Erros ──────────────────────────────────────────────────────────────────────
 
 class MemoryToolError(Exception):
@@ -518,6 +602,17 @@ __all__ = [
     'IndexedFileWriteResponse',
     'MemoryEntry',
     'MemoryToolError',
+    'PlanCreateRequest',
+    'PlanCreateResponse',
+    'PlanDeleteRequest',
+    'PlanDeleteResponse',
+    'PlanEntry',
+    'PlanListResponse',
+    'PlanReadRequest',
+    'PlanReadResponse',
+    'PlanStep',
+    'PlanUpdateRequest',
+    'PlanUpdateResponse',
     'ReadRequest',
     'ReadResponse',
     'ReadSTRequest',

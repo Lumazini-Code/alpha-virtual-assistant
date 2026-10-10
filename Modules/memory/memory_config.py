@@ -30,6 +30,11 @@ if _MODULES_DIR not in sys.path:
 # Diretório de dados do memory — ancorado no próprio pacote, independe do CWD
 _DB_DIR = _BASE_DIR / "db"
 
+# ── NEW: Planos de execução híbridos (macro + modelo) ──────────────────────────
+PLANS_DB_PATH           = str(_DB_DIR / "ava_plans.db")
+PLANS_MAX_STEPS         = 50       # teto de passos por plano (validação Pydantic)
+PLANS_MAX_ACTIONS_MODEL = 15       # default de ações de browser por step "modelo"
+
 # Logger compartilhado por todos os módulos memory_*
 # ── Configuração ───────────────────────────────────────────────────────────────
 
@@ -523,6 +528,9 @@ __all__ = [
     'TOOLS_TOP_K',
     'TOOLS_USAGE_MAX_SEQUENCE',
     'TOP_K_READ',
+    'PLANS_DB_PATH',
+    'PLANS_MAX_STEPS',
+    'PLANS_MAX_ACTIONS_MODEL',
     'UPDATE_SIM_THRESHOLD',
     'VD_AMBIGUOUS_MARGIN',
     'VD_DB_PATH',

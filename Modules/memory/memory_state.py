@@ -43,6 +43,7 @@ from memory_config import (
     MT_VOICE_DICT,
     MT_VISUAL_DICT,
     ONNX_SERVING_URL,
+    PLANS_DB_PATH,
     ST_CLEANUP_INTERVAL_S,
     ST_DB_PATH,
     ST_FAISS_ID_MAP_PATH,
@@ -66,6 +67,7 @@ from memory_db import (
     FaceDictDB,
     IndexedFilesDB,
     MemoryDB,
+    PlansDB,
     ShortTermDB,
     ToolsDB,
     VisualDictDB,
@@ -116,6 +118,8 @@ class AppState:
     # ── NEW: RAG de tools ──
     tl_db:        ToolsDB         = field(default=None)
     tl_index:     MemoryIndex     = field(default=None)
+    # ── NEW: Planos de execução híbridos (macro + modelo) ──
+    plans_db:     PlansDB         = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
@@ -260,6 +264,9 @@ async def startup():
     state.tl_db    = ToolsDB(TOOLS_DB_PATH)
     state.tl_index = MemoryIndex(state.lance, MT_TOOL, EMBED_DIM)
 
+    # ── NEW: Planos de execução híbridos ──
+    state.plans_db = PlansDB(PLANS_DB_PATH)
+
     if _VS_AVAILABLE:
         try:
             vs_idx, vs_db, vs_idmap = _resolve_vs_paths()
@@ -306,7 +313,8 @@ async def startup():
         f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings) | "
         f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto) | "
         f"{state.vo_db.count()} pessoas com voz cadastrada ({state.vo_index.total} embeddings de voz) | "
-        f"{state.tl_db.count()} tools indexadas ({state.tl_index.total} vetores)"
+        f"{state.tl_db.count()} tools indexadas ({state.tl_index.total} vetores) | "
+        f"{state.plans_db.count()} planos"
     )
 
 
