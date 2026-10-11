@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "alpha-ai": "./dist/alpha-ai.js"
+    "alpha-ai": "./dist/cli.js"
   },
   "scripts": {
     "dev": "tsx src/cli.tsx",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/alpha-ai.js"
+    "build": "bun scripts/patch-cfonts.mjs && bun build --compile --minify --target=bun-linux-x64   src/cli.tsx --outfile dist/alpha-ai && bun build --compile --minify --target=bun-windows-x64 src/cli.tsx --outfile dist/alpha-ai.exe",
+    "start": "node dist/cli.js"
   },
   "dependencies": {
     "execa": "^9.3.0",
@@ -23,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^20.14.2",
     "@types/react": "^18.3.3",
+    "react-devtools-core": "^8.0.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.3"
   }

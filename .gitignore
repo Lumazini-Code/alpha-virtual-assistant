@@ -51,3 +51,7 @@ Modules/memory/db/*
 Modules/.playwright-mcp
 
 .graphifyignore
+
+resource/Alpha icon.xcf
+
+*.lock

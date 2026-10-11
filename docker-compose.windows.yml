@@ -10,6 +10,12 @@ services:
   # ─────────────────────────────────────────────
   ava:
     ports:
+      # Tray (ava-tray no host) — orchestrator chama /docker/start e
+      # /browser/start (Chrome de depuração) na API dele.
+      - "9001:9001"
+      # CDP do Chrome do host aberto pelo tray (--cdp-endpoint do
+      # @playwright/mcp dentro do container).
+      - "9222:9222"
       - "3000:3000"
       - "4005:4005"
       - "4003:4003"

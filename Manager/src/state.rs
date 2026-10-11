@@ -49,9 +49,40 @@ impl Default for DockerState {
     }
 }
 
+/// Porta padrão do CDP — mesma usada pelo @playwright/mcp no
+/// mcp_manager.py (`--cdp-endpoint http://localhost:9222`).
+pub const CDP_DEFAULT_PORT: u16 = 9222;
+
+/// Informações sobre o Chrome em modo depuração (CDP :9222).
+///
+/// O Chrome é um processo DO HOST, spawnado detached — sobrevive ao
+/// stop do docker e ao timer de inatividade de propósito: a intenção
+/// é que a janela fique aberta para o usuário depois que o modelo
+/// terminar as ações (o Playwright MCP conecta via --cdp-endpoint).
+#[derive(Debug, Clone)]
+pub struct BrowserState {
+    pub status: ProcStatus,
+    pub pid: Option<u32>,
+    pub cdp_port: u16,
+    /// Cópia do perfil padrão do usuário usada como --user-data-dir.
+    pub profile_dir: PathBuf,
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self {
+            status: ProcStatus::Stopped,
+            pid: None,
+            cdp_port: CDP_DEFAULT_PORT,
+            profile_dir: PathBuf::new(),
+        }
+    }
+}
+
 /// Estado raiz da aplicação. Uma única instância, compartilhada via `Arc`.
 pub struct AppState {
     pub docker: Arc<TokioMutex<DockerState>>,
+    pub browser: Arc<TokioMutex<BrowserState>>,
     pub docker_start_script: PathBuf,
 }
 
@@ -115,6 +146,7 @@ pub fn new_shared_state() -> SharedState {
 
     Arc::new(AppState {
         docker: Arc::new(TokioMutex::new(DockerState::default())),
+        browser: Arc::new(TokioMutex::new(BrowserState::default())),
         docker_start_script: find_docker_start_script(),
     })
 }
