@@ -30,6 +30,11 @@ if _MODULES_DIR not in sys.path:
 # Diretório de dados do memory — ancorado no próprio pacote, independe do CWD
 _DB_DIR = _BASE_DIR / "db"
 
+# ── NEW: Planos de execução híbridos (macro + modelo) ──────────────────────────
+PLANS_DB_PATH           = str(_DB_DIR / "ava_plans.db")
+PLANS_MAX_STEPS         = 50       # teto de passos por plano (validação Pydantic)
+PLANS_MAX_ACTIONS_MODEL = 15       # default de ações de browser por step "modelo"
+
 # Logger compartilhado por todos os módulos memory_*
 # ── Configuração ───────────────────────────────────────────────────────────────
 
@@ -156,6 +161,10 @@ TOOLS_MAX_EXAMPLES          = 10     # exemplos de query fornecidos no cadastro,
 TOOLS_MAX_LEARNED_EXAMPLES  = 20     # queries reais aprendidas via tools_record_usage, por tool
 TOOLS_LEARN_DEDUP_SCORE     = 0.95   # query aprendida ≥ isso de outra já existente → não duplica
 TOOLS_USAGE_MAX_SEQUENCE    = 12     # teto de tools por registro de uso (anti-O(n²))
+TOOLS_MAX_PER_SERVER        = 4      # cota de slots por servidor MCP no top_k — servidor com
+                                     # 24 tools não pode monopolizar o kNN contra um de 1
+                                     # (a seleção final é por SERVIDOR, então 1 hit já
+                                     # libera as 24; sem cota, o de 1 tool nunca entra)
 
 # ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
 DICT_GRAPH_MAX_RELATED = 3
@@ -519,6 +528,9 @@ __all__ = [
     'TOOLS_TOP_K',
     'TOOLS_USAGE_MAX_SEQUENCE',
     'TOP_K_READ',
+    'PLANS_DB_PATH',
+    'PLANS_MAX_STEPS',
+    'PLANS_MAX_ACTIONS_MODEL',
     'UPDATE_SIM_THRESHOLD',
     'VD_AMBIGUOUS_MARGIN',
     'VD_DB_PATH',

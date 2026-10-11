@@ -45,6 +45,10 @@ from memory_config import (
 
 class EdgeGraphMixin:
     EDGE_TABLE = "memory_edges"     # sobrescrito em ToolsDB
+    # Rótulo do grafo no log de ativação JSONL (graph_activation.py precisa
+    # saber se os ids do evento são de memórias ou de tools — sem isso os
+    # ids inteiros colidem entre os dois grafos e a UI acende o nó errado).
+    GRAPH_LABEL = "memory"
 
     def _edge_table_ddl(self) -> str:
         return f"""
@@ -382,7 +386,7 @@ def _expand_graph_sync(
 
 def _log_activation_sync(
     seed_ids: list[int], rank: dict[int, float], elapsed_ms: float,
-    ctx: Optional[dict] = None,
+    ctx: Optional[dict] = None, graph: str = "memory",
 ):
     """Grava um evento de ativação PPR no log JSONL, consumido por
     graph_activation.py p/ visualização em tempo real. Best-effort:
@@ -390,11 +394,14 @@ def _log_activation_sync(
 
     `ctx` (opcional) enriquece o evento com o CONTEXTO da leitura que o
     provocou (query, strategy, session_id) — a UI mostra POR QUÊ o grafo
-    ativou, não só que ativou."""
+    ativou, não só que ativou. `graph` identifica o grafo de origem
+    ("memory" | "tools") — ids inteiros colidem entre os dois, e a UI
+    prefixa os de tools com "t"."""
     try:
         top = sorted(rank.items(), key=lambda kv: kv[1], reverse=True)[:ACTIVATION_LOG_MAX_IDS]
         line = json.dumps({
             "type": "activation",
+            "graph": graph,
             "ts": time.time(),
             "seeds": seed_ids,
             "rank": {str(k): round(v, 4) for k, v in top},

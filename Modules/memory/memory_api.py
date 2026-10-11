@@ -271,6 +271,33 @@ async def tools_delete(name: str):
     return await mem.tools_delete(name)
 
 
+# ── Planos de execução híbridos (macro + modelo) ─────────────────────────────────
+
+@app.post("/plans/write", response_model=mem.PlanCreateResponse)
+async def plans_create(req: mem.PlanCreateRequest):
+    return await mem.plan_create(req)
+
+
+@app.post("/plans/read", response_model=mem.PlanReadResponse)
+async def plans_read(req: mem.PlanReadRequest):
+    return await mem.plan_read(req)
+
+
+@app.post("/plans/list", response_model=mem.PlanListResponse)
+async def plans_list():
+    return await mem.plan_list()
+
+
+@app.patch("/plans/update", response_model=mem.PlanUpdateResponse)
+async def plans_update(req: mem.PlanUpdateRequest):
+    return await mem.plan_update(req)
+
+
+@app.delete("/plans/delete", response_model=mem.PlanDeleteResponse)
+async def plans_delete(req: mem.PlanDeleteRequest):
+    return await mem.plan_delete(req)
+
+
 # ── Status ───────────────────────────────────────────────────────────────────────
 
 @app.get("/status")

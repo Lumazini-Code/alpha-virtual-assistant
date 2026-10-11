@@ -39,8 +39,64 @@ services:
       start_period: 240s
       retries: 5
 
+  # ── Pipeline de busca web (websearch-mcp consome os três abaixo) ──────────
+  # Portas publicadas só em 127.0.0.1: o ava roda com network_mode: host no
+  # override linux e alcança tudo via localhost; nada fica exposto na rede.
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: ava-searxng
+    restart: unless-stopped
+    volumes:
+      - ./resource/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      SEARXNG_BASE_URL: "http://127.0.0.1:8081/"
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: ava-valkey
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - websearch-cache:/data
+    command: ["valkey-server", "--appendonly", "no", "--save", ""]
+
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: ava-crawl4ai
+    restart: unless-stopped
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:11235:11235"
+    environment:
+      # Token interno — sem ele o servidor só escuta no loopback do container
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:-ava-crawl4ai-internal}"
+
+  websearch-mcp:
+    build:
+      context: ./mcp_servers/websearch
+      dockerfile: Dockerfile
+    image: ava-websearch-mcp:latest
+    container_name: ava-websearch-mcp
+    restart: unless-stopped
+    volumes:
+      - ./resource:/app/resource:ro
+    ports:
+      - "127.0.0.1:4010:4010"
+    environment:
+      WEBSEARCH_CONFIG: "/app/resource/websearch/config.json"
+      SEARXNG_URL: "http://searxng:8080"
+      CRAWL4AI_URL: "http://crawl4ai:11235"
+      VALKEY_URL: "redis://valkey:6379/0"
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:-ava-crawl4ai-internal}"
+
 volumes:
   ava-cache:
     driver: local
   ava-logs:
+    driver: local
+  websearch-cache:
     driver: local

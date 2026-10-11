@@ -1,4 +1,4 @@
-"""graph_activation.py — Visualização em tempo real do grafo Hebbiano de memórias LT.
+"""graph_activation.py — Visualização em tempo real do grafo Hebbiano (memórias LT + tools).
 
 Arquitetura (v2 — polling de diff):
   ══════════════════════════════════════════════════════════════════════════
@@ -13,15 +13,30 @@ Arquitetura (v2 — polling de diff):
       automaticamente (auto-link na escrita, hebbiano em leitura, link_to
       explícito, cadeias temporais do batch, reforço PPR), sem o memory
       module precisar emitir evento nenhum.
+
+  v3 — TOOLS: o mesmo polling cobre o grafo de tools (ToolsDB: ava_tools.db,
+  tabelas `tools` + `tool_edges` — mesmo esquema de arestas tipadas). Tools
+  (nativas + MCP registradas no mcp_manager) entram como nós HEXAGONAIS
+  verdes com id prefixado ("t{id}") — os ids inteiros de tool colidem com os
+  de memória, então o prefixo é obrigatório. Eventos de ativação PPR no
+  JSONL carregam "graph" ("memory" | "tools", ver memory_graph._log_activation_sync)
+  e a UI prefixa os ids de tools antes de acender.
+
+  v4 — PLANS: os planos de execução híbridos (PlansDB: ava_plans.db) entram
+  como nós DIAMANTE roxos com id prefixado ("p{id}") — sem arestas (nós
+  soltos). Cobrem criação (POST /plans/write) e edição (PATCH /plans/update,
+  que versiona — o diff acende "updated" a cada versão nova) feitas pela TUI
+  ou pelo plan_recorder.
   ══════════════════════════════════════════════════════════════════════════
 
   Eventos SSE (o cliente roteia por "type"):
-    {"type": "activation",  "ts", "seeds", "rank", "elapsed_ms",
+    {"type": "activation",  "graph", "ts", "seeds", "rank", "elapsed_ms",
                             "query", "strategy", "session_id"}   ← PPR numa leitura
     {"type": "graph_delta", "ts",
                             "nodes": {"added": [...], "updated": [...], "removed": [id,...]},
                             "edges": {"added": [...], "updated": [...],
                                       "removed": ["a|b|type", ...]}}
+      — nós de tools têm id string "t{id}" e kind="tool"; os de memória, id int.
 
   Endpoints:
     GET /                  → UI (vis-network, overhaul: cores/setas/weights por
@@ -34,6 +49,7 @@ Arquitetura (v2 — polling de diff):
 Rodar:
     python graph_activation.py                      (defaults abaixo)
     python graph_activation.py --port 8777 --poll 1.0
+    python graph_activation.py --tools-db ./Modules/memory/db/ava_tools.db
 """
 
 import argparse
@@ -65,6 +81,7 @@ def _node_public(row: sqlite3.Row) -> dict:
     text = (row["text"] or "").strip().replace("\n", " ")
     return {
         "id":          row["id"],
+        "kind":        "memory",
         "label":       text[:40] + ("…" if len(text) > 40 else ""),
         "title":       html.escape(text[:400]),
         "text":        row["text"],
@@ -73,6 +90,30 @@ def _node_public(row: sqlite3.Row) -> dict:
         "created_at":  row["created_at"],
         "access_count": row["access_count"],
         "forgettable": bool(row["forgettable"]),
+    }
+
+
+def _tool_node_public(row: sqlite3.Row) -> dict:
+    """Nó público de uma tool (ToolsDB). Id STRING com prefixo "t" — os ids
+    inteiros de tool colidem com os de memória no mesmo espaço visual. O
+    servidor MCP é inferido do graph name (`servidor__tool`, gravado pelo
+    mcp_manager); tools nativas não têm o separador."""
+    name = (row["name"] or "").strip()
+    desc = (row["description"] or "").strip().replace("\n", " ")
+    server = name.split("__", 1)[0] if "__" in name else None
+    return {
+        "id":          f"t{row['id']}",
+        "kind":        "tool",
+        "label":       name[:40] + ("…" if len(name) > 40 else ""),
+        "title":       html.escape(desc[:400]),
+        "text":        row["description"],   # p/ busca (mesma chave das memórias)
+        "name":        name,
+        "server":      server,               # None = tool nativa
+        "core":        bool(row["is_core"]),
+        "use_count":   row["use_count"],
+        "last_used":   row["last_used"],
+        "created_at":  row["created_at"],
+        "source":      f"tool:{server}" if server else "tool",
     }
 
 
@@ -88,22 +129,70 @@ def _edge_public(row: sqlite3.Row) -> dict:
     }
 
 
+def _tool_edge_public(row: sqlite3.Row) -> dict:
+    """Aresta do grafo de tools — mesmo formato das de memória, com o
+    prefixo "t" nos ids (nós e key) pra não colidir no espaço visual."""
+    return {
+        "key":   f"t{row['memory_id_a']}|t{row['memory_id_b']}|{row['edge_type']}",
+        "from":  f"t{row['memory_id_a']}",
+        "to":    f"t{row['memory_id_b']}",
+        "type":  row["edge_type"],
+        "weight": round(row["weight"], 4),
+        "count": row["coactivation_count"],
+        "last":  row["last_coactivated"],
+    }
+
+
+def _plan_node_public(row: sqlite3.Row) -> dict:
+    """Nó público de um plano de execução (PlansDB: ava_plans.db). Id STRING
+    com prefixo "p" — planos não têm arestas (nós soltos no espaço visual):
+    entram no grafo só para acompanhar criação/edição em tempo real (o
+    /plans/update da memory versiona, e o diff acende "updated")."""
+    name = (row["name"] or "").strip()
+    desc = (row["description"] or "").strip()
+    steps_count = len(json.loads(row["steps_json"] or "[]"))
+    return {
+        "id":          f"p{row['id']}",
+        "kind":        "plan",
+        "label":       name[:40] + ("…" if len(name) > 40 else ""),
+        "title":       html.escape(desc[:400]),
+        "text":        row["description"],   # p/ busca (mesma chave das demais)
+        "name":        name,
+        "description": desc,
+        "version":     row["version"],
+        "steps_count": steps_count,
+        "created_at":  row["created_at"],
+        "updated_at":  row["updated_at"],
+        "source":      "plan",
+    }
+
+
 class GraphState:
-    """Snapshot do grafo + diff por poll. Scan completo das duas tabelas a
+    """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
     completo cobre criação, atualização E remoção (decay job) sem depender
-    de surrogate keys."""
+    de surrogate keys. Cobre TRÊS grafos no mesmo espaço visual:
+      - memórias LT (ava_memory.db) — ids inteiros, kind="memory";
+      - tools (ava_tools.db) — ids string "t{id}", kind="tool"; o DB é
+        opcional (memory process pode não tê-lo criado ainda);
+      - planos (ava_plans.db) — ids string "p{id}", kind="plan"; nós
+        soltos (sem arestas), também opcional."""
 
-    def __init__(self, db_path: str):
+    TOOL_ID_PREFIX = "t"
+    PLAN_ID_PREFIX = "p"
+
+    def __init__(self, db_path: str, tools_db_path: str = "", plans_db_path: str = ""):
         self.db_path = db_path
+        self.tools_db_path = tools_db_path
+        self.plans_db_path = plans_db_path
         self.lock = threading.Lock()
-        self.nodes: dict[int, dict] = {}                       # id -> node público
-        self.nodes_sig: dict[int, tuple] = {}                  # id -> (text, source, confidence, forgettable)
+        self.nodes: dict = {}                                  # id -> node público (int | "tN")
+        self.nodes_sig: dict = {}                              # id -> sig por tipo
         self.edges: dict[str, dict] = {}                       # key -> edge pública
         self.edges_sig: dict[str, tuple] = {}                  # key -> (weight, count)
 
     def _scan(self) -> tuple[dict, dict]:
-        """Scan completo (nodes, edges) — tudo público/serializável."""
+        """Scan completo (nodes, edges) dos dois grafos — tudo público."""
         conn = _open_ro(self.db_path)
         try:
             nodes = {
@@ -122,6 +211,48 @@ class GraphState:
             }
         finally:
             conn.close()
+        # ── Grafo de tools (opcional): mesmo esquema de arestas tipadas ──
+        if self.tools_db_path:
+            try:
+                tconn = _open_ro(self.tools_db_path)
+                try:
+                    tnodes = {
+                        f"{self.TOOL_ID_PREFIX}{r['id']}": _tool_node_public(r)
+                        for r in tconn.execute(
+                            "SELECT id, name, description, is_core, created_at, "
+                            "last_used, use_count FROM tools"
+                        )
+                    }
+                    tedges = {
+                        _tool_edge_public(r)["key"]: _tool_edge_public(r)
+                        for r in tconn.execute(
+                            "SELECT memory_id_a, memory_id_b, edge_type, weight, "
+                            "coactivation_count, last_coactivated FROM tool_edges"
+                        )
+                    }
+                finally:
+                    tconn.close()
+                nodes.update(tnodes)
+                edges.update(tedges)
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # tools DB ainda não existe / sem tabelas — só memórias
+        # ── Grafo de planos (opcional): nós soltos, sem arestas ──
+        if self.plans_db_path:
+            try:
+                pconn = _open_ro(self.plans_db_path)
+                try:
+                    pnodes = {
+                        f"{self.PLAN_ID_PREFIX}{r['id']}": _plan_node_public(r)
+                        for r in pconn.execute(
+                            "SELECT id, name, description, version, steps_json, "
+                            "created_at, updated_at FROM plans"
+                        )
+                    }
+                finally:
+                    pconn.close()
+                nodes.update(pnodes)
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # plans DB ainda não existe / sem tabela — ignora
         return nodes, edges
 
     def refresh(self) -> dict:
@@ -141,7 +272,13 @@ class GraphState:
 
         with self.lock:
             for nid, node in db_nodes.items():
-                sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
+                # sig por tipo de nó — memórias, tools e planos têm campos distintos
+                if node["kind"] == "tool":
+                    sig = (node["text"], node["name"], node["core"], node["use_count"], node["last_used"])
+                elif node["kind"] == "plan":
+                    sig = (node["name"], node["text"], node["version"])
+                else:
+                    sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
                 old_sig = self.nodes_sig.get(nid)
                 if old_sig is None:
                     self.nodes[nid] = node
@@ -462,7 +599,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <div id="hud">
-  <b>Grafo Hebbiano</b> — memórias LT em tempo real
+  <b>Grafo Hebbiano</b> — memórias LT + tools + planos em tempo real
   <div id="counts">carregando…</div>
   <div id="log"></div>
 </div>
@@ -474,8 +611,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <h4>Animação</h4>
   <div class="row">decay <input type="range" id="decaySlider" min="0.80" max="0.98" step="0.01" value="0.93"><span id="decayVal">0.93</span></div>
   <div class="row"><label style="margin:0"><input type="checkbox" id="autoFollow" checked> auto-follow em nós novos</label></div>
-  <h4>Buscar memória</h4>
-  <input type="text" id="searchBox" placeholder="texto contém… (Enter)">
+  <h4>Buscar memória ou tool</h4>
+  <input type="text" id="searchBox" placeholder="texto / nome contém… (Enter)">
   <h4>Replay</h4>
   <div class="row">
     <input type="text" id="replayN" value="40" style="width:60px">
@@ -495,6 +632,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <span><i class="chip node" style="background:#ff6b6b"></i>semente</span>
   <span><i class="chip node" style="background:#ffd166"></i>PPR</span>
   <span><i class="chip node" style="background:#51cf66"></i>novo</span>
+  <span><i class="chip node" style="background:#38d9a9"></i>tool (⬡ MCP/nativa)</span>
+  <span><i class="chip node" style="background:#b197fc"></i>plano (⬥ p{id})</span>
   <span style="opacity:.65">espessura = peso da aresta · tamanho = grau + ativação</span>
 </div>
 
@@ -511,6 +650,10 @@ const TYPE_STYLE = {
   contradicts:         { color: '#ff6b6b', directed: false, dashes: [6, 4], name: 'contradicts' },
 };
 const BASE_NODE_BG = '#33384a', BASE_NODE_BORDER = '#54607a';
+// Tools (nativas + MCP): hexágonos verdes — distinguem de memória à primeira vista
+const TOOL_NODE_BG = '#1f3d3a', TOOL_NODE_BORDER = '#38d9a9', TOOL_FONT_COLOR = '#7fe3c8';
+// Planos de execução: diamantes roxos, id "p{id}" — nós soltos (sem arestas)
+const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = '#d0bfff';
 const FONT_COLOR   = '#9aa0b4';
 
 const nodes = new vis.DataSet();
@@ -564,16 +707,35 @@ const network = new vis.Network(
 
 function baseNodeOptions(meta) {
   const deg = degreeOf(meta.id);
+  const isTool = meta.kind === 'tool';
+  const isPlan = meta.kind === 'plan';
   return {
     id: meta.id, label: meta.label, title: nodeTitle(meta),
-    shape: 'dot',
-    size: 5 + Math.min(deg, 12) * 1.3,
-    color: { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
-    font: { color: FONT_COLOR, size: 11 },
+    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : 'dot',
+    size: (isTool ? 9 : isPlan ? 8 : 5) + Math.min(deg, 12) * 1.3,
+    color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
+                  : isPlan ? { background: PLAN_NODE_BG, border: PLAN_NODE_BORDER }
+                           : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
+    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : FONT_COLOR, size: 11 },
   };
 }
 
 function nodeTitle(meta) {
+  if (meta.kind === 'plan') {
+    const fmt = (t) => {
+      const d = new Date((t || 0) * 1000);
+      return isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    };
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PLAN_FONT_COLOR}">v${meta.version ?? '?'}</span><br>` +
+           `<i>${meta.title || '(sem descrição)'}</i><br>` +
+           `${meta.steps_count ?? '?'} passo(s) · criado: ${fmt(meta.created_at)} · atualizado: ${fmt(meta.updated_at)}`;
+  }
+  if (meta.kind === 'tool') {
+    const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> ${meta.core ? '⭐ core' : ''}<br>` +
+           `<i>${meta.title || '(sem snippet — rode /sync ou defina o skill.md no mcp_manager)'}</i><br>` +
+           `usos: ${meta.use_count ?? 0} · última: ${lu}`;
+  }
   const d = new Date((meta.created_at || 0) * 1000);
   const dateStr = isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
   return `<b>#${meta.id}</b> (${TYPE_STYLE ? '' : ''}${(meta.source || '?')})<br>` +
@@ -666,7 +828,8 @@ function applyDelta(delta) {
   const parts = [];
   const typesAdded = {};
   (e.added || []).forEach(x => typesAdded[x.type] = (typesAdded[x.type] || 0) + 1);
-  if ((n.added || []).length) parts.push(`+${n.added.length} nó(s)`);
+  const toolsAdded = (n.added || []).filter(x => x.kind === 'tool').length;
+  if ((n.added || []).length) parts.push(`+${n.added.length} nó(s)` + (toolsAdded ? ` [${toolsAdded} tool 🔧]` : ''));
   if ((e.added || []).length) {
     const detail = Object.entries(typesAdded).map(([t, c]) => `${c}×${TYPE_STYLE[t]?.name || t}`).join(', ');
     parts.push(`+${e.added.length} aresta(s) [${detail}]`);
@@ -679,22 +842,27 @@ function applyDelta(delta) {
 }
 
 function applyActivation(evt) {
+  // Eventos PPR trazem "graph" ("memory" | "tools") — ids de tool são
+  // prefixados com "t" (os inteiros colidem entre os dois grafos). Linhas
+  // antigas do JSONL sem "graph" eram só de memórias.
+  const prefix = evt.graph === 'tools' ? 't' : '';
   const now = Date.now();
-  const seeds = evt.seeds || [];
+  const seeds = (evt.seeds || []).map(sid => prefix + sid);
   for (const sid of seeds) {
     if (!nodeMeta.has(sid)) continue;   // semente de nó ainda não visto — será quando o delta chegar
     activation.set(sid, Math.max(activation.get(sid) || 0, 1.0));
     isSeed.set(sid, now);
   }
   for (const [k, v] of Object.entries(evt.rank || {})) {
-    const id = parseInt(k, 10);
-    if (!nodeMeta.has(id) || seeds.includes(id)) continue;
+    const nid = prefix + parseInt(k, 10);
+    if (!nodeMeta.has(nid) || seeds.includes(nid)) continue;
     // rank PPR vem <= PPR_SPREAD_WEIGHT (0.4) — escala p/ brilho visível
-    activation.set(id, Math.max(activation.get(id) || 0, Math.min(1, v * 2.5)));
+    activation.set(nid, Math.max(activation.get(nid) || 0, Math.min(1, v * 2.5)));
   }
   const q = evt.query ? `"${String(evt.query).slice(0, 48)}"` : '(leitura)';
   const st = evt.strategy ? ` [${evt.strategy}]` : '';
-  pushLog(`⚡ ${q}${st} → ${Object.keys(evt.rank || {}).length} nós em ${evt.elapsed_ms ?? '?'}ms`);
+  const g = evt.graph === 'tools' ? ' 🔧tools' : '';
+  pushLog(`⚡${g} ${q}${st} → ${Object.keys(evt.rank || {}).length} nós em ${evt.elapsed_ms ?? '?'}ms`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -702,11 +870,25 @@ function applyActivation(evt) {
 // ═══════════════════════════════════════════════════════════════════════════
 function lerp(a, b, t) { return a + (b - a) * t; }
 
-function nodeColor(act, seedRecent, born) {
-  if (born) return { background: BASE_NODE_BG, border: '#51cf66' };
+function nodeColor(act, seedRecent, born, meta) {
+  const isTool = meta && meta.kind === 'tool';
+  const isPlan = meta && meta.kind === 'plan';
+  if (born) return isTool ? { background: TOOL_NODE_BG, border: '#51cf66' }
+                          : isPlan ? { background: PLAN_NODE_BG, border: '#51cf66' }
+                                   : { background: BASE_NODE_BG, border: '#51cf66' };
   if (seedRecent) {
     return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 107, act))}, ${Math.round(lerp(74, 107, act))})`,
              border: '#ff3b3b' };
+  }
+  if (isTool) {
+    // ativação de tool: verde-quente (teal → verde claro), borda teal acesa
+    return { background: `rgb(${Math.round(lerp(31, 130, act))}, ${Math.round(lerp(61, 245, act))}, ${Math.round(lerp(58, 190, act))})`,
+             border: act > 0.05 ? '#38d9a9' : TOOL_NODE_BORDER };
+  }
+  if (isPlan) {
+    // ativação de plano (defensiva — PPR não semeia planos): lilás escuro → lilás claro
+    return { background: `rgb(${Math.round(lerp(42, 224, act))}, ${Math.round(lerp(35, 219, act))}, ${Math.round(lerp(64, 255, act))})`,
+             border: act > 0.05 ? '#e5dbff' : PLAN_NODE_BORDER };
   }
   return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 209, act))}, ${Math.round(lerp(74, 102, act))})`,
            border: act > 0.05 ? '#ffd166' : BASE_NODE_BORDER };
@@ -723,7 +905,7 @@ function tick() {
       activation.delete(id);
       isSeed.delete(id);
       const meta = nodeMeta.get(id);
-      if (meta) nodeUpdates.push({ id, size: baseNodeOptions(meta).size, color: { background: BASE_NODE_BG, border: BASE_NODE_BORDER } });
+      if (meta) nodeUpdates.push({ id, size: baseNodeOptions(meta).size, color: baseNodeOptions(meta).color });
       continue;
     }
     activation.set(id, newAct);
@@ -735,7 +917,7 @@ function tick() {
     nodeUpdates.push({
       id,
       size: baseNodeOptions(meta).size + newAct * 22 + Math.max(0, pulse),
-      color: nodeColor(newAct, seedRecent, born),
+      color: nodeColor(newAct, seedRecent, born, meta),
     });
   }
   if (nodeUpdates.length) nodes.update(nodeUpdates);
@@ -781,7 +963,13 @@ function updateCounts() {
   const parts = Object.keys(TYPE_STYLE).map(t =>
     `<span class="t" style="background:${TYPE_STYLE[t].color}22;color:${TYPE_STYLE[t].color}">${TYPE_STYLE[t].name}: ${byType[t] || 0}</span>`
   ).join(' ');
-  document.getElementById('counts').innerHTML = `nós: ${nodeMeta.size} · ${parts}`;
+  let tools = 0, plans = 0;
+  for (const m of nodeMeta.values()) {
+    if (m.kind === 'tool') tools++;
+    else if (m.kind === 'plan') plans++;
+  }
+  document.getElementById('counts').innerHTML =
+    `memórias: ${nodeMeta.size - tools - plans} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · ${parts}`;
 }
 
 function pushLog(msg) {
@@ -810,9 +998,37 @@ function edgeKey(visId) {
 function showPanel(id) {
   const meta = nodeMeta.get(id);
   if (!meta) return;
+  const isTool = meta.kind === 'tool';
+  const isPlan = meta.kind === 'plan';
   const d = new Date((meta.created_at || 0) * 1000);
-  const conf = Math.round((meta.confidence || 0) * 100);
-  const confColor = conf >= 80 ? '#51cf66' : conf >= 55 ? '#ffd166' : '#ff6b6b';
+  let head = '', body = '';
+  if (isPlan) {
+    const cu = new Date((meta.created_at || 0) * 1000);
+    const uu = new Date((meta.updated_at || 0) * 1000);
+    const fmt = (dd) => isNaN(dd) ? '?' : dd.toLocaleString('pt-BR');
+    head = `<h3 style="color:${PLAN_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">plano de execução (⬥ ${escapeHtml(String(meta.id))}) · versão: <b>${meta.version ?? '?'}</b> · grau: ${degreeOf(id)}</div>
+      <div class="meta">passos: ${meta.steps_count ?? '?'} · criado: ${fmt(cu)} · atualizado: ${fmt(uu)}</div>`;
+    body = `<div class="text">${escapeHtml(meta.description || '(sem descrição — edite na TUI via Ctrl+S → planos)')}</div>`;
+  } else if (isTool) {
+    const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
+    head = `<h3 style="color:${TOOL_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">tool ${meta.server ? `MCP — servidor: <b>${escapeHtml(meta.server)}</b>` : 'nativa'} · grau: ${degreeOf(id)}</div>
+      <div class="meta">usos: ${meta.use_count ?? 0} · última: ${lu}
+        ${meta.core ? '<span class="pill" style="background:#38d9a922;color:#38d9a9">core ⭐</span>' : ''}</div>
+      <div class="meta">registrada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')}</div>
+      <div class="text">${escapeHtml(meta.description || '(sem snippet — defina o skill.md via PUT /tools/{graph}/snippet no mcp_manager)')}</div>`;
+  } else {
+    const conf = Math.round((meta.confidence || 0) * 100);
+    const confColor = conf >= 80 ? '#51cf66' : conf >= 55 ? '#ffd166' : '#ff6b6b';
+    head = `<h3>#${meta.id} — memória LT</h3>
+      <div class="meta">fonte: ${meta.source || '?'} · grau: ${degreeOf(id)}</div>
+      <div class="meta">criada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')} · acessos: ${meta.access_count ?? '?'}</div>
+      <div class="meta">confiança: <span style="color:${confColor}"><b>${conf}%</b></span>
+        ${meta.forgettable ? '<span class="pill" style="background:#ffd16622;color:#ffd166">esquecível</span>'
+                            : '<span class="pill" style="background:#51cf6622;color:#51cf66">permanente</span>'}</div>`;
+    body = `<div class="text">${escapeHtml(meta.text || '')}</div>`;
+  }
   let nbrs = [];
   for (const key of (adjByNode.get(id) || [])) {
     const e = edgeMeta.get(key);
@@ -823,20 +1039,15 @@ function showPanel(id) {
   nbrs.sort((x, y) => (y.edge.weight || 0) - (x.edge.weight || 0));
   const nbrsHtml = nbrs.map(({ other, edge }) => {
     const st = TYPE_STYLE[edge.type] || { color: '#888', name: edge.type };
-    return `<div class="nbr" onclick="focusNode(${other?.id})">
+    // JSON.stringify preserva o TIPO do id: memória = número, tool = "tN"
+    return `<div class="nbr" onclick="focusNode(${JSON.stringify(other?.id ?? null)})">
       <span class="t" style="background:${st.color}22;color:${st.color}">${st.name}</span>
-      <span>${other ? other.label : '#' + '?'} · w=${(edge.weight || 0).toFixed(2)}</span>
+      <span>${other ? escapeHtml(other.label) : '#?'} · w=${(edge.weight || 0).toFixed(2)}</span>
     </div>`;
-  }).join('') || '<div class="meta">(sem vizinhos — memória isolada no grafo)</div>';
+  }).join('') || '<div class="meta">(sem vizinhos — nó isolado no grafo)</div>';
 
   document.getElementById('panelBody').innerHTML = `
-    <h3>#${meta.id} — memória LT</h3>
-    <div class="meta">fonte: ${meta.source || '?'} · grau: ${degreeOf(id)}</div>
-    <div class="meta">criada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')} · acessos: ${meta.access_count ?? '?'}</div>
-    <div class="meta">confiança: <span style="color:${confColor}"><b>${conf}%</b></span>
-      ${meta.forgettable ? '<span class="pill" style="background:#ffd16622;color:#ffd166">esquecível</span>'
-                          : '<span class="pill" style="background:#51cf6622;color:#51cf66">permanente</span>'}</div>
-    <div class="text">${escapeHtml(meta.text || '')}</div>
+    ${head}${body}
     <h4 style="margin:10px 0 4px;font-size:11px;color:#7a819a;text-transform:uppercase;letter-spacing:.08em">Vizinhos (${nbrs.length})</h4>
     ${nbrsHtml}`;
   panel.classList.add('open');
@@ -891,10 +1102,13 @@ document.getElementById('autoFollow').onchange = (e) => { autoFollow = e.target.
 let searchHighlight = [];
 document.getElementById('searchBox').onkeydown = (e) => {
   if (e.key !== 'Enter') return;
-  // limpa highlight anterior
+  // limpa highlight anterior (restaura cores/shape base de memória OU tool)
   for (const id of searchHighlight) {
     const meta = nodeMeta.get(id);
-    if (meta) nodes.update({ id, color: { background: BASE_NODE_BG, border: BASE_NODE_BORDER } });
+    if (meta) {
+      const base = baseNodeOptions(meta);
+      nodes.update({ id, color: base.color, shape: base.shape, borderWidth: 1, font: base.font });
+    }
   }
   searchHighlight = [];
   const q = e.target.value.trim().toLowerCase();
@@ -902,10 +1116,10 @@ document.getElementById('searchBox').onkeydown = (e) => {
   for (const [id, meta] of nodeMeta.entries()) {
     if ((meta.text || '').toLowerCase().includes(q)) {
       searchHighlight.push(id);
-      nodes.update({ id, color: { background: BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
+      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
     }
   }
-  pushLog(`🔍 busca "${q}": ${searchHighlight.length} memória(s)`);
+  pushLog(`🔍 busca "${q}": ${searchHighlight.length} nó(s)`);
   if (searchHighlight.length) {
     network.selectNodes(searchHighlight);
     network.fit({ nodes: searchHighlight, animation: { duration: 500 } });
@@ -965,14 +1179,18 @@ es.onmessage = (ev) => {
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Visualização em tempo real do grafo Hebbiano de memórias")
+    ap = argparse.ArgumentParser(description="Visualização em tempo real do grafo Hebbiano (memórias + tools)")
     ap.add_argument("--db", default="./Modules/memory/db/ava_memory.db")
+    ap.add_argument("--tools-db", default="./Modules/memory/db/ava_tools.db",
+                    help="grafo de tools (ToolsDB) — omitido com '' ; se o arquivo não existir, só memórias")
+    ap.add_argument("--plans-db", default="./Modules/memory/db/ava_plans.db",
+                    help="grafo de planos (PlansDB) — omitido com '' ; se o arquivo não existir, ignora")
     ap.add_argument("--log", default="./Modules/memory/db/activation_log.jsonl")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
     args = ap.parse_args()
 
-    state = GraphState(args.db)
+    state = GraphState(args.db, args.tools_db, args.plans_db)
 
     # Snapshot inicial ANTES de servir — o cliente já nasce com o grafo atual.
     delta = state.refresh()
@@ -981,7 +1199,10 @@ def main():
         extra = f"+{len(delta['edges']['added'])} arestas desde o último poll"
     else:
         extra = "nada novo"
-    print(f"Grafo carregado: {len(snap['nodes'])} nós, {len(snap['edges'])} arestas ({extra})")
+    tools_n = sum(1 for n in snap["nodes"] if n.get("kind") == "tool")
+    plans_n = sum(1 for n in snap["nodes"] if n.get("kind") == "plan")
+    print(f"Grafo carregado: {len(snap['nodes'])} nós ({tools_n} tools, {plans_n} planos), "
+          f"{len(snap['edges'])} arestas ({extra})")
 
     broadcaster = Broadcaster()
 

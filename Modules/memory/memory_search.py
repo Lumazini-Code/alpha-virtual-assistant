@@ -335,6 +335,7 @@ async def _ppr_spread_on(
         loop.run_in_executor(
             None, _log_activation_sync, seed_ids, rank,
             (time.perf_counter() - t0) * 1000.0, ctx,
+            getattr(db, "GRAPH_LABEL", "memory"),
         )
     )
     seed_set = set(seed_ids)

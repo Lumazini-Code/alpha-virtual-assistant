@@ -1,16 +1,7 @@
-# ==============================================================================
-# AVA — .dockerignore
-# Arquivos/diretórios excluídos do contexto de build do Docker
-# ==============================================================================
-
-# Modelos GGUF e ONNX (montados como volume)
-*.gguf
-
 # Python
 *.pyc
 *.py[cod]
 *$py.class
-*.so
 *.egg-info/
 dist
 build
@@ -53,9 +44,6 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
-
-*.gguf
-*.onnx
 
 docker-start.sh
 docker-start.bat

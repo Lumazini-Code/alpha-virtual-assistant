@@ -60,9 +60,7 @@ load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 
 BASEFOLDER = Path(__file__).parent.parent
 
-# Memória agora é acessada via API REST (memory_api.py — FastAPI sobre
-# memory.py), não mais via iceoryx2/MCP. Client httpx persistente, criado
-# lazy na primeira chamada e reutilizado pelo resto do processo.
+
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:3000")
 TTS_URL    = "http://localhost:3004"
 
@@ -70,8 +68,8 @@ TTS_URL    = "http://localhost:3004"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 
-# Modelos (fixos — não há mais servido local via llama-server)
-MAIN_MODEL  = "z-ai/glm-5.3-flash"
+# Modelos
+MAIN_MODEL  = "z-ai/glm-5.3-flash:floor"
 # Extrator de memórias pós-turno. Env-configurável: modelos free/pequenos
 # frequentemente NÃO suportam o `response_format: json_schema` do OpenRouter
 # e retornam 200 com `content` vazio — a cadeia de tentativas do extrator
@@ -461,10 +459,6 @@ def _read(path: Path) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
-username   = _read(BASEFOLDER / r"resource/username.dll")
-voiceModel = _read(BASEFOLDER / r"resource/VoiceModel.dll") or "F1"
-ctxUsed    = _read(BASEFOLDER / r"resource/ctxConfig.dll")
-context    = _read(BASEFOLDER / f"ctxBin/{ctxUsed}.bin")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -605,23 +599,6 @@ async def _openrouter_post_with_retry(
 # dinâmico de memória vai DEPOIS do prefixo estável, em uma mensagem
 # separada (role:assistant) — o custo de prefill é pequeno, mas o prefixo
 # ainda aproveita o cache.
-
-_SYSTEM_PROMPT_BASE = (
-    f"{context}\n\n"
-    f"O nome do usuário é {username}. "
-    f"Responda sempre no idioma em que o usuário escrever.\n\n"
-    # ── MEMORY SEMANTICS INSTRUCTION ─────────────────────────────────────────
-    # Diz ao modelo COMO interpretar o bloco de memória injetado.
-    # Sem isso, o modelo pode tratar o recall em voz de assistant como
-    # uma resposta anterior em vez de conhecimento próprio recuperado.
-    "Você possui um sistema de memória persistente. Antes de cada resposta, "
-    "fragmentos relevantes da sua memória de longo prazo e do histórico recente "
-    "são recuperados e apresentados em uma mensagem sua anterior nesta conversa. "
-    "Trate essas informações como conhecimento próprio e utilize-as naturalmente, "
-    "sem mencionar explicitamente que são 'memórias recuperadas' ou citar o "
-    "mecanismo de memória ao usuário."
-)
-
 
 # ─────────────────────────────────────────────────────────────
 #                     INTEGRAÇÃO: MEMÓRIA
@@ -1349,10 +1326,7 @@ def _build_messages(
       [0] system:     prompt ESTÁVEL
       [1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
     """
-    messages = [
-        # ESTÁVEL: porção que aproveita cache no provedor
-        {"role": "system", "content": _SYSTEM_PROMPT_BASE},
-    ]
+    messages = []
 
     # DINÂMICO: recall de memória em voz do próprio assistant.
     # role=assistant para o modelo tratar como autoconhecimento.
@@ -1676,9 +1650,8 @@ async def chat(req: ChatRequest):
         )
 
     # Disparar TTS em background
-    voice = req.voice or voiceModel
-    if req.tts and voice:
-        asyncio.create_task(tts_speak(response_text, voice, lang))
+    if req.tts and req.voice:
+        asyncio.create_task(tts_speak(response_text, req.voice, lang))
 
     return {
         "response": response_text,
@@ -1797,8 +1770,8 @@ async def chat_stream(req: ChatRequest):
         payload["logprobs"] = True
 
     # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
-    voice = req.voice or voiceModel
-    use_tts = (not tool_mode) and bool(req.tts and voice)
+    
+    use_tts = (not tool_mode) and bool(req.tts and req.voice)
     if use_tts:
         _ensure_tts_queue()
     _tts_buf = ""
@@ -1817,7 +1790,7 @@ async def chat_stream(req: ChatRequest):
         nonlocal _tts_buf
         cleaned = _clean_for_tts(_tts_buf)
         if len(cleaned) >= 3:
-            _tts_queue.put_nowait((cleaned, voice, lang))
+            _tts_queue.put_nowait((cleaned, req.voice, lang))
         _tts_buf = ""
 
     async def generator():
