@@ -7,18 +7,23 @@ import { StatusPanel } from "./components/StatusPanel.js";
 import { ChatMessage } from "./components/ChatMessage.js";
 import { InputBar } from "./components/InputBar.js";
 import { DockerLogPanel } from "./components/DockerLogPanel.js";
+import { SettingsPanel } from "./components/SettingsPanel.js";
 import { useSystemStats } from "./hooks/useSystemStats.js";
 import { useDockerLogs } from "./hooks/useDockerLogs.js";
 import { useOrchestratorStream } from "./hooks/useOrchestratorStream.js";
 import { useProcessManagerStatus } from "./hooks/useProcessManagerStatus.js";
+import { useServiceStatus } from "./hooks/useServiceStatus.js";
 import { ProcessStatusLine } from "./components/ProcessStatusLine.js";
-import { COLORS } from "./lib/constants.js";
+import { COLORS, GRAPH_VIEWER_URL } from "./lib/constants.js";
 
 export function App() {
   const { exit } = useApp();
-  const stats = useSystemStats();
-  const procStatus = useProcessManagerStatus();
-  const docker = useDockerLogs();
+  const [suspended, setSuspended] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const stats = useSystemStats(2000, suspended);
+  const procStatus = useProcessManagerStatus(3000, suspended);
+  const graphOnline = useServiceStatus(GRAPH_VIEWER_URL, 10000, suspended);
+  const docker = useDockerLogs(suspended);
   const {
     messages,
     isStreaming,
@@ -51,10 +56,15 @@ export function App() {
       setPendingImagePath(fullPath);
       return;
     }
+    if (value.trim().toLowerCase() === "/settings") {
+      setShowSettings(true);
+      return;
+    }
     submit(value);
   };
 
-  // Equivalente aos BINDINGS do Textual (ctrl+k toggle code, ctrl+d docker, ctrl+l clear...)
+  // Equivalente aos BINDINGS do Textual (ctrl+k toggle code, ctrl+d docker,
+  // ctrl+s settings, ctrl+l clear...)
   useInput((input, key) => {
     if (key.ctrl && input === "c") {
       exit();
@@ -68,6 +78,10 @@ export function App() {
       setShowDocker((prev) => !prev);
       return;
     }
+    if (key.ctrl && input === "s") {
+      setShowSettings((prev) => !prev);
+      return;
+    }
     if (key.ctrl && input === "l") {
       clear();
       return;
@@ -79,16 +93,13 @@ export function App() {
       <Logo />
       <StatusPanel stats={stats} />
       <Box marginTop={1}>
-        <ProcessStatusLine status={procStatus} />
+        <ProcessStatusLine status={procStatus} graphOnline={graphOnline} />
       </Box>
 
       <Box flexDirection="column" marginY={1}>
         {messages.length === 0 ? (
           <Text color={COLORS.dim}>
-            Digite uma mensagem para começar. Ctrl+K alterna modo código,
-            Ctrl+D mostra/esconde logs do Docker, Ctrl+L limpa o chat.
-            {"\n"}Use /image caminho/para/arquivo.png para anexar uma
-            imagem à próxima pergunta (recurso de vision).
+            {"  "}(/settings também lista/edita planos)
           </Text>
         ) : (
           messages.map((m) => <ChatMessage key={m.id} message={m} />)
@@ -98,6 +109,15 @@ export function App() {
       {showDocker && (
         <Box marginBottom={1}>
           <DockerLogPanel lines={docker.lines} status={docker.status} />
+        </Box>
+      )}
+
+      {showSettings && (
+        <Box marginBottom={1}>
+          <SettingsPanel
+            onClose={() => setShowSettings(false)}
+            onSuspendChange={setSuspended}
+          />
         </Box>
       )}
 
@@ -115,7 +135,12 @@ export function App() {
         </Box>
       )}
 
-      <InputBar disabled={isStreaming} codeMode={codeMode} onSubmit={handleSubmit} />
+      <InputBar
+        disabled={isStreaming || suspended}
+        codeMode={codeMode}
+        focus={!showSettings && !suspended}
+        onSubmit={handleSubmit}
+      />
     </Box>
   );
 }

@@ -2,14 +2,27 @@
 //!
 //! Tela única de status: mostra se o docker está ativo/inativo,
 //! com botões para ligar/desligar.
+//!
+//! Comportamento de tray: fechar a janela (botão X do window manager)
+//! NÃO encerra o app — só esconde a janela; o processo e o ícone da
+//! bandeja continuam vivos. O encerramento real acontece só pelo menu
+//! de contexto do tray ("Sair"), que envia UiCommand::Quit pelo canal
+//! mpsc (a thread do tray é dona do ícone; ver main.rs).
 
 use crate::process_manager;
 use crate::state::{ProcStatus, SharedState};
+use crate::UiCommand;
 use eframe::egui;
+use std::sync::mpsc;
 
 pub struct TrayApp {
     state: SharedState,
     rt: tokio::runtime::Handle,
+    /// Comandos vindos da thread do tray (GTK).
+    cmd_rx: mpsc::Receiver<UiCommand>,
+    /// Setado pelo UiCommand::Quit — o próximo close da janela NÃO é
+    /// cancelado e o run_native de fato retorna, encerrando o processo.
+    quit_requested: bool,
 
     // Snapshot local do estado, atualizado a cada frame (lido do Mutex async
     // via try_lock para não travar a thread de UI).
@@ -20,10 +33,16 @@ pub struct TrayApp {
 }
 
 impl TrayApp {
-    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        state: SharedState,
+        rt: tokio::runtime::Handle,
+        cmd_rx: mpsc::Receiver<UiCommand>,
+    ) -> Self {
         Self {
             state,
             rt,
+            cmd_rx,
+            quit_requested: false,
             docker_status: ProcStatus::Stopped,
             feedback: None,
         }
@@ -35,11 +54,52 @@ impl TrayApp {
             self.docker_status = docker.status.clone();
         }
     }
+
+    /// Processa os comandos pendentes da thread do tray.
+    fn handle_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            tracing::debug!("UiCommand recebido: {cmd:?}");
+            match cmd {
+                UiCommand::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                UiCommand::Quit => {
+                    // Menu "Sair" com a janela oculta: nada dispara um close
+                    // natural, então a própria UI pede o fechamento — sem
+                    // CancelClose no handle_close_request, o run_native
+                    // encerra o processo.
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Intercepta o fechamento da janela (X do window manager): sem
+    /// `quit_requested`, cancela o close e apenas esconde a janela — o app
+    /// continua na bandeja. Com `quit_requested` (menu "Sair" do tray), NÃO
+    /// envia CancelClose e o `run_native` de fato retorna, encerrando o
+    /// processo de forma limpa.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.quit_requested {
+            tracing::debug!("handle_close_request: escondendo janela");
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // Visible(false) sozinho não esconde neste ambiente; minimizar
+            // é respeitado pelo gerenciador de janelas.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
 }
 
 impl eframe::App for TrayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_snapshot();
+        self.handle_commands(ctx);
+        self.handle_close_request(ctx);
 
         // Repaint periódico para refletir mudanças de estado vindas da API
         // (ex: outro processo chamando /docker/stop) mesmo sem interação do usuário.

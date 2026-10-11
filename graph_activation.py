@@ -21,6 +21,12 @@ Arquitetura (v2 — polling de diff):
   de memória, então o prefixo é obrigatório. Eventos de ativação PPR no
   JSONL carregam "graph" ("memory" | "tools", ver memory_graph._log_activation_sync)
   e a UI prefixa os ids de tools antes de acender.
+
+  v4 — PLANS: os planos de execução híbridos (PlansDB: ava_plans.db) entram
+  como nós DIAMANTE roxos com id prefixado ("p{id}") — sem arestas (nós
+  soltos). Cobrem criação (POST /plans/write) e edição (PATCH /plans/update,
+  que versiona — o diff acende "updated" a cada versão nova) feitas pela TUI
+  ou pelo plan_recorder.
   ══════════════════════════════════════════════════════════════════════════
 
   Eventos SSE (o cliente roteia por "type"):
@@ -137,20 +143,48 @@ def _tool_edge_public(row: sqlite3.Row) -> dict:
     }
 
 
+def _plan_node_public(row: sqlite3.Row) -> dict:
+    """Nó público de um plano de execução (PlansDB: ava_plans.db). Id STRING
+    com prefixo "p" — planos não têm arestas (nós soltos no espaço visual):
+    entram no grafo só para acompanhar criação/edição em tempo real (o
+    /plans/update da memory versiona, e o diff acende "updated")."""
+    name = (row["name"] or "").strip()
+    desc = (row["description"] or "").strip()
+    steps_count = len(json.loads(row["steps_json"] or "[]"))
+    return {
+        "id":          f"p{row['id']}",
+        "kind":        "plan",
+        "label":       name[:40] + ("…" if len(name) > 40 else ""),
+        "title":       html.escape(desc[:400]),
+        "text":        row["description"],   # p/ busca (mesma chave das demais)
+        "name":        name,
+        "description": desc,
+        "version":     row["version"],
+        "steps_count": steps_count,
+        "created_at":  row["created_at"],
+        "updated_at":  row["updated_at"],
+        "source":      "plan",
+    }
+
+
 class GraphState:
     """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
     completo cobre criação, atualização E remoção (decay job) sem depender
-    de surrogate keys. Cobre DOIS grafos no mesmo espaço visual:
+    de surrogate keys. Cobre TRÊS grafos no mesmo espaço visual:
       - memórias LT (ava_memory.db) — ids inteiros, kind="memory";
       - tools (ava_tools.db) — ids string "t{id}", kind="tool"; o DB é
-        opcional (memory process pode não tê-lo criado ainda)."""
+        opcional (memory process pode não tê-lo criado ainda);
+      - planos (ava_plans.db) — ids string "p{id}", kind="plan"; nós
+        soltos (sem arestas), também opcional."""
 
     TOOL_ID_PREFIX = "t"
+    PLAN_ID_PREFIX = "p"
 
-    def __init__(self, db_path: str, tools_db_path: str = ""):
+    def __init__(self, db_path: str, tools_db_path: str = "", plans_db_path: str = ""):
         self.db_path = db_path
         self.tools_db_path = tools_db_path
+        self.plans_db_path = plans_db_path
         self.lock = threading.Lock()
         self.nodes: dict = {}                                  # id -> node público (int | "tN")
         self.nodes_sig: dict = {}                              # id -> sig por tipo
@@ -202,6 +236,23 @@ class GraphState:
                 edges.update(tedges)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # tools DB ainda não existe / sem tabelas — só memórias
+        # ── Grafo de planos (opcional): nós soltos, sem arestas ──
+        if self.plans_db_path:
+            try:
+                pconn = _open_ro(self.plans_db_path)
+                try:
+                    pnodes = {
+                        f"{self.PLAN_ID_PREFIX}{r['id']}": _plan_node_public(r)
+                        for r in pconn.execute(
+                            "SELECT id, name, description, version, steps_json, "
+                            "created_at, updated_at FROM plans"
+                        )
+                    }
+                finally:
+                    pconn.close()
+                nodes.update(pnodes)
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # plans DB ainda não existe / sem tabela — ignora
         return nodes, edges
 
     def refresh(self) -> dict:
@@ -221,9 +272,11 @@ class GraphState:
 
         with self.lock:
             for nid, node in db_nodes.items():
-                # sig por tipo de nó — memórias e tools têm campos distintos
+                # sig por tipo de nó — memórias, tools e planos têm campos distintos
                 if node["kind"] == "tool":
                     sig = (node["text"], node["name"], node["core"], node["use_count"], node["last_used"])
+                elif node["kind"] == "plan":
+                    sig = (node["name"], node["text"], node["version"])
                 else:
                     sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
                 old_sig = self.nodes_sig.get(nid)
@@ -546,7 +599,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <div id="hud">
-  <b>Grafo Hebbiano</b> — memórias LT + tools em tempo real
+  <b>Grafo Hebbiano</b> — memórias LT + tools + planos em tempo real
   <div id="counts">carregando…</div>
   <div id="log"></div>
 </div>
@@ -580,6 +633,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <span><i class="chip node" style="background:#ffd166"></i>PPR</span>
   <span><i class="chip node" style="background:#51cf66"></i>novo</span>
   <span><i class="chip node" style="background:#38d9a9"></i>tool (⬡ MCP/nativa)</span>
+  <span><i class="chip node" style="background:#b197fc"></i>plano (⬥ p{id})</span>
   <span style="opacity:.65">espessura = peso da aresta · tamanho = grau + ativação</span>
 </div>
 
@@ -598,6 +652,8 @@ const TYPE_STYLE = {
 const BASE_NODE_BG = '#33384a', BASE_NODE_BORDER = '#54607a';
 // Tools (nativas + MCP): hexágonos verdes — distinguem de memória à primeira vista
 const TOOL_NODE_BG = '#1f3d3a', TOOL_NODE_BORDER = '#38d9a9', TOOL_FONT_COLOR = '#7fe3c8';
+// Planos de execução: diamantes roxos, id "p{id}" — nós soltos (sem arestas)
+const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = '#d0bfff';
 const FONT_COLOR   = '#9aa0b4';
 
 const nodes = new vis.DataSet();
@@ -652,17 +708,28 @@ const network = new vis.Network(
 function baseNodeOptions(meta) {
   const deg = degreeOf(meta.id);
   const isTool = meta.kind === 'tool';
+  const isPlan = meta.kind === 'plan';
   return {
     id: meta.id, label: meta.label, title: nodeTitle(meta),
-    shape: isTool ? 'hexagon' : 'dot',
-    size: (isTool ? 9 : 5) + Math.min(deg, 12) * 1.3,
+    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : 'dot',
+    size: (isTool ? 9 : isPlan ? 8 : 5) + Math.min(deg, 12) * 1.3,
     color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
-                  : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
-    font: { color: isTool ? TOOL_FONT_COLOR : FONT_COLOR, size: 11 },
+                  : isPlan ? { background: PLAN_NODE_BG, border: PLAN_NODE_BORDER }
+                           : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
+    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : FONT_COLOR, size: 11 },
   };
 }
 
 function nodeTitle(meta) {
+  if (meta.kind === 'plan') {
+    const fmt = (t) => {
+      const d = new Date((t || 0) * 1000);
+      return isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    };
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PLAN_FONT_COLOR}">v${meta.version ?? '?'}</span><br>` +
+           `<i>${meta.title || '(sem descrição)'}</i><br>` +
+           `${meta.steps_count ?? '?'} passo(s) · criado: ${fmt(meta.created_at)} · atualizado: ${fmt(meta.updated_at)}`;
+  }
   if (meta.kind === 'tool') {
     const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
     return `<b>${escapeHtml(meta.name || meta.label)}</b> ${meta.core ? '⭐ core' : ''}<br>` +
@@ -805,8 +872,10 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 
 function nodeColor(act, seedRecent, born, meta) {
   const isTool = meta && meta.kind === 'tool';
+  const isPlan = meta && meta.kind === 'plan';
   if (born) return isTool ? { background: TOOL_NODE_BG, border: '#51cf66' }
-                          : { background: BASE_NODE_BG, border: '#51cf66' };
+                          : isPlan ? { background: PLAN_NODE_BG, border: '#51cf66' }
+                                   : { background: BASE_NODE_BG, border: '#51cf66' };
   if (seedRecent) {
     return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 107, act))}, ${Math.round(lerp(74, 107, act))})`,
              border: '#ff3b3b' };
@@ -815,6 +884,11 @@ function nodeColor(act, seedRecent, born, meta) {
     // ativação de tool: verde-quente (teal → verde claro), borda teal acesa
     return { background: `rgb(${Math.round(lerp(31, 130, act))}, ${Math.round(lerp(61, 245, act))}, ${Math.round(lerp(58, 190, act))})`,
              border: act > 0.05 ? '#38d9a9' : TOOL_NODE_BORDER };
+  }
+  if (isPlan) {
+    // ativação de plano (defensiva — PPR não semeia planos): lilás escuro → lilás claro
+    return { background: `rgb(${Math.round(lerp(42, 224, act))}, ${Math.round(lerp(35, 219, act))}, ${Math.round(lerp(64, 255, act))})`,
+             border: act > 0.05 ? '#e5dbff' : PLAN_NODE_BORDER };
   }
   return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 209, act))}, ${Math.round(lerp(74, 102, act))})`,
            border: act > 0.05 ? '#ffd166' : BASE_NODE_BORDER };
@@ -889,10 +963,13 @@ function updateCounts() {
   const parts = Object.keys(TYPE_STYLE).map(t =>
     `<span class="t" style="background:${TYPE_STYLE[t].color}22;color:${TYPE_STYLE[t].color}">${TYPE_STYLE[t].name}: ${byType[t] || 0}</span>`
   ).join(' ');
-  let tools = 0;
-  for (const m of nodeMeta.values()) if (m.kind === 'tool') tools++;
+  let tools = 0, plans = 0;
+  for (const m of nodeMeta.values()) {
+    if (m.kind === 'tool') tools++;
+    else if (m.kind === 'plan') plans++;
+  }
   document.getElementById('counts').innerHTML =
-    `memórias: ${nodeMeta.size - tools} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · ${parts}`;
+    `memórias: ${nodeMeta.size - tools - plans} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · ${parts}`;
 }
 
 function pushLog(msg) {
@@ -922,9 +999,18 @@ function showPanel(id) {
   const meta = nodeMeta.get(id);
   if (!meta) return;
   const isTool = meta.kind === 'tool';
+  const isPlan = meta.kind === 'plan';
   const d = new Date((meta.created_at || 0) * 1000);
   let head = '', body = '';
-  if (isTool) {
+  if (isPlan) {
+    const cu = new Date((meta.created_at || 0) * 1000);
+    const uu = new Date((meta.updated_at || 0) * 1000);
+    const fmt = (dd) => isNaN(dd) ? '?' : dd.toLocaleString('pt-BR');
+    head = `<h3 style="color:${PLAN_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">plano de execução (⬥ ${escapeHtml(String(meta.id))}) · versão: <b>${meta.version ?? '?'}</b> · grau: ${degreeOf(id)}</div>
+      <div class="meta">passos: ${meta.steps_count ?? '?'} · criado: ${fmt(cu)} · atualizado: ${fmt(uu)}</div>`;
+    body = `<div class="text">${escapeHtml(meta.description || '(sem descrição — edite na TUI via Ctrl+S → planos)')}</div>`;
+  } else if (isTool) {
     const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
     head = `<h3 style="color:${TOOL_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
       <div class="meta">tool ${meta.server ? `MCP — servidor: <b>${escapeHtml(meta.server)}</b>` : 'nativa'} · grau: ${degreeOf(id)}</div>
@@ -1030,7 +1116,7 @@ document.getElementById('searchBox').onkeydown = (e) => {
   for (const [id, meta] of nodeMeta.entries()) {
     if ((meta.text || '').toLowerCase().includes(q)) {
       searchHighlight.push(id);
-      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
+      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
     }
   }
   pushLog(`🔍 busca "${q}": ${searchHighlight.length} nó(s)`);
@@ -1097,12 +1183,14 @@ def main():
     ap.add_argument("--db", default="./Modules/memory/db/ava_memory.db")
     ap.add_argument("--tools-db", default="./Modules/memory/db/ava_tools.db",
                     help="grafo de tools (ToolsDB) — omitido com '' ; se o arquivo não existir, só memórias")
+    ap.add_argument("--plans-db", default="./Modules/memory/db/ava_plans.db",
+                    help="grafo de planos (PlansDB) — omitido com '' ; se o arquivo não existir, ignora")
     ap.add_argument("--log", default="./Modules/memory/db/activation_log.jsonl")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
     args = ap.parse_args()
 
-    state = GraphState(args.db, args.tools_db)
+    state = GraphState(args.db, args.tools_db, args.plans_db)
 
     # Snapshot inicial ANTES de servir — o cliente já nasce com o grafo atual.
     delta = state.refresh()
@@ -1112,7 +1200,9 @@ def main():
     else:
         extra = "nada novo"
     tools_n = sum(1 for n in snap["nodes"] if n.get("kind") == "tool")
-    print(f"Grafo carregado: {len(snap['nodes'])} nós ({tools_n} tools), {len(snap['edges'])} arestas ({extra})")
+    plans_n = sum(1 for n in snap["nodes"] if n.get("kind") == "plan")
+    print(f"Grafo carregado: {len(snap['nodes'])} nós ({tools_n} tools, {plans_n} planos), "
+          f"{len(snap['edges'])} arestas ({extra})")
 
     broadcaster = Broadcaster()
 

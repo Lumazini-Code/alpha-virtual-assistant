@@ -93,6 +93,15 @@ async def plan_update(req: PlanUpdateRequest) -> PlanUpdateResponse:
     async with _plans_write_lock:
         row = _resolve_row(req.plan_id, req.name)
         plan_id = row["id"]
+        # renomeio: checa duplicidade ANTES de gravar (name_key é UNIQUE);
+        # renomear para o mesmo nome (key) é no-op e não falha.
+        new_name = req.new_name.strip() if req.new_name else None
+        if new_name:
+            existing = state.plans_db.get_by_name(new_name)
+            if existing is not None and existing["id"] != plan_id:
+                raise MemoryToolError(
+                    f"Plano '{new_name}' já existe (id={existing['id']}) — nome duplicado"
+                )
         steps_json = (
             json.dumps([s.model_dump() for s in req.steps], ensure_ascii=False)
             if req.steps is not None else None
@@ -103,11 +112,12 @@ async def plan_update(req: PlanUpdateRequest) -> PlanUpdateResponse:
             current.update(req.corrections)
             corrections_json = json.dumps(current, ensure_ascii=False)
         version = state.plans_db.update_plan(
-            plan_id, req.description, steps_json, corrections_json
+            plan_id, req.description, steps_json, corrections_json, name=new_name
         )
     if version == 0:
         raise MemoryToolError(f"Plano id={plan_id} não encontrado")
-    log.info(f"Plans: id={plan_id} atualizado → versão {version}")
+    log.info(f"Plans: id={plan_id} atualizado → versão {version}"
+             + (f" (renomeado para {new_name!r})" if new_name else ""))
     return PlanUpdateResponse(plan_id=plan_id, version=version, updated=True)
 
 

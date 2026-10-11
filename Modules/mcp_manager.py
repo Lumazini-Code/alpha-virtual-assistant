@@ -43,6 +43,8 @@ Descoberta em duas etapas (consumida pelo orchestrator):
 Rotas:
   GET    /health
   POST   /servers                      (registrar/atualizar servidor)
+  POST   /servers/install              (instalação assistida de MCP npm: resolve pacote,
+                                        registra `npx -y <pkg>` e sincroniza)
   GET    /servers                      (listar)
   GET    /servers/{name}               (detalhe)
   DELETE /servers/{name}               (remover + remover tools do grafo)
@@ -71,6 +73,14 @@ curl -X POST http://localhost:4008/servers -H 'Content-Type: application/json' -
 
 curl -X POST http://localhost:4008/servers/playwright/sync 
 *SEMPRE que cadastras um novo MCP, ou atualiza o snippet de uma tool, ou muda a config do servidor (re-register), ou remove um servidor (DELETE) — para manter o grafo de tools atualizado.*
+
+Instalação assistida (pacote npm — valida no registry, registra e sincroniza):
+
+curl -X POST http://localhost:4008/servers/install -H 'Content-Type: application/json' -d '{
+  "package": "@playwright/mcp@latest",
+  "skill_summary": "Automação de navegador",
+  "args": ["--cdp-endpoint", "http://localhost:9222"]
+}'
 """
 
 import asyncio
@@ -184,6 +194,19 @@ class SkillsSelectRequest(BaseModel):
 
 class SnippetUpdateRequest(BaseModel):
     snippet: str
+
+class ServerInstallRequest(BaseModel):
+    """Instalação assistida de servidor MCP npm: resolve o pacote no
+    registry, deriva o binário, registra como stdio `npx -y` e sincroniza
+    — o usuário só passa o nome do pacote."""
+    package: str
+    name: Optional[str] = None          # default: derivado do nome do pacote
+    skill_summary: str = ""
+    args: list[str] = []                # argumentos extras ao binário (ex.: --cdp-endpoint ...)
+    env: dict[str, str] = {}
+    enabled: bool = True
+    always_on: bool = False
+    examples: dict[str, list[str]] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -773,6 +796,110 @@ async def test_server(name: str):
         await _drop_session(name)
         raise HTTPException(502, f"Servidor '{name}' conectou mas list_tools falhou: {type(e).__name__}: {e}") from e
     return {"ok": True, "server": name, "tools": len(result.tools), "names": [t.name for t in result.tools]}
+
+
+# ── Instalação assistida (pacotes npm) ──────────────────────────────────────
+
+# Uma instalação global por vez — `npm install -g`/`npm view` concorrentes
+# podem corromper o cache do npm.
+_install_lock = asyncio.Lock()
+
+async def _run_cmd(cmd: list[str], timeout: float) -> tuple[int, str]:
+    """Roda um subprocesso com teto de tempo; stdout+stderr joined."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(Exception):
+            proc.kill()
+        raise RuntimeError(f"`{' '.join(cmd)}` excedeu {timeout:.0f}s") from None
+    return proc.returncode or 0, out.decode(errors="replace").strip()
+
+def _npm_package_from_spec(spec: str) -> str:
+    """'@playwright/mcp@0.0.80' → '@playwright/mcp' (spec com versão é aceita
+    e repassada intacta ao npx; aqui extraímos só o NOME pra validar no
+    registry e derivar o `name` do servidor)."""
+    # Escopados (@org/pkg@ver): só o ÚLTIMO '@' separa versão.
+    if spec.startswith("@"):
+        base, sep, _ver = spec.rpartition("@")
+        return base if sep and base != "@" else spec
+    return spec.split("@", 1)[0]
+
+async def _resolve_npm_package(package: str) -> dict:
+    """Consulta o registry (`npm view`) e devolve {name, version, bin}.
+    Levanta RuntimeError com mensagem amigável se o pacote não existir
+    ou não expor binário (um MCP precisa de executável pro stdio)."""
+    rc, out = await _run_cmd(
+        ["npm", "view", package, "--json"], timeout=60.0,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Pacote npm '{package}' não encontrado no registry: {out[:400]}")
+    try:
+        meta = json.loads(out)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Resposta inválida do npm para '{package}': {out[:400]}") from None
+    name = meta.get("name", _npm_package_from_spec(package))
+    bin_field = meta.get("bin")
+    if isinstance(bin_field, dict):
+        bin_name = next(iter(bin_field), None)
+    elif isinstance(bin_field, str):
+        bin_name = name.rsplit("/", 1)[-1]
+    else:
+        bin_name = None
+    if not bin_name:
+        raise RuntimeError(
+            f"Pacote '{name}' (v{meta.get('version', '?')}) não expõe 'bin' — "
+            f"não é executável via stdio. Registre manualmente com o command correto."
+        )
+    return {"name": name, "version": meta.get("version", ""), "bin": bin_name}
+
+
+@app.post("/servers/install")
+async def install_server(req: ServerInstallRequest):
+    """Instalação assistida de servidor MCP npm: valida o pacote no registry,
+    deriva o binário e registra como stdio `npx -y <pkg>` (o spawn lazy do
+    manager resolve o download no primeiro uso — sem estado extra de
+    instalação) e roda /sync pra tools entrarem no grafo. Idempotente:
+    pacote já registrado com o MESMO spec só re-sincroniza. O spec pode
+    vir com versão ('@playwright/mcp@latest')."""
+    spec = (req.package or "").strip()
+    if not spec or " " in spec or spec.startswith("-"):
+        raise HTTPException(400, "package inválido (ex.: '@playwright/mcp' ou '@playwright/mcp@0.0.80')")
+    npm_name = _npm_package_from_spec(spec)
+    pkg_name = npm_name.rsplit("/", 1)[-1]
+    server_name = (req.name or "").strip() or pkg_name.replace("@", "").replace("/", "-")
+    if not _SERVER_NAME_RE.match(server_name) or "__" in server_name:
+        raise HTTPException(400, f"Nome de servidor derivado inválido: '{server_name}' — passe 'name' explícito")
+
+    async with _install_lock:
+        existing = _db_get_server(server_name)
+        npx_args = ["-y", spec]
+        if existing is not None:
+            if existing["command"] == "npx" and json.loads(existing["args_json"] or "[]") == npx_args:
+                log.info(f"MCP install: '{server_name}' já registrado com {spec} — re-sync apenas")
+            else:
+                raise HTTPException(409, f"Servidor '{server_name}' já existe com config diferente — DELETE antes ou registre manualmente")
+        else:
+            meta = await _resolve_npm_package(npm_name)
+            log.info(f"MCP install: {npm_name} v{meta['version']} → bin '{meta['bin']}' → servidor '{server_name}' (npx {spec})")
+            row = _db_upsert_server(ServerRegisterRequest(
+                name=server_name, skill_summary=req.skill_summary,
+                transport="stdio", command="npx", args=npx_args,
+                env=req.env, enabled=req.enabled, always_on=req.always_on,
+                examples=req.examples,
+            ))
+            log.info(f"MCP: servidor '{server_name}' registrado via install ({spec})")
+
+        sync = await sync_server(server_name)
+        return {
+            "installed": True, "name": server_name, "package": spec,
+            "transport": "stdio", "command": "npx", "args": npx_args,
+            "synced": sync["synced"],
+            "skill_summary": sync["skill_summary"],
+            "tools": sync["tools"],
+        }
 
 
 # ── Etapa 2: schemas + snippets (do cache, sem conexão MCP) ─────────────────

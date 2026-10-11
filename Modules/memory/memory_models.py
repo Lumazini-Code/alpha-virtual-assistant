@@ -531,6 +531,9 @@ class PlanUpdateRequest(BaseModel):
     # identificação: por id OU por name (name_key)
     plan_id: Optional[int] = None
     name: Optional[str] = None
+    # renomear: novo nome do plano (name_key é recalculado; falha se já
+    # existir outro plano com o mesmo nome). None = mantém o nome atual.
+    new_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     description: Optional[str] = None
     steps: Optional[list[PlanStep]] = Field(default=None, max_length=PLANS_MAX_STEPS)
     # merge ou replace das correções acumuladas ({step_index: seletor corrigido})

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { API_BASE } from "../lib/constants.js";
 
 // Fatia docker do StatusResponse do api.rs (o app não usa mais o
@@ -11,13 +11,23 @@ export interface ProcessManagerStatus {
   };
 }
 
-/** Faz polling de GET /status na API Rust (porta 9001). */
-export function useProcessManagerStatus(intervalMs = 3000): ProcessManagerStatus | null {
+/**
+ * Faz polling de GET /status na API Rust (porta 9001). `paused` congela
+ * as atualizações de estado (sem isso a TUI redesenharia e corromperia a
+ * tela de um subprocesso interativo — ver SettingsPanel).
+ */
+export function useProcessManagerStatus(
+  intervalMs = 3000,
+  paused = false,
+): ProcessManagerStatus | null {
   const [status, setStatus] = useState<ProcessManagerStatus | null>(null);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      if (pausedRef.current) return;
       try {
         const res = await fetch(`${API_BASE}/status`);
         if (!res.ok) return;

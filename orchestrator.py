@@ -1808,7 +1808,7 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
         + " Never switch languages mid-conversation unless the user does.",
         "",
-        "You have live tool access (web search, memory, local files, etc.) — you are NOT "
+        "You have live tool access (web search, memory, etc.) — you are NOT "
         "limited to a static training cutoff and you DO have a way to get current "
         "information when a tool is available for it. Never tell the user you \"don't have "
         "real-time access\", that your \"knowledge stops at [some date]\", or similar generic "

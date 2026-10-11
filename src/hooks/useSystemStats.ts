@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import si from "systeminformation";
 import type { SystemStats } from "../lib/types.js";
 
@@ -43,13 +43,20 @@ async function collect(): Promise<SystemStats> {
   };
 }
 
-/** Substitui o polling de collect_metrics() do Textual (a cada N segundos). */
-export function useSystemStats(intervalMs = 2000): SystemStats {
+/**
+ * Substitui o polling de collect_metrics() do Textual (a cada N segundos).
+ * `paused` congela a coleta (sem setState → sem redraw do Ink enquanto um
+ * subprocesso interativo ocupa o terminal — ver SettingsPanel).
+ */
+export function useSystemStats(intervalMs = 2000, paused = false): SystemStats {
   const [stats, setStats] = useState<SystemStats>(EMPTY_STATS);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      if (pausedRef.current) return;
       try {
         const next = await collect();
         if (!cancelled) setStats(next);

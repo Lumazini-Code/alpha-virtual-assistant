@@ -1196,9 +1196,13 @@ class PlansDB:
         ).fetchone()
 
     def update_plan(self, plan_id: int, description: Optional[str],
-                    steps_json: Optional[str], corrections_json: Optional[str]) -> int:
+                    steps_json: Optional[str], corrections_json: Optional[str],
+                    name: Optional[str] = None) -> int:
         """Atualiza o plano e incrementa a versão. Campos None preservam o
-        valor atual. Retorna a nova versão (0 se o plano não existe)."""
+        valor atual. `name` renomeia o plano (name_key recalculado — a
+        checagem de duplicidade fica na camada de handlers, sob o mesmo lock;
+        aqui um UNIQUE violado ainda assim levanta sqlite3.IntegrityError).
+        Retorna a nova versão (0 se o plano não existe)."""
         row = self._conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         if row is None:
             return 0
@@ -1206,6 +1210,8 @@ class PlansDB:
             new_version = row["version"] + 1
             self._conn.execute(
                 "UPDATE plans SET "
+                "name            = ?, "
+                "name_key        = ?, "
                 "description      = ?, "
                 "steps_json       = ?, "
                 "corrections_json = ?, "
@@ -1213,6 +1219,8 @@ class PlansDB:
                 "updated_at       = ? "
                 "WHERE id = ?",
                 (
+                    name if name is not None else row["name"],
+                    self._normalize_key(name) if name is not None else row["name_key"],
                     description if description is not None else row["description"],
                     steps_json if steps_json is not None else row["steps_json"],
                     corrections_json if corrections_json is not None else row["corrections_json"],
