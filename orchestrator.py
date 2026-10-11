@@ -110,6 +110,12 @@ MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://localhost:4008")
 MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 PROCESS_MANAGER_URL  = "http://localhost:9001"
+# ── Browser CDP (Chrome do host p/ tools de browser) ─────────────────────────
+# Servidores MCP que precisam de um Chrome do HOST em modo depuração
+# (CDP :9222). O @playwright/mcp é registrado com --cdp-endpoint
+# (mcp_manager.py) — quem garante o Chrome é o Manager Rust via
+# POST /browser/start no tray (copia o perfil e spawn detached).
+CDP_BROWSERS         = {s.strip() for s in os.getenv("AVA_CDP_SERVERS", "playwright").split(",") if s.strip()}
 
 # ── Planos de execução híbridos (macro + modelo) ─────────────────────────────
 # Planos ficam persistidos na memory (POST /plans/*). Cada passo é "macro"
@@ -1598,6 +1604,37 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
     return schema, dispatch
 
 
+async def _ensure_cdp_browser() -> None:
+    """Garante o Chrome do host em modo depuração (CDP :9222) antes de
+    executar uma tool de um servidor em CDP_BROWSERS.
+
+    Chama POST /browser/start no tray (Manager Rust): ele copia o perfil
+    padrão do usuário e abre o Chrome com --remote-debugging-port. É
+    idempotente — com o CDP vivo responde rápido (probe TCP).
+
+    Best-effort e fail-open de propósito: se o tray estiver fora do ar ou
+    sem Chrome instalado, a tool MESMO ASSIM é executada — o Playwright
+    MCP falha dentro dela e o modelo vê o erro real, em vez de a
+    ferramenta sumir por um problema de infraestrutura.
+    """
+    try:
+        r = await asyncio.wait_for(
+            state.process_manager_client.post("/browser/start"),
+            timeout=60.0,  # 1ª chamada paga a cópia do perfil + espera do CDP
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("ok"):
+            log.info(f"[BROWSER] {data.get('message')} cdp={data.get('cdp_url')}")
+        else:
+            log.warning(f"[BROWSER] tray não conseguiu abrir o Chrome: {data.get('message')}")
+    except Exception as e:
+        log.warning(
+            f"[BROWSER] /browser/start indisponível ({type(e).__name__}: {e}) "
+            "— seguindo sem Chrome CDP."
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LLM call helper (tool-calling nativo)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2157,6 +2194,12 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     # com folga de 10s pra overhead de rede/spawn).
                     server, mcp_tool_name = mcp_dispatch[tool_name]
                     mcp_timeout = EXECUTOR_TIMEOUTS.get(tool_name, MCP_CALL_TIMEOUT)
+                    # Tools de browser (CDP_BROWSERS) precisam do Chrome do
+                    # host em modo depuração — o tray garante (best-effort,
+                    # FORA do teto de timeout da tool, para não comer o
+                    # orçamento do round-trip com infraestrutura).
+                    if server in CDP_BROWSERS:
+                        await _ensure_cdp_browser()
                     r = await asyncio.wait_for(
                         state.mcp_client.post(
                             f"/servers/{server}/call",
