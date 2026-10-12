@@ -152,20 +152,18 @@ Uma única tool exposta ao modelo (`web_search`) esconde o pipeline: **cache Val
 
 ## Instalação
 
-
-
 **Linux**
 ```bash
 curl -fsSL -o /tmp/alpha-install.sh \
   https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.sh \
-  && bash /tmp/alpha-install.sh     
+  && bash /tmp/alpha-install.sh    
+  
 ```
 **Windows**
 ```bat
 curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\install.bat"
-```
-O instalador: valida prereqs → baixa o último release do GitHub → extrai em `~/.local/opt/alpha-ai` (Linux) / `%LOCALAPPDATA%\Programs\AlphaAI` (Windows) → extrai `Modules/Models.zip` (pesos ONNX) → pede e grava a `OPENROUTER_API_KEY` em `Modules/.env` (chmod 600) → build + `up` do stack e espera o healthcheck → cria o comando `alpha-ai` → registra o auto-start do tray → abre a TUI.
 
+```
 ## Uso
 
 ```bash
