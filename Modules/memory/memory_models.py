@@ -459,7 +459,9 @@ class ToolRegisterBatchRequest(BaseModel):
 class ToolRegisterResponse(BaseModel):
     name:    str
     tool_id: int
-    status:  Literal["created", "updated", "unchanged"]
+    # "healed": doc_hash batia mas vetores estavam ausentes no LanceDB —
+    # re-embedados a partir dos textos originais (self-heal de índice).
+    status:  Literal["created", "updated", "unchanged", "healed"]
     vectors: int
 
 class ToolRegisterBatchResponse(BaseModel):

@@ -1116,6 +1116,17 @@ class ToolsDB(EdgeGraphMixin):
         ).fetchall()
         return {r["id"]: r["tool_id"] for r in rows}
 
+    def get_vector_rows(self, vector_ids: list[int]) -> list[sqlite3.Row]:
+        """Linhas (id, text) dos vetores pedidos — insumo do self-heal do
+        índice vetorial (re-embedar exatamente o texto que sumiu do LanceDB,
+        sem depender do doc atual da tool)."""
+        if not vector_ids:
+            return []
+        ph = ",".join("?" * len(vector_ids))
+        return self._conn.execute(
+            f"SELECT id, text FROM tool_vectors WHERE id IN ({ph})", list(vector_ids)
+        ).fetchall()
+
     def delete_vectors(self, vector_ids: list[int]):
         if not vector_ids:
             return

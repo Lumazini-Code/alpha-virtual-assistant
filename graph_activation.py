@@ -263,9 +263,18 @@ class GraphState:
         try:
             db_nodes, db_edges = self._scan()
         except sqlite3.Error as e:
-            print(f"[graph] poll falhou ({e}) — mantendo snapshot anterior")
+            # Erro de leitura (lock/WAL indisponível — clássico de SQLite
+            # sobre bind mount lento do Docker Desktop/WSL2: "unable to open
+            # database file"). Sem backoff isso spamava o log a cada 1s:
+            # loga a 1ª falha e depois 1 a cada 30 (~30s no interval default).
+            # O snapshot anterior permanece — o grafo segue servindo.
+            self._fail_n = getattr(self, "_fail_n", 0) + 1
+            if self._fail_n == 1 or self._fail_n % 30 == 0:
+                print(f"[graph] poll falhou ({e}) — mantendo snapshot anterior "
+                      f"(falha nº {self._fail_n})")
             return {"nodes": {"added": [], "updated": [], "removed": []},
                     "edges": {"added": [], "updated": [], "removed": []}}
+        self._fail_n = 0
 
         nodes_added, nodes_updated, nodes_removed = [], [], []
         edges_added, edges_updated, edges_removed = [], [], []

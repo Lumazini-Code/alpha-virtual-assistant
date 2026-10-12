@@ -109,7 +109,10 @@ MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://localhost:4008")
 # que repassa ao call_tool do SDK).
 MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
-PROCESS_MANAGER_URL  = "http://localhost:9001"
+# Env: no Windows o container precisa alcançar o tray NO HOST —
+# host.docker.internal (docker-compose.windows.yml injeta o valor);
+# no Linux (host network) o default localhost é o próprio host.
+PROCESS_MANAGER_URL  = os.getenv("PROCESS_MANAGER_URL", "http://localhost:9001")
 # ── Browser CDP (Chrome do host p/ tools de browser) ─────────────────────────
 # Servidores MCP que precisam de um Chrome do HOST em modo depuração
 # (CDP :9222). O @playwright/mcp é registrado com --cdp-endpoint
@@ -214,6 +217,13 @@ class ExecuteRequest(BaseModel):
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
+    # Onde o áudio da resposta toca:
+    #   client — orchestrator sintetiza via TTS /synthesize e DEVOLVE o WAV
+    #            num evento SSE `audio` (a TUI toca no HOST — uniforme
+    #            Linux/Windows; o container não precisa de device de áudio)
+    #   device — comportamento antigo: TTS toca no player local do container
+    #            (miniaudio; requer /dev/snd ou Pulse — Linux com overlay)
+    tts_output:    Literal["client", "device"] = "client"
     # Base64 puro da imagem (sem prefixo "data:...;base64,"), já codificado
     # pelo cliente (TUI) — o orchestrator NUNCA lê arquivo de disco nem
     # decodifica/recodifica isso, só repassa para o vision service. Isso
@@ -397,11 +407,159 @@ def _result_to_text(res) -> str:
 
 
 async def _fire_tts(text, req):
-    """TTS é disparado pelo SISTEMA sobre a resposta final — o modelo nunca chama TTS."""
+    """TTS é disparado pelo SISTEMA sobre a resposta final — o modelo nunca chama TTS.
+    Modo device: TTS toca no player local do container (miniaudio)."""
     try:
         await state.tts_client.post("/speak", json={"text": text[:2000], "voice": req.voice, "lang": req.lang})
     except Exception:
         pass
+
+
+class _StreamedTTS:
+    """Fala PROGRESSIVA da resposta (modo tts_output=client): enquanto a
+    resposta é GERADA, acumula os deltas do LLM, corta por fim de frase e
+    sintetiza chunk a chunk no TTS (/synthesize format=pcm). O gerador SSE
+    drena os resultados EM ORDEM contígua e emite `event: audio` (PCM cru
+    base64) — a TUI escreve no stdin de um player persistente (gapless).
+
+    Ciclo por TURNO de conteúdo: um `tool_call` a meio da geração reseta o
+    streamer (cancela sínteses em voo e descarta o não-emitido — evita falar
+    preâmbulo de turno intermediário). O que JÁ foi emitido tocou: trade-off
+    assumido do streaming otimista (mitigado pelo gate do 1º chunk).
+
+    Falha de síntese de um chunk = buraco na fala, nunca derruba o turno
+    (payload None pula a posição sem travar a sequência)."""
+
+    BOUNDARIES = ".!?\n"
+    # Gate do 1º chunk: 2+ frases ou 25+ palavras acumuladas. Preambulos
+    # curtos de turno intermediário raramente chegam lá — reduz a chance de
+    # o usuário ouvir texto que vai ser seguido de tool_call.
+    FIRST_CHUNK_MIN_SENTENCES = 2
+    FIRST_CHUNK_MIN_WORDS   = 25
+
+    def __init__(self, voice: str, lang: str, fmt: str = "pcm"):
+        self.voice, self.lang, self.fmt = voice, lang, fmt
+        self._buf        = ""              # texto aguardando fim de frase
+        self._ready      = []              # frases completas à espera de despacho
+        self._dispatched = False           # gate do 1º chunk já passou?
+        self._tasks      = []              # synth tasks em voo (ordem = seq)
+        self._results    = {}              # seq → payload TTS (ou None = falhou)
+        self._next_seq   = 0
+        self._next_emit  = 0
+        self._cancelled  = False
+
+    # ── ingestão (chamado no branch `delta` do gerador) ──
+    def feed(self, delta: str) -> None:
+        if self._cancelled or not delta:
+            return
+        self._buf += delta
+        while True:
+            idx = next((i for i, ch in enumerate(self._buf) if ch in self.BOUNDARIES), -1)
+            if idx < 0:
+                break
+            sent = self._buf[:idx + 1].strip()
+            self._buf = self._buf[idx + 1:]
+            if sent:
+                self._ready.append(sent)
+
+    def has_chunk(self) -> bool:
+        if self._cancelled or not self._ready:
+            return False
+        if self._dispatched:
+            return True
+        words = sum(len(s.split()) for s in self._ready)
+        return (len(self._ready) >= self.FIRST_CHUNK_MIN_SENTENCES
+                or words >= self.FIRST_CHUNK_MIN_WORDS)
+
+    def take_chunk(self) -> Optional[str]:
+        """Coalesce TODAS as frases prontas num chunk — síntese maior = menos
+        gaps de playback e menos chamadas; atraso de 1-2 frases é inaudível."""
+        if not self.has_chunk():
+            return None
+        chunk = " ".join(self._ready).strip()
+        self._ready.clear()
+        self._dispatched = True
+        return chunk or None
+
+    def flush(self) -> Optional[str]:
+        """Fim da resposta: o que sobrar (frases prontas + buffer sem pontuação)."""
+        if self._cancelled:
+            return None
+        rest = self._buf.strip()
+        self._buf = ""
+        chunk = " ".join([*self._ready, rest]).strip()
+        self._ready.clear()
+        return chunk or None
+
+    # ── despacho/dreno ──
+    def dispatch(self, chunk: str) -> None:
+        if self._cancelled or not chunk:
+            return
+        seq = self._next_seq
+        self._next_seq += 1
+        self._tasks.append(asyncio.create_task(self._synth(seq, chunk)))
+
+    async def _synth(self, seq: int, chunk: str) -> None:
+        try:
+            r = await asyncio.wait_for(
+                state.tts_client.post("/synthesize", json={
+                    "text": chunk[:2000], "voice": self.voice,
+                    "lang": self.lang, "format": self.fmt,
+                }),
+                timeout=120.0,
+            )
+            r.raise_for_status()
+            self._results[seq] = r.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"[TTS] chunk {seq} falhou (buraco na fala, turno segue): {type(e).__name__}: {e}")
+            self._results[seq] = None
+
+    def drain(self) -> list[dict]:
+        """Payloads emitíveis em ordem contígua (None/falha pula a posição)."""
+        out = []
+        while self._next_emit in self._results:
+            payload = self._results.pop(self._next_emit)
+            if payload:
+                out.append(payload)
+            self._next_emit += 1
+        return out
+
+    async def wait_pending(self) -> list[dict]:
+        """Espera as sínteses em voo e devolve o resto em ordem (fim de turno)."""
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
+        return self.drain()
+
+    def reset(self) -> None:
+        """Novo turno de conteúdo (tool_call no meio): cancela o que está em
+        voo e zera o buffer — o próximo delta começa a coleta do zero. Os
+        contadores de seq recomeçam: as sínteses canceladas nunca gravam
+        resultado, e um seq "furado" travaria o drain para sempre."""
+        self._cancelled = False
+        for t in self._tasks:
+            t.cancel()
+        self._tasks.clear()
+        self._results.clear()
+        self._ready.clear()
+        self._buf = ""
+        self._dispatched = False
+        self._next_seq = 0
+        self._next_emit = 0
+
+    def cancel(self) -> None:
+        """Abort total (erro fatal no turno)."""
+        self._cancelled = True
+        for t in self._tasks:
+            t.cancel()
+        self._tasks.clear()
+        self._results.clear()
+        self._ready.clear()
+        self._buf = ""
+        self._next_seq = 0
+        self._next_emit = 0
 
 async def _save_turn(u, a, sid):
     try:
@@ -2369,6 +2527,25 @@ async def _execute_stream_generator(req: ExecuteRequest):
     final_response = ""
     error_msg: Optional[str] = None
 
+    # ── Fala progressiva (modo client): streamer vive no gerador ──
+    tts_streamer = _StreamedTTS(req.voice, req.lang) if (req.tts and req.tts_output == "client") else None
+    audio_started = False
+
+    def _audio_frames(payload: dict) -> str:
+        """audio_start (uma vez, com os metadados do 1º payload) + audio."""
+        nonlocal audio_started
+        frames = ""
+        if not audio_started:
+            audio_started = True
+            frames += _sse("audio_start", {
+                "mime":        payload.get("mime", "audio/pcm"),
+                "format":      "s16le",
+                "channels":    1,
+                "sample_rate": payload.get("sample_rate", 44100),
+            })
+        frames += _sse("audio", {"data": payload.get("audio_b64", "")})
+        return frames
+
     while True:
         name, data = await events_queue.get()
         if name == "__done__":
@@ -2376,6 +2553,8 @@ async def _execute_stream_generator(req: ExecuteRequest):
             break
         if name == "__error__":
             error_msg = data
+            if tts_streamer is not None:
+                tts_streamer.cancel()
             yield _sse("error", {"error": error_msg})
             break
         if name == "delta":
@@ -2383,8 +2562,19 @@ async def _execute_stream_generator(req: ExecuteRequest):
             # _llm_chat_stream durante o tool loop). A UI concatena; o `done`
             # final cura o texto visível com final_response.
             yield _sse("delta", data)
+            if tts_streamer is not None:
+                tts_streamer.feed(data)
+                if tts_streamer.has_chunk():
+                    tts_streamer.dispatch(tts_streamer.take_chunk())
+                for payload in tts_streamer.drain():
+                    yield _audio_frames(payload)
         elif name == "tool_call":
             yield _sse("tool_call", data)
+            # Turno terminou em tool call: zera o streamer — o preâmbulo
+            # falado até aqui toca (já emitido), o resto é descartado; a
+            # coleta recomeça no próximo turno de conteúdo (a resposta final).
+            if tts_streamer is not None:
+                tts_streamer.reset()
         elif name == "tool_result":
             yield _sse("step_done", data)
             res = data.get("result")
@@ -2398,7 +2588,19 @@ async def _execute_stream_generator(req: ExecuteRequest):
     # e os paths que não passam pelo content (vision auto-finish/force_finish)
     # emitem o próprio delta único dentro do _run_tool_loop.
 
-    if req.tts and final_response:
+    if req.tts and tts_streamer is not None and not error_msg:
+        # Fim da resposta: despacha a sobra (última frase sem pontuação,
+        # texto do force_finish etc.), espera as sínteses em voo e fecha
+        # o stream de áudio. O stream fica aberto até a última fala —
+        # a resposta textual já chegou inteira via deltas.
+        final_chunk = tts_streamer.flush()
+        if final_chunk:
+            tts_streamer.dispatch(final_chunk)
+        for payload in await tts_streamer.wait_pending():
+            yield _audio_frames(payload)
+        yield _sse("audio_end", {})
+    elif req.tts and req.tts_output == "device" and final_response:
+        # Modo device (opt-in): TTS toca dentro do container.
         asyncio.create_task(_fire_tts(final_response, req))
 
     if final_response:

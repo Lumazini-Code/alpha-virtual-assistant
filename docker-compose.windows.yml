@@ -10,12 +10,10 @@ services:
   # ─────────────────────────────────────────────
   ava:
     ports:
-      # Tray (ava-tray no host) — orchestrator chama /docker/start e
-      # /browser/start (Chrome de depuração) na API dele.
-      - "9001:9001"
-      # CDP do Chrome do host aberto pelo tray (--cdp-endpoint do
-      # @playwright/mcp dentro do container).
-      - "9222:9222"
+      # Serviços DO CONTAINER expostos ao host (TUI/process manager).
+      # NUNCA publicar 9001 (tray) nem 9222 (Chrome CDP) — são serviços do
+      # HOST: publicar faz o proxy do Docker Desktop capturar a porta e
+      # sombrear o serviço local (TUI recebia "socket closed" no tray).
       - "3000:3000"
       - "4005:4005"
       - "4003:4003"
@@ -29,9 +27,29 @@ services:
       - "3005:3005"
       - "2001:2001"
 
-    volumes:
-      - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+    # Container → serviços do host (tray :9001, Chrome CDP :9222).
+    # No Windows/WSL2 `localhost` dentro do container NÃO é o host —
+    # o PROCESS_MANAGER_URL e o AVA_CDP_ENDPOINT abaixo apontam os
+    # clientes do container pro tray/Chrome no host. No Linux (host
+    # network) os defaults localhost continuam valendo.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     environment:
       PULSE_SERVER: "unix:/run/user/1000/pulse/native"
       PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
+      PROCESS_MANAGER_URL: "http://host.docker.internal:9001"
+      AVA_CDP_ENDPOINT: "http://host.docker.internal:9222"
+
+    # ── DBs da memory em volume nomeado (fs Linux da VM) ──
+    # SQLite + WAL sobre o bind mount do Docker Desktop (drvfs/9p) não é
+    # confiável — "unable to open database file" no graph poll. O volume
+    # sombreia o subdiretório db/ dentro do bind mount de ./Modules.
+    # No Linux (docker-compose.linux.yml) o bind mount nativo continua.
+    volumes:
+      - ava-memory:/app/Modules/memory/db
+      - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+
+volumes:
+  ava-memory:
+    driver: local

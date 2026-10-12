@@ -6,7 +6,6 @@ services:
       dockerfile: Dockerfile
     image: ava:latest
     container_name: ava
-    restart: unless-stopped
 
     volumes:
       - ./mcp_servers:/app/mcp_servers

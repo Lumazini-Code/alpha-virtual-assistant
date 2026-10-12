@@ -17,12 +17,14 @@ Optimizations:
 
 from __future__ import annotations
 
+import os
 import time
 import asyncio
 import logging
 import concurrent.futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -326,23 +328,69 @@ state = AppState()
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
+# Exit code EX_CONFIG (sysexits): config/dados irrecuperáveis. O supervisor
+# restart_on_fail do start.sh NÃO reinicia serviços que saíram com 78 —
+# sem isso um modelo corrompido gerava crash-loop eterno (restart a cada 5s).
+EXIT_CONFIG = 78
+
+# Piso de tamanho de um .onnx válido — e5-small/MiniLM têm dezenas de MB.
+# Arquivo truncado (download/zip interrompido) fica bem abaixo disso.
+MIN_MODEL_BYTES = 10 * 1024 * 1024
+
+_FATAL_FIX_HINT = (
+    "Correção: rode `python3 scripts/verify_models.py` (revalida/rebaixa os "
+    "modelos) e reinicie o container. O serviço fica fora até o modelo "
+    "ser reparado — reiniciar em loop não resolve."
+)
+
+
+def _fatal_exit(msg: str) -> None:
+    """Erro de startup irrecuperável: loga acionável e sai com EX_CONFIG.
+    os._exit garante o código no container (o uvicorn captura exceções de
+    lifespan e sairia com o código DELE, mascarando o 78)."""
+    for h in log.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    log.error(msg)
+    os._exit(EXIT_CONFIG)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting AVA ONNX Serving...")
 
-    # Validate model files
+    # ── Validação de integridade dos modelos ──
+    # ONNX truncado/corrompido (download ou extração interrompida — caso
+    # real em instalação Windows) estoura InvalidProtobuf em
+    # ort.InferenceSession. Valida existência + tamanho mínimo ANTES e
+    # captura falha de carga com mensagem acionável — em vez de crash
+    # opaque + loop de restart.
     for path, label in [
         (EMBED_MODEL_PATH,  "Embedding model"),
         (EMBED_TOKENIZER,   "Embedding tokenizer"),
         (RERANK_MODEL_PATH, "Reranker model"),
         (RERANK_TOKENIZER,  "Reranker tokenizer"),
     ]:
-        if not _file_exists(path):
-            raise RuntimeError(f"{label} not found: {path}")
+        p = Path(path)
+        if not p.exists():
+            _fatal_exit(f"[FATAL] {label} não encontrado: {path} — {_FATAL_FIX_HINT}")
+        if p.suffix == ".onnx" and p.stat().st_size < MIN_MODEL_BYTES:
+            _fatal_exit(
+                f"[FATAL] {label} TRUNCADO/corrompido: {path} tem "
+                f"{p.stat().st_size} bytes (< {MIN_MODEL_BYTES} esperados) — {_FATAL_FIX_HINT}"
+            )
 
-    # Load models
-    state.embed_model  = EmbeddingModel(EMBED_MODEL_PATH, EMBED_TOKENIZER)
-    state.rerank_model = RerankerModel(RERANK_MODEL_PATH, RERANK_TOKENIZER)
+    try:
+        state.embed_model  = EmbeddingModel(EMBED_MODEL_PATH, EMBED_TOKENIZER)
+        state.rerank_model = RerankerModel(RERANK_MODEL_PATH, RERANK_TOKENIZER)
+    except Exception as e:
+        name = type(e).__name__
+        hint = ""
+        if "INVALID_PROTOBUF" in str(e) or "Protobuf" in name:
+            hint = f" — arquivo do modelo CORROMPIDO. {_FATAL_FIX_HINT}"
+        _fatal_exit(f"[FATAL] falha ao carregar modelos ONNX: {name}: {e}{hint}")
 
     # Create thread pools — isolate workloads to avoid contention
     state.embed_pool  = concurrent.futures.ThreadPoolExecutor(
@@ -369,11 +417,6 @@ async def lifespan(app: FastAPI):
     state.embed_pool.shutdown(wait=False)
     state.rerank_pool.shutdown(wait=False)
     log.info("AVA ONNX Serving shut down")
-
-
-def _file_exists(path: str) -> bool:
-    from pathlib import Path
-    return Path(path).exists()
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────

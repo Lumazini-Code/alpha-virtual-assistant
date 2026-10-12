@@ -35,14 +35,24 @@ except Exception as e: print(f'⚠ Supertonic: {e}')
 "
 echo "🚀 Iniciando AVA..."
 
-# Função que reinicia serviços que caem
+# Função que reinicia serviços que caem.
+# Exit code 78 (EX_CONFIG) = falha irrecuperável de config/dados (ex.:
+# modelo ONNX corrompido detectado pelo onnxManager) — reiniciar em loop
+# NÃO resolve; para e grita no log. Correção: rodar
+# `python3 scripts/verify_models.py` e reiniciar o container.
 restart_on_fail() {
     local name="$1"
     local cmd="$2"
     while true; do
         echo "  [START] $name"
         eval "$cmd"
-        echo "  [WARN] $name caiu — reiniciando em 5s..."
+        local rc=$?
+        if [ "$rc" -eq 78 ]; then
+            echo "  [FATAL] $name saiu com código 78 (config/dados inválidos) — SEM auto-restart."
+            echo "  [FATAL] Rode python3 scripts/verify_models.py dentro do container e reinicie."
+            return 78
+        fi
+        echo "  [WARN] $name caiu (rc=$rc) — reiniciando em 5s..."
         sleep 5
     done
 }

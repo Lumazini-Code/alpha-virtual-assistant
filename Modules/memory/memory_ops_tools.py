@@ -66,6 +66,32 @@ def _tool_doc_text(name: str, description: str) -> str:
     return f"{name.replace('_', ' ')}: {description.strip()}"
 
 
+async def _heal_missing_vectors(tool_id: int, vids: list[int]) -> int:
+    """Self-heal do índice vetorial: re-embeda os vetores da tool que SUMIRAM
+    do LanceDB com o SQLite intacto (tabela limpa/perdida — caso real: tools
+    de navegador ficavam 'unchanged' e invisíveis pro kNN pra sempre, porque
+    o doc_hash batia e ninguém conferia o índice). doc/example/learned são
+    TODOS embedados como passage e o texto exato de cada vetor vive em
+    tool_vectors — um único embed_passages cobre os três tipos. Devolve o
+    total de vetores recuperados (0 = índice consistente)."""
+    if not vids:
+        return 0
+    loop = asyncio.get_event_loop()
+    present = await loop.run_in_executor(None, state.tl_index.get_vectors, vids)
+    missing = [vid for vid in vids if vid not in present]
+    if not missing:
+        return 0
+    rows = state.tl_db.get_vector_rows(missing)
+    if not rows:
+        return 0
+    embeddings = await state.embed_engine.embed_passages([r["text"] for r in rows])
+    await loop.run_in_executor(
+        None, state.tl_index.add_batch, embeddings, [r["id"] for r in rows]
+    )
+    log.info(f"Tools: self-heal re-embedou {len(rows)} vetor(es) ausentes no LanceDB (tool_id={tool_id})")
+    return len(rows)
+
+
 async def _delete_tool_row(row: sqlite3.Row) -> None:
     loop = asyncio.get_event_loop()
     vids = state.tl_db.get_vector_ids(row["id"])
@@ -94,10 +120,19 @@ async def _register_tool_locked(req: ToolRegisterRequest) -> ToolRegisterRespons
     if existing is not None and existing["doc_hash"] == doc_hash:
         if bool(existing["is_core"]) != req.core:
             state.tl_db.set_core(existing["id"], req.core)
-        return ToolRegisterResponse(
-            name=name, tool_id=existing["id"], status="unchanged",
-            vectors=len(state.tl_db.get_vector_ids(existing["id"])),
-        )
+        # doc_hash igual NÃO garante índice sã — confere os vetores contra o
+        # LanceDB e re-embeda o que faltar (self-heal; barato: só get_vectors).
+        vids = state.tl_db.get_vector_ids(existing["id"])
+        if vids:
+            healed = await _heal_missing_vectors(existing["id"], vids)
+            return ToolRegisterResponse(
+                name=name, tool_id=existing["id"],
+                status="healed" if healed else "unchanged",
+                vectors=len(state.tl_db.get_vector_ids(existing["id"])),
+            )
+        # Sem NENHUM vetor (limpeza apagou tool_vectors junto) — cai pro
+        # fluxo de re-embed abaixo, que recria doc + exemplos (queries
+        # "learned" preservadas — nenhuma, neste caso).
 
     texts = [doc_text, *examples]
     embeddings = await state.embed_engine.embed_passages(texts)   # antes de mutar qualquer coisa

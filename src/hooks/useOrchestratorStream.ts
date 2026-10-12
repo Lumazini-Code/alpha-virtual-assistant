@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { ORCHESTRATOR_URL } from "../lib/constants.js";
 import { ensureDockerStarted } from "../lib/processManager.js";
 import { waitForServicesReady } from "../lib/waitForServices.js";
+import { startAudioStream, pushAudioChunk, endAudioStream, cancelAudioStream, finishAudioStream } from "../lib/audio.js";
 import { logger } from "../lib/logger.js";
 import { parseSseStream, tryParseJson } from "../lib/sse.js";
 import type {
@@ -152,6 +153,10 @@ export function useOrchestratorStream() {
             voice: "M1",
             lang: "pt",
             tts: true,
+            // Áudio tocado NA TUI (host) — o orchestrator devolve o WAV no
+            // evento SSE `audio`. "device" (player dentro do container,
+            // miniaudio) é opt-in via env AVA_TTS_OUTPUT=device.
+            tts_output: process.env.AVA_TTS_OUTPUT === "device" ? "device" : "client",
             image_base64: imageBase64,
             search_pdfs: false,
             stream: true,
@@ -211,6 +216,10 @@ export function useOrchestratorStream() {
           error: `Orchestrator offline — ${ORCHESTRATOR_URL} (${message})`,
         }));
       } finally {
+        // audio_end chegou? stream encerrou limpo (no-op). Se o orchestrator
+        // caiu no meio (sem audio_end), mata o player para não ficar sem voz
+        // pendurada. O cancel() do usuário também mata via cancelAudioStream.
+        finishAudioStream();
         setIsStreaming(false);
         abortRef.current = null;
       }
@@ -219,6 +228,7 @@ export function useOrchestratorStream() {
   );
 
   const cancel = useCallback(() => {
+    cancelAudioStream();   // mata o player de fala em execução (se houver)
     abortRef.current?.abort();
   }, []);
 
@@ -255,6 +265,10 @@ export function useOrchestratorStream() {
  *   delta       texto puro — fragmento INCREMENTAL do content do LLM
  *               (concatenar); pode vir em chunk único nos paths que não
  *               passam pelo content streamado (finish/vision/force_finish)
+ *   audio       JSON  {data} — chunk PCM cru base64 da fala (modo
+ *               tts_output=client); vai ao stdin do player persistente
+ *   audio_start JSON  {mime, format, channels, sample_rate} — abre o player
+ *   audio_end   —      fecha o stdin (player exita ao drenar)
  *   error       JSON  {error, fatal?}
  *   done        JSON  ExecuteDonePayload | CodeDonePayload
  */
@@ -396,6 +410,36 @@ function handleFrame(
     // vision, force_finish) também passam aqui, só que de uma vez.
     case "delta": {
       updateLast((m) => ({ ...m, text: (m.text ?? "") + frame.raw }));
+      break;
+    }
+
+    // Áudio PROGRESSIVO (modo tts_output=client): o orchestrator sintetiza
+    // por frase conforme a resposta é gerada e emite PCM cru (s16le mono
+    // base64). audio_start abre UM player persistente no host; cada chunk
+    // `audio` vai ao stdin dele (gapless); audio_end fecha o stdin e o
+    // player exita ao drenar.
+    case "audio_start": {
+      const data = tryParseJson<{ sample_rate?: number; format?: string; channels?: number }>(frame.raw);
+      if (typeof data === "object") {
+        startAudioStream({
+          sampleRate: data.sample_rate,
+          format: data.format,
+          channels: data.channels,
+        });
+      }
+      break;
+    }
+
+    case "audio": {
+      const data = tryParseJson<{ data?: string }>(frame.raw);
+      if (typeof data === "object" && data.data) {
+        pushAudioChunk(data.data);
+      }
+      break;
+    }
+
+    case "audio_end": {
+      endAudioStream();
       break;
     }
 

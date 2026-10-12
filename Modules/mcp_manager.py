@@ -240,6 +240,10 @@ class MCPState:
     # Servidores com falha recente de conexão/call: name → até quando
     # (time.time()+TTL) ficar fora da /skills/select.
     unhealthy: dict[str, float] = field(default_factory=dict)
+    # Watchdog da memory_api: nasce quando o startup não a encontrou (corrida
+    # do docker-compose) — quando ela volta, re-sincroniza os servidores
+    # habilitados no grafo de tools.
+    memory_watchdog_task: Optional[asyncio.Task] = field(default=None)
 
 state = MCPState()
 
@@ -258,6 +262,46 @@ def _clear_unhealthy(name: str) -> None:
 def _is_unhealthy(name: str) -> bool:
     until = state.unhealthy.get(name)
     return until is not None and time.time() < until
+
+
+async def _memory_watchdog(poll_s: float = 10.0) -> None:
+    """Vigia a memory_api: quando ela VOLTA depois de um período offline,
+    re-sincroniza os servidores habilitados — as tools reentram no grafo
+    sem intervenção manual (o register é idempotente; o doc_hash evita
+    re-embed de tool inalterada; o self-heal cobre índice vetorial perdido).
+
+    Motivação: o docker-compose sobe o manager ANTES da memory — o check
+    one-shot do lifespan via `✗ OFFLINE`, ninguém re-tentava, e o grafo de
+    tools ficava vazio/invisível até um sync manual. Também cobre a memory
+    cair e voltar no meio da sessão."""
+    was_offline = True   # só nasce quando o startup não achou a memory
+    while True:
+        await asyncio.sleep(poll_s)
+        try:
+            r = await state.memory.get("/status", timeout=5.0)
+            online = r.status_code == 200
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            online = False
+        if not online:
+            was_offline = True
+            continue
+        if not was_offline:
+            continue
+        was_offline = False
+        servers = [row["name"] for row in _db_list_servers(enabled_only=True)]
+        log.info(f"MCP watchdog: memory_api de volta — re-sincronizando {servers}")
+        for name in servers:
+            try:
+                summary = await sync_server(name)
+                log.info(f"MCP watchdog: sync de '{name}' ok — {summary['synced']} tool(s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Falha isolada não impede os demais — a próxima detecção de
+                # volta (memory fora→dentro) re-tenta tudo.
+                log.warning(f"MCP watchdog: sync de '{name}' falhou: {type(e).__name__}: {e}")
 
 
 def _open_db() -> sqlite3.Connection:
@@ -407,6 +451,37 @@ def _db_update_snippet(server: str, name: str, snippet: str):
 
 # ── Runtime MCP (executor) ──────────────────────────────────────────────────
 
+def _resolve_cdp_endpoint(args: list[str]) -> list[str]:
+    """Reescreve o `--cdp-endpoint` NO MOMENTO do spawn.
+
+    O endpoint registrado no DB (`http://localhost:9222`) aponta para o
+    Chrome de depuração NO HOST. Dentro do container no Windows/WSL2,
+    `localhost` é o PRÓPRIO container — o docker-compose.windows.yml injeta
+    `AVA_CDP_ENDPOINT=http://host.docker.internal:9222` e este helper
+    troca a URL aqui. No Linux (host network) o env não existe → no-op,
+    o default localhost continua valendo."""
+    endpoint = os.getenv("AVA_CDP_ENDPOINT", "").strip()
+    if not endpoint:
+        return list(args)
+    out: list[str] = []
+    pending = False   # --cdp-endpoint esperando a URL no arg seguinte
+    for a in args:
+        if pending:
+            out.append(endpoint)
+            pending = False
+        elif a == "--cdp-endpoint":
+            out.append(a)
+            pending = True
+        elif a.startswith("--cdp-endpoint="):
+            out.append(f"--cdp-endpoint={endpoint}")
+        elif "://localhost:9222" in a:
+            out.append(a.replace("http://localhost:9222", endpoint)
+                         .replace("https://localhost:9222", endpoint))
+        else:
+            out.append(a)
+    return out
+
+
 async def _drop_session(name: str) -> None:
     """Derruba a sessão/subprocesso do servidor (se vivo). Usado quando a
     config muda, o servidor é removido, ou uma chamada falhou (sessão
@@ -443,7 +518,7 @@ async def _session_keeper(name: str, row: sqlite3.Row, ready: asyncio.Event,
         else:
             if not row["command"]:
                 raise RuntimeError("transport='stdio' sem command configurado")
-            args = json.loads(row["args_json"] or "[]")
+            args = _resolve_cdp_endpoint(json.loads(row["args_json"] or "[]"))
             env = json.loads(row["env_json"] or "{}")
             params = StdioServerParameters(
                 command=row["command"], args=args, env=env or None,
@@ -538,13 +613,25 @@ async def lifespan(app: FastAPI):
     )
     try:
         r = await state.memory.get("/status", timeout=5.0)
-        log.info(f"  ✓ memory_api OK ({r.status_code})" if r.status_code == 200 else f"  ⚠ memory_api {r.status_code} — syncs vão falhar até voltar")
+        memory_ok = r.status_code == 200
+        log.info(f"  ✓ memory_api OK ({r.status_code})" if memory_ok else f"  ⚠ memory_api {r.status_code} — syncs vão falhar até voltar")
     except Exception:
+        memory_ok = False
         log.warning("  ✗ memory_api OFFLINE — /sync não conseguirá gravar no grafo de tools")
+    if not memory_ok:
+        # A memory sobe DEPOIS no docker-compose (corrida de startup) — o
+        # watchdog re-sincroniza os servidores assim que ela responder.
+        state.memory_watchdog_task = asyncio.create_task(_memory_watchdog())
     n = state.db.execute("SELECT COUNT(*) FROM mcp_servers").fetchone()[0]
     log.info(f"MCP Manager pronto — {n} servidor(es) registrado(s): "
              f"{[r['name'] for r in state.db.execute('SELECT name FROM mcp_servers ORDER BY name').fetchall()]}")
     yield
+    # Watchdog antes do mais: pode estar no meio de um sync (spawn stdio).
+    if state.memory_watchdog_task is not None:
+        state.memory_watchdog_task.cancel()
+        with contextlib.suppress(Exception):
+            await state.memory_watchdog_task
+        state.memory_watchdog_task = None
     # Derruba sessões vivas E connects em voo (keepers ainda não "ready") —
     # depois espera cada keeper fechar o próprio subprocesso (com teto).
     for name in list(set(state.sessions) | set(state.keeper_tasks)):
@@ -821,11 +908,27 @@ def _npm_package_from_spec(spec: str) -> str:
     """'@playwright/mcp@0.0.80' → '@playwright/mcp' (spec com versão é aceita
     e repassada intacta ao npx; aqui extraímos só o NOME pra validar no
     registry e derivar o `name` do servidor)."""
-    # Escopados (@org/pkg@ver): só o ÚLTIMO '@' separa versão.
+    # Escopados (@org/pkg@ver): só o ÚLTIMO '@' separa versão. CUIDADO: num
+    # escopado SEM versão ('@playwright/mcp') o único '@' é o do INÍCIO do
+    # scope — rpartition devolve base='' e NÃO é separador de versão; nesse
+    # caso o spec inteiro é o nome. (Bug antigo: guard errado deixava passar
+    # base vazio → spec derivava server_name '' → POST /install 400.)
     if spec.startswith("@"):
         base, sep, _ver = spec.rpartition("@")
-        return base if sep and base != "@" else spec
+        return base if sep and base else spec
     return spec.split("@", 1)[0]
+
+
+def _server_name_from_spec(npm_name: str) -> str:
+    """Nome de servidor derivado do pacote npm. Escopado ganha o scope como
+    prefixo: '@playwright/mcp' → 'playwright-mcp' (dois escopos podem expor
+    pacotes de mesmo nome — 'mcp' sozinho colidiria). '.' não é permitido
+    em nome de servidor (_SERVER_NAME_RE) — vira '-'."""
+    if npm_name.startswith("@"):
+        scope, sep, pkg = npm_name[1:].partition("/")
+        if sep and scope and pkg:
+            return f"{scope}-{pkg}".replace(".", "-")
+    return npm_name.replace(".", "-")
 
 async def _resolve_npm_package(package: str) -> dict:
     """Consulta o registry (`npm view`) e devolve {name, version, bin}.
@@ -868,8 +971,7 @@ async def install_server(req: ServerInstallRequest):
     if not spec or " " in spec or spec.startswith("-"):
         raise HTTPException(400, "package inválido (ex.: '@playwright/mcp' ou '@playwright/mcp@0.0.80')")
     npm_name = _npm_package_from_spec(spec)
-    pkg_name = npm_name.rsplit("/", 1)[-1]
-    server_name = (req.name or "").strip() or pkg_name.replace("@", "").replace("/", "-")
+    server_name = (req.name or "").strip() or _server_name_from_spec(npm_name)
     if not _SERVER_NAME_RE.match(server_name) or "__" in server_name:
         raise HTTPException(400, f"Nome de servidor derivado inválido: '{server_name}' — passe 'name' explícito")
 

@@ -101,20 +101,26 @@ pub async fn discover_running_processes(state: &SharedState) {
 // ════════════════════════════════════════════════════════════════════════
 
 pub async fn start_docker(state: &SharedState) -> Result<()> {
-    {
-        let docker = state.docker.lock().await;
-        if docker.status == ProcStatus::Running {
-            // JÁ estava rodando: apenas resetamos o timer de inatividade.
-            // A TUI chama /docker/start a cada pergunta — é exatamente isso
-            // que "atividade" significa. Sem este touch, o idle_watcher
-            // matava o docker 45 min após o START mesmo em uso contínuo
-            // (touch_docker_activity existia mas nunca era chamado).
-            let mut docker = state.docker.lock().await;
-            docker.last_activity = Some(Instant::now());
-            tracing::info!("Docker já estava em execução — timer de inatividade resetado.");
-            return Ok(());
-        }
+    // Status "Running" (já estava de pé) → só toca o timer de inatividade
+    // e retorna. UM ÚNICO lock: a versão antiga re-lockava o Mutex com o
+    // guard da checagem ainda vivo → self-deadlock no tokio::sync::Mutex;
+    // o handler do /docker/start travava pra sempre RETENDO o lock e o
+    // tray inteiro congelava (/status, stop, tudo). "Running" stale é
+    // comum (containers mortos por fora não atualizam o estado) — o
+    // health_check_docker corrige no tick seguinte; aqui basta não
+    // travar nunca.
+    let mut docker = state.docker.lock().await;
+    if docker.status == ProcStatus::Running {
+        // JÁ estava rodando: apenas resetamos o timer de inatividade.
+        // A TUI chama /docker/start a cada pergunta — é exatamente isso
+        // que "atividade" significa. Sem este touch, o idle_watcher
+        // matava o docker 45 min após o START mesmo em uso contínuo
+        // (touch_docker_activity existia mas nunca era chamado).
+        docker.last_activity = Some(Instant::now());
+        tracing::info!("Docker já estava em execução — timer de inatividade resetado.");
+        return Ok(());
     }
+    drop(docker);   // solta antes das seções abaixo (cada uma re-locka)
 
     let script = &state.docker_start_script;
     if !script.exists() {
@@ -130,9 +136,13 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
 
     let script_dir = script.parent().unwrap_or(script);
 
+    // `up -d` (detached): o filho EXITA quando os containers sobem. Sem o
+    // -d, `docker compose up` ANEXA e roda pra sempre — o tray ficava com
+    // um filho vivo eternamente (e, se o filho morresse, os containers
+    // iam junto).
     let child = if cfg!(target_os = "windows") {
         Command::new(script)
-            .args(["up"])
+            .args(["up", "-d"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
@@ -141,7 +151,7 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     } else {
         Command::new("bash")
             .arg(script)
-            .args(["up"])
+            .args(["up", "-d"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
