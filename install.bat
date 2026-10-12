@@ -12,7 +12,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%install.ps1" %*
+[IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8), (New-Object Text.UTF8Encoding $true))
+powershell -NoProfile -ExecutionPolicy Bypass -File $p
 
 REM Se foi aberto com duplo-clique (cmd /c), pausa para o usuario ler o resultado.
 echo %cmdcmdline% | find /i "%~0" >nul 2>&1

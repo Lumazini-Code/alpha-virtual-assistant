@@ -102,6 +102,29 @@ if (-not $KeepModelsZip) {
   Write-Ok 'Modules/Models.zip removido (economia de ~450 MB).'
 }
 
+# ── 4b. Verificacao de modelos ────────────────────────────────────────────────
+# Modelo truncado (download/extracao interrompida) deixa o onnxManager fora
+# do ar (INVALID_PROTOBUF). O verify confere tamanho minimo e re-baixa o que
+# estiver corrompido. Best-effort: sem python no host, a validacao acontece
+# dentro do container no boot (exit 78 + instrucao no log).
+$VerifyScript = Join-Path $InstallDir 'scripts\verify_models.py'
+$Py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $Py) { $Py = Get-Command python3 -ErrorAction SilentlyContinue }
+if ((Test-Path $VerifyScript) -and $Py) {
+  Write-Info 'Verificando integridade dos modelos (verify_models)...'
+  & $Py.Source $VerifyScript --quiet
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 'Modelo invalido detectado — tentando re-download...'
+    & $Py.Source $VerifyScript --download
+    if ($LASTEXITCODE -eq 0) { Write-Ok 'Modelos reparados.' }
+    else { Write-Warn2 'Nao foi possivel reparar os modelos automaticamente — o boot do container vai indicar o arquivo exato.' }
+  } else {
+    Write-Ok 'Modelos integros.'
+  }
+} else {
+  Write-Warn2 'python/scripts indisponiveis no host — verificacao de modelos sera feita dentro do container no boot.'
+}
+
 # ── 5. API key (antes do up) ──────────────────────────────────────────────────
 $EnvFile = Join-Path $InstallDir 'Modules\.env'
 

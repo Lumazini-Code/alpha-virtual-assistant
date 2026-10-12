@@ -139,6 +139,28 @@ if [ "$KEEP_MODELS_ZIP" -eq 0 ]; then
   ok "Modules/Models.zip removido (economia de ~450 MB)."
 fi
 
+# ── 4b. Verificação de modelos ───────────────────────────────────────────────
+# Modelo truncado (download/extracão interrompida) deixa o onnxManager fora
+# do ar (INVALID_PROTOBUF). O verify confere tamanho mínimo e re-baixa o que
+# estiver corrompido. Best-effort: sem python no host, a validação acontece
+# dentro do container no boot (exit 78 + instrução no log).
+VERIFY="scripts/verify_models.py"
+if [ -f "$VERIFY" ] && command -v python3 >/dev/null 2>&1; then
+  info "Verificando integridade dos modelos (verify_models)..."
+  if python3 "$VERIFY" --quiet; then
+    ok "Modelos íntegros."
+  else
+    warn "Modelo inválido detectado — tentando re-download..."
+    if python3 "$VERIFY" --download; then
+      ok "Modelos reparados."
+    else
+      warn "Não foi possível reparar os modelos automaticamente — o boot do container vai indicar o arquivo exato."
+    fi
+  fi
+else
+  warn "python3/scripts indisponíveis no host — verificação de modelos será feita dentro do container no boot."
+fi
+
 # ── 5. API key (antes do up: LLM.py lê no import) ─────────────────────────────
 ENV_FILE="Modules/.env"
 

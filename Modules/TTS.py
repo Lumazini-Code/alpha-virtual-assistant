@@ -21,6 +21,7 @@ Uso:
 
 from __future__ import annotations
 
+import base64
 import io
 import re
 import sys
@@ -456,19 +457,33 @@ class HeapPlayer:
 
                 required_frames = yield output.tobytes()
 
-        try:
-            with miniaudio.PlaybackDevice(
-                output_format   = miniaudio.SampleFormat.SIGNED16,
-                nchannels       = 1,
-                sample_rate     = SAMPLE_RATE,
-                buffersize_msec = BUFFER_MS,
-            ) as device:
-                gen = _stream_gen()
-                next(gen)
-                device.start(gen)
-                threading.Event().wait()
-        except Exception as e:
-            log.error(f"[PLAY] Erro fatal no playback: {e}", exc_info=True)
+        # Backoff: falha de device (sem /dev/snd, ALSA sem card — caso do
+        # container no Windows/WSLg) NÃO mata a thread de playback: avisa
+        # uma vez com traceback, re-tenta com backoff crescente (10s → 60s)
+        # e retoma sozinho se o device aparecer. A API segue de pé (o modo
+        # client de áudio nem usa este path).
+        fail_n = 0
+        while True:
+            try:
+                with miniaudio.PlaybackDevice(
+                    output_format   = miniaudio.SampleFormat.SIGNED16,
+                    nchannels       = 1,
+                    sample_rate     = SAMPLE_RATE,
+                    buffersize_msec = BUFFER_MS,
+                ) as device:
+                    gen = _stream_gen()
+                    next(gen)
+                    device.start(gen)
+                    fail_n = 0
+                    threading.Event().wait()
+            except Exception as e:
+                fail_n += 1
+                if fail_n == 1:
+                    log.error(f"[PLAY] Erro fatal no playback: {e}", exc_info=True)
+                    log.error("[PLAY] playback local indisponível — re-tentando com backoff (o modo client de áudio não é afetado)")
+                else:
+                    log.info(f"[PLAY] device ainda indisponível (retry {fail_n}, {e})")
+                time.sleep(min(10.0 * fail_n, 60.0))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -647,6 +662,11 @@ class SpeakRequest(BaseModel):
     voice: str   = DEFAULT_VOICE
     lang:  str   = DEFAULT_LANG
     speed: float = 1.0
+    # Formato do áudio devolvido pelo /synthesize:
+    #   wav — WAV mono 16-bit completo (header incluído; um arquivo tocável)
+    #   pcm — PCM cru s16le SEM header (chunks de streaming — a TUI abre o
+    #         player uma vez e empurra os chunks no stdin; gapless)
+    format: str  = "wav"
 
 class SpeakResponse(BaseModel):
     duration_s: float
@@ -824,6 +844,88 @@ async def stream(req: StreamRequest):
         total_duration_s = round(sum(durations), 3),
         latency_ms       = latency_ms,
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST /synthesize — áudio RETORNADO (sem player local)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _wav_bytes(pcms: list[np.ndarray]) -> bytes:
+    """Empacota chunks PCM int16 mono num único WAV (RIFF/fmt PCM 16-bit
+    @ SAMPLE_RATE — mesmo formato do tts_to_bytes)."""
+    import struct
+
+    buf       = io.BytesIO()
+    data_size = sum(p.nbytes for p in pcms)
+    byte_rate = SAMPLE_RATE * 2
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, byte_rate, 2, 16))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    for p in pcms:
+        buf.write(p.tobytes())
+    return buf.getvalue()
+
+
+@app.post("/synthesize")
+async def synthesize(req: SpeakRequest):
+    """Sintetiza e DEVOLVE o áudio (WAV mono 16-bit, base64) — NÃO toca no
+    player local. É o caminho do modo tts_output=client: o orchestrator
+    embute o payload num evento SSE `audio` e a TUI toca no HOST (uniforme
+    Linux/Windows — o container não precisa de device de áudio; o playback
+    local via miniaudio vira opt-in). Chunks sintetizados EM SEQUÊNCIA num
+    único executor call — ordem determinística num só WAV."""
+    texto = normalizar_texto(req.text.strip())
+    if not texto:
+        raise HTTPException(status_code=400, detail="texto vazio após normalização")
+    if req.voice not in AVAILABLE_VOICES:
+        raise HTTPException(status_code=400, detail=f"voz inválida — use: {AVAILABLE_VOICES}")
+    if req.format not in ("wav", "pcm"):
+        raise HTTPException(status_code=400, detail="format inválido — use 'wav' ou 'pcm'")
+
+    chunks = split_chunks(texto) or [texto]
+    t0   = time.perf_counter()
+    loop = asyncio.get_event_loop()
+
+    def _synth_all() -> tuple[list[np.ndarray], float]:
+        pcms: list[np.ndarray] = []
+        total = 0.0
+        for i, c in enumerate(chunks):
+            wav, dur = state.pool.synthesize(c, req.voice, req.lang, req.speed, seq_idx=i)
+            wav = np.asarray(wav, dtype=np.float32).squeeze()
+            pcms.append((np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16))
+            total += float(dur)
+        return pcms, total
+
+    try:
+        pcms, total_dur = await loop.run_in_executor(None, _synth_all)
+    except Exception as e:
+        log.error(f"[SYNTH] erro: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"falha na síntese: {e}") from e
+
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    log.info(f"[SYNTH] {len(chunks)} chunk(s), {total_dur:.2f}s de áudio em {latency_ms}ms")
+
+    if req.format == "pcm":
+        raw = b"".join(p.tobytes() for p in pcms)
+        audio_b64 = base64.b64encode(raw).decode("ascii")
+        mime = "audio/pcm"
+    else:
+        audio_b64 = base64.b64encode(_wav_bytes(pcms)).decode("ascii")
+        mime = "audio/wav"
+
+    return {
+        "mime":        mime,
+        "sample_rate": SAMPLE_RATE,
+        "duration_s":  round(total_dur, 3),
+        "latency_ms":  latency_ms,
+        "text":        texto,
+        "chunks":      len(chunks),
+        "audio_b64":   audio_b64,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════

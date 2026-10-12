@@ -156,11 +156,13 @@ Uma única tool exposta ao modelo (`web_search`) esconde o pipeline: **cache Val
 ```bash
 curl -fsSL -o /tmp/alpha-install.sh \
   https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.sh \
-  && bash /tmp/alpha-install.sh
+  && bash /tmp/alpha-install.sh    
+  
 ```
 **Windows**
 ```bat
-curl -fsSL -o "%TEMP%\alpha-install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\alpha-install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\alpha-install.bat"
+curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\install.bat"
+
 ```
 ## Uso
 

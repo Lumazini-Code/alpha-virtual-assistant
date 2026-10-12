@@ -10,19 +10,40 @@ interface SimpleResponseDto {
   message: string;
 }
 
+// Teto para toda chamada ao process manager (tray :9001). Sem isso, um
+// tray congelado/travado prende o fetch para sempre e a pergunta nunca
+// sai do TUI (bug real: /docker/start pendurado silenciava o submit).
+// /docker/start costuma responder em ms — o tray spawnando o compose é
+// fire-and-forget; 15s é folga ampla. Override via env.
+const TRAY_TIMEOUT_MS = Number(process.env.AVA_TRAY_TIMEOUT_MS ?? 15_000);
+
 async function postAndCheck(path: string, body?: unknown): Promise<SimpleResponseDto> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    ...(body !== undefined && {
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  });
-  const data = (await res.json().catch(() => null)) as SimpleResponseDto | null;
-  if (!res.ok || !data || !data.ok) {
-    throw new Error(data?.message ?? `HTTP ${res.status}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TRAY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      signal: controller.signal,
+      ...(body !== undefined && {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    });
+    const data = (await res.json().catch(() => null)) as SimpleResponseDto | null;
+    if (!res.ok || !data || !data.ok) {
+      throw new Error(data?.message ?? `HTTP ${res.status}`);
+    }
+    return data;
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        `process manager não respondeu ${path} em ${Math.round(TRAY_TIMEOUT_MS / 1000)}s — seguindo sem ele (best-effort)`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
 export interface EnsureDockerResult {

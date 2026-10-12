@@ -88,15 +88,25 @@ struct BrowserStatusResponse {
 // ════════════════════════════════════════════════════════════════════════
 
 async fn get_status(State(state): State<SharedState>) -> impl IntoResponse {
-    let docker = state.docker.lock().await;
-
-    let resp = StatusResponse {
-        docker: DockerStatusDto {
+    // try_lock: o /status é polado pela TUI e pelo health check — se o
+    // Mutex do docker estiver retido (start/stop demorando, ou qualquer
+    // bug que retenha o lock), responde "Ocupado" na hora em vez de
+    // enfileirar. Um lock preso nunca mais pode congelar o painel de
+    // status (e, com ele, o fluxo inteiro da TUI).
+    let docker_dto = match state.docker.try_lock() {
+        Ok(docker) => DockerStatusDto {
             status: docker.status.label().to_string(),
             pid: docker.pid,
             idle_seconds: docker.last_activity.map(|t| t.elapsed().as_secs()),
         },
+        Err(_busy) => DockerStatusDto {
+            status: "Ocupado".to_string(),
+            pid: None,
+            idle_seconds: None,
+        },
     };
+
+    let resp = StatusResponse { docker: docker_dto };
 
     Json(resp)
 }
