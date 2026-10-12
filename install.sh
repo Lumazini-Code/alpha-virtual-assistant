@@ -109,7 +109,7 @@ TAG="$(printf '%s' "$RELEASE_JSON" | grep -oE '"tag_name": *"[^"]+"' | head -1 |
 ASSET_URL="$(printf '%s' "$RELEASE_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -i 'linux' | grep -i '\.zip$' | head -1)" || true
 [ -n "$ASSET_URL" ] || die "Release $TAG não tem asset *linux*.zip. Verifique: https://github.com/$REPO/releases"
 
-info "Release $TAG — baixando $(basename "$ASSET_URL") (~700 MB)..."
+info "Release $TAG — baixando $(basename "$ASSET_URL")..."
 
 curl -fL --connect-timeout 15 --progress-bar -o "$TMP_DIR/alpha-ai.zip" "$ASSET_URL" || \
   die "Download falhou. Verifique a conexão e tente de novo."
