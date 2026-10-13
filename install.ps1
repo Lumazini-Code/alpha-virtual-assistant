@@ -1,14 +1,14 @@
-# install.ps1 — Instalador Alpha AI (Windows)
+# install.ps1 - Instalador Alpha AI (Windows)
 #
 # Espelha o fluxo do install.sh:
 #   1. Valida prereqs (Docker + compose v2)
-#   2. Baixa o asset *windows*.zip do último release no GitHub
+#   2. Baixa o asset *windows*.zip do ultimo release no GitHub
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
 #   4. Extrai Modules/Models.zip em Modules/Models
-#   5. Pede a OPENROUTER_API_KEY e grava em Modules\.env — ANTES do up,
-#      porque Modules/LLM.py lê a chave no import
+#   5. Pede a OPENROUTER_API_KEY e grava em Modules\.env - ANTES do up,
+#      porque Modules/LLM.py le a chave no import
 #   6. Build + up via docker-start.bat e espera o /status responder
-#   7. Adiciona tui\ ao PATH do usuário (comando `alpha-ai`)
+#   7. Adiciona tui\ ao PATH do usuario (comando `alpha-ai`)
 #   8. Auto-start do ava-tray.exe via HKCU\...\Run (+ inicia agora)
 #   9. Inicia a TUI
 #
@@ -37,17 +37,17 @@ function Die {
   exit 1
 }
 
-# ── 1. Prereqs ────────────────────────────────────────────────────────────────
+# -- 1. Prereqs ----------------------------------------------------------------
 Write-Info 'Validando pre-requisitos...'
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
   Die "Docker nao encontrado. Instale o Docker Desktop (com WSL2) e rode novamente."
 }
 try { docker compose version | Out-Null } catch {
-  Die "Plugin 'docker compose' ausente — atualize o Docker Desktop."
+  Die "Plugin 'docker compose' ausente - atualize o Docker Desktop."
 }
 # EAP=Stop + stderr de comando nativo redirecionado dispara NativeCommandError
-# (derruba o script exatamente quando o daemon esta desligado) — relaxa aqui.
+# (derruba o script exatamente quando o daemon esta desligado) - relaxa aqui.
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 docker info *> $null
@@ -59,7 +59,7 @@ if (-not $dockerOk) {
 
 Write-Ok 'Pre-requisitos validados.'
 
-# ── 2. Download do ultimo release ─────────────────────────────────────────────
+# -- 2. Download do ultimo release ---------------------------------------------
 Write-Info "Consultando ultimo release de https://github.com/$Repo..."
 
 try {
@@ -74,13 +74,13 @@ if (-not $Asset) {
 }
 
 $Tag = $Release.tag_name
-Write-Info "Release $Tag — baixando $($Asset.name) (~700 MB)..."
+Write-Info "Release $Tag - baixando $($Asset.name) (~700 MB)..."
 
 $TmpZip = Join-Path $env:TEMP "alpha-ai-$Tag.zip"
 Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $TmpZip -UseBasicParsing
 Write-Ok 'Download concluido.'
 
-# ── 3. Extracao ───────────────────────────────────────────────────────────────
+# -- 3. Extracao ---------------------------------------------------------------
 Write-Info "Extraindo em $InstallDir ..."
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Expand-Archive -Path $TmpZip -DestinationPath $InstallDir -Force
@@ -88,12 +88,12 @@ Remove-Item -Force $TmpZip
 
 $ModelsZip = Join-Path $InstallDir 'Modules\Models.zip'
 if (-not (Test-Path $ModelsZip)) {
-  Die "Modules/Models.zip nao veio no zip do release — asset incompativel com esta versao do instalador."
+  Die "Modules/Models.zip nao veio no zip do release - asset incompativel com esta versao do instalador."
 }
 Set-Location $InstallDir
 Write-Ok 'Arquivos extraidos.'
 
-# ── 4. Modelos ────────────────────────────────────────────────────────────────
+# -- 4. Modelos ----------------------------------------------------------------
 Write-Info 'Extraindo Models.zip (~1,4 GB) para Modules/Models...'
 Expand-Archive -Path $ModelsZip -DestinationPath (Join-Path $InstallDir 'Modules\Models') -Force
 Write-Ok 'Modelos extraidos.'
@@ -102,7 +102,7 @@ if (-not $KeepModelsZip) {
   Write-Ok 'Modules/Models.zip removido (economia de ~450 MB).'
 }
 
-# ── 4b. Verificacao de modelos ────────────────────────────────────────────────
+# -- 4b. Verificacao de modelos ------------------------------------------------
 # Modelo truncado (download/extracao interrompida) deixa o onnxManager fora
 # do ar (INVALID_PROTOBUF). O verify confere tamanho minimo e re-baixa o que
 # estiver corrompido. Best-effort: sem python no host, a validacao acontece
@@ -114,18 +114,18 @@ if ((Test-Path $VerifyScript) -and $Py) {
   Write-Info 'Verificando integridade dos modelos (verify_models)...'
   & $Py.Source $VerifyScript --quiet
   if ($LASTEXITCODE -ne 0) {
-    Write-Warn2 'Modelo invalido detectado — tentando re-download...'
+    Write-Warn2 'Modelo invalido detectado - tentando re-download...'
     & $Py.Source $VerifyScript --download
     if ($LASTEXITCODE -eq 0) { Write-Ok 'Modelos reparados.' }
-    else { Write-Warn2 'Nao foi possivel reparar os modelos automaticamente — o boot do container vai indicar o arquivo exato.' }
+    else { Write-Warn2 'Nao foi possivel reparar os modelos automaticamente - o boot do container vai indicar o arquivo exato.' }
   } else {
     Write-Ok 'Modelos integros.'
   }
 } else {
-  Write-Warn2 'python/scripts indisponiveis no host — verificacao de modelos sera feita dentro do container no boot.'
+  Write-Warn2 'python/scripts indisponiveis no host - verificacao de modelos sera feita dentro do container no boot.'
 }
 
-# ── 5. API key (antes do up) ──────────────────────────────────────────────────
+# -- 5. API key (antes do up) --------------------------------------------------
 $EnvFile = Join-Path $InstallDir 'Modules\.env'
 
 function Test-ExistingKey {
@@ -145,7 +145,7 @@ function Prompt-Key {
     $secure = Read-Host -Prompt 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys)' -AsSecureString
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
     $Key = $plain.Trim()
-    if (-not $Key) { Write-Warn2 'Chave vazia — tente de novo.'; continue }
+    if (-not $Key) { Write-Warn2 'Chave vazia - tente de novo.'; continue }
     if ($Key -notlike 'sk-or-*') { Write-Warn2 "Chaves do OpenRouter normalmente comecam com 'sk-or-'. Prosseguindo mesmo assim." }
     Write-Key $Key
     return
@@ -160,11 +160,11 @@ if (Test-ExistingKey) {
 }
 Write-Ok "OPENROUTER_API_KEY configurada em $EnvFile"
 
-# ── 6. Build + first up ───────────────────────────────────────────────────────
+# -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
   & .\docker-start.bat build
-  if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou — rode .\docker-start.bat build para ver o erro.' }
+  if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou - rode .\docker-start.bat build para ver o erro.' }
 
   Write-Info 'Subindo o stack...'
   & .\docker-start.bat up -d
@@ -207,17 +207,19 @@ if (-not $SkipBuild) {
   Write-Info '-SkipBuild: pulei o build/up do Docker.'
 }
 
-# ── 7. PATH do usuario ────────────────────────────────────────────────────────
+# -- 7. PATH do usuario --------------------------------------------------------
 $TuiDir = Join-Path $InstallDir 'tui'
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not $UserPath) { $UserPath = '' }
 if ($UserPath -notlike "*$TuiDir*") {
-  [Environment]::SetEnvironmentVariable('Path', "$UserPath;$TuiDir", 'User')
+  $NewPath = if ($UserPath) { "$UserPath;$TuiDir" } else { $TuiDir }
+  [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
   Write-Ok "Comando instalado: alpha-ai (em $TuiDir). Reabra o terminal para valer."
 } else {
   Write-Ok "Comando alpha-ai ja no PATH."
 }
 
-# ── 8. Auto-start do tray ─────────────────────────────────────────────────────
+# -- 8. Auto-start do tray -----------------------------------------------------
 $TrayExe = Join-Path $InstallDir 'Manager\ava-tray.exe'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if (Test-Path $TrayExe) {
@@ -226,10 +228,10 @@ if (Test-Path $TrayExe) {
   Start-Process -FilePath $TrayExe
   Write-Ok 'ava-tray iniciado agora.'
 } else {
-  Write-Warn2 "ava-tray.exe nao encontrado em $TrayExe — auto-start pulado."
+  Write-Warn2 "ava-tray.exe nao encontrado em $TrayExe - auto-start pulado."
 }
 
-# ── 9. Encerramento ───────────────────────────────────────────────────────────
+# -- 9. Encerramento -----------------------------------------------------------
 Write-Host ''
 Write-Ok "Instalacao concluida ($InstallDir)"
 Write-Info 'Comandos uteis:'
