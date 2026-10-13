@@ -262,6 +262,67 @@ register_playwright_mcp() {
   ok "Playwright MCP registrado e sincronizado."
 }
 
+register_websearch_mcp() {
+  # URL do MCP do websearch (server.py). Se o manager rodar dentro do Docker,
+  # use o nome do serviço (http://websearch:4010/mcp) ou host.docker.internal.
+  local ws_url="${WEBSEARCH_MCP_URL:-http://localhost:4010/mcp}"
+  local payload
+  payload=$(cat <<EOF
+{
+  "name": "websearch",
+  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.",
+  "transport": "http",
+  "url": "$ws_url",
+  "enabled": true,
+  "always_on": false,
+  "examples": {
+    "web_search": [
+      "pesquise na internet sobre",
+      "qual é a notícia mais recente sobre",
+      "busque informações atuais de",
+      "procure na web"
+    ]
+  }
+}
+EOF
+)
+
+  info "Registrando websearch MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  local registered=0 i
+  for i in $(seq 1 24); do
+    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
+         -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$registered" -ne 1 ]; then
+    warn "Não consegui cadastrar o websearch MCP — manager não respondeu em 2 min."
+    warn "Cadastre manualmente depois (dois comandos):"
+    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
+    printf '  curl -X POST %s/servers/websearch/sync\n' "$MCP_MANAGER_URL"
+    return 1
+  fi
+
+  # /sync: exige a memory_api (:3000) de pé E o server.py do websearch
+  # respondendo em $ws_url (o cadastro é lazy; só o sync conecta de fato).
+  local synced=0
+  for i in $(seq 1 12); do
+    if curl -fsS --max-time 120 -X POST "$MCP_MANAGER_URL/servers/websearch/sync" >/dev/null 2>&1; then
+      synced=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$synced" -ne 1 ]; then
+    warn "websearch MCP cadastrado, mas o sync falhou (memory_api ou websearch ainda bootando?)."
+    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/websearch/sync"
+    return 1
+  fi
+  ok "websearch MCP registrado e sincronizado."
+}
+
 # ── 6. Build + first up ───────────────────────────────────────────────────────
 if [ "$SKIP_BUILD" -eq 0 ]; then
   info "Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)..."
@@ -272,6 +333,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
   # Registro do Playwright MCP — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
+  register_websearch_mcp || true
 
   # Espera o /status do orchestrator (1º boot baixa Supertonic do HF)
   STATUS_URL="http://localhost:9000/status"

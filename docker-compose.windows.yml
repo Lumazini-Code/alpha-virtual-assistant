@@ -41,6 +41,11 @@ services:
       PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
       PROCESS_MANAGER_URL: "http://host.docker.internal:9001"
       AVA_CDP_ENDPOINT: "http://host.docker.internal:9222"
+      # Servidores MCP http cadastrados como http://localhost:PORTA pela
+      # TUI no HOST — dentro do container "localhost" é o próprio container.
+      # O mcp_manager reescreve localhost/127.0.0.1 → host.docker.internal
+      # (porta e path preservados) no momento da conexão.
+      AVA_LOCALHOST_REWRITE: "http://host.docker.internal"
 
     # ── DBs da memory em volume nomeado (fs Linux da VM) ──
     # SQLite + WAL sobre o bind mount do Docker Desktop (drvfs/9p) não é

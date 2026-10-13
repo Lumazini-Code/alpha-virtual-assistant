@@ -54,4 +54,4 @@ Modules/.playwright-mcp
 
 resource/Alpha icon.xcf
 
-*.lock
+Modules/mcp_manager/target

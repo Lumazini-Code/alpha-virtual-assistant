@@ -9,12 +9,26 @@ import { spawnPlanRecorder } from "../lib/planRecorder.js";
 import {
   listMCPServers,
   installMCPServer,
+  registerMCPServer,
   deleteMCPServer,
+  isValidServerName,
+  serverNameFromUrl,
+  serverNameFromCommand,
+  splitArgs,
   type MCPServerEntry,
 } from "../lib/mcpServers.js";
 
 type View = "menu" | "plans" | "edit" | "record" | "mcp" | "mcp-install" | "mcp-delete";
-type MCPInstallStage = "package" | "summary" | "installing" | "done" | "error";
+type MCPInstallKind = "npm" | "http" | "stdio";
+type MCPInstallStage =
+  | "type" // escolha: pacote npm / URL externa / comando stdio
+  | "target" // pkg npm | url http(s) | comando do executável
+  | "args" // (stdio) argumentos do comando
+  | "name" // (http/stdio) nome do servidor (Enter aceita sugestão)
+  | "summary" // descrição opcional → Enter registra
+  | "installing"
+  | "done"
+  | "error";
 type MCPDeletePhase = "list" | "confirm" | "deleting" | "done" | "error";
 type EditStage = "name" | "description" | "saving" | "saved" | "error";
 type RecordPhase = "input" | "running" | "result";
@@ -64,9 +78,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const [mcpServers, setMcpServers] = useState<MCPServerEntry[]>([]);
   const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpError, setMcpError] = useState<string | null>(null);
-  const [mcpPkg, setMcpPkg] = useState("");
+  const [mcpInstallKind, setMcpInstallKind] = useState<MCPInstallKind>("npm");
+  const [mcpInstallStage, setMcpInstallStage] = useState<MCPInstallStage>("type");
+  const [mcpTarget, setMcpTarget] = useState(""); // pacote npm | url | comando
+  const [mcpArgs, setMcpArgs] = useState(""); // args do comando (stdio)
+  const [mcpName, setMcpName] = useState(""); // nome do servidor (vazio = deriva)
   const [mcpSummary, setMcpSummary] = useState("");
-  const [mcpInstallStage, setMcpInstallStage] = useState<MCPInstallStage>("package");
   const [mcpInstallResult, setMcpInstallResult] = useState<string | null>(null);
   const [mcpDeleting, setMcpDeleting] = useState<MCPServerEntry | null>(null);
   const [mcpDeletePhase, setMcpDeletePhase] = useState<MCPDeletePhase>("list");
@@ -183,37 +200,131 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     void loadMCPServers();
   }, [loadMCPServers]);
 
-  const startInstall = useCallback(async () => {
-    const pkg = mcpPkg.trim();
-    if (!pkg) return;
+  const resetInstallWizard = useCallback(() => {
+    setMcpInstallKind("npm");
+    setMcpInstallStage("type");
+    setMcpTarget("");
+    setMcpArgs("");
+    setMcpName("");
+    setMcpSummary("");
+    setMcpInstallResult(null);
+  }, []);
+
+  const beginInstall = useCallback((kind: MCPInstallKind) => {
+    setMcpInstallKind(kind);
+    setMcpInstallStage("target");
+    setMcpTarget("");
+    setMcpArgs("");
+    setMcpName("");
+    setMcpSummary("");
+    setMcpInstallResult(null);
+  }, []);
+
+  /**
+   * Submissão final: valida o cadastro conforme o tipo escolhido e
+   * despacha para o mcp_manager (:4008).
+   *   npm   → POST /servers/install (backend deriva o nome do pacote)
+   *   http  → POST /servers {transport:"http", url}  (externa ou localhost)
+   *   stdio → POST /servers {transport:"stdio", command, args}
+   * Nos dois casos manuais, o nome vem do usuário (ou derivado da
+   * URL/comando) e o sync de tools roda logo em seguida.
+   */
+  const submitInstall = useCallback(async () => {
     setMcpInstallStage("installing");
     setMcpInstallResult(null);
     try {
-      const res = await installMCPServer({
-        package: pkg,
-        ...(mcpSummary.trim() ? { skill_summary: mcpSummary.trim() } : {}),
-      });
-      logger.info("settings: MCP instalado", { name: res.name, synced: res.synced });
+      let result: { name: string; synced: number };
+      if (mcpInstallKind === "npm") {
+        const pkg = mcpTarget.trim();
+        if (!pkg) {
+          setMcpInstallStage("target");
+          return;
+        }
+        result = await installMCPServer({
+          package: pkg,
+          ...(mcpSummary.trim() ? { skill_summary: mcpSummary.trim() } : {}),
+        });
+      } else {
+        const name =
+          mcpName.trim() ||
+          (mcpInstallKind === "http" ? serverNameFromUrl(mcpTarget) : serverNameFromCommand(mcpTarget));
+        if (!isValidServerName(name)) {
+          setMcpInstallResult(
+            "nome inválido — use apenas letras, números, hífen ou underline (sem '__')",
+          );
+          setMcpInstallStage("error");
+          return;
+        }
+        if (mcpInstallKind === "http") {
+          result = await registerMCPServer({
+            name,
+            transport: "http",
+            url: mcpTarget.trim(),
+            ...(mcpSummary.trim() ? { skill_summary: mcpSummary.trim() } : {}),
+          });
+        } else {
+          result = await registerMCPServer({
+            name,
+            transport: "stdio",
+            command: mcpTarget.trim(),
+            args: splitArgs(mcpArgs),
+            ...(mcpSummary.trim() ? { skill_summary: mcpSummary.trim() } : {}),
+          });
+        }
+      }
+      logger.info("settings: MCP registrado", { kind: mcpInstallKind, ...result });
       setMcpInstallResult(
-        `✓ ${res.name} instalado — ${res.synced} tool(s) sincronizadas no grafo`,
+        `✓ ${result.name} registrado — ${result.synced} tool(s) sincronizadas no grafo`,
       );
       setMcpInstallStage("done");
       void loadMCPServers();
       // volta pra lista após um instante, pra leitura do resultado
       if (backTimerRef.current) clearTimeout(backTimerRef.current);
       backTimerRef.current = setTimeout(() => {
-        setMcpInstallStage("package");
-        setMcpPkg("");
-        setMcpSummary("");
+        resetInstallWizard();
         setView("mcp");
       }, 2500);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.warn("settings: POST /servers/install falhou", { message: msg });
+      logger.warn("settings: falha ao registrar MCP", { kind: mcpInstallKind, message: msg });
       setMcpInstallResult(msg);
       setMcpInstallStage("error");
     }
-  }, [mcpPkg, mcpSummary, loadMCPServers]);
+  }, [mcpInstallKind, mcpTarget, mcpName, mcpArgs, mcpSummary, loadMCPServers, resetInstallWizard]);
+
+  /** Validação por etapa — em erro, cai direto em "error" (Esc volta). */
+  const advanceFromTarget = useCallback(() => {
+    const t = mcpTarget.trim();
+    if (!t) return;
+    if (mcpInstallKind === "npm") {
+      setMcpInstallStage("summary");
+      return;
+    }
+    if (mcpInstallKind === "http") {
+      if (!/^https?:\/\//i.test(t) || /\s/.test(t)) {
+        setMcpInstallResult("URL inválida — comece com http:// ou https:// (sem espaços)");
+        setMcpInstallStage("error");
+        return;
+      }
+      setMcpInstallStage("name");
+      return;
+    }
+    // stdio
+    setMcpInstallStage("args");
+  }, [mcpInstallKind, mcpTarget]);
+
+  /** Enter no campo de nome (http/stdio): vazio deriva da URL/comando. */
+  const advanceFromName = useCallback(() => {
+    const t = mcpName.trim();
+    if (t && !isValidServerName(t)) {
+      setMcpInstallResult(
+        "nome inválido — use apenas letras, números, hífen ou underline (sem '__')",
+      );
+      setMcpInstallStage("error");
+      return;
+    }
+    setMcpInstallStage("summary");
+  }, [mcpName]);
 
   const confirmDelete = useCallback(async () => {
     if (!mcpDeleting) return;
@@ -284,9 +395,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     } else if (view === "mcp") setView("menu");
     else if (view === "mcp-install") {
       if (mcpInstallStage === "installing") return; // não interrompe instalação
-      setView("mcp");
-      setMcpInstallStage("package");
-      setMcpInstallResult(null);
+      if (mcpInstallStage === "type") {
+        setView("mcp");
+        setMcpInstallResult(null);
+      } else {
+        resetInstallWizard();
+      }
     } else if (view === "mcp-delete") {
       setView("mcp");
       setMcpDeletePhase("list");
@@ -445,24 +559,21 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
           {mcpLoading && <Text color={COLORS.dim}>carregando servidores…</Text>}
           {mcpError && <Text color={COLORS.red}>✗ {mcpError}</Text>}
           {!mcpLoading && !mcpError && mcpServers.length === 0 && (
-            <Text color={COLORS.dim}>nenhum servidor instalado — use "Instalar servidor MCP"</Text>
+            <Text color={COLORS.dim}>nenhum servidor adicionado — use "Adicionar servidor MCP"</Text>
           )}
           {mcpServers.length > 0 && (
             <SelectInput<string | MCPServerEntry>
               items={[
-                { label: "⤓  Instalar servidor MCP (pacote npm)", value: "install" },
+                { label: "⤓  Adicionar servidor MCP (npm · URL · stdio)", value: "install" },
                 ...mcpServers.map((s) => ({
-                  label: `☐  ${s.name} · ${s.tools} tool(s)` + (s.enabled ? "" : " · desabilitado"),
+                  label: `☐  ${s.name} · ${s.transport} · ${s.tools} tool(s)` + (s.enabled ? "" : " · desabilitado"),
                   value: s,
                 })),
                 { label: "↩  Voltar (Esc)", value: "back" },
               ]}
               onSelect={(item) => {
                 if (item.value === "install") {
-                  setMcpPkg("");
-                  setMcpSummary("");
-                  setMcpInstallStage("package");
-                  setMcpInstallResult(null);
+                  resetInstallWizard();
                   setView("mcp-install");
                 } else if (item.value !== "back") {
                   setMcpDeleting(item.value as MCPServerEntry);
@@ -476,15 +587,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
           {mcpServers.length === 0 && !mcpLoading && !mcpError && (
             <SelectInput<string>
               items={[
-                { label: "⤓  Instalar servidor MCP (pacote npm)", value: "install" },
+                { label: "⤓  Adicionar servidor MCP (npm · URL · stdio)", value: "install" },
                 { label: "↩  Voltar (Esc)", value: "back" },
               ]}
               onSelect={(item) => {
                 if (item.value === "install") {
-                  setMcpPkg("");
-                  setMcpSummary("");
-                  setMcpInstallStage("package");
-                  setMcpInstallResult(null);
+                  resetInstallWizard();
                   setView("mcp-install");
                 }
               }}
@@ -495,35 +603,116 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
 
       {view === "mcp-install" && (
         <Box flexDirection="column" marginTop={1}>
-          {mcpInstallStage === "package" && (
+          {mcpInstallStage === "type" && (
             <>
-              <Text>pacote npm: </Text>
+              <Text>tipo de servidor: </Text>
+              <SelectInput<MCPInstallKind>
+                items={[
+                  { label: "⤓  Pacote npm (npx -y <pkg> stdio)", value: "npm" as const },
+                  { label: "🌐  Servidor externo — URL http(s), ex. http://localhost:4010", value: "http" as const },
+                  { label: "⚙   Comando local (stdio) — ex. python / uvx / node", value: "stdio" as const },
+                ]}
+                onSelect={(item) => beginInstall(item.value)}
+              />
+              <Text color={COLORS.dim}>Esc volta</Text>
+            </>
+          )}
+          {mcpInstallStage === "target" && (
+            <>
+              {mcpInstallKind === "npm" && (
+                <>
+                  <Text>pacote npm: </Text>
+                  <TextInput
+                    value={mcpTarget}
+                    onChange={setMcpTarget}
+                    onSubmit={advanceFromTarget}
+                    placeholder="@org/mcp-servidor (ou @org/pkg@versão)"
+                  />
+                  <Text color={COLORS.dim}>Enter p/ descrição · Esc volta</Text>
+                </>
+              )}
+              {mcpInstallKind === "http" && (
+                <>
+                  <Text>URL do servidor: </Text>
+                  <TextInput
+                    value={mcpTarget}
+                    onChange={setMcpTarget}
+                    onSubmit={advanceFromTarget}
+                    placeholder="https://… ou http://localhost:4010/mcp"
+                  />
+                  <Text color={COLORS.dim}>Enter p/ nome · Esc volta</Text>
+                </>
+              )}
+              {mcpInstallKind === "stdio" && (
+                <>
+                  <Text>comando: </Text>
+                  <TextInput
+                    value={mcpTarget}
+                    onChange={setMcpTarget}
+                    onSubmit={advanceFromTarget}
+                    placeholder="python / uvx / node / npx …"
+                  />
+                  <Text color={COLORS.dim}>Enter p/ argumentos · Esc volta</Text>
+                </>
+              )}
+            </>
+          )}
+          {mcpInstallStage === "args" && (
+            <>
+              <Text color={COLORS.dim}>comando: {mcpTarget}</Text>
+              <Text>argumentos: </Text>
               <TextInput
-                value={mcpPkg}
-                onChange={setMcpPkg}
-                onSubmit={() => setMcpInstallStage("summary")}
-                placeholder="@org/mcp-servidor (ou @org/pkg@versão)"
+                value={mcpArgs}
+                onChange={setMcpArgs}
+                onSubmit={() => setMcpInstallStage("name")}
+                placeholder="--flag valor … (aspas agrupam; Enter vazio segue)"
+              />
+              <Text color={COLORS.dim}>Enter p/ nome · Esc volta</Text>
+            </>
+          )}
+          {mcpInstallStage === "name" && (
+            <>
+              <Text color={COLORS.dim}>
+                {mcpInstallKind === "http" ? `url: ${mcpTarget}` : `comando: ${mcpTarget}${mcpArgs ? ` ${mcpArgs}` : ""}`}
+              </Text>
+              <Text>nome do servidor: </Text>
+              <TextInput
+                value={mcpName}
+                onChange={setMcpName}
+                onSubmit={advanceFromName}
+                placeholder={
+                  mcpInstallKind === "http"
+                    ? `${serverNameFromUrl(mcpTarget)} (Enter aceita)`
+                    : `${serverNameFromCommand(mcpTarget)} (Enter aceita)`
+                }
               />
               <Text color={COLORS.dim}>Enter p/ descrição · Esc volta</Text>
             </>
           )}
           {(mcpInstallStage === "summary" || mcpInstallStage === "installing" || mcpInstallStage === "done" || mcpInstallStage === "error") && (
             <>
-              <Text color={COLORS.dim}>pacote: {mcpPkg}</Text>
+              <Text color={COLORS.dim}>
+                {mcpInstallKind === "npm" && `pacote: ${mcpTarget}`}
+                {mcpInstallKind === "http" && `url: ${mcpTarget} · nome: ${mcpName || serverNameFromUrl(mcpTarget)}`}
+                {mcpInstallKind === "stdio" &&
+                  `comando: ${mcpTarget}${mcpArgs ? ` ${mcpArgs}` : ""} · nome: ${mcpName || serverNameFromCommand(mcpTarget)}`}
+              </Text>
               {mcpInstallStage === "summary" && (
                 <>
                   <Text>descrição (opcional): </Text>
                   <TextInput
                     value={mcpSummary}
                     onChange={setMcpSummary}
-                    onSubmit={() => void startInstall()}
-                    placeholder="para que serve (Enter instala)"
+                    onSubmit={() => void submitInstall()}
+                    placeholder="para que serve (Enter registra)"
                   />
-                  <Text color={COLORS.dim}>Enter instala · Esc volta</Text>
+                  <Text color={COLORS.dim}>Enter registra + sincroniza · Esc volta</Text>
                 </>
               )}
               {mcpInstallStage === "installing" && (
-                <Text color={COLORS.amber}>▶ instalando e sincronizando (npm + embeddings podem demorar)…</Text>
+                <Text color={COLORS.amber}>
+                  ▶ registrando e sincronizando (sync com embeddings pode demorar)…
+                </Text>
               )}
               {mcpInstallStage === "done" && mcpInstallResult && (
                 <Text color={COLORS.green}>{mcpInstallResult}</Text>
