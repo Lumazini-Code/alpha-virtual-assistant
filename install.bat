@@ -12,7 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-$p = "$env:TEMP\install.ps1" 
+$p = "$env:TEMP\install.ps1"
 [IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8), (New-Object Text.UTF8Encoding $true))
 powershell -NoProfile -ExecutionPolicy Bypass -File $p
 

@@ -22,7 +22,9 @@ Uso:
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
+import os
 import re
 import sys
 import time
@@ -49,7 +51,10 @@ from supertonic import TTS
 DEFAULT_VOICE    = "M1"
 DEFAULT_LANG     = "pt"
 SAMPLE_RATE      = 48000
-NUM_WORKERS      = 3
+# 1 worker = 1 cópia do Supertonic (~470MB de pesos+arena). A fila de fala é
+# sequencial de qualquer forma (sentenças em ordem), então workers extras
+# só multiplicam RAM sem ganho perceptível. Antes: 3 → ~1.4GB de RSS.
+NUM_WORKERS      = max(1, int(os.getenv("TTS_NUM_WORKERS", "1")))
 WORKER_TIMEOUT   = 30.0
 
 # Playback
@@ -560,6 +565,11 @@ class TTSWorker(threading.Thread):
             finally:
                 done_event.set()
                 self._task_q.task_done()
+                # Devolve buffers do ORT/numpy ao OS na hora (padrão do watchdog)
+                try:
+                    _libc.malloc_trim(0)
+                except Exception:
+                    pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -689,6 +699,31 @@ class VoicesResponse(BaseModel):
     default: str
 
 
+def _malloc_trim_watchdog(interval_s: float = 60.0) -> None:
+    """Thread daemon: devolve ao OS o heap glibc liberado pelo free().
+
+    Medição real no container: após sintetizar e liberar sessões ORT, ~305MB
+    ficavam presos em arenas glibc (free() não devolve ao OS exceto nas pontas
+    do heap). malloc_trim(0) devolve — TTS idle cai de ~530MB para ~120MB."""
+    global _libc
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except Exception:
+        _libc = None
+        return
+
+    def _loop():
+        while True:
+            time.sleep(interval_s)
+            try:
+                _libc.malloc_trim(0)
+            except Exception:
+                return
+
+    threading.Thread(target=_loop, daemon=True, name="malloc-trim").start()
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # LIFESPAN
 # ════════════════════════════════════════════════════════════════════════════
@@ -696,6 +731,8 @@ class VoicesResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA TTS API...")
+
+    _malloc_trim_watchdog()
 
     state.player = HeapPlayer()
     state.player.start()

@@ -21,7 +21,6 @@ services:
 
     environment:
       AVA_DEBUG: ""
-      AVA_N_GPU_LAYERS: "99"
       ONNX_PROVIDERS: "CPUExecutionProvider"
       PYTHONUNBUFFERED: "1"
       HF_HOME: "/root/.cache/huggingface"
@@ -43,7 +42,6 @@ services:
   searxng:
     image: searxng/searxng:latest
     container_name: ava-searxng
-    restart: unless-stopped
     volumes:
       - ./resource/searxng/settings.yml:/etc/searxng/settings.yml:ro
     ports:
@@ -54,7 +52,6 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     container_name: ava-valkey
-    restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
@@ -64,7 +61,6 @@ services:
   crawl4ai:
     image: unclecode/crawl4ai:latest
     container_name: ava-crawl4ai
-    restart: unless-stopped
     shm_size: 1g
     ports:
       - "127.0.0.1:11235:11235"
@@ -78,9 +74,11 @@ services:
       dockerfile: Dockerfile
     image: ava-websearch-mcp:latest
     container_name: ava-websearch-mcp
-    restart: unless-stopped
     volumes:
       - ./resource:/app/resource:ro
+      # Socket do Docker — crawl4ai on-demand (sobe/para quando o fetch
+      # estático não resolve; com TTL de inatividade economiza ~490MB de RAM)
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "127.0.0.1:4010:4010"
     environment:

@@ -37,6 +37,7 @@ import os
 import io
 import base64
 import logging
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -89,11 +90,26 @@ def _env_bool(name: str, default: bool) -> bool:
 # memory.py — onde o dicionário visual (e a memória normal) é lido/escrito
 MEMORY_API_URL = _env_str("VISION_MEMORY_API_URL", "http://localhost:3001")
 
+# Componentes carregados: "all" (default) ou CSV — ex.: "depth,sam,embedder,faces".
+# Desligar um componente aqui NUNCA carrega seus modelos (~410MB no total do
+# pipeline de objetos): os endpoints que dependem dele respondem 503 com
+# mensagem clara. Em PCs fracos, ex.: VISION_ENABLED=faces (só reconhecimento
+# facial) ou VISION_ENABLED=faces,embedder (sem segmentação por profundidade).
+VISION_ENABLED_RAW = _env_str("VISION_ENABLED", "all")
+
+def _enabled(name: str) -> bool:
+    if VISION_ENABLED_RAW.strip().lower() in ("", "all"):
+        return True
+    parts = {p.strip().lower() for p in VISION_ENABLED_RAW.split(",") if p.strip()}
+    return name in parts
+
 # Modelos — caminhos default assumem uma pasta ./models ao lado deste arquivo.
 # Todos são opcionais: se o arquivo não existir, o componente correspondente
 # fica "indisponível" e o /vision/process retorna 503 (sem derrubar a API).
 DEPTH_MODEL_PATH = _env_str("VISION_DEPTH_MODEL_PATH", "./Models/depth_anything_v2_small_FP32.onnx")
 DEPTH_INPUT_SIZE = _env_int("VISION_DEPTH_INPUT_SIZE", 518)  # padrão da exportação oficial DA-V2
+DEPTH_INT8_MODEL_PATH = _env_str("VISION_DEPTH_INT8_MODEL_PATH", "./Models/depth_anything_v2_small_int8.onnx")
+DEPTH_AUTO_QUANTIZE  = _env_bool("VISION_DEPTH_AUTO_QUANTIZE", True)
 
 EDGESAM_ENCODER_PATH = _env_str("VISION_EDGESAM_ENCODER_PATH", "./Models/EdgeSAM/edge_sam_3x_encoder.onnx")
 EDGESAM_DECODER_PATH = _env_str("VISION_EDGESAM_DECODER_PATH", "./Models/EdgeSAM/edge_sam_3x_decoder.onnx")
@@ -116,8 +132,11 @@ DINOV3_INPUT_SIZE      = _env_int("VISION_DINOV3_INPUT_SIZE", 224)
 USE_INT8_EMBEDDER      = _env_bool("VISION_USE_INT8_EMBEDDER", True)
 AUTO_QUANTIZE          = _env_bool("VISION_AUTO_QUANTIZE", True)
 
-# CPU tuning — onnxruntime
-CPU_THREADS = _env_int("VISION_CPU_THREADS", max(1, os.cpu_count() or 4))
+# CPU tuning — onnxruntime.
+# Default com teto de 4: sessões de visão com intra-op = todos os cores
+# multiplicavam o spike de CPU no boot e disputavam thread com os outros
+# 7 serviços Python. Aumente via env em máquinas boas.
+CPU_THREADS = _env_int("VISION_CPU_THREADS", min(4, max(1, os.cpu_count() or 4)))
 
 # Clusterização por profundidade
 N_DEPTH_LAYERS   = _env_int("VISION_N_DEPTH_LAYERS", 4)
@@ -184,8 +203,12 @@ def _make_ort_session(model_path: str, threads: int) -> ort.InferenceSession:
     so.inter_op_num_threads   = 1
     so.execution_mode         = ort.ExecutionMode.ORT_SEQUENTIAL
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    so.enable_mem_pattern    = True
-    so.enable_cpu_mem_arena  = True
+    # Arena CPU do ORT com extend power-of-two cresce até o pico histórico e
+    # nunca encolhe (mesmo bug medido no onnxManager: +850MB permanentes).
+    # Arena off + mem_pattern off mantêm o RSS estável com shapes variáveis.
+    so.enable_mem_pattern    = False
+    so.enable_cpu_mem_arena  = False
+    so.arena_extend_strategy = ort.ArenaExtendStrategy.kSameAsRequested
     return ort.InferenceSession(model_path, sess_options=so, providers=["CPUExecutionProvider"])
 
 
@@ -1159,6 +1182,55 @@ class VisionAppState:
 
 state = VisionAppState()
 
+# ── Lazy loading dos modelos pesados ─────────────────────────────────────────
+# O pipeline de objetos (depth+SAM+DINOv3) somava ~410MB de RSS carregado no
+# boot MESMO sem nenhuma request de visão. Agora carregam na 1ª request que
+# os usa (_ensure_pipeline); faces são baratos (~60MB) e continuam no boot
+# porque o reconhecimento é sensível a latência.
+
+_lazy_lock = threading.Lock()
+
+def _ensure_embedder() -> None:
+    """Carrega só o DINOv3 (usado por /vision/register)."""
+    if state.embedder is not None:
+        return
+    with _lazy_lock:
+        if state.embedder is not None:
+            return
+        if _enabled("embedder"):
+            dinov3_path, dinov3_is_int8 = _ensure_quantized(
+                DINOV3_FP32_MODEL_PATH, DINOV3_INT8_MODEL_PATH
+            )
+            state.embedder = DinoV3Embedder(
+                dinov3_path, DINOV3_INPUT_SIZE, CPU_THREADS, is_int8=dinov3_is_int8
+            )
+        else:
+            log.info("[LAZY] embedder (DINOv3) desativado via VISION_ENABLED")
+
+
+def _ensure_pipeline() -> None:
+    """Carrega depth+sam+embedder na 1ª /vision/process (thread-safe)."""
+    if state.depth is not None and state.sam is not None:
+        return _ensure_embedder()
+    with _lazy_lock:
+        if state.depth is None:
+            if _enabled("depth"):
+                depth_path, depth_is_int8 = (
+                    _ensure_quantized(DEPTH_MODEL_PATH, DEPTH_INT8_MODEL_PATH)
+                    if DEPTH_AUTO_QUANTIZE else (DEPTH_MODEL_PATH, False)
+                )
+                state.depth = DepthEstimator(depth_path, DEPTH_INPUT_SIZE, CPU_THREADS)
+            else:
+                log.info("[LAZY] depth desativado via VISION_ENABLED")
+        if state.sam is None:
+            if _enabled("sam"):
+                state.sam = EdgeSAMSegmenter(
+                    EDGESAM_ENCODER_PATH, EDGESAM_DECODER_PATH, EDGESAM_INPUT_SIZE, CPU_THREADS
+                )
+            else:
+                log.info("[LAZY] sam desativado via VISION_ENABLED")
+    _ensure_embedder()
+
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
@@ -1166,12 +1238,7 @@ state = VisionAppState()
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Vision API...")
 
-    state.depth     = DepthEstimator(DEPTH_MODEL_PATH, DEPTH_INPUT_SIZE, CPU_THREADS)
     state.clusterer = DepthClusterer()
-    state.sam       = EdgeSAMSegmenter(EDGESAM_ENCODER_PATH, EDGESAM_DECODER_PATH, EDGESAM_INPUT_SIZE, CPU_THREADS)
-
-    dinov3_path, dinov3_is_int8 = _ensure_quantized(DINOV3_FP32_MODEL_PATH, DINOV3_INT8_MODEL_PATH)
-    state.embedder = DinoV3Embedder(dinov3_path, DINOV3_INPUT_SIZE, CPU_THREADS, is_int8=dinov3_is_int8)
 
     state.dict_client = MemoryDictClient(MEMORY_API_URL)
     try:
@@ -1183,16 +1250,20 @@ async def lifespan(app: FastAPI):
             f"/vision/process vai falhar ao consultar o dicionário até ele subir"
         )
 
-    # ── NEW: Reconhecimento facial ──
-    state.face_detector    = FaceDetector(FACE_DETECTOR_MODEL_PATH, FACE_DET_SCORE_THRESH, FACE_DET_NMS_THRESH, FACE_DET_TOP_K)
-    state.face_embedder    = EdgeFaceEmbedder(EDGEFACE_MODEL_PATH, EDGEFACE_INPUT_SIZE, CPU_THREADS)
+    # ── Reconhecimento facial — barato (~60MB), carrega no boot ──
+    if _enabled("faces"):
+        state.face_detector    = FaceDetector(FACE_DETECTOR_MODEL_PATH, FACE_DET_SCORE_THRESH, FACE_DET_NMS_THRESH, FACE_DET_TOP_K)
+        state.face_embedder    = EdgeFaceEmbedder(EDGEFACE_MODEL_PATH, EDGEFACE_INPUT_SIZE, CPU_THREADS)
+    else:
+        log.info("[LAZY] faces desativados via VISION_ENABLED")
     state.face_dict_client = FaceDictClient(MEMORY_API_URL)
 
     log.info(
-        f"Pronto — depth={state.depth.available} sam={state.sam.available} "
-        f"embedder={state.embedder.available} (modelo={state.embedder.model_path_used}) "
-        f"face_detector={state.face_detector.available} face_embedder={state.face_embedder.available} "
-        f"threads_cpu={CPU_THREADS}"
+        f"Pronto — enabled={VISION_ENABLED_RAW} "
+        f"face_detector={state.face_detector.available if state.face_detector else 'off'} "
+        f"face_embedder={state.face_embedder.available if state.face_embedder else 'off'} "
+        f"threads_cpu={CPU_THREADS} "
+        f"(depth/sam/embedder carregam sob demanda na 1ª /vision/process)"
     )
     yield
 
@@ -1369,6 +1440,9 @@ async def vision_process(req: VisionProcessRequest):
     que fazer com objetos ambíguos (`ambiguous=True`, sem candidato
     confiável) é do orquestrador externo.
     """
+    # Lazy: carrega depth+sam+embedder na 1ª request (componentes desativados
+    # via VISION_ENABLED ficam None e caem no guard 503 abaixo).
+    _ensure_pipeline()
     missing = [
         name for name, comp in (
             ("depth", state.depth), ("edgesam", state.sam), ("dinov3", state.embedder),
@@ -1503,6 +1577,7 @@ async def vision_register(req: VisionRegisterRequest):
     um embedding de exemplo se já existir (reconhecimento mais robusto a
     ângulo/luz diferentes).
     """
+    _ensure_embedder()
     if state.embedder is None or not state.embedder.available:
         raise HTTPException(status_code=503, detail="Modelo DINOv3 não carregado")
 

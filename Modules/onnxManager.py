@@ -17,11 +17,13 @@ Optimizations:
 
 from __future__ import annotations
 
+import ctypes
 import os
 import time
 import asyncio
 import logging
 import concurrent.futures
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +31,7 @@ from typing import Optional
 
 import numpy as np
 import onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -39,27 +42,44 @@ except ImportError:
     HAS_TOKENIZERS = False
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+# Tudo por env para trocar modelo/afinar consumo SEM rebuild: basta reiniciar
+# o container (Modules/ é montado por volume).
 
-# Embedding model (multilingual-e5-small)
-EMBED_MODEL_PATH   = "./Models/multilingual-e5-small/multilingual-e5-small.onnx"
-EMBED_TOKENIZER    = "./Models/multilingual-e5-small/tokenizer.json"
-EMBED_MAX_LENGTH   = 128
-EMBED_DIM          = 384
-EMBED_THREADS      = 4
+# Embedding model — troca de modelo não requer mudança de código: aponte
+# ONNX_EMBED_MODEL_PATH/ONNX_EMBED_TOKENIZER/ONNX_EMBED_DIM pro novo modelo.
+# Candidatas com recall melhor que o e5-small (testar com rebuild_indices.py):
+#   - intfloat/multilingual-e5-base   (278M, dim 768, int8 ≈ 280MB)
+#   - Alibaba-NLP/gte-multilingual-base (305M, dim 768)
+#   - BAAI/bge-m3 (568M, dim 1024) — só em máquina boa
+EMBED_MODEL_PATH   = os.getenv("ONNX_EMBED_MODEL_PATH",  "./Models/multilingual-e5-small/multilingual-e5-small.onnx")
+EMBED_TOKENIZER    = os.getenv("ONNX_EMBED_TOKENIZER", "./Models/multilingual-e5-small/tokenizer.json")
+EMBED_MAX_LENGTH   = max(32, int(os.getenv("ONNX_EMBED_MAX_LENGTH", "128")))
+EMBED_DIM          = int(os.getenv("ONNX_EMBED_DIM", "384"))
+EMBED_THREADS      = max(1, int(os.getenv("ONNX_EMBED_THREADS", "2")))
+# Teto de textos por chamada de inferência. A arena do ORT cresce com o batch
+# e com workers concorrentes (medido: 3 batches de 128 → +850MB que não voltam).
+# Chunkar aqui bounda o pico sem mudar a API.
+EMBED_MAX_BATCH    = max(8, int(os.getenv("ONNX_EMBED_MAX_BATCH", "64")))
+# Quantização int8 automática (fp32 → ~25% do tamanho). Mesmo padrão do
+# vision.py (_ensure_quantized): quantiza na 1ª execução e cacheia o arquivo.
+ONNX_EMBED_AUTO_QUANTIZE = os.getenv("ONNX_EMBED_AUTO_QUANTIZE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Reranker model (ms-marco-MiniLM-L-6-v2)
 RERANK_MODEL_PATH  = "./Models/ms-marco-MiniLM-L-6-v2/ms-marco-MiniLM-L-6-v2.onnx"
 RERANK_TOKENIZER   = "./Models/ms-marco-MiniLM-L-6-v2/tokenizer.json"
 RERANK_MAX_LENGTH  = 512
-RERANK_THREADS     = 2
+RERANK_THREADS     = max(1, int(os.getenv("ONNX_RERANK_THREADS", "2")))
+RERANK_MAX_BATCH   = max(8, int(os.getenv("ONNX_RERANK_MAX_BATCH", "32")))
 
 # Server
 SERVER_HOST        = "0.0.0.0"
 SERVER_PORT        = 2002
 
-# Thread pools — isolate embedding and reranker workloads
-EMBED_POOL_WORKERS = 4
-RERANK_POOL_WORKERS = 2
+# Thread pools — isolate embedding and reranker workloads.
+# 4 workers × sessão intra-op concorrente era o que explodia a arena + arenas
+# glibc; 2 já dão paralelismo suficiente para query + indexação.
+EMBED_POOL_WORKERS  = max(1, int(os.getenv("ONNX_EMBED_POOL_WORKERS", "2")))
+RERANK_POOL_WORKERS = max(1, int(os.getenv("ONNX_RERANK_POOL_WORKERS", "1")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONNX Manager] %(message)s")
 log = logging.getLogger("ava.onnx_serving")
@@ -156,19 +176,86 @@ class TokenizerWrapper:
         }
 
 
+# ── Session options (memória) ─────────────────────────────────────────────────
+
+def _memory_opts(intra: int, inter: int) -> ort.SessionOptions:
+    """SessionOptions com tuning de memória.
+
+    O default do ORT (arena CPU ativada + extend power-of-two) faz o RSS
+    crescer até o PICO histórico e nunca voltar (medido: +850MB após 3
+    batches de 128 textos). Aqui:
+      - arena desativada → cada run aloca/desaloca direto (heap glibc, que
+        o malloc_trim watchdog devolve ao OS);
+      - mem_pattern off → não cacheia plano por shape (batches variam);
+      - intra/inter-op baixos → menos buffers intermediários e menos
+        threads concorrentes na mesma sessão.
+    Custo: ~5-10% mais lento por run; ganho: RSS estável sob uso prolongado.
+    """
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads     = intra
+    opts.inter_op_num_threads     = inter
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.enable_cpu_mem_arena     = False
+    opts.arena_extend_strategy    = ort.ArenaExtendStrategy.kSameAsRequested
+    opts.enable_mem_pattern       = False
+    return opts
+
+
+def _malloc_trim_watchdog(interval_s: float = 60.0) -> None:
+    """Thread daemon: devolve ao OS o heap glibc liberado pelo free().
+
+    glibc mantém memória free()da no heap do processo (brk/mmap trimming só
+    acontece nas pontas). malloc_trim(0) força a devolução — essencial aqui
+    porque os runs do ORT + numpy geram picos repetidos de alocação."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        return
+
+    def _loop():
+        while True:
+            time.sleep(interval_s)
+            try:
+                libc.malloc_trim(0)
+            except Exception:
+                return
+
+    threading.Thread(target=_loop, daemon=True, name="malloc-trim").start()
+
+
+def _ensure_quantized(fp32_path: str) -> tuple[str, bool]:
+    """Retorna (caminho_a_usar, usou_int8). Quantiza int8 na 1ª execução e
+    cacheia ao lado do fp32 (`<nome>_int8.onnx`). Mesmo padrão do vision.py."""
+    if not ONNX_EMBED_AUTO_QUANTIZE:
+        return fp32_path, False
+    p = Path(fp32_path)
+    if p.suffix != ".onnx" or "int8" in p.stem.lower():
+        return fp32_path, False
+    int8_path = p.with_name(f"{p.stem}_int8.onnx")
+    if int8_path.exists():
+        return str(int8_path), True
+    try:
+        log.info(f"Quantizando embedding model int8 (uma única vez): {p.name} → {int8_path.name}")
+        quantize_dynamic(fp32_path, str(int8_path), weight_type=QuantType.QInt8)
+        log.info(f"Modelo int8 salvo: {int8_path} ({int8_path.stat().st_size // (1024*1024)} MB)")
+        return str(int8_path), True
+    except Exception as e:
+        log.warning(f"Falha ao quantizar ({e}) — usando fp32")
+        return fp32_path, False
+
+
 # ── Embedding Model ────────────────────────────────────────────────────────────
 
 class EmbeddingModel:
     """ONNX bi-encoder: multilingual-e5-small with mean pooling + L2 norm."""
 
     def __init__(self, model_path: str, tokenizer_path: str):
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads     = EMBED_THREADS
-        opts.inter_op_num_threads     = 2
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts = _memory_opts(EMBED_THREADS, 1)
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        model_path, used_int8 = _ensure_quantized(model_path)
         self._session   = ort.InferenceSession(model_path, opts, providers=providers)
         self._tokenizer = TokenizerWrapper(tokenizer_path, EMBED_MAX_LENGTH)
         self._provider  = self._session.get_providers()[0]
@@ -198,6 +285,15 @@ class EmbeddingModel:
         if prefix:
             texts = [f"{prefix}: {t}" for t in texts]
 
+        # Chunking: bounda o tamanho de cada run do ORT (arena/alocador não
+        # explode com requests grandes) preservando a ordem dos resultados.
+        chunks = [texts[i:i + EMBED_MAX_BATCH] for i in range(0, len(texts), EMBED_MAX_BATCH)]
+        out: list[np.ndarray] = []
+        for chunk in chunks:
+            out.append(self._embed_batch(chunk))
+        return np.concatenate(out, axis=0)
+
+    def _embed_batch(self, texts: list[str]) -> np.ndarray:
         inputs = self._tokenizer.encode_batch(texts)
         ort_inputs: dict = {
             "input_ids":      inputs["input_ids"],
@@ -227,11 +323,7 @@ class RerankerModel:
     """ONNX cross-encoder: ms-marco-MiniLM-L-6-v2 with sigmoid scoring."""
 
     def __init__(self, model_path: str, tokenizer_path: str):
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads     = RERANK_THREADS
-        opts.inter_op_num_threads     = 1
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts = _memory_opts(RERANK_THREADS, 1)
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self._session   = ort.InferenceSession(model_path, opts, providers=providers)
@@ -258,6 +350,12 @@ class RerankerModel:
         if not passages:
             return np.array([], dtype=np.float32)
 
+        # Chunking igual ao embed: bounda cada run do ORT (passages de 256 ×
+        # 512 tokens alocavam centenas de MB por request).
+        chunks = [passages[i:i + RERANK_MAX_BATCH] for i in range(0, len(passages), RERANK_MAX_BATCH)]
+        return np.concatenate([self._score_batch(query, c) for c in chunks]).astype(np.float32)
+
+    def _score_batch(self, query: str, passages: list[str]) -> np.ndarray:
         pairs  = [(query, p) for p in passages]
         inputs = self._tokenizer.encode_pairs(pairs)
 
@@ -407,9 +505,13 @@ async def lifespan(app: FastAPI):
     _ = state.rerank_model.score("warmup", ["test passage"])
     log.info("Warm-up complete")
 
+    # Watchdog de memória: devolve heap glibc ao OS a cada minuto.
+    _malloc_trim_watchdog()
+
     state.start_time = time.time()
     log.info(
-        f"AVA ONNX Serving ready — embed({state.embed_model.provider}) "
+        f"AVA ONNX Serving ready — embed({state.embed_model.provider}, "
+        f"dim={EMBED_DIM}, max_batch={EMBED_MAX_BATCH}) "
         f"+ rerank({state.rerank_model.provider})"
     )
     yield
@@ -545,8 +647,8 @@ async def health():
     uptime = time.time() - state.start_time
     return HealthResponse(
         status         = "ok",
-        embed_model    = "multilingual-e5-small",
-        rerank_model   = "ms-marco-MiniLM-L-6-v2",
+        embed_model    = Path(EMBED_MODEL_PATH).stem,
+        rerank_model   = Path(RERANK_MODEL_PATH).stem,
         embed_provider = state.embed_model.provider if state.embed_model else "N/A",
         rerank_provider= state.rerank_model.provider if state.rerank_model else "N/A",
         uptime_s       = round(uptime, 1),
