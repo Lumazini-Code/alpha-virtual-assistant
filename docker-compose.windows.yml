@@ -26,6 +26,7 @@ services:
       - "9000:9000"
       - "3005:3005"
       - "2001:2001"
+      - "4008:4008"
 
     # Container → serviços do host (tray :9001, Chrome CDP :9222).
     # No Windows/WSL2 `localhost` dentro do container NÃO é o host —
