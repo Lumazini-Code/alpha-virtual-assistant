@@ -12,6 +12,16 @@
 _shutting_down=0
 export ALPHA_ENABLE_GIT=0
 
+# ── Otimização de memória/CPU (onnxManager, TTS, vision) ──────────────────────
+# MALLOC_ARENA_MAX=2 — glibc aloca 1 arena heap por thread; serviços ONNX têm
+#   dezenas de threads e isso inflava o RSS (regiões anônimas fantasma).
+# SUPERTONIC_INTRA_OP_THREADS=2 — o default do ORT usa TODOS os cores por
+#   sessão; com workers + warmup isso causava spike de CPU no boot.
+# OMP_NUM_THREADS — teto de segurança para libs que consultam OpenMP.
+export MALLOC_ARENA_MAX=2
+export SUPERTONIC_INTRA_OP_THREADS=2
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+
 # cwd fixo do Memory Server — isolado do resto do script (nenhum outro `cd`
 # depende dele nem é afetado por ele; ver uso em `restart_on_fail` abaixo).
 MEMORY_API_CWD="/app/Modules/memory"

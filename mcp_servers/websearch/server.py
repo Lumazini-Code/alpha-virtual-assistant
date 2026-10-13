@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -97,6 +98,113 @@ def _load_config() -> dict:
 CFG = _load_config()
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Crawl4AI on-demand — o container (~490MB: Playwright + Chromium) só roda
+# quando o fetch estático não resolve. Sobe/para via socket do Docker montado
+# no compose. CRAWL4AI_ON_DEMAND=0 volta ao comportamento "sempre ligado".
+# ══════════════════════════════════════════════════════════════════════════════
+
+C4_CONTAINER    = os.getenv("CRAWL4AI_CONTAINER", "ava-crawl4ai")
+C4_ON_DEMAND    = os.getenv("CRAWL4AI_ON_DEMAND", "1").strip().lower() in ("1", "true", "yes", "on")
+C4_IDLE_STOP_S  = max(60, int(os.getenv("CRAWL4AI_IDLE_STOP_S", "600")))
+C4_BOOT_TIMEOUT = max(30, int(os.getenv("CRAWL4AI_BOOT_TIMEOUT_S", "120")))
+
+_docker_client: object | None | bool = None   # None=uninit, False=indisponível
+_started_by_us  = False
+_last_crawl_use = 0.0
+_crawl_watchdog: asyncio.Task | None = None
+
+
+def _docker():
+    global _docker_client
+    if _docker_client is False:
+        return None
+    if _docker_client is None:
+        try:
+            import docker
+            _docker_client = docker.from_env()
+        except Exception as e:
+            log.warning(f"Docker SDK indisponível ({e}) — crawl4ai permanece gerenciado manualmente")
+            _docker_client = False
+    return _docker_client or None
+
+
+async def _crawl4ai_healthy() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.get(f"{CFG['crawl4ai']['url']}/health")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _ensure_crawl4ai() -> bool:
+    """Garante o crawl4ai no ar (subindo on-demand se necessário).
+    Retorna True se saudável; False = pipeline segue só com fetch estático."""
+    global _started_by_us, _last_crawl_use
+    _last_crawl_use = time.monotonic()
+    if await _crawl4ai_healthy():
+        return True
+    if not C4_ON_DEMAND:
+        return False
+    d = _docker()
+    if d is None:
+        return False
+    try:
+        c = d.containers.get(C4_CONTAINER)
+        if c.status != "running":
+            log.info(f"[crawl4ai] indisponível — subindo {C4_CONTAINER} on-demand "
+                     f"(1ª vez pode levar até {C4_BOOT_TIMEOUT}s)...")
+            c.start()
+            _started_by_us = True
+        deadline = time.monotonic() + C4_BOOT_TIMEOUT
+        while time.monotonic() < deadline:
+            if await _crawl4ai_healthy():
+                log.info("[crawl4ai] pronto")
+                _schedule_crawl_stop()
+                return True
+            await asyncio.sleep(2)
+        log.warning("[crawl4ai] não ficou saudável dentro do timeout — seguindo sem ele")
+    except Exception as e:
+        log.warning(f"[crawl4ai] falha ao subir container ({e}) — seguindo sem ele")
+    return False
+
+
+async def _stop_crawl4ai() -> None:
+    global _started_by_us
+    try:
+        d = _docker()
+        if d is None:
+            return
+        c = d.containers.get(C4_CONTAINER)
+        if c.status == "running":
+            c.stop(timeout=30)
+            log.info(f"[crawl4ai] parado após {C4_IDLE_STOP_S}s sem uso (economia de RAM)")
+    except Exception as e:
+        log.debug(f"[crawl4ai] stop falhou ({e})")
+    finally:
+        _started_by_us = False
+
+
+def _schedule_crawl_stop() -> None:
+    """Watchdog idempotente: para o container após TTL sem uso — só se NÓS
+    o subimos (não interfere em quem subiu manualmente)."""
+    global _crawl_watchdog
+    if _crawl_watchdog and not _crawl_watchdog.done():
+        return
+
+    async def _watch():
+        while True:
+            await asyncio.sleep(C4_IDLE_STOP_S)
+            if time.monotonic() - _last_crawl_use < C4_IDLE_STOP_S:
+                continue  # houve uso recente — segue esperando
+            if _started_by_us:
+                await _stop_crawl4ai()
+            return
+
+    _crawl_watchdog = asyncio.create_task(_watch())
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Valkey (cache) — degrada com graça se indisponível
@@ -244,6 +352,9 @@ async def _static_fetch(url: str) -> str | None:
 async def _crawl4ai_batch(urls: list[str]) -> dict[str, str]:
     """Lote pro Crawl4AI (navegador reutilizado). Falha individual vira
     ausência no dict retornado — nunca trava o resto do lote."""
+    if not await _ensure_crawl4ai():
+        log.info("[crawl4ai] ausente — batch ignorado (só fetch estático nesta busca)")
+        return {}
     c4 = CFG["crawl4ai"]
     payload = {
         "urls": urls,
