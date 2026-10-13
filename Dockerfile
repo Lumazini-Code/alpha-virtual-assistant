@@ -16,7 +16,4 @@ RUN apt-get install -y curl && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs
 
-
-RUN npm install -g @playwright/mcp
-
 CMD ["/bin/bash", "/app/start.sh"]

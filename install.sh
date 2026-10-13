@@ -209,6 +209,59 @@ fi
 
 ok "OPENROUTER_API_KEY configurada em $ENV_FILE (chmod 600)."
 
+# ── 5b. Registro do Playwright MCP (dependência direta do sistema) ────────────
+# Cadastra o @playwright/mcp no mcp_manager (:4008) logo após o `up` do stack.
+# O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
+# seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
+# retenta; se falhar de vez, só avisa (não aborta a instalação).
+MCP_MANAGER_URL="http://localhost:4008"
+
+register_playwright_mcp() {
+  local payload
+  payload='{
+  "name": "playwright",
+  "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://localhost:9222"],
+  "env": {"DISPLAY": ":0"}
+}'
+
+  info "Registrando Playwright MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  local registered=0 i
+  for i in $(seq 1 24); do
+    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
+         -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$registered" -ne 1 ]; then
+    warn "Não consegui cadastrar o Playwright MCP — manager não respondeu em 2 min."
+    warn "Cadastre manualmente depois (dois comandos):"
+    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
+    printf '  curl -X POST %s/servers/playwright/sync\n' "$MCP_MANAGER_URL"
+    return 1
+  fi
+
+  # /sync: exige a memory_api (:3000) de pé; o 1º sync baixa o pacote npm.
+  local synced=0
+  for i in $(seq 1 12); do
+    if curl -fsS --max-time 240 -X POST "$MCP_MANAGER_URL/servers/playwright/sync" >/dev/null 2>&1; then
+      synced=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$synced" -ne 1 ]; then
+    warn "Playwright MCP cadastrado, mas o sync falhou (memory_api ainda bootando?)."
+    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/playwright/sync"
+    return 1
+  fi
+  ok "Playwright MCP registrado e sincronizado."
+}
+
 # ── 6. Build + first up ───────────────────────────────────────────────────────
 if [ "$SKIP_BUILD" -eq 0 ]; then
   info "Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)..."
@@ -216,6 +269,9 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
   info "Subindo o stack..."
   ./docker-start.sh up -d || die "docker compose up falhou."
+
+  # Registro do Playwright MCP — logo após o up, quando o stack já está carregado.
+  register_playwright_mcp || true
 
   # Espera o /status do orchestrator (1º boot baixa Supertonic do HF)
   STATUS_URL="http://localhost:9000/status"

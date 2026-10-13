@@ -160,6 +160,62 @@ if (Test-ExistingKey) {
 }
 Write-Ok "OPENROUTER_API_KEY configurada em $EnvFile"
 
+# -- 5b. Registro do Playwright MCP (dependencia direta do sistema) -----------
+# Cadastra o @playwright/mcp no mcp_manager (:4008) logo apos o `up` do stack.
+# O POST /servers e upsert idempotente e o /sync tem no-op por doc_hash -
+# seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
+# retenta; se falhar de vez, so avisa (nao aborta a instalacao).
+$McpManagerUrl = 'http://localhost:4008'
+
+function Register-PlaywrightMcp {
+  # No Windows nao ha X server (DISPLAY) e o Chrome CDP roda no host
+  # via host.docker.internal (mesmo endereco do AVA_CDP_ENDPOINT).
+  $payload = @{
+    name           = 'playwright'
+    skill_summary  = 'Automação de navegador (navegar, clicar, extrair conteúdo)'
+    transport      = 'stdio'
+    command        = 'npx'
+    args           = @('-y', '@playwright/mcp@latest', '--cdp-endpoint', 'http://host.docker.internal:9222')
+  } | ConvertTo-Json -Depth 3
+
+  Write-Info "Registrando Playwright MCP no mcp_manager ($McpManagerUrl)..."
+  $registered = $false
+  for ($i = 0; $i -lt 24; $i++) {
+    try {
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
+        -ContentType 'application/json' -Body $payload -TimeoutSec 10 | Out-Null
+      $registered = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $registered) {
+    Write-Warn2 'Nao consegui cadastrar o Playwright MCP - manager nao respondeu em 2 min.'
+    Write-Warn2 "Cadastre manualmente depois: POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/playwright/sync"
+    return $false
+  }
+
+  # /sync: exige a memory_api (:3000) de pe; o 1o sync baixa o pacote npm.
+  $synced = $false
+  for ($i = 0; $i -lt 12; $i++) {
+    try {
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers/playwright/sync" -Method Post -TimeoutSec 240 | Out-Null
+      $synced = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 10
+    }
+  }
+  if (-not $synced) {
+    Write-Warn2 'Playwright MCP cadastrado, mas o sync falhou (memory_api ainda bootando?).'
+    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/playwright/sync"
+    return $false
+  }
+  Write-Ok 'Playwright MCP registrado e sincronizado.'
+  return $true
+}
+
 # -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
@@ -169,6 +225,9 @@ if (-not $SkipBuild) {
   Write-Info 'Subindo o stack...'
   & .\docker-start.bat up -d
   if ($LASTEXITCODE -ne 0) { Die 'docker compose up falhou.' }
+
+  # Registro do Playwright MCP - logo apos o up, quando o stack ja esta carregado.
+  Register-PlaywrightMcp | Out-Null
 
   $StatusUrl = 'http://localhost:9000/status'
   $MaxWait = 1200  # 20 min

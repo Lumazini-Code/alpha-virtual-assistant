@@ -197,7 +197,6 @@ def _memory_opts(intra: int, inter: int) -> ort.SessionOptions:
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.enable_cpu_mem_arena     = False
-    opts.arena_extend_strategy    = ort.ArenaExtendStrategy.kSameAsRequested
     opts.enable_mem_pattern       = False
     return opts
 

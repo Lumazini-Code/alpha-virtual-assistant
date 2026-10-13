@@ -208,7 +208,6 @@ def _make_ort_session(model_path: str, threads: int) -> ort.InferenceSession:
     # Arena off + mem_pattern off mantêm o RSS estável com shapes variáveis.
     so.enable_mem_pattern    = False
     so.enable_cpu_mem_arena  = False
-    so.arena_extend_strategy = ort.ArenaExtendStrategy.kSameAsRequested
     return ort.InferenceSession(model_path, sess_options=so, providers=["CPUExecutionProvider"])
 
 

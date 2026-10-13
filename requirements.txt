@@ -74,3 +74,5 @@ lancedb
 mcp
 
 regex
+
+onnx
