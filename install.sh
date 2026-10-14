@@ -390,7 +390,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # Registro do Playwright MCP — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
   register_websearch_mcp || true
-  registrer_desktop_commander_mcp || true
+  register_desktop_commander_mcp || true
 
 
 

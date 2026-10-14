@@ -6,8 +6,10 @@
 //!
 //! ÚNICA adição em relação ao Python: a inicialização dos servidores MCP
 //! stdio (spawn) é compatível com Linux E Windows — ver `build_stdio_command`
-//! (resolução de `npx` → `npx.cmd` no Windows, ambiente herdado por
-//! plataforma, sem janela de console no Windows, grupo de processos no Unix).
+//! (resolução automática de `npx`/`node`/etc. pelo PATH E pelas instalações
+//! bem-conhecidas do usuário — nvm/volta/fnm/npm-global — em ambas as
+//! plataformas, ambiente herdado por plataforma, sem janela de console no
+//! Windows, grupo de processos no Unix).
 //!
 //! Rotas:
 //!   GET    /health
@@ -891,6 +893,11 @@ fn resolve_cdp_endpoint(args: &[String]) -> Vec<String> {
 //     (+ o `env` do servidor por cima) — o filho NÃO herda o ambiente inteiro.
 //   • Windows: `npx` é um shim `.cmd` — resolvido via PATH/PATHEXT (CreateProcess
 //     não o acha pelo nome puro); sem janela de console.
+//   • `npx`/`node` fora do PATH (manager iniciado pelo desktop/tray, sem shell —
+//     nvm/volta/fnm/npm-global não aparecem no PATH herdado): resolução
+//     automática varrendo instalações bem-conhecidas por plataforma, e o
+//     diretório do binário resolvido é injetado à frente do PATH herdado pelo
+//     filho (processos neto também acham o runtime).
 //   • Unix: o filho vira líder de grupo de processos, para o encerramento
 //     derrubar a árvore toda (npx → node), não só o wrapper.
 
@@ -927,16 +934,238 @@ fn default_environment() -> IndexMap<String, String> {
     env
 }
 
-#[cfg(windows)]
+// ── Resolução automática de executáveis (npx/node/uvx/…) ────────────────────
+//
+// O usuário registra servidores com `command: "npx"` — sem caminho absoluto.
+// O manager pode rodar iniciado pelo desktop/tray, fora de um shell, onde o
+// PATH nem sempre contém nvm/volta/fnm/npm-global. A resolução tenta, nesta
+// ordem:
+//   1. caminho explícito (contém separador `/` ou `\`) → usado como está;
+//   2. PATH do processo via `which` (Windows respeita PATHEXT → acha npx.cmd);
+//   3. fallback: varredura de instalações bem-conhecidas POR PLATAFORMA
+//      (nvm, volta, fnm, asdf, npm global, nodejs oficial, scoop,
+//      chocolatey…), da versão mais nova para a mais velha.
+// O resultado é cacheado por nome de comando (a varredura roda 1× por
+// processo) e o diretório do binário resolvido é injetado à frente do PATH
+// herdado pelo filho — ver `build_stdio_command`.
+
+static RESOLVED_EXECUTABLES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn resolve_executable(command: &str) -> String {
-    which::which(command)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| command.to_string())
+    // Caminho explícito (absoluto ou relativo) não precisa de resolução.
+    if command.contains('/') || command.contains('\\') {
+        return command.to_string();
+    }
+    if let Ok(cache) = RESOLVED_EXECUTABLES.lock() {
+        if let Some(hit) = cache.get(command) {
+            return hit.clone();
+        }
+    }
+    let resolved = resolve_executable_uncached(command);
+    if let Ok(mut cache) = RESOLVED_EXECUTABLES.lock() {
+        cache.insert(command.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+fn resolve_executable_uncached(command: &str) -> String {
+    // 1) PATH do processo (via crate `which`, válido nas duas plataformas).
+    if let Ok(p) = which::which(command) {
+        return p.to_string_lossy().into_owned();
+    }
+    // 2) Instalações bem-conhecidas (o PATH do processo não cobriu — caso
+    //    comum quando o manager é iniciado pelo desktop/tray, sem shell).
+    for dir in well_known_command_dirs() {
+        for candidate in command_suffixes(command) {
+            let p = dir.join(&candidate);
+            if is_executable_file(&p) {
+                info!(
+                    "MCP spawn: '{command}' não está no PATH — resolvido via instalação conhecida: {}",
+                    p.display()
+                );
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // 3) Não achou em lugar nenhum — devolve o nome puro e deixa o erro de
+    //    spawn acontece com a mensagem nativa (comportamento anterior).
+    command.to_string()
+}
+
+/// Sufixos tentados na varredura de fallback. Windows: `npx` vive como shim
+/// `.cmd` (e ferramentas podem ser `.exe`/`.bat`); Unix: nome exato.
+#[cfg(windows)]
+fn command_suffixes(command: &str) -> Vec<String> {
+    vec![
+        command.to_string(),
+        format!("{command}.cmd"),
+        format!("{command}.exe"),
+        format!("{command}.bat"),
+    ]
 }
 
 #[cfg(not(windows))]
-fn resolve_executable(command: &str) -> String {
-    command.to_string()
+fn command_suffixes(command: &str) -> Vec<String> {
+    vec![command.to_string()]
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    match std::fs::metadata(p) {
+        Ok(md) if md.is_file() => {
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(windows)]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Diretórios onde os gerenciadores de Node/npx comuns instalam os binários —
+/// usados quando o comando não está no PATH do processo.
+fn well_known_command_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let env_dir = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    let home = env_dir("HOME").or_else(|| env_dir("USERPROFILE"));
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env_dir("APPDATA") {
+            dirs.push(appdata.join("npm")); // npm global: npx.cmd vive aqui
+            dirs.push(appdata.join("nvm")); // nvm-windows: versão ativa
+            push_version_dirs(&mut dirs, &appdata.join("nvm"), ""); // todas as versões
+        }
+        if let Some(d) = env_dir("NVM_HOME") {
+            dirs.push(d.clone());
+            push_version_dirs(&mut dirs, &d, "");
+        }
+        if let Some(d) = env_dir("NVM_SYMLINK") {
+            dirs.push(d);
+        }
+        if let Some(local) = env_dir("LOCALAPPDATA") {
+            push_version_dirs(
+                &mut dirs,
+                &local.join("fnm").join("node-versions"),
+                "installation",
+            );
+            dirs.push(local.join("Volta").join("bin")); // shims volta
+            push_version_dirs(
+                &mut dirs,
+                &local
+                    .join("Volta")
+                    .join("tools")
+                    .join("image")
+                    .join("node"),
+                "",
+            );
+        }
+        if let Some(d) = env_dir("ProgramFiles") {
+            dirs.push(d.join("nodejs"));
+        }
+        if let Some(d) = env_dir("ProgramFiles(x86)") {
+            dirs.push(d.join("nodejs"));
+        }
+        if let Some(home) = &home {
+            dirs.push(home.join("scoop").join("apps").join("nodejs").join("current"));
+            dirs.push(home.join("scoop").join("shims"));
+        }
+        if let Some(d) = env_dir("ProgramData") {
+            dirs.push(d.join("chocolatey").join("bin"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = &home {
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".nvm").join("versions").join("node"),
+                "bin",
+            );
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".local").join("share").join("fnm").join("node-versions"),
+                "installation/bin",
+            );
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".fnm").join("node-versions"),
+                "installation/bin",
+            );
+            dirs.push(home.join(".volta").join("bin"));
+            dirs.push(home.join(".asdf").join("shims"));
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join("bin"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push(PathBuf::from("/opt/homebrew/bin"));
+            dirs.push(PathBuf::from("/usr/local/opt/node/bin"));
+        }
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/opt/node/bin"));
+        dirs.push(PathBuf::from("/opt/nodejs/bin"));
+    }
+
+    dirs
+}
+
+/// Para gerenciadores de versão (nvm/fnm/volta): empurra `base/<versão>[/<sub>]`
+/// para cada subdiretório de `base` cujo nome começa com `v` ou dígito, da
+/// versão mais nova para a mais velha.
+fn push_version_dirs(out: &mut Vec<PathBuf>, base: &std::path::Path, sub: &str) {
+    let Ok(rd) = std::fs::read_dir(base) else { return };
+    let mut versions: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| {
+                        n.starts_with('v') || n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    versions.sort_by(|a, b| {
+        let ka = a.file_name().map(version_key).unwrap_or_default();
+        let kb = b.file_name().map(version_key).unwrap_or_default();
+        kb.cmp(&ka) // mais nova primeiro
+    });
+    for v in versions {
+        let mut d = v;
+        if !sub.is_empty() {
+            d.push(sub);
+        }
+        out.push(d);
+    }
+}
+
+/// Chave de ordenação de versão ("v22.11.0" → [22, 11, 0]) para ordenar as
+/// instalações dos gerenciadores de versão da mais nova para a mais velha.
+fn version_key(name: &std::ffi::OsStr) -> Vec<u64> {
+    name.to_string_lossy()
+        .trim_start_matches('v')
+        .split(['.', '-'])
+        .map(|seg| {
+            seg.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn build_stdio_command(
@@ -944,12 +1173,37 @@ fn build_stdio_command(
     args: &[String],
     env: &IndexMap<String, String>,
 ) -> process_wrap::tokio::TokioCommandWrap {
-    let mut cmd = tokio::process::Command::new(resolve_executable(command));
+    let resolved = resolve_executable(command);
+    let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args);
     // env = {**default_environment(), **server.env}
     let mut merged = default_environment();
     for (k, v) in env {
         merged.insert(k.clone(), v.clone());
+    }
+    // Se o executável foi resolvido (fora do PATH), injeta o diretório dele à
+    // frente do PATH herdado — processos neto (npx → node → binários do
+    // pacote) precisam achar o runtime também, mesmo sem shell de origem.
+    if (resolved.contains('/') || resolved.contains('\\')) && resolved != command {
+        if let Some(bin_dir) = std::path::Path::new(&resolved).parent() {
+            let bin_dir = bin_dir.to_path_buf();
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            let already = merged
+                .get("PATH")
+                .map(|existing| {
+                    existing
+                        .split(sep)
+                        .any(|p| std::path::Path::new(p.trim_matches('"')) == bin_dir)
+                })
+                .unwrap_or(false);
+            if !already {
+                let new_val = match merged.get("PATH") {
+                    Some(existing) => format!("{}{}{}", bin_dir.to_string_lossy(), sep, existing),
+                    None => bin_dir.to_string_lossy().into_owned(),
+                };
+                merged.insert("PATH".to_string(), new_val);
+            }
+        }
     }
     cmd.env_clear();
     cmd.envs(merged.iter());
