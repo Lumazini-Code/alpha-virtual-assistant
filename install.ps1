@@ -216,6 +216,103 @@ function Register-PlaywrightMcp {
   return $true
 }
 
+# -- 5c. Registro dos demais MCPs (websearch e Desktop Commander) -------------
+# Mesmo fluxo do Playwright: POST /servers (upsert idempotente) + POST /sync.
+# Helper generico para nao triplicar o loop de retry. O body vai em bytes UTF-8
+# (Invoke-RestMethod com string usa ISO-8859-1 no Windows PowerShell 5.1 e
+# corromperia os acentos do skill_summary).
+function Register-McpServer {
+  param(
+    [Parameter(Mandatory)][string]$Label,
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][hashtable]$Spec,
+    [int]$SyncTimeoutSec = 240
+  )
+  $payload = $Spec | ConvertTo-Json -Depth 6
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+
+  Write-Info "Registrando $Label MCP no mcp_manager ($McpManagerUrl)..."
+  $registered = $false
+  for ($i = 0; $i -lt 24; $i++) {
+    try {
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
+        -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10 | Out-Null
+      $registered = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $registered) {
+    Write-Warn2 "Nao consegui cadastrar o $Label MCP - manager nao respondeu em 2 min."
+    Write-Warn2 "Cadastre manualmente depois: POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/$Name/sync"
+    return $false
+  }
+
+  # /sync: exige a memory_api (:3000) de pe.
+  $synced = $false
+  for ($i = 0; $i -lt 12; $i++) {
+    try {
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers/$Name/sync" -Method Post -TimeoutSec $SyncTimeoutSec | Out-Null
+      $synced = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 10
+    }
+  }
+  if (-not $synced) {
+    Write-Warn2 "$Label MCP cadastrado, mas o sync falhou (memory_api ou o proprio servidor ainda bootando?)."
+    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/$Name/sync"
+    return $false
+  }
+  Write-Ok "$Label MCP registrado e sincronizado."
+  return $true
+}
+
+function Register-WebsearchMcp {
+  # URL do MCP do websearch (server.py, streamable-http em :4010/mcp). O manager
+  # roda DENTRO do container: localhost seria ele mesmo, entao o default usa
+  # host.docker.internal (porta 4010 publicada no host). Se o websearch for um
+  # servico do mesmo compose, sobrescreva: $env:WEBSEARCH_MCP_URL = 'http://websearch:4010/mcp'
+  $wsUrl = if ($env:WEBSEARCH_MCP_URL) { $env:WEBSEARCH_MCP_URL } else { 'http://host.docker.internal:4010/mcp' }
+  return (Register-McpServer -Label 'websearch' -Name 'websearch' -SyncTimeoutSec 120 -Spec @{
+    name          = 'websearch'
+    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.'
+    transport     = 'http'
+    url           = $wsUrl
+    enabled       = $true
+    always_on     = $false
+    examples      = @{
+      web_search = @(
+        'pesquise na internet sobre',
+        'qual é a notícia mais recente sobre',
+        'busque informações atuais de',
+        'procure na web'
+      )
+      memory_write_batch = @(
+        'lembre que',
+        'guarde isso na memoria',
+        'anote que',
+        'salve essa informacao',
+        'lembre-se de que',
+        'memorize os fatos deste documento'
+      )
+    }
+  })
+}
+
+function Register-DesktopCommanderMcp {
+  return (Register-McpServer -Label 'Desktop Commander' -Name 'desktop-commander' -SyncTimeoutSec 240 -Spec @{
+    name          = 'desktop-commander'
+    skill_summary = 'Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)'
+    transport     = 'stdio'
+    command       = 'npx'
+    args          = @('-y', '@wonderwhy-er/desktop-commander@latest')
+    enabled       = $true
+    always_on     = $false
+  })
+}
+
 # -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
@@ -228,6 +325,8 @@ if (-not $SkipBuild) {
 
   # Registro do Playwright MCP - logo apos o up, quando o stack ja esta carregado.
   Register-PlaywrightMcp | Out-Null
+  Register-WebsearchMcp | Out-Null
+  Register-DesktopCommanderMcp | Out-Null
 
   $StatusUrl = 'http://localhost:9000/status'
   $MaxWait = 1200  # 20 min

@@ -9,8 +9,9 @@
 //! de contexto do tray ("Sair"), que envia UiCommand::Quit pelo canal
 //! mpsc (a thread do tray é dona do ícone; ver main.rs).
 
+use crate::mcp_manager;
 use crate::process_manager;
-use crate::state::{ProcStatus, SharedState};
+use crate::state::{McpStatus, ProcStatus, SharedState};
 use crate::UiCommand;
 use eframe::egui;
 use std::sync::mpsc;
@@ -27,6 +28,8 @@ pub struct TrayApp {
     // Snapshot local do estado, atualizado a cada frame (lido do Mutex async
     // via try_lock para não travar a thread de UI).
     docker_status: ProcStatus,
+    mcp_status: McpStatus,
+    mcp_installed: bool,
 
     // Mensagens de feedback transitórias (ex: "Docker iniciado com sucesso").
     feedback: Option<String>,
@@ -44,6 +47,8 @@ impl TrayApp {
             cmd_rx,
             quit_requested: false,
             docker_status: ProcStatus::Stopped,
+            mcp_status: McpStatus::NotInstalled,
+            mcp_installed: false,
             feedback: None,
         }
     }
@@ -52,6 +57,10 @@ impl TrayApp {
     fn refresh_snapshot(&mut self) {
         if let Ok(docker) = self.state.docker.try_lock() {
             self.docker_status = docker.status.clone();
+        }
+        if let Ok(mcp) = self.state.mcp.try_lock() {
+            self.mcp_status = mcp.status.clone();
+            self.mcp_installed = mcp.binary.exists();
         }
     }
 
@@ -152,6 +161,48 @@ impl TrayApp {
             });
         });
 
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                mcp_status_dot(ui, &self.mcp_status);
+                ui.vertical(|ui| {
+                    ui.strong("MCP Manager (host)");
+                    ui.label(self.mcp_status.label());
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let running = self.mcp_status == McpStatus::Running;
+
+                if ui
+                    .add_enabled(self.mcp_installed && !running, egui::Button::new("Ligar"))
+                    .clicked()
+                {
+                    self.spawn_start_mcp();
+                }
+
+                if ui
+                    .add_enabled(self.mcp_installed && running, egui::Button::new("Desligar"))
+                    .clicked()
+                {
+                    self.spawn_stop_mcp();
+                }
+            });
+
+            if !self.mcp_installed {
+                ui.label(
+                    egui::RichText::new(
+                        "executável não encontrado — coloque mcp_manager (port Rust) \
+                         na raiz do projeto ou defina AVA_MCP_MANAGER_BIN",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+        });
+
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);
@@ -188,6 +239,25 @@ impl TrayApp {
             }
         });
     }
+
+    fn spawn_start_mcp(&self) {
+        let state = self.state.clone();
+        self.rt.spawn(async move {
+            match mcp_manager::start(&state).await {
+                Ok(()) => tracing::info!("MCP manager iniciado (UI do tray)."),
+                Err(e) => tracing::error!("Erro ao iniciar MCP manager: {e:#}"),
+            }
+        });
+    }
+
+    fn spawn_stop_mcp(&self) {
+        let state = self.state.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = mcp_manager::stop(&state).await {
+                tracing::error!("Erro ao parar MCP manager: {e:#}");
+            }
+        });
+    }
 }
 
 fn status_dot(ui: &mut egui::Ui, status: &ProcStatus) {
@@ -195,6 +265,18 @@ fn status_dot(ui: &mut egui::Ui, status: &ProcStatus) {
         ProcStatus::Running => egui::Color32::from_rgb(90, 200, 100),
         ProcStatus::Stopped => egui::Color32::from_rgb(150, 150, 150),
         ProcStatus::Starting | ProcStatus::Stopping => egui::Color32::from_rgb(230, 180, 60),
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
+    ui.add_space(6.0);
+}
+
+fn mcp_status_dot(ui: &mut egui::Ui, status: &McpStatus) {
+    let color = match status {
+        McpStatus::Running => egui::Color32::from_rgb(90, 200, 100),
+        McpStatus::Stopped | McpStatus::NotInstalled => egui::Color32::from_rgb(150, 150, 150),
+        McpStatus::Starting | McpStatus::Stopping => egui::Color32::from_rgb(230, 180, 60),
+        McpStatus::Crashed => egui::Color32::from_rgb(224, 80, 60),
     };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);

@@ -27,6 +27,18 @@ Arquitetura (v2 — polling de diff):
   soltos). Cobrem criação (POST /plans/write) e edição (PATCH /plans/update,
   que versiona — o diff acende "updated" a cada versão nova) feitas pela TUI
   ou pelo plan_recorder.
+
+  v5 — MCP DB (fonte de verdade das tools MCP): o registry do mcp_manager
+  (Rust no HOST: Modules/mcp_manager/db/ava_mcp_servers.db, tabelas
+  `mcp_servers` + `mcp_tools`) entra no mesmo espaço visual. Como as ARESTAS
+  de co-uso só existem na ToolsDB (ids inteiros), a fusão é por graph_name
+  (`servidor__tool`):
+    - tool presente nos DOIS: o nó `t{id}` MANTÉM o id (arestas intactas) e
+      o CONTEÚDO passa a vir da MCP DB (snippet como descrição, core,
+      transporte, enabled do servidor);
+    - tool que só existe na MCP DB (sync pendente / memory offline): entra
+      como nó extra id "m{servidor__tool}" (prefixo m, sem arestas);
+    - servidor desabilitado aparece com badge "desabilitado" no tooltip/painel.
   ══════════════════════════════════════════════════════════════════════════
 
   Eventos SSE (o cliente roteia por "type"):
@@ -117,6 +129,36 @@ def _tool_node_public(row: sqlite3.Row) -> dict:
     }
 
 
+def _mcp_tool_node_public(graph_name: str, srow: sqlite3.Row | None,
+                          trow: sqlite3.Row) -> dict:
+    """Nó público de tool MCP que existe SÓ na MCP registry do mcp_manager
+    (Modules/mcp_manager/db/ava_mcp_servers.db) — ainda sem sync na ToolsDB
+    (ex.: memory offline na hora do /sync). Id string com prefixo "m" +
+    graph_name — nunca colide com t{N}/p{N}/ids inteiros. Sem arestas (o
+    co-uso só existe na ToolsDB). O snippet (skill.md) é a descrição."""
+    snippet = ((trow["snippet"] or "").strip()
+               or (trow["description_raw"] or "").strip())
+    snippet = snippet or f"Tool '{trow['name']}' do servidor MCP '{trow['server']}'."
+    return {
+        "id":          f"m{graph_name}",
+        "kind":        "tool",
+        "label":       graph_name[:40] + ("…" if len(graph_name) > 40 else ""),
+        "title":       html.escape(snippet[:400]),
+        "text":        snippet,              # p/ busca (mesma chave das demais)
+        "name":        graph_name,
+        "server":      trow["server"],
+        "core":        bool(trow["core"]),
+        "use_count":   0,
+        "last_used":   None,
+        "created_at":  None,
+        "source":      f"tool:{trow['server']}",
+        # metadata do registry (não existe na ToolsDB)
+        "transport":   srow["transport"] if srow is not None else None,
+        "enabled":     bool(srow["enabled"]) if srow is not None else True,
+        "always_on":   bool(srow["always_on"]) if srow is not None else False,
+    }
+
+
 def _edge_public(row: sqlite3.Row) -> dict:
     return {
         "key":   f"{row['memory_id_a']}|{row['memory_id_b']}|{row['edge_type']}",
@@ -171,22 +213,30 @@ class GraphState:
     """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
     completo cobre criação, atualização E remoção (decay job) sem depender
-    de surrogate keys. Cobre TRÊS grafos no mesmo espaço visual:
+    de surrogate keys. Cobre QUATRO grafos no mesmo espaço visual:
       - memórias LT (ava_memory.db) — ids inteiros, kind="memory";
       - tools (ava_tools.db) — ids string "t{id}", kind="tool"; o DB é
         opcional (memory process pode não tê-lo criado ainda);
       - planos (ava_plans.db) — ids string "p{id}", kind="plan"; nós
-        soltos (sem arestas), também opcional."""
+        soltos (sem arestas), também opcional;
+      - MCP registry (mcp_manager Rust no HOST: Modules/mcp_manager/db/
+        ava_mcp_servers.db) — opcional; FUSÃO por graph_name com as tools
+        da ToolsDB: conteúdo (snippet/core/enabled/transporte) vem daqui,
+        ids t{N} e arestas ficam na ToolsDB; tools só-MCP entram como
+        "m{servidor__tool}"."""
 
     TOOL_ID_PREFIX = "t"
     PLAN_ID_PREFIX = "p"
+    MCP_ID_PREFIX = "m"
 
-    def __init__(self, db_path: str, tools_db_path: str = "", plans_db_path: str = ""):
+    def __init__(self, db_path: str, tools_db_path: str = "",
+                 plans_db_path: str = "", mcp_db_path: str = ""):
         self.db_path = db_path
         self.tools_db_path = tools_db_path
         self.plans_db_path = plans_db_path
+        self.mcp_db_path = mcp_db_path
         self.lock = threading.Lock()
-        self.nodes: dict = {}                                  # id -> node público (int | "tN")
+        self.nodes: dict = {}                                  # id -> node público (int | "tN" | "pN" | "m...")
         self.nodes_sig: dict = {}                              # id -> sig por tipo
         self.edges: dict[str, dict] = {}                       # key -> edge pública
         self.edges_sig: dict[str, tuple] = {}                  # key -> (weight, count)
@@ -253,6 +303,60 @@ class GraphState:
                 nodes.update(pnodes)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # plans DB ainda não existe / sem tabela — ignora
+        # ── MCP registry (opcional): fusão por graph_name ─────────────────
+        # 1. Enriquece t-nodes da ToolsDB cujo name existe na MCP DB — o
+        #    id t{N} MANTÉM (arestas de co-uso intactas) e o CONTEÚDO passa
+        #    a vir daqui (snippet como descrição, core, enabled/transporte).
+        # 2. Tools só na MCP DB (sync pendente / memory offline) entram
+        #    como nós extras "m{graph_name}", sem arestas.
+        if self.mcp_db_path:
+            try:
+                mconn = _open_ro(self.mcp_db_path)
+                try:
+                    servers = {
+                        r["name"]: r
+                        for r in mconn.execute(
+                            "SELECT name, transport, enabled, always_on "
+                            "FROM mcp_servers"
+                        )
+                    }
+                    mcp_tools = {
+                        f"{r['server']}__{r['name']}": (servers.get(r["server"]), r)
+                        for r in mconn.execute(
+                            "SELECT server, name, description_raw, snippet, "
+                            "core FROM mcp_tools"
+                        )
+                    }
+                finally:
+                    mconn.close()
+
+                for node in nodes.values():
+                    if node.get("kind") != "tool" or node.get("server") is None:
+                        continue
+                    entry = mcp_tools.get(node["name"])
+                    if entry is None:
+                        continue
+                    srow, trow = entry
+                    snippet = ((trow["snippet"] or "").strip()
+                               or (trow["description_raw"] or "").strip())
+                    if snippet:
+                        node["text"] = snippet
+                        node["title"] = html.escape(snippet[:400])
+                    node["core"] = bool(trow["core"])
+                    node["transport"] = srow["transport"] if srow is not None else None
+                    node["enabled"] = bool(srow["enabled"]) if srow is not None else True
+                    node["always_on"] = bool(srow["always_on"]) if srow is not None else False
+
+                known = {n["name"] for n in nodes.values() if n.get("kind") == "tool"}
+                for gname, (srow, trow) in mcp_tools.items():
+                    if gname in known:
+                        continue
+                    mnode = _mcp_tool_node_public(
+                        gname, srow, trow
+                    )
+                    nodes[mnode["id"]] = mnode
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # MCP DB ainda não existe / vazia — ToolsDB cobre
         return nodes, edges
 
     def refresh(self) -> dict:
@@ -283,7 +387,11 @@ class GraphState:
             for nid, node in db_nodes.items():
                 # sig por tipo de nó — memórias, tools e planos têm campos distintos
                 if node["kind"] == "tool":
-                    sig = (node["text"], node["name"], node["core"], node["use_count"], node["last_used"])
+                    # enabled = campo da MCP registry (t-nodes enriquecidos e
+                    # m-nodes; t-nodes sem MCP DB usam o default True)
+                    sig = (node["text"], node["name"], node["core"],
+                           node["use_count"], node["last_used"],
+                           node.get("enabled", True))
                 elif node["kind"] == "plan":
                     sig = (node["name"], node["text"], node["version"])
                 else:
@@ -741,9 +849,12 @@ function nodeTitle(meta) {
   }
   if (meta.kind === 'tool') {
     const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
+    const mcpInfo = meta.server
+      ? `MCP${meta.transport ? ` · ${escapeHtml(meta.transport)}` : ''}${meta.enabled === false ? ' — <span style="color:#e0503c">desabilitado</span>' : ''}`
+      : 'nativa';
     return `<b>${escapeHtml(meta.name || meta.label)}</b> ${meta.core ? '⭐ core' : ''}<br>` +
            `<i>${meta.title || '(sem snippet — rode /sync ou defina o skill.md no mcp_manager)'}</i><br>` +
-           `usos: ${meta.use_count ?? 0} · última: ${lu}`;
+           `${mcpInfo} · usos: ${meta.use_count ?? 0} · última: ${lu}`;
   }
   const d = new Date((meta.created_at || 0) * 1000);
   const dateStr = isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
@@ -1021,10 +1132,14 @@ function showPanel(id) {
     body = `<div class="text">${escapeHtml(meta.description || '(sem descrição — edite na TUI via Ctrl+S → planos)')}</div>`;
   } else if (isTool) {
     const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
+    const pills =
+      (meta.core ? '<span class="pill" style="background:#38d9a922;color:#38d9a9">core ⭐</span>' : '') +
+      (meta.always_on ? '<span class="pill" style="background:#ffd16622;color:#ffd166">always_on</span>' : '') +
+      (meta.transport ? `<span class="pill" style="background:#54607a22;color:#9aa0b4">${escapeHtml(meta.transport)}</span>` : '') +
+      (meta.enabled === false ? '<span class="pill" style="background:#e0503c22;color:#e0503c">desabilitado</span>' : '');
     head = `<h3 style="color:${TOOL_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
       <div class="meta">tool ${meta.server ? `MCP — servidor: <b>${escapeHtml(meta.server)}</b>` : 'nativa'} · grau: ${degreeOf(id)}</div>
-      <div class="meta">usos: ${meta.use_count ?? 0} · última: ${lu}
-        ${meta.core ? '<span class="pill" style="background:#38d9a922;color:#38d9a9">core ⭐</span>' : ''}</div>
+      <div class="meta">usos: ${meta.use_count ?? 0} · última: ${lu}${pills ? ' · ' + pills : ''}</div>
       <div class="meta">registrada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')}</div>
       <div class="text">${escapeHtml(meta.description || '(sem snippet — defina o skill.md via PUT /tools/{graph}/snippet no mcp_manager)')}</div>`;
   } else {
@@ -1194,12 +1309,15 @@ def main():
                     help="grafo de tools (ToolsDB) — omitido com '' ; se o arquivo não existir, só memórias")
     ap.add_argument("--plans-db", default="./Modules/memory/db/ava_plans.db",
                     help="grafo de planos (PlansDB) — omitido com '' ; se o arquivo não existir, ignora")
+    ap.add_argument("--mcp-db", default="./Modules/mcp_manager/db/ava_mcp_servers.db",
+                    help="registry do mcp_manager (Rust, HOST) — opcional; fusão por "
+                         "graph_name: conteúdo/snippet/enabled vêm daqui, arestas da ToolsDB")
     ap.add_argument("--log", default="./Modules/memory/db/activation_log.jsonl")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
     args = ap.parse_args()
 
-    state = GraphState(args.db, args.tools_db, args.plans_db)
+    state = GraphState(args.db, args.tools_db, args.plans_db, args.mcp_db)
 
     # Snapshot inicial ANTES de servir — o cliente já nasce com o grafo atual.
     delta = state.refresh()

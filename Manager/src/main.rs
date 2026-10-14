@@ -11,6 +11,7 @@
 
 mod api;
 mod idle_watcher;
+mod mcp_manager;
 mod process_manager;
 mod state;
 mod ui;
@@ -69,6 +70,16 @@ fn main() -> anyhow::Result<()> {
     // Isso permite que a aplicação "se conecte" a instâncias do
     // docker que foram iniciadas anteriormente.
     rt_handle.block_on(process_manager::discover_running_processes(&shared_state));
+    // MCP manager (host, placeholder): descoberta em TASK BACKGROUND —
+    // NUNCA block_on na main thread. Um health check pendurado aqui não
+    // pode atrasar a subida da API/tray/janela (defaults do estado até a
+    // descoberta completar: NotInstalled/Stopped).
+    {
+        let state = shared_state.clone();
+        rt.spawn(async move {
+            mcp_manager::discover(&state).await;
+        });
+    }
 
     // Sobe a API REST (axum) em background.
     {
@@ -95,6 +106,8 @@ fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 process_manager::health_check_docker(&state).await;
+                // MCP manager (host): Running sem /health → Crashed → respawn.
+                mcp_manager::health_check(&state).await;
             }
         });
     }

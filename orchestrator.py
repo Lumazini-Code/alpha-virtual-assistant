@@ -28,6 +28,9 @@ Resumo do fluxo:
 
 Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
   - vision_objects: reusa o histórico real da conversa. Auto-finish especial.
+    GATE por VISION_OBJECTS_ENABLED (default 0 — vision.py fora do ar): com a
+    flag desligada a tool NÃO é oferecida e as imagens vão embutidas direto
+    no contexto do modelo principal (blocos image_url multi-parte).
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
@@ -96,6 +99,17 @@ MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://localhost:3000")
 TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
+# ── Fluxo vision_objects (vision.py :4002) ────────────────────────────────────
+# vision.py está desativado por enquanto (start.sh não sobe o serviço — a
+# forma com que ele foi projetado para ser usado, agente totalmente autônomo
+# com visão constante, ainda não é suportada). Com a flag DESLIGADA (default),
+# as imagens anexadas pela TUI são embutidas DIRETO no contexto do modelo
+# principal (blocos multi-parte {type:"image_url"} que LLM.py repassa
+# verbatim ao OpenRouter) — sem tool, sem crops, sem vision.py. Com
+# VISION_OBJECTS_ENABLED=1, o fluxo antigo volta: a tool nativa
+# vision_objects (face recognition + segmentação de objetos → crops →
+# _answer_vision_with_llm) fica disponível e o nudge original é restaurado.
+VISION_OBJECTS_ENABLED = os.getenv("VISION_OBJECTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 DEEP_SEARCH_URL      = "http://localhost:4005"
 ALPHA_CODE_URL       = "http://localhost:4006"
 # mcp_manager.py — registro REST + executor de servidores MCP (stdio/http).
@@ -108,6 +122,15 @@ MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://localhost:4008")
 # externa que não tiver override usa este valor (também enviado ao manager,
 # que repassa ao call_tool do SDK).
 MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
+# ── Servidores MCP always-on ──────────────────────────────────────────────────
+# Servidores MCP cujas tools devem estar SEMPRE disponíveis ao modelo, sem
+# passar pelo seletor semântico (/skills/select) — união com o resultado do
+# grafo em _select_skills (respeitando a lista de servidores habilitados).
+# Ainda filtered pelo /skills do manager, então um servidor desabilitado ou
+# offline não é injetado. Env para override sem tocar em código.
+ALWAYS_ON_MCP_SERVERS = {
+    s.strip() for s in os.getenv("AVA_ALWAYS_ON_MCP_SERVERS", "websearch").split(",") if s.strip()
+}
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 # Env: no Windows o container precisa alcançar o tray NO HOST —
 # host.docker.internal (docker-compose.windows.yml injeta o valor);
@@ -226,9 +249,12 @@ class ExecuteRequest(BaseModel):
     tts_output:    Literal["client", "device"] = "client"
     # Base64 puro da imagem (sem prefixo "data:...;base64,"), já codificado
     # pelo cliente (TUI) — o orchestrator NUNCA lê arquivo de disco nem
-    # decodifica/recodifica isso, só repassa para o vision service. Isso
-    # elimina o problema de path resolution entre cliente e orchestrator
-    # (ex.: orchestrator rodando em container sem o filesystem do host).
+    # decodifica/recodifica isso (só sniffa os magic bytes para o MIME do
+    # data URL). Com VISION_OBJECTS_ENABLED=0 (default) a imagem é embutida
+    # DIRETO no contexto do modelo principal como bloco image_url multi-
+    # parte; com a flag em 1 é repassada ao vision service. Isso elimina o
+    # problema de path resolution entre cliente e orchestrator (ex.:
+    # orchestrator rodando em container sem o filesystem do host).
     image_base64:  Optional[str]  = None
     search_pdfs:   bool           = False
     stream:        bool           = True
@@ -1658,11 +1684,43 @@ TOOLS: dict[str, dict[str, Any]] = {
 
 _JSON_SCHEMA_TYPES = {"string": "string", "number": "number"}
 
+# ── Detecção de MIME por assinatura binária ──────────────────────────────────
+# A TUI envia a imagem como base64 PURO (sem prefixo data:) — o data URL
+# embutido no bloco image_url precisa do MIME correto. Sniff dos magic bytes
+# cobre os formatos aceitos por modelos multimodais (PNG/JPEG/GIF/WEBP);
+# fallback image/jpeg (o mais tolerado quando a assinatura não casa).
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff",      "image/jpeg"),
+    (b"GIF87a",            "image/gif"),
+    (b"GIF89a",            "image/gif"),
+)
+
+
+def _detect_image_mime(b64: str) -> str:
+    """MIME de um base64 de imagem (prefixo data: opcional e ignorado)."""
+    payload = b64.split(",", 1)[-1]
+    try:
+        head = base64.b64decode(payload[:64], validate=False)[:12]
+    except Exception:
+        return "image/jpeg"
+    for magic, mime in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 def _build_native_tools_schema() -> list[dict]:
-    """Converte o TOOLS registry (só as nativas: vision_objects, memory_search)
-    para a lista `tools` no formato OpenAI."""
+    """Converte o TOOLS registry (nativas: memory_search + vision_objects
+    quando VISION_OBJECTS_ENABLED=1) para a lista `tools` no formato OpenAI.
+    vision_objects é omitido quando a flag está desligada (vision.py fora do
+    ar — imagens vão embutidas direto no contexto do modelo principal)."""
     schema = []
     for name, spec in TOOLS.items():
+        if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
+            continue
         properties = {}
         required = []
         for field_name, field_type, field_required in spec["fields"]:
@@ -1730,6 +1788,15 @@ async def _select_skills(user_input: str) -> list[str]:
         chosen = [s["name"] for s in enabled]
         log.warning(f"[_select_skills] seleção via grafo falhou ({type(e).__name__}: {e}) — "
                     f"liberando todos os servidores habilitados: {chosen}")
+    # Always-on: servidores self-hosted cujas tools (ex.: gravação de
+    # memórias via websearch__memory_write_batch) devem estar disponíveis
+    # em TODO turno — bypass do seletor. Filtrados pela lista de habilitados
+    # acima (servidor desabilitado nunca é injetado).
+    always_on = [s["name"] for s in enabled if s["name"] in ALWAYS_ON_MCP_SERVERS]
+    missing = [n for n in always_on if n not in chosen]
+    if missing:
+        log.info(f"[_select_skills] always-on injetado sem seletor: {missing}")
+        chosen = chosen + missing
     return chosen
 
 
@@ -2068,6 +2135,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "Available tools:",
     ]
     for name, spec in TOOLS.items():
+        if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
+            continue  # flag off (vision.py fora do ar) — não anunciar a tool
         lines.append(f"- {name}: {spec['description']}")
     for name, description in (mcp_tool_names or {}).items():
         lines.append(f"- {name}: {description}")
@@ -2190,20 +2259,48 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
 
-    user_content = req.input
+    user_content: str | list[dict] = req.input
     if req.image_base64:
-        # Sem isso, o LLM não tem nenhum sinal no histórico de que uma
-        # imagem foi de fato anexada a ESTE request — só a descrição
-        # genérica da tool vision_objects ("only works if an image was
-        # sent"), que não é uma confirmação. Resultado: o modelo assume
-        # que não há imagem e pede pro usuário reenviar, mesmo com
-        # req.image_base64 preenchido.
-        user_content = (
-            f"{req.input}\n\n"
-            "[An image was attached to this message. Use the vision_objects "
-            "tool to see it before answering — do not ask the user to send "
-            "it again.]"
-        )
+        if VISION_OBJECTS_ENABLED:
+            # Fluxo vision_objects (flag ligada): sem o nudge, o LLM não tem
+            # nenhum sinal no histórico de que uma imagem foi de fato
+            # anexada a ESTE request — só a descrição genérica da tool
+            # vision_objects ("only works if an image was sent"), que não é
+            # uma confirmação. Resultado: o modelo assume que não há imagem
+            # e pede pro usuário reenviar, mesmo com req.image_base64
+            # preenchido.
+            user_content = (
+                f"{req.input}\n\n"
+                "[An image was attached to this message. Use the vision_objects "
+                "tool to see it before answering — do not ask the user to send "
+                "it again.]"
+            )
+        else:
+            # Fluxo direto ao modelo principal: a imagem vai embutida no
+            # CONTEXTO como bloco multi-parte do OpenAI vision — o LLM.py
+            # repassa verbatim ao OpenRouter (ToolCallMessage aceita
+            # content: str | list[dict]). Sem tool, sem crops, sem vision.py:
+            # o modelo vê a imagem original (melhor que os crops da pipeline
+            # antiga) e responde em texto puro, com streaming normal.
+            mime = _detect_image_mime(req.image_base64)
+            user_content = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"{req.input}\n\n"
+                        "[An image was attached to this message — see it above; "
+                        "do not ask the user to send it again.]"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{req.image_base64}"},
+                },
+            ]
+            log.info(
+                f"[{eid[:8]}] imagem anexada ({mime}, {len(req.image_base64)} chars b64) "
+                "embutida no contexto do modelo principal"
+            )
 
     # ── Histórico: system (com recall) + turnos ST crus + user atual ────────
     # Os turnos ST dão continuidade conversacional literal (mesmo contrato do
@@ -2252,7 +2349,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # vision_objects: o modelo multimodal já respondeu diretamente à
     # pergunta do usuário usando os crops (ver _answer_vision_with_llm) —
     # só pronto pro PRÓXIMO turno, sem gerar resposta pra este.
-    AUTO_FINISH_TOOLS = {"vision_objects"}
+    # Com a flag desligada (vision.py fora do ar, imagens vão embutidas
+    # direto no contexto), a tool não é oferecida e o auto-finish é vazio.
+    AUTO_FINISH_TOOLS = {"vision_objects"} if VISION_OBJECTS_ENABLED else set()
 
     # ── Streaming de verdade pro /execute ──────────────────────────────────
     # Quando há on_event (modo SSE do /execute), cada fragmento de content

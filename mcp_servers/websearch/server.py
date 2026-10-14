@@ -1,9 +1,16 @@
-"""websearch-mcp — pipeline de busca web do AVA (SearXNG → filtro/BM25 → crawl → chunks).
+"""websearch-mcp — tools self-hosted do AVA (busca web + memória).
 
-Expõe UMA única tool MCP: `web_search(query, max_results)` → trechos relevantes
-com fontes. O LLM não vê as etapas internas — recebe só o resultado final.
+Tools MCP expostas:
+  - `web_search(query, max_results)` → trechos relevantes com fontes.
+    O LLM não vê as etapas internas — recebe só o resultado final.
+  - `memory_write_batch(facts)` → grava múltiplos fatos PERMANENTES na
+    memória de longo prazo (LT) via a memory_api — o análogo da extração
+    automática de memórias, mas disparado pelo próprio modelo (ex.: extrair
+    fatos de um documento ou fonte que o usuário pediu para memorizar).
+    Mesmo contrato de gravação do extrator de LLM.py (_MEMORY_EXTRACTION_SCHEMA):
+    fatos semânticos, forgettable=False, source=tool:memory_write_batch.
 
-Fluxo:
+Fluxo da busca web:
   1. Cache de busca no Valkey (hash da query, TTL de horas) → hit retorna direto
   2. SearXNG `GET /search?format=json` (~15 resultados, timeout curto)
   3. Filtro: dedup por domínio, blocklist de SEO/spam/paywall
@@ -21,7 +28,8 @@ Transporte: streamable-http em /mcp (o mcp_manager do AVA registra via
 
 Config: resource/websearch/config.json — caminho via env WEBSEARCH_CONFIG;
 no container default é /app/resource/websearch/config.json, em dev cai no
-relativo ../../resource/websearch/config.json.
+relativo ../../resource/websearch/config.json. A memory_api é apontada via
+env MEMORY_API_URL (default http://127.0.0.1:3000; no compose, http://ava:3000).
 """
 
 import asyncio
@@ -561,6 +569,99 @@ async def run_pipeline(query: str, max_results: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Memory API — gravação de fatos em memória de longo prazo (LT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:3000")
+
+_memory_client: httpx.AsyncClient | None = None
+
+
+def _get_memory_client() -> httpx.AsyncClient:
+    """Client persistente para a memory_api (connection pooling, mesmo padrão
+    do LLM.py). Recria de forma segura se a anterior foi fechada."""
+    global _memory_client
+    if _memory_client is None or _memory_client.is_closed:
+        _memory_client = httpx.AsyncClient(
+            base_url=MEMORY_API_URL,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
+        )
+    return _memory_client
+
+
+async def _resolve_possible_update(item: dict, res: dict) -> dict:
+    """Espelha `_resolve_possible_update` de Modules/LLM.py: quando o write é
+    recusado com reason="possible_update:<score>" e o servidor devolve
+    candidate_id, reenvia a escrita com action="update" + memory_id para
+    efetivar a correção na memória candidata em vez de descartar o fato.
+    Sem candidate_id, o fato NÃO vira registro solto (por design, uma correção
+    não deve criar fato desancorado) — mas o descarte é logado em WARNING."""
+    reason = str(res.get("reason") or "")
+    if not reason.startswith("possible_update:"):
+        return res
+    candidate_id = res.get("candidate_id")
+    if candidate_id is None:
+        log.warning(
+            f"[memory] possible_update sem candidate_id — fato descartado "
+            f"(reason={reason!r}, text={str(item.get('text'))[:80]!r})"
+        )
+        return res
+    log.info(
+        f"[memory] possible_update — candidate_id={candidate_id}, "
+        f"candidate_score={res.get('candidate_score')}, "
+        f"candidate_text={str(res.get('candidate_text'))[:80]!r}"
+    )
+    try:
+        r = await _get_memory_client().post("/write", json={
+            **item, "action": "update", "memory_id": candidate_id,
+        })
+        r.raise_for_status()
+        data = r.json()
+        data["resolved"] = "update" if data.get("stored") else "not_applied"
+        if not data.get("stored"):
+            log.info(
+                f"[memory] update LT não efetivado (candidate_id={candidate_id}): "
+                f"{data.get('reason')}"
+            )
+        return data
+    except Exception as e:
+        log.warning(
+            f"[memory] possible_update resolve falhou (candidate_id={candidate_id}): {e}"
+        )
+        return res
+
+
+async def _memory_write_facts(texts: list[str]) -> list[dict]:
+    """Grava os fatos em LT via POST /write/batch (1 round-trip) e resolve
+    possible_update por item. Mesmo contrato do extrator de LLM.py para
+    memórias semânticas não-esquecíveis: forgettable=False (isenta de decay),
+    confidence=0.9 (prioridade na busca) e sequential=True (o servidor cria
+    cadeia de arestas temporal_precedence entre fatos consecutivos — o PPR
+    propaga contexto entre memórias do mesmo episódio)."""
+    items = [
+        {
+            "text":        t,
+            "source":      "tool:memory_write_batch",
+            "confidence":  0.9,
+            "forgettable": False,
+            "ttl_days":    None,
+        }
+        for t in texts
+    ]
+    r = await _get_memory_client().post(
+        "/write/batch", json={"items": items, "sequential": True},
+    )
+    r.raise_for_status()
+    data = r.json()
+    results = data.get("results", [])
+    return [
+        await _resolve_possible_update(item, res)
+        for item, res in zip(items, results)
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Servidor MCP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -581,6 +682,41 @@ async def web_search(query: str, max_results: int = 5) -> str:
     except Exception as e:
         log.exception("pipeline falhou")
         return f"Erro na busca web: {e}"
+
+
+@mcp.tool()
+async def memory_write_batch(facts: list[str]) -> str:
+    """Grava múltiplos fatos na memória de LONGO prazo (permanente) do usuário.
+    Cada item de `facts` deve ser um fato AUTOCONTIDO em terceira pessoa
+    (ex.: "O usuário chama-se João", "O usuário é alérgico a amendoim",
+    "O autor do livro X é Y") — sem referências a "esta conversa" nem
+    pronomes soltos. Use ao extrair informações úteis de documentos, páginas
+    da web ou qualquer fonte que o usuário pedir para memorizar; não use
+    para eventos transitórios da conversa em andamento."""
+    if not isinstance(facts, list):
+        return "Erro: `facts` deve ser uma lista de strings."
+    cleaned = [f.strip() for f in facts if isinstance(f, str) and f.strip()]
+    if not cleaned:
+        return "Erro: nenhum fato válido fornecido."
+    try:
+        results = await _memory_write_facts(cleaned)
+    except Exception as e:
+        log.exception("memory_write_batch falhou")
+        return f"Erro ao gravar memórias: {e}"
+    stored = sum(1 for r in results if r.get("stored"))
+    lines = []
+    for i, (f, r) in enumerate(zip(cleaned, results), 1):
+        if r.get("stored") and r.get("resolved") == "update":
+            lines.append(f"[{i}] Atualizada memória candidata #{r.get('memory_id')}: {f[:100]}")
+        elif r.get("stored"):
+            lines.append(f"[{i}] Gravada (memory_id={r.get('memory_id')}): {f[:100]}")
+        else:
+            lines.append(f"[{i}] Recusada ({r.get('reason')}): {f[:100]}")
+    log.info(f"[memory] memory_write_batch: {stored}/{len(cleaned)} fato(s) gravado(s)")
+    return (
+        f"{stored}/{len(cleaned)} fato(s) gravados na memória de longo prazo (permanente):\n"
+        + "\n".join(lines)
+    )
 
 
 if __name__ == "__main__":

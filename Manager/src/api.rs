@@ -12,6 +12,7 @@
 //!   POST /browser/stop    -> encerra o Chrome de depuração (controle manual)
 //!   GET  /browser/status  -> estado do Chrome + liveness do CDP
 
+use crate::mcp_manager;
 use crate::process_manager;
 use crate::state::SharedState;
 use axum::{
@@ -32,6 +33,9 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         .route("/browser/start", post(post_browser_start))
         .route("/browser/stop", post(post_browser_stop))
         .route("/browser/status", get(get_browser_status))
+        .route("/mcp/start", post(post_mcp_start))
+        .route("/mcp/stop", post(post_mcp_stop))
+        .route("/mcp/status", get(get_mcp_status))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{API_PORT}");
@@ -189,5 +193,61 @@ async fn get_browser_status(State(state): State<SharedState>) -> impl IntoRespon
         cdp_alive,
         cdp_url: format!("http://localhost:{port}"),
         profile_dir: profile_dir.display().to_string(),
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MCP manager (HOST) — ativação + supervisão do executável standalone
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    /// "não instalado" | "Inativo" | "Iniciando..." | "Ativo" | "Encerrando..."
+    /// | "Crash — reiniciando..."
+    status: String,
+    pid: Option<u32>,
+    /// Executável encontrado na raiz do projeto (ou AVA_MCP_MANAGER_BIN)?
+    installed: bool,
+    /// GET /health (:4008) respondeu 2xx agora?
+    healthy: bool,
+    binary: String,
+}
+
+async fn post_mcp_start(State(state): State<SharedState>) -> impl IntoResponse {
+    match mcp_manager::start(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "MCP manager iniciado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn post_mcp_stop(State(state): State<SharedState>) -> impl IntoResponse {
+    match mcp_manager::stop(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "MCP manager encerrado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn get_mcp_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (status, pid, installed, healthy) = mcp_manager::mcp_snapshot(&state).await;
+    let binary = { state.mcp.lock().await.binary.display().to_string() };
+
+    Json(McpStatusResponse {
+        status: status.label().to_string(),
+        pid,
+        installed,
+        healthy,
+        binary,
     })
 }
