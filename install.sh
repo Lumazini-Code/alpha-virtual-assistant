@@ -281,6 +281,14 @@ register_websearch_mcp() {
       "qual é a notícia mais recente sobre",
       "busque informações atuais de",
       "procure na web"
+    ],
+    "memory_write_batch": [
+      "lembre que",
+      "guarde isso na memória",
+      "anote que",
+      "salve essa informação",
+      "lembre-se de que",
+      "memorize os fatos deste documento"
     ]
   }
 }
@@ -323,6 +331,54 @@ EOF
   ok "websearch MCP registrado e sincronizado."
 }
 
+register_desktop_commander_mcp() {
+  local payload
+  payload='{
+  "name": "desktop-commander",
+  "skill_summary": "Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
+  "enabled": true,
+  "always_on": false
+}'
+
+  info "Registrando Desktop Commander MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  local registered=0 i
+  for i in $(seq 1 24); do
+    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
+         -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$registered" -ne 1 ]; then
+    warn "Não consegui cadastrar o Desktop Commander MCP — manager não respondeu em 2 min."
+    warn "Cadastre manualmente depois (dois comandos):"
+    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
+    printf '  curl -X POST %s/servers/desktop-commander/sync\n' "$MCP_MANAGER_URL"
+    return 1
+  fi
+
+  # /sync: exige a memory_api (:3000) de pé; o 1º sync baixa o pacote npm.
+  local synced=0
+  for i in $(seq 1 12); do
+    if curl -fsS --max-time 240 -X POST "$MCP_MANAGER_URL/servers/desktop-commander/sync" >/dev/null 2>&1; then
+      synced=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$synced" -ne 1 ]; then
+    warn "Desktop Commander MCP cadastrado, mas o sync falhou (memory_api ainda bootando?)."
+    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/desktop-commander/sync"
+    return 1
+  fi
+  ok "Desktop Commander MCP registrado e sincronizado."
+}
+
+
 # ── 6. Build + first up ───────────────────────────────────────────────────────
 if [ "$SKIP_BUILD" -eq 0 ]; then
   info "Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)..."
@@ -334,6 +390,9 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # Registro do Playwright MCP — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
   register_websearch_mcp || true
+  registrer_desktop_commander_mcp || true
+
+
 
   # Espera o /status do orchestrator (1º boot baixa Supertonic do HF)
   STATUS_URL="http://localhost:9000/status"

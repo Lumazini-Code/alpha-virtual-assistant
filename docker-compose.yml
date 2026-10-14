@@ -86,6 +86,9 @@ services:
       SEARXNG_URL: "http://searxng:8080"
       CRAWL4AI_URL: "http://crawl4ai:11235"
       VALKEY_URL: "redis://valkey:6379/0"
+      # memory_write_batch: a tool de gravação de memórias fala com a
+      # memory_api direto (mesmo contrato REST do LLM.py /write/batch)
+      MEMORY_API_URL: "http://ava:3000"
       CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:-ava-crawl4ai-internal}"
 
 volumes:

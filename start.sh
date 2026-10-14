@@ -89,8 +89,10 @@ restart_on_fail "onnx Manager" "python3 onnxManager.py" &
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &
 
-echo "  • TTS API..."
-restart_on_fail "TTS" "python3 TTS.py" &
+# Desativando o TTS por enquanto — a forma com que ele foi projetado para ser usado (agente totalmente outônomo, com fala constante) ainda não é suportada.
+
+#echo "  • TTS API..."
+#restart_on_fail "TTS" "python3 TTS.py" &
 
 # Desativando o Vision API por enquanto — A forma com que ele foi projetado para ser usado (agente totalmente outônomo, com visão constante) ainda não é suportada.
 
