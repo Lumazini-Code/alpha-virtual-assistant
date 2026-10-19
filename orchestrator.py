@@ -334,6 +334,13 @@ class MemoryWriteRequest(BaseModel):
     action: Literal["create", "update"] = "create"
     memory_id: Optional[int] = None
 
+class VoiceContextRequest(BaseModel):
+    # POST /voice/ingest — main.cpp (transcribe) dispara isso assim que o
+    # speaker embedding (CAM++, 192 dims) fica pronto. Deve bater ANTES do
+    # /execute correspondente: o /execute só CONSOME o cache, nunca espera.
+    session_id: Optional[str] = Field(None, description="Sessão da TUI (None = anônimo)")
+    embedding:  list[float] = Field(..., description="Embedding do locutor (CAM++ 192 dims)")
+
 class AlphaCodeRequest(BaseModel):
     task: str = Field(..., max_length=200_000, description="Descrição da tarefa em linguagem natural")
     session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
@@ -866,10 +873,105 @@ async def _recall_plans(user_input: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+# ── Voice memory context (Fase 1 — cache de ingestão) ────────────────────────
+# main.cpp (transcribe) dispara POST /voice/ingest com o speaker embedding
+# (CAM++ 192 dims) logo no endpoint do VAD — em paralelo com o flush do ASR.
+# O orchestrator faz o kNN (/voice-dict/read) e guarda o resultado aqui,
+# com TTL curto. O /execute só CONSOME o cache: se o lookup chegou a tempo,
+# custo do turno = 0ms; se não chegou, seguimos sem memória de voz (degraded,
+# nunca bloqueia o tool loop).
+_VOICE_CONTEXT_TTL = 30.0            # segundos — frase típica: < 5s de gap
+_voice_context_cache: dict[str, tuple[dict, float]] = {}
+
+
+async def _ingest_voice_context(session_id: Optional[str], embedding: list[float]) -> dict:
+    """POST /voice/ingest — kNN na memória de voz e cacheia o resultado.
+    Nunca levanta: falha → dict vazio (o turno seguinte apenas ignora)."""
+    # 192 dims (VO_EMBED_DIM do memory_config) — valida aqui p/ dar erro claro
+    # ao produtor C++ sem tocar o kNN.
+    if not embedding or len(embedding) != 192:
+        return {"ok": False, "reason": f"embedding deve ter 192 dims, recebido {len(embedding) if embedding else 0}"}
+    try:
+        resp = await _memory_request("POST", "/voice-dict/read", {
+            "embedding": embedding,
+            "top_k": 3,
+            "min_score": 0.45,
+            "include_related": True,
+        })
+    except Exception as e:
+        log.warning(f"voice-dict/read falhou (seguindo sem memória de voz): {type(e).__name__}: {e}")
+        return {"ok": False, "reason": f"voice_dict_read: {type(e).__name__}: {e}"}
+
+    sid = session_id or "__anon__"
+    _voice_context_cache[sid] = (resp, time.time())
+    # Poda: cache é minúsculo (uma entrada por sessão falante ativa), mas
+    # evitamos acumular sessões mortas.
+    if len(_voice_context_cache) > 64:
+        now = time.time()
+        for k in [k for k, (_, ts) in _voice_context_cache.items() if now - ts > _VOICE_CONTEXT_TTL]:
+            _voice_context_cache.pop(k, None)
+    n_candidates = len(resp.get("results") or [])
+    n_related = len(resp.get("related") or [])
+    log.info(f"voice/ingest: cache={sid[:8]} candidatos={n_candidates} related={n_related}")
+    return {"ok": True, "results": n_candidates, "related": n_related}
+
+
+def _consume_voice_context(sid: str) -> Optional[dict]:
+    """Pop o cache de voz da sessão (TTL + consumo único — evita contaminação
+    entre turnos). Sem contexto ou expirado → None.
+
+    Fallback "__anon__": o produtor C++ (transcribe/main.cpp) não conhece o
+    session_id da TUI e envia session_id=null — o sistema é single-session,
+    então o /execute consome a entrada anônima quando não há uma para o sid.
+    """
+    entry = _voice_context_cache.pop(sid, None)
+    if not entry:
+        entry = _voice_context_cache.pop("__anon__", None)
+    if not entry:
+        return None
+    res, ts = entry
+    if time.time() - ts > _VOICE_CONTEXT_TTL:
+        return None
+    return res
+
+
+def _format_voice_context_block(voice_res: Optional[dict]) -> str:
+    """VoiceDictReadResponse → bloco de contexto p/ o system prompt.
+    Em inglês (língua do system prompt do tool loop). Retorna "" se vazio."""
+    if not voice_res:
+        return ""
+    candidates = voice_res.get("results") or []
+    if not candidates:
+        return ""
+    best = candidates[0]
+    lines = [
+        "## Speaker voice context (biometric identification, pre-fetched)",
+        f"- Most likely speaker: \"{best.get('person_name')}\""
+        f" (voice-match score {best.get('score', 0):.2f}, {best.get('confidence', 0):.2f} confidence).",
+    ]
+    if best.get("description"):
+        lines.append(f"- Who this is: {best['description']}")
+    for c in candidates[1:3]:
+        lines.append(f"- Other candidate: \"{c.get('person_name')}\""
+                     f" (score {c.get('score', 0):.2f}): {c.get('description') or 'no description'}")
+    related = voice_res.get("related") or []
+    rel_texts = [((m.get("text") or m.get("content") or "").strip()) for m in related]
+    rel_texts = [t for t in rel_texts if t][:3]
+    if rel_texts:
+        lines.append("- Memories associated with this speaker:")
+        lines.extend(f"  - {t}" for t in rel_texts)
+    lines.append("- Treat this speaker identity as high-priority context; address/personalize accordingly.")
+    return "\n".join(lines)
+
+
 async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     """Recall pré-loop: /read e /read-short-term EM PARALELO. Retorna
     (bloco de recall formatado, turnos ST saneados). Qualquer falha degrada
-    para vazio — nunca derruba o tool loop."""
+    para vazio — nunca derruba o tool loop.
+
+    O contexto de memória de voz NÃO é buscado aqui: já foi pré-buscado pelo
+    /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
+    com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
     read_res, st_turns = await asyncio.gather(
         _memory_read_semantic(
             query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
@@ -877,7 +979,14 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
         _memory_read_st_raw(sid, ORCH_ST_PAIRS),
     )
     clean_turns = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
-    return _format_recall_block(read_res, clean_turns), clean_turns
+    recall_block = _format_recall_block(read_res, clean_turns)
+
+    # Injeção do contexto de voz (Fase 3 do plano) — custo O(1), se existir.
+    voice_block = _format_voice_context_block(_consume_voice_context(sid))
+    if voice_block:
+        recall_block = (voice_block + "\n\n" + recall_block) if recall_block else voice_block
+
+    return recall_block, clean_turns
 
 
 async def _extract_memories_via_llm(u: str, a: str, sid: str):
@@ -3020,6 +3129,15 @@ async def deep_search(req: DeepSearchRequest):
         return r.json()
     except Exception as e:
         raise HTTPException(502, f"Deep Search falhou: {e}")
+
+
+@app.post("/voice/ingest")
+async def voice_ingest(req: VoiceContextRequest):
+    """Recebe o speaker embedding do main.cpp (disparado no endpoint do VAD)
+    e pré-busca a memória de voz (kNN em /voice-dict/read) para injeção no
+    próximo /execute da sessão. Latência crítica: esta chamada roda FORA do
+    caminho do turno — o /execute só consome o cache, custo 0ms."""
+    return await _ingest_voice_context(req.session_id, req.embedding)
 
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):

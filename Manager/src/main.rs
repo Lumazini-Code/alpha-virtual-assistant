@@ -14,6 +14,7 @@ mod idle_watcher;
 mod mcp_manager;
 mod process_manager;
 mod state;
+mod transcript;
 mod ui;
 
 use eframe::egui;
@@ -81,6 +82,15 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Transcript (voz, host): descoberta em background pelo mesmo motivo —
+    // o liveness é só um pid check, mas nada aqui pode atrasar a tray.
+    {
+        let state = shared_state.clone();
+        rt.spawn(async move {
+            transcript::discover(&state).await;
+        });
+    }
+
     // Sobe a API REST (axum) em background.
     {
         let state = shared_state.clone();
@@ -108,6 +118,9 @@ fn main() -> anyhow::Result<()> {
                 process_manager::health_check_docker(&state).await;
                 // MCP manager (host): Running sem /health → Crashed → respawn.
                 mcp_manager::health_check(&state).await;
+                // Transcript (host): Running sem pid → Crashed → respawn
+                // (com o container de pé).
+                transcript::health_check(&state).await;
             }
         });
     }

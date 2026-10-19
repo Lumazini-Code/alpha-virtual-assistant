@@ -23,11 +23,12 @@ find_library(TENVAD_LIB      ten_vad               PATHS ${ROOT} NO_DEFAULT_PATH
 find_library(ONNXRUNTIME_LIB onnxruntime           PATHS ${ROOT} NO_DEFAULT_PATH REQUIRED)
 find_library(SHERPA_LIB      sherpa-onnx-c-api     PATHS ${ROOT} NO_DEFAULT_PATH REQUIRED)
 
+find_package(CURL REQUIRED)                                   # sudo apt install libcurl4-openssl-dev
 find_package(PkgConfig REQUIRED)                              # sudo apt install portaudio19-dev pkg-config
 pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
 
 target_link_libraries(transcript PRIVATE
-    ${TRANSCRIBE_LIB} ${TENVAD_LIB} ${SHERPA_LIB} ${ONNXRUNTIME_LIB} PkgConfig::PORTAUDIO)
+    ${TRANSCRIBE_LIB} ${TENVAD_LIB} ${SHERPA_LIB} ${ONNXRUNTIME_LIB} PkgConfig::PORTAUDIO CURL::libcurl)
 
 # Achar as .so na pasta do executável (DT_RPATH vale também pras dependências das libs)
 set_target_properties(transcript PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")

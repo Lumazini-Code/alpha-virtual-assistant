@@ -8,12 +8,12 @@
 //!
 //! Este módulo é o placeholder de ativação + supervisão no tray:
 //!   - discover():      no boot, vê se o binário existe e se o manager
-//!                      já está de pé (health :4008) — reaproveita.
+//!     já está de pé (health :4008) — reaproveita.
 //!   - start():         spawn do executável (cwd = raiz do projeto),
-//!                      aguarda o /health responder.
+//!     aguarda o /health responder.
 //!   - stop():          encerra o processo (graceful → kill).
 //!   - health_check():  tick periódico — Running sem /health vira Crashed;
-//!                      Crashed é re-espawnado (restart-on-fail).
+//!     Crashed é re-espawnado (restart-on-fail).
 //!
 //! Enquanto o executável não existir (find_mcp_manager_binary em
 //! state.rs), TUDO aqui é inerte: start responde erro claro de "não

@@ -135,6 +135,54 @@ impl Default for McpManagerState {
     }
 }
 
+/// Status do transcript (pipeline de voz) no HOST. Mesma forma do
+/// McpStatus: NotInstalled (binário do build CMake não existe) e Crashed
+/// (estava Running e o health check o perdeu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptStatus {
+    NotInstalled,
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Crashed,
+}
+
+impl TranscriptStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            TranscriptStatus::NotInstalled => "não instalado",
+            TranscriptStatus::Stopped => "Inativo",
+            TranscriptStatus::Starting => "Iniciando...",
+            TranscriptStatus::Running => "Ativo",
+            TranscriptStatus::Stopping => "Encerrando...",
+            TranscriptStatus::Crashed => "Crash — reiniciando...",
+        }
+    }
+}
+
+/// Estado do transcript no HOST — binário C++ (Modules/transcribe) que
+/// abre o microfone (PortAudio) e alimenta o orchestrator (/voice/ingest).
+/// Não pode viver no container: precisa de device de áudio do host.
+#[derive(Debug, Clone)]
+pub struct TranscriptState {
+    pub status: TranscriptStatus,
+    pub pid: Option<u32>,
+    /// Caminho do executável (o candidato default, mesmo quando ausente —
+    /// o campo `status == NotInstalled` é que diz se ele existe de fato).
+    pub binary: PathBuf,
+}
+
+impl Default for TranscriptState {
+    fn default() -> Self {
+        Self {
+            status: TranscriptStatus::NotInstalled,
+            pid: None,
+            binary: PathBuf::new(),
+        }
+    }
+}
+
 /// Estado raiz da aplicação. Uma única instância, compartilhada via `Arc`.
 pub struct AppState {
     pub docker: Arc<TokioMutex<DockerState>>,
@@ -143,6 +191,9 @@ pub struct AppState {
     /// vira um executável standalone Rust; enquanto ele não existe, o estado
     /// fica em NotInstalled e nada é spawnado).
     pub mcp: Arc<TokioMutex<McpManagerState>>,
+    /// Transcript (voz): processo do HOST supervisionado pelo tray —
+    /// auto-iniciado junto com o container (same lifecycle do mcp).
+    pub transcript: Arc<TokioMutex<TranscriptState>>,
     pub docker_start_script: PathBuf,
     /// Diretório raiz do projeto (onde ficam docker-compose.yml, o binário
     /// do MCP manager, etc.) — cwd dos processos supervisionados.
@@ -270,6 +321,82 @@ fn find_mcp_manager_binary() -> PathBuf {
     fallback
 }
 
+/// ✅ Detecta o binário do transcript (pipeline de voz C++ no HOST).
+///
+/// Ordem de resolução:
+///   1. env AVA_TRANSCRIPT_BIN — caminho explícito (absoluto ou relativo
+///      à raiz do projeto);
+///   2. `Modules/transcribe/transcript` (Linux) / `transcript.exe`
+///      (Windows) — saída do build CMake do módulo de transcrição
+///      (`./Modules/transcribe/make.sh`);
+///   3. `transcript` direto nos mesmos diretórios candidatos do MCP
+///      manager (exe lado a lado / raiz do projeto).
+///
+/// Não encontrado → retorno aponta o candidato default: o estado fica em
+/// NotInstalled e a supervisão é INERTE (nada é spawnado, sem crash).
+fn find_transcript_binary() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+
+    if let Some(env_path) = std::env::var_os("AVA_TRANSCRIPT_BIN") {
+        let p = PathBuf::from(env_path);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            let root = exe_dir
+                .clone()
+                .map(|d| d.join("..").canonicalize().unwrap_or(d))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            root.join(p)
+        };
+        tracing::info!("Transcript (env AVA_TRANSCRIPT_BIN): {}", p.display());
+        return p;
+    }
+
+    let names: &[&str] = if cfg!(windows) {
+        &["transcript.exe"]
+    } else {
+        &["transcript"]
+    };
+
+    // Diretórios candidatos (mesma lógica do MCP manager):
+    //   1. exe_dir/../.. — layout de BUILD do cargo (Manager/target/debug →
+    //      raiz do projeto, onde Modules/transcribe/ vive no desenvolvimento)
+    //   2. exe_dir/..    — layout INSTALADO (ex.: <projeto>/bin/ava-tray → raiz)
+    //   3. exe_dir       — exe e binário lado a lado
+    //   4. cwd
+    // Dentro de cada um, procuramos em Modules/transcribe/ (layout do build
+    // CMake) e na própria raiz.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = &exe_dir {
+        dirs.push(d.join("../..").canonicalize().unwrap_or_else(|_| d.clone()));
+        dirs.push(d.join("..").canonicalize().unwrap_or_else(|_| d.clone()));
+        dirs.push(d.clone());
+    }
+    dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let subdirs = [PathBuf::from("Modules").join("transcribe"), PathBuf::from(".")];
+    for dir in &dirs {
+        for sub in &subdirs {
+            for name in names {
+                let p = dir.join(sub).join(name);
+                if p.exists() {
+                    tracing::info!("Binário transcript encontrado: {}", p.display());
+                    return p;
+                }
+            }
+        }
+    }
+
+    let fallback = dirs[0].join("Modules").join("transcribe").join(names[0]);
+    tracing::info!(
+        "Binário transcript não encontrado (procurado {names:?} em Modules/transcribe/) — \
+         supervisão inerte até o build do módulo de transcrição existir."
+    );
+    fallback
+}
+
 pub fn new_shared_state() -> SharedState {
     tracing::info!(
         "Diretório do executável: {}",
@@ -286,6 +413,7 @@ pub fn new_shared_state() -> SharedState {
         .unwrap_or_else(|| PathBuf::from("."));
     let project_root = exe_dir.join("..").canonicalize().unwrap_or_else(|_| exe_dir.clone());
     let mcp_binary = find_mcp_manager_binary();
+    let transcript_binary = find_transcript_binary();
 
     // Health check aponta para a porta do manager no HOST (env
     // AVA_MCP_MANAGER_URL sobrescreve — ex.: porta diferente no port).
@@ -306,6 +434,15 @@ pub fn new_shared_state() -> SharedState {
             pid: None,
             binary: mcp_binary,
             health_url: format!("http://localhost:{mcp_port}/health"),
+        })),
+        transcript: Arc::new(TokioMutex::new(TranscriptState {
+            status: if transcript_binary.exists() {
+                TranscriptStatus::Stopped
+            } else {
+                TranscriptStatus::NotInstalled
+            },
+            pid: None,
+            binary: transcript_binary,
         })),
         docker_start_script: find_docker_start_script(),
         project_root,

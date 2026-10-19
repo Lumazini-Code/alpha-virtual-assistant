@@ -3,7 +3,9 @@
 //! O docker continua sendo chamado via subprocess, exatamente como no
 //! script original (docker-start.bat / docker-start.sh).
 
+use crate::mcp_manager;
 use crate::state::{ProcStatus, SharedState};
+use crate::transcript;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,6 +52,7 @@ async fn discover_docker(state: &SharedState) {
         .output()
         .await;
 
+    let mut containers_up = false;
     match output {
         Ok(out) if out.status.success() => {
             let running_containers = String::from_utf8_lossy(&out.stdout);
@@ -60,6 +63,7 @@ async fn discover_docker(state: &SharedState) {
 
             if count > 0 {
                 tracing::info!("Docker detectado! {} container(s) rodando.", count);
+                containers_up = true;
 
                 let mut docker = state.docker.lock().await;
                 docker.status = ProcStatus::Running;
@@ -78,6 +82,14 @@ async fn discover_docker(state: &SharedState) {
         Err(e) => {
             tracing::debug!("Não foi possível executar docker: {e}");
         }
+    }
+
+    // Container já carregado (tray reiniciou sem derrubar o docker) →
+    // auto-inicializa os serviços do HOST que dependem dele. Mesma
+    // semântica do start_docker: quem sobe o container também sobe o
+    // transcript de voz e o MCP manager, sem diferença para o usuário.
+    if containers_up {
+        spawn_auto_start_host_services(state);
     }
 }
 
@@ -167,6 +179,11 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     docker.pid = pid;
     docker.last_activity = Some(Instant::now());
 
+    // Container carregado → auto-inicializa os serviços do HOST que
+    // dependem dele (transcript de voz + MCP manager), em background —
+    // o handler do /docker/start NÃO espera o boot deles.
+    spawn_auto_start_host_services(state);
+
     tracing::info!("Docker iniciado.");
     Ok(())
 }
@@ -238,6 +255,49 @@ pub async fn touch_docker_activity(state: &SharedState) {
     if docker.status == ProcStatus::Running {
         docker.last_activity = Some(Instant::now());
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Auto-inicialização dos serviços do HOST quando o container carrega
+// ════════════════════════════════════════════════════════════════════════
+
+/// Sobe, em background, os serviços do HOST que dependem do container:
+///   - transcript de voz (mic → ASR → /voice/ingest no orchestrator);
+///   - MCP manager (executável standalone no host).
+///
+/// Chamado sempre que o container é CARREGADO:
+///   - start_docker() com sucesso;
+///   - descoberta no boot com containers já rodando (tray reiniciou).
+///
+/// Ambos os starts são IDEMPOTENTES (reaproveitam processo vivo), então
+/// chamar de novo é barato e sem efeito colateral. Nada aqui bloqueia o
+/// chamador — o /docker/start responde sem esperar o boot dos serviços.
+///
+/// Nota: o Chrome de depuração NÃO entra aqui — por design ele é controle
+/// manual (/browser/start), pois a janela deve ficar aberta ao usuário.
+fn spawn_auto_start_host_services(state: &SharedState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Gate: só com o container de pé — sem o orchestrator não há para
+        // quem mandar embeddings (transcript) nem tools MCP funcionais.
+        let docker_running = {
+            let docker = state.docker.lock().await;
+            docker.status == ProcStatus::Running
+        };
+        if !docker_running {
+            tracing::debug!("Auto-init: docker não está Running — pulando serviços do host.");
+            return;
+        }
+
+        match transcript::start(&state).await {
+            Ok(()) => tracing::info!("Auto-init: transcript de voz ativo."),
+            Err(e) => tracing::warn!("Auto-init: transcript não subiu: {e:#}"),
+        }
+        match mcp_manager::start(&state).await {
+            Ok(()) => tracing::info!("Auto-init: MCP manager ativo."),
+            Err(e) => tracing::warn!("Auto-init: MCP manager não subiu: {e:#}"),
+        }
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════

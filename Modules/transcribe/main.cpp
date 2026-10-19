@@ -59,6 +59,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <curl/curl.h>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -312,6 +313,126 @@ private:
 };
 
 // ---------------------------------------------------------------------
+// Ingestão de contexto de voz (Fase 2): envia o embedding do locutor ao
+// orchestrator (POST /voice/ingest) numa thread dedicada — fire-and-forget,
+// NUNCA bloqueia a thread do CAM++ nem a thread principal. A busca kNN roda
+// fora do caminho do turno; o /execute só consome o cache do orchestrator.
+// session_id=null: o sistema é single-session — o orchestrator cacheia como
+// "__anon__" e o /execute consome essa entrada.
+// ---------------------------------------------------------------------
+class VoiceIngest {
+public:
+    bool init() {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        const char* port = std::getenv("ORCHESTRATOR_PORT");
+        url_ = std::string("http://127.0.0.1:")
+             + (port && *port ? port : "9000") + "/voice/ingest";
+        const char* tok = std::getenv("AVA_INTERNAL_TOKEN");
+        if (tok && *tok) token_ = tok;
+        worker_ = std::thread(&VoiceIngest::loop, this);
+        return true;
+    }
+
+    void submit(std::vector<float>&& emb) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (queue_.size() >= QUEUE_MAX) queue_.pop_front();   // atrasou: joga a mais velha fora
+            queue_.push_back(std::move(emb));
+        }
+        cv_.notify_one();
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+        if (curl_) curl_easy_cleanup(curl_);
+        curl_global_cleanup();
+    }
+
+private:
+    static size_t _discard(char*, size_t size, size_t nmemb) { return size * nmemb; }
+
+    void loop() {
+        for (;;) {
+            std::vector<float> emb;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+                if (queue_.empty()) return;
+                emb = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            post(emb);
+        }
+    }
+
+    void post(const std::vector<float>& emb) {
+        if (!curl_) curl_ = curl_easy_init();
+        if (!curl_) return;
+
+        // {"session_id": null, "embedding": [f1, f2, ...]}
+        std::string body;
+        body.reserve(emb.size() * 10 + 64);
+        body += "{\"session_id\":null,\"embedding\":[";
+        char num[32];
+        for (size_t i = 0; i < emb.size(); i++) {
+            std::snprintf(num, sizeof(num), "%.7g", emb[i]);
+            if (i) body += ',';
+            body += num;
+        }
+        body += "]}";
+
+        curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        if (!token_.empty())
+            hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + token_).c_str());
+
+        curl_easy_reset(curl_);
+        curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, _discard);
+
+        const CURLcode rc = curl_easy_perform(curl_);
+        curl_slist_free_all(hdrs);
+
+        long code = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+        if (rc != CURLE_OK) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::fprintf(stderr, "\033[2m[voice ingest: %s]\033[0m\n", curl_easy_strerror(rc));
+        } else if (code != 200) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::fprintf(stderr, "\033[2m[voice ingest: HTTP %ld]\033[0m\n", code);
+        } else {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::printf("\033[2m[voice ingest: ok (%zu dims)]\033[0m\n", emb.size());
+            std::fflush(stdout);
+        }
+    }
+
+    static constexpr size_t QUEUE_MAX = 4;
+    std::string url_;
+    std::string token_;
+    CURL* curl_ = nullptr;
+    std::deque<std::vector<float>> queue_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    std::thread worker_;
+};
+
+static VoiceIngest g_voice_ingest;
+
+// ---------------------------------------------------------------------
 // Speaker embedding (CAM++ / 3D-Speaker) numa thread dedicada
 // ---------------------------------------------------------------------
 class SpeakerEmbedder {
@@ -392,6 +513,10 @@ private:
             // Aqui você pluga o tratamento (enrollment, cosine, diarização...).
             // `emb` tem `dim` floats e é válido só até o fim deste escopo.
             last_embedding_.assign(emb, emb + dim);
+
+            // Fase 2 — ingestão: dispara POST /voice/ingest com o embedding
+            // (fire-and-forget na thread do VoiceIngest; não bloqueia o CAM++).
+            g_voice_ingest.submit(std::vector<float>(emb, emb + dim));
 
             const double took_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -643,6 +768,9 @@ int main() {
         std::fprintf(stderr, "Seguindo sem speaker embedding.\n");
     }
 
+    std::printf("Conectando ingestão de voz (orchestrator /voice/ingest)...\n");
+    g_voice_ingest.init();
+
     std::printf("Carregando wake word (sherpa-onnx KWS)...\n");
     const bool wake_ok = g_wake.init();
     if (!wake_ok) {
@@ -823,6 +951,7 @@ int main() {
     }
     if (wake_ok) g_wake.shutdown();
     if (speaker_ok) g_speaker.shutdown();   // drena a fila antes de sair
+    g_voice_ingest.shutdown();              // drena ingestões pendentes
 
     if (g_dropped.load() > 0) {
         std::fprintf(stderr, "Aviso: %lu blocos de áudio descartados (inferência lenta demais?)\n",
