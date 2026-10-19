@@ -45,7 +45,7 @@
 #include <portaudio.h>
 #include <ten_vad.h>
 #include <onnxruntime_cxx_api.h>
-#include <sherpa-onnx/c-api/c-api.h>
+#include <c-api.h>
 
 #include <algorithm>
 #include <array>
@@ -78,9 +78,9 @@ static constexpr int FRAME_SAMPLES = 256;                 // hop do TEN VAD (160
 static constexpr int FRAME_MS = FRAME_SAMPLES * 1000 / SAMPLE_RATE;   // 16ms
 static constexpr float VAD_THRESHOLD = 0.5f;             // 0.0-1.0: maior = mais rígido
 static constexpr int SILENCE_MS_TO_ENDPOINT = 400;       // silêncio que fecha a frase
+static constexpr int SILENCE_MS_AFTER_WAKE = 1500;       // após a wake word: espera mais pra não cortar o comando
 static constexpr int ONSET_FRAMES = 4;                   // ~64ms de fala seguida pra abrir
 static constexpr int PREROLL_FRAMES = 13;                // ~208ms guardados antes do onset
-static constexpr int MAX_UTTERANCE_MS = 30000;           // força finalize em frases longas
 static constexpr bool DEBUG_EMPTY = true;                // mostra frases descartadas (vazias) em cinza
 static constexpr int ATT_CONTEXT_RIGHT = 3;              // menu do nemotron-3.5: {13, 6, 3, 0} => {1040,480,240,0}ms de lookahead
 
@@ -99,7 +99,8 @@ static constexpr const char* KWS_JOINER  = "../Models/sherpa-onnx/joiner-epoch-1
 static constexpr const char* KWS_TOKENS  = "../Models/sherpa-onnx/tokens.txt";
 static constexpr const char* KWS_KEYWORDS = "../Models/sherpa-onnx/keywords.txt";   // uma wake word por linha (já tokenizada)
 static constexpr bool  WAKE_GATE_ASR = true;             // true: ASR só abre depois da wake word
-static constexpr bool  DEBUG_WAKE = true;                // mostra frases ignoradas por falta de wake word
+// mostra frases ignoradas por falta de wake word (ativa se ALPHA_DEBUG_WAKE estiver setada no ambiente)
+static bool debug_wake() { return std::getenv("ALPHA_DEBUG_WAKE") != nullptr; }
 static constexpr float KWS_THRESHOLD = 0.25f;            // maior = menos falsos positivos, mais misses
 static constexpr float KWS_SCORE = 1.0f;                 // boost global (cada linha pode ter o seu com :x.x)
 static constexpr int   KWS_THREADS = 1;                  // modelo minúsculo: 1 thread basta
@@ -471,6 +472,7 @@ public:
     // Início de uma frase: stream limpo.
     void begin() {
         end();
+        last_unmatched_.clear();
         stream_ = SherpaOnnxCreateKeywordStream(spotter_);
     }
 
@@ -498,6 +500,9 @@ public:
         if (spotter_) { SherpaOnnxDestroyKeywordSpotter(spotter_); spotter_ = nullptr; }
     }
 
+    // O que o KWS identificou na frase atual sem corresponder a nenhuma keyword (para debug).
+    const std::string& last_unmatched() const { return last_unmatched_; }
+
 private:
     bool drain(std::string& name) {
         while (SherpaOnnxIsKeywordStreamReady(spotter_, stream_)) {
@@ -505,6 +510,8 @@ private:
             const SherpaOnnxKeywordResult* r = SherpaOnnxGetKeywordResult(spotter_, stream_);
             const bool hit = r && r->keyword && r->keyword[0] != '\0';
             if (hit) name = r->keyword;
+            // debug: guarda o que o KWS identificou mesmo sem ser uma keyword alvo
+            else if (r && r->keyword && r->keyword[0] != '\0') last_unmatched_ = r->keyword;
             if (r) SherpaOnnxDestroyKeywordResult(r);
             if (hit) return true;
         }
@@ -513,6 +520,7 @@ private:
 
     const SherpaOnnxKeywordSpotter* spotter_ = nullptr;
     const SherpaOnnxOnlineStream* stream_ = nullptr;
+    std::string last_unmatched_;
 };
 
 static WakeWord g_wake;
@@ -689,7 +697,7 @@ int main() {
     // Áudio bruto da frase atual: alimenta o speaker embedding e, no modo gate,
     // é o que se reenvia ao ASR quando a wake word dispara.
     std::vector<int16_t> utt_pcm;
-    utt_pcm.reserve((size_t)SAMPLE_RATE * MAX_UTTERANCE_MS / 1000);
+    utt_pcm.reserve((size_t)SAMPLE_RATE * 60 / 1000);   // pré-aloca ~60s; cresce além disso se a frase for maior (sem limite)
 
     bool active = false;      // segmento de fala aberto (VAD)
     bool asr_open = false;    // transcribe_stream_begin já foi chamado nesta frase
@@ -771,7 +779,9 @@ int main() {
             if (is_speech) speech_frames++;
             max_prob = std::max(max_prob, vad_prob);
 
-            if (silence_ms >= SILENCE_MS_TO_ENDPOINT || utterance_ms >= MAX_UTTERANCE_MS) {
+            // após a wake word, toleramos uma pausa maior (usuário ainda está falando o comando)
+            const int silence_limit = woke ? SILENCE_MS_AFTER_WAKE : SILENCE_MS_TO_ENDPOINT;
+            if (silence_ms >= silence_limit) {
                 // última chance da wake word (tail padding do KWS)
                 if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
 
@@ -786,10 +796,10 @@ int main() {
                                     utterance_ms, speech_frames, max_prob);
                         std::fflush(stdout);
                     }
-                } else if (DEBUG_WAKE) {
+                } else if (debug_wake()) {
                     std::lock_guard<std::mutex> lk(g_print_mu);
-                    std::printf("\033[2m[sem wake word: %d ms, prob. max %.2f]\033[0m\n",
-                                utterance_ms, max_prob);
+                    std::printf("\033[2m[sem wake word: %d ms, prob. max %.2f, identificado: \"%s\"]\033[0m\n",
+                                utterance_ms, max_prob, g_wake.last_unmatched().c_str());
                     std::fflush(stdout);
                 }
                 if (wake_ok) g_wake.end();

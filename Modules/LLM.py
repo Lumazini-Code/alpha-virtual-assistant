@@ -45,6 +45,8 @@ from langdetect import detect
 import logging
 from dotenv import load_dotenv
 import os
+import queue
+import threading
 
 
 
@@ -337,6 +339,21 @@ async def _get_openrouter_client() -> httpx.AsyncClient:
     return _openrouter_client
 
 
+def _get_internal_auth_headers() -> dict[str, str]:
+    """Headers de auth para chamadas internas (Plano 1 — T4). Fail-open:
+    sem token, retorna {} (o middleware fail-open do destino aceita)."""
+    try:
+        from Modules.internal_auth import internal_token as _tok_fn  # type: ignore
+    except Exception:
+        try:
+            import internal_auth as _ia  # type: ignore
+            _tok_fn = _ia.internal_token  # type: ignore
+        except Exception:
+            _tok_fn = lambda: os.getenv("AVA_INTERNAL_TOKEN", "").strip() or None  # type: ignore
+    tok = _tok_fn()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
 def _get_memory_client() -> httpx.AsyncClient:
     """Persistent client para a API REST de memória (memory_api.py) —
     connection pooling + keep-alive, mesmo padrão do client OpenRouter/TTS."""
@@ -346,6 +363,7 @@ def _get_memory_client() -> httpx.AsyncClient:
             base_url=MEMORY_API_URL,
             timeout=httpx.Timeout(30.0, connect=5.0),
             limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+            headers=_get_internal_auth_headers(),
         )
     return _memory_http
 
@@ -416,6 +434,7 @@ def _get_tts_client() -> httpx.AsyncClient:
             base_url=TTS_URL,
             timeout=httpx.Timeout(9999999.0),
             limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
+            headers=_get_internal_auth_headers(),
         )
     return _tts_http
 
@@ -430,21 +449,47 @@ def _setup_logging():
     log_path = log_dir / f"LLM_api_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     class LogDuplicado:
+        # Escrita de arquivo assíncrona (queue + thread daemon): o stdout/stderr
+        # nunca bloqueia o event loop esperando I/O de disco.
         def __init__(self, terminal, path):
             self.terminal = terminal
             self.log = open(path, "w", encoding="utf-8")
+            self._queue: "queue.Queue[str | None]" = queue.Queue()
+            self._worker = threading.Thread(target=self._writer_loop, daemon=True)
+            self._worker.start()
+
+        def _writer_loop(self):
+            while True:
+                msg = self._queue.get()
+                if msg is None:  # sentinel: sinaliza flush
+                    try:
+                        self.log.flush()
+                    except Exception:
+                        pass
+                    self._queue.task_done()
+                    continue
+                try:
+                    self.log.write(msg)
+                except Exception:
+                    pass
+                self._queue.task_done()
 
         def write(self, msg):
-            try: self.terminal.write(msg)
-            except Exception: pass
-            self.log.write(msg)
+            try:
+                self.terminal.write(msg)
+            except Exception:
+                pass
+            self._queue.put(msg)
 
         def flush(self):
-            try: self.terminal.flush()
-            except Exception: pass
-            self.log.flush()
+            try:
+                self.terminal.flush()
+            except Exception:
+                pass
+            self._queue.put(None)
 
-        def isatty(self): return False
+        def isatty(self):
+            return False
 
     sys.stdout = LogDuplicado(sys.__stdout__, log_path)
     sys.stderr = LogDuplicado(sys.__stderr__, log_path)
@@ -1362,7 +1407,15 @@ def _build_messages(
 #                           FASTAPI
 # ─────────────────────────────────────────────────────────────
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA — LLM API", version="3.0.0")
+install_internal_auth(app, service_name="LLM")
 
 # ── Schemas ───────────────────────────────────────────────────
 
@@ -1598,7 +1651,15 @@ async def chat(req: ChatRequest):
 
     # Inferência (OpenRouter, com retry para falhas transitórias)
     t0 = time.perf_counter()
-    log.info(messages)
+    if os.environ.get("AVA_DEBUG") == "1":
+        log.info(messages)  # dump completo apenas em debug
+    else:
+        log.info(
+            "llm request: n_msgs=%d approx_chars=%d session=%s",
+            len(messages),
+            sum(len(str(m.get("content", ""))) for m in messages),
+            req.session_id,
+        )
     try:
         client_used, model_used, r = await _openrouter_post_with_retry(
             json_payload={
@@ -2388,4 +2449,4 @@ async def chat_tools(req: ToolUseRequest):
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=4003, log_level="info")
+    uvicorn.run(app, host=internal_bind_host(), port=4003, log_level="info")

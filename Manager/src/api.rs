@@ -38,7 +38,8 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         .route("/mcp/status", get(get_mcp_status))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{API_PORT}");
+    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{bind_host}:{API_PORT}");
     tracing::info!("API REST escutando em http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -7,6 +7,10 @@ EmbeddingEngine (E5: query/passage prefixados) e RerankEngine
 (cross-encoder p/ confirmação de duplicata/update).
 """
 
+import time
+from collections import OrderedDict
+from typing import Optional
+
 import numpy as np
 
 # memory_config primeiro: ele faz o bootstrap que coloca a pasta-mãe (Modules/)
@@ -17,6 +21,8 @@ from memory_config import (
     EMBED_PASSAGE_PREFIX,
     EMBED_QUERY_PREFIX,
     ONNX_SERVING_URL,
+    QUERY_EMBED_CACHE_MAX_ENTRIES,
+    QUERY_EMBED_CACHE_TTL_S,
     log,
 )
 
@@ -38,6 +44,10 @@ class EmbeddingEngine:
 
     def __init__(self, base_url: str = ONNX_SERVING_URL):
         self._client = EmbeddingClient(base_url=base_url)
+        # ── NEW (Plano 3 / T3): LRU+TTL cache de embeddings do LADO QUERY ──
+        # Chave: texto normalizado (modelo é fixo por instância — o prefixo
+        # de query E5 é constante). Passagens NÃO passam por aqui.
+        self._query_cache: "OrderedDict[str, tuple[float, np.ndarray]]" = OrderedDict()
         log.info(f"EmbeddingEngine carregado — via API: {base_url}")
 
     @staticmethod
@@ -58,9 +68,46 @@ class EmbeddingEngine:
     # ── lado "busca" (o que vai comparar contra o índice) ───────────────────
 
     async def embed_queries(self, texts: list[str]) -> np.ndarray:
+        """NEW (Plano 3 / T3): cache LRU+TTL do lado query.
+
+        Textos repetidos (queries recorrentes, re-segmentações, contexto
+        reenviado) reusam o vetor sem round-trip HTTP → onnxManager.
+        Cache HIT não consome quota/serviço; miss só para textos novos.
+        Passagens (embed_passages) NÃO passam por aqui — lado passage fica
+        sem cache de propósito."""
         if not texts:
             return np.empty((0, EMBED_DIM), dtype=np.float32)
-        return await self._client.embed(self._prefixed(texts, EMBED_QUERY_PREFIX))
+
+        now = time.time()
+        results: list[Optional[np.ndarray]] = [None] * len(texts)
+        misses: list[int] = []
+        miss_texts: list[str] = []
+
+        for i, text in enumerate(texts):
+            key = text.strip().lower()          # texto normalizado = chave
+            entry = self._query_cache.get(key)
+            if entry is not None and (now - entry[0]) < QUERY_EMBED_CACHE_TTL_S:
+                self._query_cache.move_to_end(key)  # LRU: hit refresca idade
+                results[i] = entry[1]
+            else:
+                if entry is not None:
+                    self._query_cache.pop(key)      # TTL expirado
+                misses.append(i)
+                miss_texts.append(text)
+
+        if miss_texts:
+            embeddings = await self._client.embed(self._prefixed(miss_texts, EMBED_QUERY_PREFIX))
+            for idx, emb in zip(misses, embeddings):
+                results[idx] = emb
+                key = miss_texts[idx].strip().lower()
+                self._query_cache[key] = (now, emb)
+                self._query_cache.move_to_end(key)
+
+        # Evict LRU quando passa do teto
+        while len(self._query_cache) > QUERY_EMBED_CACHE_MAX_ENTRIES:
+            self._query_cache.popitem(last=False)
+
+        return np.stack(results)
 
     async def embed_query_one(self, text: str) -> np.ndarray:
         result = await self.embed_queries([text])

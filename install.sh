@@ -209,7 +209,47 @@ fi
 
 ok "OPENROUTER_API_KEY configurada em $ENV_FILE (chmod 600)."
 
-# ── 5b. Registro do Playwright MCP (dependência direta do sistema) ────────────
+# ── 5a. Token de autenticação interna (AVA_INTERNAL_TOKEN) ───────────────────
+# Todos os serviços internos (orchestrator, LLM, TTS, vision, memory, mcp_manager, Manager)
+# escutam em 127.0.0.1 e exigem `Authorization: Bearer <AVA_INTERNAL_TOKEN>`.
+
+existing_token() {
+  [ -f "$ENV_FILE" ] && grep -E '^AVA_INTERNAL_TOKEN=.+' "$ENV_FILE" >/dev/null 2>&1
+}
+
+if existing_token; then
+  printf 'Já existe um AVA_INTERNAL_TOKEN em Modules/.env.\n'
+  printf 'Manter o token existente? [S/n] '
+  read -r ans || ans=""
+  case "$ans" in
+    n|N*)
+      TOKEN_VAL="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+      printf 'AVA_INTERNAL_TOKEN=%s\n' "$TOKEN_VAL" >> "$ENV_FILE"
+      chmod 600 "$ENV_FILE"
+      ;;
+  esac
+else
+  TOKEN_VAL="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  printf 'AVA_INTERNAL_TOKEN=%s\n' "$TOKEN_VAL" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+fi
+
+ok "AVA_INTERNAL_TOKEN configurado em $ENV_FILE (chmod 600)."
+
+# ── 5b. Token do crawl4ai (CRAWL4AI_API_TOKEN) ───────────────────────────────
+# O compose exige esta variável (falha de boot se ausente). O websearch-mcp
+# e o crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
+
+if ! grep -q '^CRAWL4AI_API_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
+  C4_TOKEN_VAL="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  printf 'CRAWL4AI_API_TOKEN=%s\n' "$C4_TOKEN_VAL" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  ok "CRAWL4AI_API_TOKEN gerado em $ENV_FILE."
+else
+  ok "CRAWL4AI_API_TOKEN já existe em $ENV_FILE."
+fi
+
+# ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
 # Cadastra o @playwright/mcp no mcp_manager (:4008) logo após o `up` do stack.
 # O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
 # seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,

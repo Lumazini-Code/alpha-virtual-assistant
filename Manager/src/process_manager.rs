@@ -364,6 +364,14 @@ const PROFILE_EXCLUDED_FILES: &[&str] = &[
     "SingletonPid",
     "lockfile",
     "LOCK",
+    // Credenciais/sessões — NUNCA copiar para o perfil CDP (Plano 1 — T7).
+    // Contêm cookies, senhas salvas, autofill e dados de cartão.
+    "Cookies",
+    "Cookies-journal",
+    "Login Data",
+    "Login Data-journal",
+    "Web Data",
+    "Web Data-journal",
 ];
 
 /// Onde ficam os dados do Chrome do usuário ("User Data" — pai de

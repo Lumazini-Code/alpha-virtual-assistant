@@ -14,19 +14,21 @@ services:
       # NUNCA publicar 9001 (tray) nem 9222 (Chrome CDP) — são serviços do
       # HOST: publicar faz o proxy do Docker Desktop capturar a porta e
       # sombrear o serviço local (TUI recebia "socket closed" no tray).
-      - "3000:3000"
-      - "4005:4005"
-      - "4003:4003"
-      - "3003:3003"
-      - "3001:3001"
-      - "2002:2002"
-      - "3002:3002"
-      - "3004:3004"
-      - "4002:4002"
-      - "9000:9000"
-      - "3005:3005"
-      - "2001:2001"
-      - "4008:4008"
+      # Prefixo 127.0.0.1: em TODAS as portas — sem ele o Docker Desktop
+      # publica em 0.0.0.0 e a LAN inteira alcança os serviços (Plano 1 — T9).
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:4005:4005"
+      - "127.0.0.1:4003:4003"
+      - "127.0.0.1:3003:3003"
+      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:2002:2002"
+      - "127.0.0.1:3002:3002"
+      - "127.0.0.1:3004:3004"
+      - "127.0.0.1:4002:4002"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:3005:3005"
+      - "127.0.0.1:2001:2001"
+      - "127.0.0.1:4008:4008"
 
     # Container → serviços do host (tray :9001, Chrome CDP :9222).
     # No Windows/WSL2 `localhost` dentro do container NÃO é o host —

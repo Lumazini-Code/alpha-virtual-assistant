@@ -351,7 +351,7 @@ IF_MIN_SCORE_READ       = 0.82     # threshold p/ /read (era min(0.83,0.75)=0.75
 # uma mistura (cross-encoder decide bem relevância; cosine preserva o sinal
 # de "quão próximo do vetor gravado" e mantém a escala dos thresholds).
 READ_RERANK_ENABLED       = True
-READ_RERANK_TOP_N         = 12    # nº de candidatos primary a reranquear
+READ_RERANK_TOP_N         = 8     # nº de candidatos primary a reranquear (Plano 3 / T6: 12→8, ~33% menos custo de cross-encoder)
 READ_RERANK_CROSS_WEIGHT  = 0.65  # peso do cross-encoder no score final
 READ_RERANK_COSINE_WEIGHT = 0.35  # peso do cosine original no score final
 
@@ -406,7 +406,34 @@ log = logging.getLogger("ava.memory")
 # Intervalo do job de manutenção periódica dos índices (ver index_flush_job).
 # No LanceDB cada add() já é durável; o "flush" passou a ser a COMPACTAÇÃO dos
 # fragmentos pequenos que os adds unitários geram (table.optimize()).
-INDEX_FLUSH_INTERVAL_S = 60
+# NEW (Plano 3 / T9): 60→300 — writes são esparços (bursts de adds unitários,
+# dias sem escrita) e cada add é durável de qualquer forma; otimizar 5× menos
+# vezes só atrasa a compactação, não a durabilidade.
+INDEX_FLUSH_INTERVAL_S = 300
+
+# ── NEW (Plano 3 / T1): índice ANN (IVF-PQ) no LanceDB ────────────────────────
+# Sem índice, table.search() é brute-force (scan completo) — com milhares de
+# vetores isso vira o gargalo do recall. O índice IVF-PQ só compensa acima de
+# um mínimo de linhas (abaixo disso o scan é mais rápido e o PQ degrada
+# recall de qualidade). num_sub_vectors deve DIVIDIR EMBED_DIM: 384/48 = 8
+# dims por sub-vetor (compressão 1536B → 48B por vetor).
+IVF_MIN_ROWS        = 1000  # abaixo disso: scan bruto (guard anti-degradação)
+IVF_NUM_SUB_VECTORS = 48    # 384 / 48 → 8 dims por sub-vetor (PQ de 48B)
+IVF_WAIT_TIMEOUT_S  = 30    # create_index: timeout p/ NÃO bloquear o flush
+
+# ── NEW (Plano 3 / T3): LRU cache de embeddings do LADO QUERY ─────────────────
+# Queries repetidas/segmentadas reusam o embedding (elimina round-trip HTTP →
+# onnxManager). SÓ o lado query — passagens mudam/multiplicam e não devem
+# ocupar cache. Chave: texto normalizado (o modelo é fixo por instância).
+QUERY_EMBED_CACHE_TTL_S       = 3600  # 1h
+QUERY_EMBED_CACHE_MAX_ENTRIES = 512
+
+# ── NEW (Plano 3 / T5): cache LRU de vetores armazenados, por id ──────────────
+# O MMR (inibição lateral) busca os vetores dos ids "related" (PPR) a CADA
+# recall — 1 query LanceDB extra. Vetores são imutáveis (só removidos junto
+# com a memória), então um cache por id é seguro: invalidamos em remove_ids
+# e reset. 384 dims float32 = 1.5KB/vetor → 4096 entradas ≈ 6MB.
+VECTOR_CACHE_MAX_ENTRIES = 4096
 
 
 __all__ = [
@@ -469,6 +496,9 @@ __all__ = [
     'IF_MIN_SCORE',
     'IF_MIN_SCORE_READ',
     'INDEX_FLUSH_INTERVAL_S',
+    'IVF_MIN_ROWS',
+    'IVF_NUM_SUB_VECTORS',
+    'IVF_WAIT_TIMEOUT_S',
     'LANCE_DIR',
     'LANCE_TABLE_PREFIX',
     'LTP_ACCESS_BOOST',
@@ -491,6 +521,8 @@ __all__ = [
     'PPR_MIN_NEIGHBORS_PER_HOP',
     'PPR_SPREAD_WEIGHT',
     'QUERY_AMBIGUOUS_RATIO',
+    'QUERY_EMBED_CACHE_MAX_ENTRIES',
+    'QUERY_EMBED_CACHE_TTL_S',
     'QUERY_SHORT_WORDS',
     'READ_IF_MAX_CHARS',
     'READ_LT_MAX_CHARS',
@@ -546,6 +578,7 @@ __all__ = [
     'VO_FAISS_INDEX_PATH',
     'VO_MIN_SCORE',
     'VO_TOP_K',
+    'VECTOR_CACHE_MAX_ENTRIES',
     'VS_DB_PATH',
     'VS_FAISS_ID_MAP_PATH',
     'VS_FAISS_INDEX_PATH',

@@ -34,12 +34,15 @@ env MEMORY_API_URL (default http://127.0.0.1:3000; no compose, http://ava:3000).
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import trafilatura
@@ -337,24 +340,104 @@ def filter_results(results: list[dict], max_urls: int) -> list[dict]:
 # Etapa 3-4: Fetch em camadas (HTTP estático → Crawl4AI)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _is_private_ip(ip_str: str) -> bool:
+    """Verifica se um IP é privado/loopback/link-local/reserved (T6 — SSRF)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    # IPv4-mapped IPv6 (ex: ::ffff:127.0.0.1)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _assert_public_url(url: str) -> None:
+    """
+    T6 — SSRF guard.
+    Resolve o hostname da URL e bloqueia IPs privados, loopback, link-local,
+    metadata (ex: 169.254.169.254), etc.
+    Raises ValueError se a URL for considerada insegura.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("URL deve usar http ou https")
+        if not parsed.hostname:
+            raise ValueError("URL sem hostname")
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            infos = socket.getaddrinfo(parsed.hostname, port)
+        except socket.gaierror:
+            raise ValueError(f"Não foi possível resolver hostname: {parsed.hostname}")
+        for info in infos:
+            if _is_private_ip(info[4][0]):
+                raise ValueError(f"URL resolve para IP bloqueado ({info[4][0]}) — SSRF suspeito")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Validação de URL falhou: {e}")
+
+
+async def _ssrf_guard_hook(request: httpx.Request) -> None:
+    """httpx event hook: valida a URL de CADA request (inclui redirects)."""
+    _assert_public_url(str(request.url))
+
+
 _static_client: httpx.AsyncClient | None = None
+
+
+def _get_static_client() -> httpx.AsyncClient:
+    """Client HTTP persistente do fetch estático (connection pooling, mesmo
+    padrão do _memory_client). Criado sob demanda e reutilizado por TODAS as
+    buscas — nunca fechado no meio de uma busca em curso (o padrão antigo,
+    `async with` em fetch_pages + global, fechava o client enquanto outra
+    busca concorrente ainda o usava → RuntimeError). TLS reutilizado:
+    ~50-150ms economizados por página."""
+    global _static_client
+    if _static_client is None or _static_client.is_closed:
+        _static_client = httpx.AsyncClient(
+            timeout=CFG["static_fetch"]["timeout_s"],
+            event_hooks={"request": [_ssrf_guard_hook]},
+        )
+    return _static_client
+
 
 
 async def _static_fetch(url: str) -> str | None:
     """Página estática? HTTP puro + trafilatura resolve em milissegundos."""
     sf = CFG["static_fetch"]
     try:
-        r = await _static_client.get(url, headers={"User-Agent": _UA}, follow_redirects=True)
+        r = await _get_static_client().get(url, headers={"User-Agent": _UA}, follow_redirects=True)
         if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
             return None
-        md = trafilatura.extract(r.text, output_format="markdown",
-                                 include_comments=False, include_links=False,
-                                 favor_recall=True)
+        # T6: trafilatura é CPU-bound puro — rodando fora do event loop para
+        # não bloquear concorrência (o semáforo do caller segue limitando).
+        md = await asyncio.to_thread(
+            trafilatura.extract, r.text, output_format="markdown",
+            include_comments=False, include_links=False,
+            favor_recall=True,
+        )
         if md and len(md) >= sf["min_chars"]:
             return md
     except Exception:
         pass
     return None
+
+
+_crawl4ai_client: httpx.AsyncClient | None = None
+
+
+def _get_crawl4ai_client() -> httpx.AsyncClient:
+    """Client persistente do lote crawl4ai (connection pooling). SEM o hook
+    SSRF de propósito: o serviço roda na rede docker interna e o hook do
+    fetch estático bloquearia o IP dele. Timeout é passado por-request —
+    varia com o tamanho do lote."""
+    global _crawl4ai_client
+    if _crawl4ai_client is None or _crawl4ai_client.is_closed:
+        _crawl4ai_client = httpx.AsyncClient()
+    return _crawl4ai_client
 
 
 async def _crawl4ai_batch(urls: list[str]) -> dict[str, str]:
@@ -381,8 +464,12 @@ async def _crawl4ai_batch(urls: list[str]) -> dict[str, str]:
         headers["Authorization"] = f"Bearer {token}"
     out: dict[str, str] = {}
     try:
-        r = await _static_client.post(f"{c4['url']}/crawl", json=payload,
-                                      timeout=timeout, headers=headers)
+        # Client persistente próprio (_get_crawl4ai_client) — o _static_client
+        # tem hook SSRF que bloquearia o IP interno do crawl4ai (rede docker
+        # privada). Timeout por-request: varia com o tamanho do lote.
+        r = await _get_crawl4ai_client().post(
+            f"{c4['url']}/crawl", json=payload, headers=headers, timeout=timeout,
+        )
         r.raise_for_status()
         data = r.json()
         results = data.get("results") or ([data["result"]] if data.get("result") else [])
@@ -402,7 +489,6 @@ async def _crawl4ai_batch(urls: list[str]) -> dict[str, str]:
 
 async def fetch_pages(pages: list[dict]) -> list[dict]:
     """Cache → HTTP estático → Crawl4AI. Preenche `markdown` em cada page."""
-    global _static_client
     sem = asyncio.Semaphore(CFG["crawl4ai"]["concurrency"])
 
     async def one(page: dict) -> None:
@@ -416,23 +502,23 @@ async def fetch_pages(pages: list[dict]) -> list[dict]:
         if page["markdown"]:
             await cache_set(key, page["markdown"], CFG["valkey"]["page_ttl_s"])
 
-    async with httpx.AsyncClient(timeout=CFG["static_fetch"]["timeout_s"]) as client:
-        _static_client = client
-        await asyncio.gather(*(one(p) for p in pages))
+    # T7: client persistente do módulo (_get_static_client) — sem `async with`,
+    # o client nunca é fechado sob buscas concorrentes.
+    await asyncio.gather(*(one(p) for p in pages))
 
-        # Estático resolveu pouco? Manda o lote inteiro de uma vez pro
-        # Crawl4AI (mais eficiente que N chamadas unitárias de browser).
+    # Estático resolveu pouco? Manda o lote inteiro de uma vez pro
+    # Crawl4AI (mais eficiente que N chamadas unitárias de browser).
+    fetched = [p for p in pages if p.get("markdown")]
+    missing = [p for p in pages if not p.get("markdown")]
+    if len(fetched) < CFG["fetch"]["min_pages"] and missing:
+        got = await _crawl4ai_batch([p["url"] for p in missing])
+        for p in missing:
+            if p["url"] in got:
+                p["markdown"] = got[p["url"]]
+                await cache_set(f"ws:page:{_hash(p['url'])}", p["markdown"],
+                                CFG["valkey"]["page_ttl_s"])
         fetched = [p for p in pages if p.get("markdown")]
-        missing = [p for p in pages if not p.get("markdown")]
-        if len(fetched) < CFG["fetch"]["min_pages"] and missing:
-            got = await _crawl4ai_batch([p["url"] for p in missing])
-            for p in missing:
-                if p["url"] in got:
-                    p["markdown"] = got[p["url"]]
-                    await cache_set(f"ws:page:{_hash(p['url'])}", p["markdown"],
-                                    CFG["valkey"]["page_ttl_s"])
-            fetched = [p for p in pages if p.get("markdown")]
-        return fetched
+    return fetched
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -542,10 +628,14 @@ async def run_pipeline(query: str, max_results: int) -> str:
     candidates = filter_results(results, max(CFG["filter"]["top_urls"], max_results))
 
     # 2) rerank pelos snippets → top N URLs
-    scores = _bm25_rank(query, [(c.get("title") or "") + " " + (c.get("content") or "")
-                                for c in candidates])
-    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
     top = min(max_results, CFG["filter"]["top_urls"])
+    if len(candidates) <= top:
+        # T9: candidatos já cabem no top — rerank por snippets é redundante.
+        ranked = [(c, 0.0) for c in candidates]
+    else:
+        scores = _bm25_rank(query, [(c.get("title") or "") + " " + (c.get("content") or "")
+                                    for c in candidates])
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
     pages = [{"url": c["url"], "title": c.get("title") or c["url"],
               "snippet": c.get("content") or ""} for c, _ in ranked[:top]]
 
@@ -582,10 +672,17 @@ def _get_memory_client() -> httpx.AsyncClient:
     do LLM.py). Recria de forma segura se a anterior foi fechada."""
     global _memory_client
     if _memory_client is None or _memory_client.is_closed:
+        try:
+            from Modules.internal_auth import internal_token as _tok_fn  # type: ignore
+        except Exception:
+            _tok_fn = lambda: os.getenv("AVA_INTERNAL_TOKEN", "").strip() or None  # type: ignore
+        _tok = _tok_fn()
+        _h: dict[str, str] = {"Authorization": f"Bearer {_tok}"} if _tok else {}
         _memory_client = httpx.AsyncClient(
             base_url=MEMORY_API_URL,
             timeout=httpx.Timeout(30.0, connect=5.0),
             limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
+            headers=_h,
         )
     return _memory_client
 
@@ -655,10 +752,11 @@ async def _memory_write_facts(texts: list[str]) -> list[dict]:
     r.raise_for_status()
     data = r.json()
     results = data.get("results", [])
-    return [
-        await _resolve_possible_update(item, res)
+    # T8: resoluções de possible_update em paralelo (gather).
+    return await asyncio.gather(*(
+        _resolve_possible_update(item, res)
         for item, res in zip(items, results)
-    ]
+    ))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

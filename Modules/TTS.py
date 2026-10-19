@@ -752,7 +752,15 @@ async def lifespan(app: FastAPI):
 # APP
 # ════════════════════════════════════════════════════════════════════════════
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA TTS API", lifespan=lifespan)
+install_internal_auth(app, service_name="TTS")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1034,4 +1042,4 @@ def tts_to_bytes(text: str, voice: str = DEFAULT_VOICE) -> bytes:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3004, log_level="info")
+    uvicorn.run(app, host=internal_bind_host(), port=3004, log_level="info")

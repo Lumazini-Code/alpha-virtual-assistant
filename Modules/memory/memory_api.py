@@ -39,7 +39,7 @@ import memory as mem
 
 log = logging.getLogger("memory_api")
 
-REST_HOST = os.environ.get("MEMORY_REST_HOST", "0.0.0.0")
+REST_HOST = os.environ.get("MEMORY_REST_HOST", internal_bind_host())
 REST_PORT = int(os.environ.get("MEMORY_REST_PORT", "3000"))
 
 
@@ -58,6 +58,15 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
+install_internal_auth(app, service_name="memory_api")
 
 
 # ── MemoryToolError → HTTP 400, uma vez só, para todas as rotas ───────────────

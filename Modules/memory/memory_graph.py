@@ -112,6 +112,14 @@ class EdgeGraphMixin:
             list(ids) + list(ids),
         ).fetchall()
 
+    def get_edges_above_weight(self, min_weight: float) -> list[sqlite3.Row]:
+        """NEW (Plano 3 / T2): todas as arestas com peso >= min_weight, em 1
+        query — materializa o candidato à expansão do PPR de uma vez (ver
+        _expand_graph_sync)."""
+        return self._conn.execute(
+            f"SELECT * FROM {self.EDGE_TABLE} WHERE weight >= ?", (min_weight,)
+        ).fetchall()
+
     def upsert_edge(
         self, id_a: int, id_b: int, lr: float, now: float,
         edge_type: str = EDGE_CO_ACTIVATION,
@@ -345,13 +353,50 @@ def _expand_graph_sync(
     restante tem peso < `min_path_weight`. Substitui o teto fixo de hops:
     memórias fortemente conectadas a 3+ hops entram; ramos fracos param cedo.
 
+    NEW (Plano 3 / T2) — BATCH: antes fazia 1 query SQLite POR nó expandido
+    (`db.get_neighbors`, até ~200 round-trips). Agora são 2 queries no total:
+      1. `get_edges_above_weight(min_path_weight)` traz as arestas candidatas
+         à expansão de uma vez e a BFS roda em memória. Guarda de
+         equivalência: pesos estão em [0,1], então o produto de um caminho é
+         sempre <= cada peso individual — toda aresta que participa de um
+         caminho com peso acumulado >= min_path_weight tem peso próprio >=
+         min_path_weight. Arestas mais fracas NUNCA expandem (acc*w_out <
+         min_path_weight para qualquer acc <= 1.0).
+      2. `get_edges_for_ids(expanded)` traz as arestas FRACAS adjacentes aos
+         nós expandidos — a versão por-nó as incluía em edge_rows (o
+         get_neighbors não filtra por peso) e elas alimentam o PPR com
+         transições mínimas; sem isso o subgrafo do PPR perderia arestas.
+    O teto de vizinhos por nó (replicando `ORDER BY weight DESC LIMIT cap`)
+    é aplicado em memória por peso BRUTO DESC, com desempate determinístico.
+
     Retorna (linhas de aresta coletadas, conjunto de nós carregados).
-    Síncrono (uma query por nó expandido) — rode via run_in_executor."""
+    Síncrono — rode via run_in_executor."""
     best: dict[int, float] = {int(s): 1.0 for s in seed_ids}
     heap: list[tuple[float, int]] = [(-1.0, s) for s in best]
     heapq.heapify(heap)
     expanded: set[int] = set()
     edge_rows: dict[tuple[int, int, str], object] = {}
+
+    # ── Fase 1: 1 query com as arestas candidatas à expansão ──
+    by_node: dict[int, list] = {}
+    for row in db.get_edges_above_weight(min_path_weight):
+        a, b = row["memory_id_a"], row["memory_id_b"]
+        if a == b:
+            continue
+        by_node.setdefault(a, []).append(row)
+        by_node.setdefault(b, []).append(row)
+
+    def _cap_by_node() -> None:
+        """Replica `get_neighbors`: teto de vizinhos por nó, ordenado por
+        peso BRUTO DESC (desempate determinístico por aresta)."""
+        for lst in by_node.values():
+            if len(lst) > neighbor_cap:
+                lst.sort(
+                    key=lambda r: (-r["weight"], r["memory_id_a"], r["memory_id_b"], r["edge_type"]),
+                )
+                del lst[neighbor_cap:]
+
+    _cap_by_node()
 
     while heap:
         neg_acc, node = heapq.heappop(heap)
@@ -361,7 +406,7 @@ def _expand_graph_sync(
         if acc < min_path_weight:
             break                         # heap é max-first: o resto é ainda mais fraco
         expanded.add(node)
-        for row in db.get_neighbors(node, neighbor_cap):
+        for row in by_node.get(node, ()):     # era: db.get_neighbors(node, neighbor_cap)
             a, b = row["memory_id_a"], row["memory_id_b"]
             other = b if a == node else a
             w_ab, w_ba = _edge_traversal_weights(row)
@@ -381,6 +426,24 @@ def _expand_graph_sync(
             elif new_acc > known:
                 best[other] = new_acc
                 heapq.heappush(heap, (-new_acc, other))
+
+    # ── Fase 2: 1 query com as arestas fracas adjacentes aos nós EXPANDIDOS ──
+    # (só nós expandidos contribuem p/ edge_rows — como na versão por-nó, em
+    # que get_neighbors só era chamado para nós retirados do heap).
+    for row in db.get_edges_for_ids(list(expanded)):
+        if row["weight"] >= min_path_weight:
+            continue                      # fortes já vieram na fase 1
+        a, b = row["memory_id_a"], row["memory_id_b"]
+        if a == b:
+            continue
+        by_node.setdefault(a, []).append(row)
+        by_node.setdefault(b, []).append(row)
+    _cap_by_node()
+    for node in expanded:
+        for row in by_node.get(node, ()):
+            if row["weight"] < min_path_weight:
+                edge_rows[(row["memory_id_a"], row["memory_id_b"], row["edge_type"])] = row
+
     return list(edge_rows.values()), set(best)
 
 

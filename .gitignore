@@ -59,3 +59,5 @@ Modules/mcp_manager/target
 Modules/mcp_manager/db/
 
 .graphifyignore
+
+AGENTS.md

@@ -68,7 +68,9 @@ import json
 import asyncio
 import base64
 import logging
+import logging.handlers
 import os
+import queue
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -78,6 +80,9 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 import datetime
 import httpx
+import socket
+import ipaddress
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
@@ -223,10 +228,57 @@ THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     10: "This is a maximally complex task requiring deep, exhaustive reasoning. Think as carefully and thoroughly as possible before responding. Decompose every sub-problem, reason from first principles at each step, validate every intermediate conclusion, consider all relevant edge cases and counter-arguments, and synthesize a complete, precise, and well-justified response. Take as much reasoning space as needed — correctness and depth are the priority.",
 }
 
+# Logging assíncrono: writes nunca bloqueiam o event loop (queue + thread daemon).
+_log_queue = queue.SimpleQueue()
+_log_queue_handler = logging.handlers.QueueHandler(_log_queue)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log_listener = logging.handlers.QueueListener(
+    _log_queue, _console_handler, respect_handler_level=True
+)
+_log_listener.start()
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("AVA_DEBUG") else logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[_log_queue_handler],
+    force=True,
 )
+def _assert_public_url(url: str) -> None:
+    """
+    T6 — SSRF guard.
+    Resolve o hostname da URL e bloqueia IPs privados, loopback, link-local,
+    metadata (ex: 169.254.169.254), etc.
+    Raises HTTPException(400) se a URL for considerada insegura.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(400, "URL deve usar http ou https")
+        if not parsed.hostname:
+            raise HTTPException(400, "URL sem hostname")
+
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            infos = socket.getaddrinfo(parsed.hostname, port)
+        except socket.gaierror:
+            raise HTTPException(400, f"Não foi possível resolver hostname: {parsed.hostname}")
+
+        for info in infos:
+            ip_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+            # IPv4-mapped IPv6 (ex: ::ffff:127.0.0.1)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                raise HTTPException(400, f"URL resolve para IP bloqueado ({ip}) — SSRF suspeito")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Validação de URL falhou: {e}")
+
 log = logging.getLogger("ava.orchestrator")
 
 
@@ -235,7 +287,7 @@ log = logging.getLogger("ava.orchestrator")
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExecuteRequest(BaseModel):
-    input:         str
+    input:         str = Field(..., max_length=200_000)
     session_id:    Optional[str]  = None
     voice:         str            = "M1"
     lang:          str            = "pt"
@@ -255,7 +307,8 @@ class ExecuteRequest(BaseModel):
     # parte; com a flag em 1 é repassada ao vision service. Isso elimina o
     # problema de path resolution entre cliente e orchestrator (ex.:
     # orchestrator rodando em container sem o filesystem do host).
-    image_base64:  Optional[str]  = None
+    # Limite ~10MB de payload base64 (DoS guard — Plano 1, T10).
+    image_base64:  Optional[str]  = Field(None, max_length=10_000_000)
     search_pdfs:   bool           = False
     stream:        bool           = True
 
@@ -269,26 +322,43 @@ class ExecuteResponse(BaseModel):
     steps: list[StepResult]; total_latency_ms: float; errors: list[str]
 
 class DeepSearchRequest(BaseModel):
-    text: str = Field(..., description="Question or research objective")
+    text: str = Field(..., max_length=200_000, description="Question or research objective")
 
 class MemoryReadRequest(BaseModel):
-    query: str; top_k: int = DEFAULT_TOP_K; min_score: float = DEFAULT_MIN_SCORE; session_id: Optional[str] = None
+    query: str = Field(..., max_length=200_000); top_k: int = DEFAULT_TOP_K; min_score: float = DEFAULT_MIN_SCORE; session_id: Optional[str] = None
 
 class MemoryWriteRequest(BaseModel):
-    text: str; source: str = "chat"; confidence: float = 1.0
+    text: str = Field(..., max_length=200_000); source: str = "chat"; confidence: float = 1.0
     forgettable: bool = True
     ttl_days: Optional[float] = None
     action: Literal["create", "update"] = "create"
     memory_id: Optional[int] = None
 
 class AlphaCodeRequest(BaseModel):
-    task: str = Field(..., description="Descrição da tarefa em linguagem natural")
+    task: str = Field(..., max_length=200_000, description="Descrição da tarefa em linguagem natural")
     session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
     project_dir: Optional[str] = Field(None, description="Diretório alvo. None = BASE_DIR do scraping_client.")
     max_steps: int = Field(25, ge=1, le=100, description="Limite de iterações ReAct")
     temperature: float = Field(0.3, ge=0.0, le=2.0)
-    model_override: Optional[str] = Field(None, description="Força modelo para TODOS os steps. None = roteamento adaptativo.")
+    model_override: Optional[str] = Field(None, max_length=200, description="Força modelo para TODOS os steps. None = roteamento adaptativo.")
     stream: bool = Field(True, description="True = SSE streaming, False = síncrono")
+
+# ── Models para endpoints de busca/extração/chat (T10 — limites DoS) ────────
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., max_length=200_000)
+    max_results: int = Field(5, ge=1, le=50)
+    search_pdfs: bool = False
+    topic: str = Field("general", max_length=50)
+
+class ReadUrlRequest(BaseModel):
+    url: str = Field(..., max_length=2048, description="URL pública a extrair (bloqueia loopback/private via SSRF guard)")
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., max_length=200_000)
+    voice: str = Field("M1", max_length=20)
+    lang: str = Field("pt", max_length=20)
+    tts: bool = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -348,7 +418,13 @@ async def lifespan(app: FastAPI):
         "mcp_manager": MCP_MANAGER_URL, "memory": MEMORY_API_URL,
         "process_manager": PROCESS_MANAGER_URL,
     }
-    async with httpx.AsyncClient(timeout=5.0) as probe:
+    from Modules.internal_auth import internal_token
+    _auth_headers: dict[str, str] = {}
+    _tok = internal_token()
+    if _tok:
+        _auth_headers = {"Authorization": f"Bearer {_tok}"}
+
+    async with httpx.AsyncClient(timeout=5.0, headers=_auth_headers) as probe:
         for name, url in service_urls.items():
             try:
                 r = await probe.get(f"{url}{HEALTH_PATHS.get(name, '/status')}")
@@ -360,7 +436,7 @@ async def lifespan(app: FastAPI):
     # microserviços HTTP acima, já entra no probe de health normal.
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
+        return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8), headers=_auth_headers)
 
     state.memory_client = _make_client(MEMORY_API_URL, 30.0)
     state.tts_client = _make_client(TTS_URL, 9999999.0)
@@ -1812,13 +1888,24 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
     schema: list[dict] = []
     dispatch: dict[str, tuple[str, str]] = {}
     log.debug(f"[_load_mcp_tools] carregando tools dos servidores: {skill_names}")
-    for server in skill_names:
+
+    async def _load_server(server: str) -> tuple[str, list[dict] | None]:
         try:
             r = await state.mcp_client.get(f"/servers/{server}/tools", timeout=15.0)
             r.raise_for_status()
-            tools = r.json()["tools"]
+            return server, r.json()["tools"]
         except Exception as e:
             log.warning(f"MCP: falha ao carregar tools do servidor '{server}': {type(e).__name__}: {e}")
+            return server, None
+
+    # T5: requisições paralelas — gather preserva a ordem dos resultados.
+    results = await asyncio.gather(*(_load_server(s) for s in skill_names), return_exceptions=True)
+    for res in results:
+        if isinstance(res, BaseException):
+            log.warning(f"MCP: falha inesperada ao carregar tools de um servidor: {res}")
+            continue
+        server, tools = res
+        if tools is None:
             continue
         for tool in tools:
             schema.append(_mcp_tool_to_openai_schema(tool))
@@ -2130,7 +2217,7 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "to say before that (progress notes, findings so far, caveats) must ride along in "
         "the same message where you call your next tool.",
         "",
-        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
+        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d')}.",
         "",
         "Available tools:",
     ]
@@ -2259,6 +2346,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
 
+    # Hora exata vive aqui (mensagem user), não no system prompt — o prefixo
+    # cacheável do system prompt fica com data apenas (prompt caching).
+    time_hint = datetime.datetime.now().strftime('%H:%M:%S')
+    req.input = f"[Current local time: {time_hint}]\n\n{req.input}"
     user_content: str | list[dict] = req.input
     if req.image_base64:
         if VISION_OBJECTS_ENABLED:
@@ -2607,18 +2698,39 @@ async def _execute_stream_generator(req: ExecuteRequest):
 
     yield _sse("meta", {"execution_id": eid, "session_id": sid})
 
-    events_queue: asyncio.Queue = asyncio.Queue()
+    events_queue: asyncio.Queue = asyncio.Queue(
+        maxsize=int(os.environ.get("AVA_EVENTS_QUEUE_MAX", "2000"))
+    )
+    dropped_events = 0
+
+    def _put_event_nowait(name, data):
+        # Produtor nunca bloqueia: se a fila encheu, aplica drop-oldest
+        # (o consumidor tolera eventos faltantes) e conta o drop.
+        nonlocal dropped_events
+        try:
+            events_queue.put_nowait((name, data))
+        except asyncio.QueueFull:
+            try:
+                events_queue.get_nowait()
+                dropped_events += 1
+                log.debug(f"[{eid[:8]}] events_queue cheia — drop-oldest (total: {dropped_events})")
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                events_queue.put_nowait((name, data))
+            except asyncio.QueueFull:
+                pass
 
     async def on_event(name, data):
-        await events_queue.put((name, data))
+        _put_event_nowait(name, data)
 
     async def run():
         try:
             sr, fr = await _run_tool_loop(req, eid, sid, on_event=on_event)
-            await events_queue.put(("__done__", (sr, fr)))
+            _put_event_nowait("__done__", (sr, fr))
         except Exception as e:
             log.exception(f"[{eid[:8]}] erro no tool loop")
-            await events_queue.put(("__error__", str(e)))
+            _put_event_nowait("__error__", str(e))
 
     task = asyncio.create_task(run())
 
@@ -2834,9 +2946,18 @@ async def _alpha_code_stream_generator(req: AlphaCodeRequest):
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:  # fallback para execução fora do diretório raiz
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA Orchestrator", version="4.0.0",
               description="Tool-Calling Execution Engine (sem router MiniLM, sem CoT/DAG)",
               lifespan=lifespan)
+
+install_internal_auth(app, service_name="orchestrator")
 
 @app.post("/execute")
 async def execute(req: ExecuteRequest):
@@ -2938,30 +3059,40 @@ async def memory_write_batch(reqs: list[MemoryWriteRequest]):
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/search")
-async def search(query: str, max_results: int = 5, search_pdfs: bool = False, topic: str = "general"):
+async def search(req: SearchRequest):
+    # T6 — SSRF guard: valida quaisquer URLs embutidas na query (o serviço de
+    # busca pode extrair/seguir URLs do texto da busca).
     try:
+        for m in re.finditer(r'https?://[^\s"\'<>]+', req.query):
+            _assert_public_url(m.group(0))
         r = await state.search_client.post("/search", json={
-            "query": query, "max_results": max_results, "use_cache": True,
-            "search_pdfs": search_pdfs, "topic": topic if topic in ("general", "news") else "general",
+            "query": req.query, "max_results": req.max_results, "use_cache": True,
+            "search_pdfs": req.search_pdfs, "topic": req.topic if req.topic in ("general", "news") else "general",
         })
         r.raise_for_status()
         return r.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Search falhou: {e}")
 
 @app.post("/read-url")
-async def read_url(url: str):
+async def read_url(req: ReadUrlRequest):
+    # T6 — SSRF guard: recusa URLs que resolvem para loopback/private/link-local
+    _assert_public_url(req.url)
     try:
-        r = await state.search_client.post("/extract", json={"urls": [url], "extract_depth": "basic"})
+        r = await state.search_client.post("/extract", json={"urls": [req.url], "extract_depth": "basic"})
         r.raise_for_status()
         return r.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Extract falhou: {e}")
 
 @app.post("/chat")
-async def chat(message: str, voice: str = "M1", lang: str = "pt", tts: bool = True):
+async def chat(req: ChatRequest):
     try:
-        r = await state.llm_client.post("/chat", json={"message": message, "voice": voice, "lang": lang, "max_turns": 10, "tts": tts})
+        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -3041,4 +3172,4 @@ async def list_voices():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=9000, log_level="info")
+    uvicorn.run("orchestrator:app", host=internal_bind_host(), port=9000, log_level="info")

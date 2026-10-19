@@ -38,9 +38,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use axum::extract::DefaultBodyLimit;
 use indexmap::IndexMap;
 use regex::Regex;
 use rmcp::model::{CallToolRequestParam, RawContent};
@@ -244,6 +246,50 @@ impl Transport {
 fn d_true() -> bool {
     true
 }
+
+/// Allowlist de executáveis permitidos para servidores MCP stdio (Plano 1 — T5).
+/// Impede registro de `bash`, `sh`, `pwsh`, `cmd`, etc. (RCE via /servers).
+fn is_command_allowed(command: &str) -> bool {
+    const ALLOWED: &[&str] = &["npx", "uvx", "python3", "node", "python", "uv"];
+    let cmd = command.trim().to_lowercase();
+    // Windows: npx.cmd / npx.exe, etc.
+    let base = std::path::Path::new(&cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd)
+        .to_lowercase();
+    let stem = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".cmd"))
+        .or_else(|| base.strip_suffix(".bat"))
+        .unwrap_or(&base);
+    ALLOWED.iter().any(|a| *a == stem)
+}
+
+/// Bloqueia args que tentam executar shell/subprocess (Plano 1 — T5).
+/// NÃO inclui metacaracteres (`|`, `&&`, `${`): o spawn usa Command::new
+/// sem shell, então esses são literais. O vetor real é passar `sh -c` etc.
+/// para um wrapper que re-executa (npx/uvx aceitam `-c`).
+fn args_look_malicious(args: &[String]) -> bool {
+    const BAD_PATTERNS: &[&str] = &[
+        "sh -c",
+        "bash -c",
+        "bash -lc",
+        "sh -lc",
+        "cmd /c",
+        "cmd.exe /c",
+        "powershell -c",
+        "pwsh -c",
+        "/bin/sh",
+        "/bin/bash",
+        "eval(",
+    ];
+    args.iter().any(|a| {
+        let low = a.to_lowercase();
+        BAD_PATTERNS.iter().any(|p| low.contains(p))
+    })
+}
+
 fn d_stdio() -> Transport {
     Transport::Stdio
 }
@@ -329,6 +375,10 @@ struct ServerInstallRequest {
     always_on: bool,
     #[serde(default)]
     examples: IndexMap<String, Vec<String>>,
+    // Plano 1 — T5: token de admin (o mesmo AVA_INTERNAL_TOKEN) para instalar
+    // servidores npm — evita que qualquer cliente LAN instale pacotes arbitrários.
+    #[serde(default)]
+    admin_token: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1531,8 +1581,29 @@ async fn register_server(
             "Nome de servidor inválido: use [A-Za-z0-9_-], sem '__' (é o separador do graph_name das tools)",
         ));
     }
-    if req.transport == Transport::Stdio && req.command.as_deref().unwrap_or("").trim().is_empty() {
-        return Err(http_err(400, "transport='stdio' exige 'command'"));
+    if req.transport == Transport::Stdio {
+        let cmd = req.command.as_deref().unwrap_or("").trim().to_string();
+        if cmd.is_empty() {
+            return Err(http_err(400, "transport='stdio' exige 'command'"));
+        }
+        // Plano 1 — T5: restringe command a allowlist e bloqueia args de shell.
+        if !is_command_allowed(&cmd) {
+            return Err(http_err(
+                422,
+                "command fora da allowlist — executáveis permitidos: npx, uvx, python3, node, python, uv",
+            ));
+        }
+        if args_look_malicious(&req.args) {
+            return Err(http_err(
+                422,
+                "args contêm padrões de execução de shell (sh -c / bash -c / powershell) — bloqueado",
+            ));
+        }
+        for (k, _) in req.env.iter() {
+            if k.eq_ignore_ascii_case("PATH") || k.eq_ignore_ascii_case("LD_PRELOAD") {
+                return Err(http_err(422, "env não pode sobrescrever PATH/LD_PRELOAD"));
+            }
+        }
     }
     if req.transport == Transport::Http {
         let u = req.url.as_deref().unwrap_or("").trim();
@@ -1910,6 +1981,19 @@ async fn install_server(
     State(st): State<Arc<AppState>>,
     ApiJson(req): ApiJson<ServerInstallRequest>,
 ) -> ApiResult {
+    // Plano 1 — T5: instalação exige token de admin (o mesmo AVA_INTERNAL_TOKEN)
+    // quando configurado — evita que qualquer cliente na LAN instale pacotes npm.
+    if let Ok(required) = std::env::var("AVA_INTERNAL_TOKEN") {
+        let required = required.trim().to_string();
+        if !required.is_empty() {
+            let supplied = req.admin_token.as_deref().unwrap_or("").trim();
+            let equal = supplied.len() == required.len()
+                && supplied.bytes().zip(required.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+            if !equal {
+                return Err(http_err(401, "Token de admin (AVA_INTERNAL_TOKEN) inválido ou ausente para /servers/install"));
+            }
+        }
+    }
     let spec = req.package.trim().to_string();
     if spec.is_empty() || spec.contains(' ') || spec.starts_with('-') {
         return Err(http_err(
@@ -2238,6 +2322,62 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/skills", get(skills))
         .route("/skills/select", post(skills_select))
         .with_state(state)
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .layer(DefaultBodyLimit::max(2_000_000))
+}
+
+/// Middleware de auth interna (Plano 1 — T3/T5).
+/// Exige `Authorization: Bearer <AVA_INTERNAL_TOKEN>` em todas as rotas
+/// exceto `/health` e `/status` (healthchecks do compose dependem).
+/// Fail-open quando AVA_INTERNAL_TOKEN ausente, a menos que AVA_REQUIRE_AUTH=1.
+async fn auth_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Isentar healthcheck e docs
+    if path == "/health"
+        || path == "/status"
+        || path == "/docs"
+        || path == "/openapi.json"
+        || path.starts_with("/docs/")
+    {
+        return next.run(req).await;
+    }
+
+    let token = std::env::var("AVA_INTERNAL_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        // Token ausente
+        if std::env::var("AVA_REQUIRE_AUTH").map(|v| v.trim() == "1").unwrap_or(false) {
+            // Fail-closed
+            let body = Json(serde_json::json!({ "detail": "Internal service requires AVA_INTERNAL_TOKEN" }));
+            return (StatusCode::UNAUTHORIZED, body).into_response();
+        }
+        // Fail-open: sem token => sem exigência (modo legado)
+        return next.run(req).await;
+    };
+
+    let auth = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(supplied) = auth.strip_prefix("Bearer ") {
+        // comparação em tempo constante para evitar timing attack
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Não vamos fazer fancy crypto aqui; comparação de strings com
+        // len igual é suficiente para o caso de uso (token de 32 bytes).
+        if supplied.len() == token.len()
+            && supplied
+                .bytes()
+                .zip(token.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+        {
+            return next.run(req).await;
+        }
+    }
+
+    let body = Json(serde_json::json!({ "detail": "Invalid or missing Bearer token" }));
+    (StatusCode::UNAUTHORIZED, body).into_response()
 }
 
 async fn shutdown_signal() {
@@ -2331,14 +2471,19 @@ async fn main() {
         py_list(&names)
     );
 
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+    let bind_host = std::env::var("AVA_BIND_HOST")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let listener = match tokio::net::TcpListener::bind((bind_host.as_str(), port)).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Falha ao abrir 0.0.0.0:{port}: {e}");
+            tracing::error!("Falha ao abrir {bind_host}:{port}: {e}");
             std::process::exit(1);
         }
     };
-    info!("Escutando em http://0.0.0.0:{port}");
+    info!("Escutando em http://{bind_host}:{port}");
     if let Err(e) = axum::serve(listener, app(st.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await

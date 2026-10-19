@@ -37,10 +37,20 @@ const HEALTH_POLL_MS: u64 = 500;
 /// o corpo só interessa ao manager; aqui basta o liveness HTTP.)
 pub async fn healthy(state: &SharedState) -> bool {
     let url = { state.mcp.lock().await.health_url.clone() };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS))
-        .build();
-    let Ok(client) = client else { return false };
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS));
+    if let Ok(token) = std::env::var("AVA_INTERNAL_TOKEN") {
+        if !token.trim().is_empty() {
+            builder = builder.default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())) {
+                    h.insert(reqwest::header::AUTHORIZATION, v);
+                }
+                h
+            });
+        }
+    }
+    let Ok(client) = builder.build() else { return false };
     matches!(
         client.get(&url).send().await,
         Ok(resp) if resp.status().is_success()

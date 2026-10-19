@@ -1273,7 +1273,15 @@ async def lifespan(app: FastAPI):
 
 # ── App ────────────────────────────────────────────────────────────────────
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA Vision API", lifespan=lifespan)
+install_internal_auth(app, service_name="vision")
 
 
 # ── [0] Filtro de rostos — exclui regiões faciais da detecção de objetos ──
@@ -1805,4 +1813,4 @@ async def vision_status():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("vision:app", host="0.0.0.0", port=4002, log_level="info")
+    uvicorn.run("vision:app", host=internal_bind_host(), port=4002, log_level="info")
