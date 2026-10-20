@@ -62,6 +62,7 @@
 #include <curl/curl.h>
 #include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -313,33 +314,86 @@ private:
 };
 
 // ---------------------------------------------------------------------
-// Ingestão de contexto de voz (Fase 2): envia o embedding do locutor ao
-// orchestrator (POST /voice/ingest) numa thread dedicada — fire-and-forget,
-// NUNCA bloqueia a thread do CAM++ nem a thread principal. A busca kNN roda
-// fora do caminho do turno; o /execute só consome o cache do orchestrator.
+// Poster do orchestrator: centraliza os POSTs HTTP do pipeline de voz.
+//  - /voice/ingest: embedding do locutor (fire-and-forget, nunca bloqueia
+//    a thread do CAM++ nem a thread principal).
+//  - /execute: o texto transcrito da fala vira um turno completo (tool loop
+//    normal). Sequencial: um turno por vez — se um POST anterior ainda está
+//    pendente/em andamento, a nova utterance é recusada com log (evita
+//    acumular turnos fire-and-forget).
 // session_id=null: o sistema é single-session — o orchestrator cacheia como
 // "__anon__" e o /execute consome essa entrada.
 // ---------------------------------------------------------------------
-class VoiceIngest {
+class OrchestratorPoster {
 public:
     bool init() {
         curl_global_init(CURL_GLOBAL_DEFAULT);
         const char* port = std::getenv("ORCHESTRATOR_PORT");
-        url_ = std::string("http://127.0.0.1:")
-             + (port && *port ? port : "9000") + "/voice/ingest";
+        base_ = std::string("http://127.0.0.1:")
+             + (port && *port ? port : "9000");
         const char* tok = std::getenv("AVA_INTERNAL_TOKEN");
         if (tok && *tok) token_ = tok;
-        worker_ = std::thread(&VoiceIngest::loop, this);
+        worker_ = std::thread(&OrchestratorPoster::loop, this);
         return true;
     }
 
-    void submit(std::vector<float>&& emb) {
+    void submit_ingest(std::vector<float>&& emb) {
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (queue_.size() >= QUEUE_MAX) queue_.pop_front();   // atrasou: joga a mais velha fora
-            queue_.push_back(std::move(emb));
+            queue_.push_back(Job{Kind::Ingest, std::move(emb), {}});
         }
         cv_.notify_one();
+    }
+
+    // Recusa se já existe um turno de voz pendente/em andamento.
+    void submit_execute(const std::string& text) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (const auto& j : queue_)
+                if (j.kind == Kind::Execute) {
+                    std::lock_guard<std::mutex> plk(g_print_mu);
+                    std::fprintf(stderr, "\033[2m[voice exec: turno anterior em andamento — novo pedido ignorado]\033[0m\n");
+                    return;
+                }
+            queue_.push_back(Job{Kind::Execute, {}, text});
+        }
+        cv_.notify_one();
+    }
+
+    // ---- sequenciamento ingest → execute (risco 1 do plano) ----
+    // O texto do turno é "palco" (staged) no finalize e só é postado DEPOIS
+    // que o embedding correspondente foi ingerido — garante que o contexto
+    // de voz (quem está falando) está no cache do orchestrator antes do
+    // _recall_for_turn do /execute consumi-lo.
+    uint64_t next_seq() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return ++seq_;
+    }
+
+    void stage_execute(uint64_t seq, std::string text) {
+        std::lock_guard<std::mutex> lk(mu_);
+        pending_execute_[seq] = std::move(text);
+    }
+
+    // Chamado pelo SpeakerEmbedder logo após o submit_ingest do turno.
+    void take_and_execute(uint64_t seq) {
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = pending_execute_.find(seq);
+            if (it != pending_execute_.end()) {
+                text = std::move(it->second);
+                pending_execute_.erase(it);
+            }
+        }
+        if (!text.empty()) submit_execute(text);
+    }
+
+    // Turno descartado (frase curta demais etc.) — nada pra executar.
+    void drop_pending(uint64_t seq) {
+        std::lock_guard<std::mutex> lk(mu_);
+        pending_execute_.erase(seq);
     }
 
     void shutdown() {
@@ -354,26 +408,102 @@ public:
     }
 
 private:
+    enum class Kind { Ingest, Execute };
+    struct Job {
+        Kind kind;
+        std::vector<float> emb;
+        std::string text;
+    };
+
     static size_t _discard(char*, size_t size, size_t nmemb) { return size * nmemb; }
+
+    static std::string json_escape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 16);
+        for (char c : s) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if ((unsigned char)c < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                        out += buf;
+                    } else {
+                        out += c;
+                    }
+            }
+        }
+        return out;
+    }
 
     void loop() {
         for (;;) {
-            std::vector<float> emb;
+            Job job;
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
                 if (queue_.empty()) return;
-                emb = std::move(queue_.front());
+                job = std::move(queue_.front());
                 queue_.pop_front();
             }
-            post(emb);
+            if (job.kind == Kind::Ingest) post_ingest(job.emb);
+            else post_execute(job.text);
         }
     }
 
-    void post(const std::vector<float>& emb) {
+    // Post genérico; retorna true em HTTP 200. `log_tag` mantém o padrão
+    // [voice ingest: ...] / [voice exec: ...].
+    bool post(const char* path, const std::string& body,
+              long timeout_ms, long low_speed_time,
+              const char* log_tag) {
         if (!curl_) curl_ = curl_easy_init();
-        if (!curl_) return;
+        if (!curl_) return false;
 
+        curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        if (!token_.empty())
+            hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + token_).c_str());
+
+        const std::string url = base_ + path;
+        curl_easy_reset(curl_);
+        curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+        // Watchdog: aborta se a conexão estiver parada (sem bytes fluindo)
+        // por `low_speed_time` segundos — sem matar respostas longas que
+        // estão progredindo normalmente (SSE do /execute).
+        curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_TIME, low_speed_time);
+        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, _discard);
+
+        const CURLcode rc = curl_easy_perform(curl_);
+        curl_slist_free_all(hdrs);
+
+        long code = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+        if (rc != CURLE_OK) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::fprintf(stderr, "\033[2m[%s: %s]\033[0m\n", log_tag, curl_easy_strerror(rc));
+        } else if (code != 200) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::fprintf(stderr, "\033[2m[%s: HTTP %ld]\033[0m\n", log_tag, code);
+        } else {
+            return true;
+        }
+        return false;
+    }
+
+    void post_ingest(const std::vector<float>& emb) {
         // {"session_id": null, "embedding": [f1, f2, ...]}
         std::string body;
         body.reserve(emb.size() * 10 + 64);
@@ -386,51 +516,43 @@ private:
         }
         body += "]}";
 
-        curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-        if (!token_.empty())
-            hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + token_).c_str());
-
-        curl_easy_reset(curl_);
-        curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
-        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, (long)body.size());
-        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, 3000L);
-        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
-        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, _discard);
-
-        const CURLcode rc = curl_easy_perform(curl_);
-        curl_slist_free_all(hdrs);
-
-        long code = 0;
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
-        if (rc != CURLE_OK) {
-            std::lock_guard<std::mutex> lk(g_print_mu);
-            std::fprintf(stderr, "\033[2m[voice ingest: %s]\033[0m\n", curl_easy_strerror(rc));
-        } else if (code != 200) {
-            std::lock_guard<std::mutex> lk(g_print_mu);
-            std::fprintf(stderr, "\033[2m[voice ingest: HTTP %ld]\033[0m\n", code);
-        } else {
+        if (post("/voice/ingest", body, 3000L, 3L, "voice ingest")) {
             std::lock_guard<std::mutex> lk(g_print_mu);
             std::printf("\033[2m[voice ingest: ok (%zu dims)]\033[0m\n", emb.size());
             std::fflush(stdout);
         }
     }
 
+    void post_execute(const std::string& text) {
+        // ExecuteRequest: {"input": ..., "session_id": null, "lang": "pt",
+        //                  "tts": true, "tts_output": "device", "source": "voice"}
+        std::string body = "{\"input\":\"" + json_escape(text) + "\","
+                           "\"session_id\":null,\"lang\":\"pt\","
+                           "\"tts\":true,\"tts_output\":\"device\",\"source\":\"voice\"}";
+
+        // /execute pode levar minutos (tool loop). Timeout longo (10 min) +
+        // watchdog de inatividade (sem bytes por 60s aborta).
+        if (post("/execute", body, 600000L, 60L, "voice exec")) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::printf("\033[2m[voice exec: ok]\033[0m\n");
+            std::fflush(stdout);
+        }
+    }
+
     static constexpr size_t QUEUE_MAX = 4;
-    std::string url_;
+    std::string base_;
     std::string token_;
     CURL* curl_ = nullptr;
-    std::deque<std::vector<float>> queue_;
+    std::deque<Job> queue_;
+    uint64_t seq_ = 0;
+    std::map<uint64_t, std::string> pending_execute_;   // seq → texto aguardando o ingest
     std::mutex mu_;
     std::condition_variable cv_;
     bool stop_ = false;
     std::thread worker_;
 };
 
-static VoiceIngest g_voice_ingest;
+static OrchestratorPoster g_orchestrator;
 
 // ---------------------------------------------------------------------
 // Speaker embedding (CAM++ / 3D-Speaker) numa thread dedicada
@@ -455,11 +577,11 @@ public:
         return true;
     }
 
-    void submit(std::vector<int16_t>&& pcm) {
+    void submit(std::vector<int16_t>&& pcm, uint64_t seq) {
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (queue_.size() >= SPK_QUEUE_MAX) queue_.pop_front();   // atrasou: joga a mais velha fora
-            queue_.push_back(std::move(pcm));
+            queue_.push_back(SpkJob{std::move(pcm), seq});
         }
         cv_.notify_one();
     }
@@ -476,25 +598,30 @@ public:
     }
 
 private:
+    struct SpkJob { std::vector<int16_t> pcm; uint64_t seq; };
+
     void loop() {
         for (;;) {
-            std::vector<int16_t> pcm;
+            SpkJob job;
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
                 if (queue_.empty()) return;            // stop_ e nada pendente
-                pcm = std::move(queue_.front());
+                job = std::move(queue_.front());
                 queue_.pop_front();
             }
-            process(pcm);
+            process(job.pcm, job.seq);
         }
     }
 
-    void process(const std::vector<int16_t>& pcm) {
+    void process(std::vector<int16_t>& pcm, uint64_t seq) {
         const auto t0 = std::chrono::steady_clock::now();
 
         const int frames = fbank_.compute(pcm.data(), pcm.size(), feats_);
-        if (frames < 10) return;
+        if (frames < 10) {                       // áudio degenerado: turno não roda
+            g_orchestrator.drop_pending(seq);
+            return;
+        }
 
         try {
             const std::array<int64_t, 3> shape{1, frames, Fbank::kNumBins};
@@ -515,8 +642,12 @@ private:
             last_embedding_.assign(emb, emb + dim);
 
             // Fase 2 — ingestão: dispara POST /voice/ingest com o embedding
-            // (fire-and-forget na thread do VoiceIngest; não bloqueia o CAM++).
-            g_voice_ingest.submit(std::vector<float>(emb, emb + dim));
+            // (fire-and-forget na thread do OrchestratorPoster; não bloqueia o CAM++).
+            g_orchestrator.submit_ingest(std::vector<float>(emb, emb + dim));
+
+            // O /execute só é enfileirado DEPOIS do ingest — a ordem no
+            // orchestrator fica garantida (contexto de voz disponível no turno).
+            g_orchestrator.take_and_execute(seq);
 
             const double took_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -527,6 +658,8 @@ private:
                         dim, audio_s, took_ms);
             std::fflush(stdout);
         } catch (const Ort::Exception& e) {
+            // Embedding falhou: o turno segue mesmo assim, só sem contexto de voz.
+            g_orchestrator.take_and_execute(seq);
             std::lock_guard<std::mutex> lk(g_print_mu);
             std::fprintf(stderr, "\nspeaker embedding: %s\n", e.what());
         }
@@ -543,7 +676,7 @@ private:
     std::vector<float> feats_;          // reaproveitado entre frases
     std::vector<float> last_embedding_;
 
-    std::deque<std::vector<int16_t>> queue_;
+    std::deque<SpkJob> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool stop_ = false;
@@ -552,17 +685,31 @@ private:
 
 static SpeakerEmbedder g_speaker;
 
-// Corta o silêncio do endpoint, aplica o recorte central e manda pra fila.
-static void submit_speaker(std::vector<int16_t>& utt, int silence_ms) {
+// Fecha o turno de voz: postura do embedding + disparo do /execute.
+//  - Com CAM++: o texto fica "palco" (staged) e o SpeakerEmbedder dispara o
+//    /execute logo depois do POST /voice/ingest — o contexto de voz chega ao
+//    orchestrator ANTES do turno consumi-lo no _recall_for_turn.
+//  - Sem CAM++ (speaker_ok=false): execute direto, sem contexto de voz.
+//  - Frase curta demais (abaixo de SPK_MIN_MS, ex.: "hm", "ok"): descartada —
+//    nem embedding nem LLM (mesmo critério de descarte do embedding).
+static void submit_turn(const std::string& text, std::vector<int16_t>& utt,
+                        int silence_ms, bool speaker_ok) {
     const size_t trim = (size_t)(silence_ms / FRAME_MS) * FRAME_SAMPLES;
-    size_t n = utt.size() > trim ? utt.size() - trim : 0;
-    if (n < (size_t)SPK_MIN_MS * SAMPLE_RATE / 1000) return;
+    const size_t n = utt.size() > trim ? utt.size() - trim : 0;
+    if (n < (size_t)SPK_MIN_MS * SAMPLE_RATE / 1000) return;   // curto demais: nem embedding nem LLM
 
     const size_t max_n = (size_t)SPK_MAX_MS * SAMPLE_RATE / 1000;
     size_t off = 0;
-    if (n > max_n) { off = (n - max_n) / 2; n = max_n; }
+    size_t cut = n;
+    if (cut > max_n) { off = (cut - max_n) / 2; cut = max_n; }
 
-    g_speaker.submit(std::vector<int16_t>(utt.begin() + off, utt.begin() + off + n));
+    if (speaker_ok) {
+        const uint64_t seq = g_orchestrator.next_seq();
+        g_orchestrator.stage_execute(seq, text);
+        g_speaker.submit(std::vector<int16_t>(utt.begin() + off, utt.begin() + off + cut), seq);
+    } else {
+        g_orchestrator.submit_execute(text);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -662,13 +809,22 @@ static bool has_content(const char* s, size_t n) {
 }
 
 // Retorna true se havia texto. Numa linha final vazia, só limpa a linha (sem "\n").
-static bool print_snapshot(struct transcribe_session* session, bool final_line) {
+// `out_text` (opcional) recebe o texto final — committed + tentative — para o
+// turno de voz (POST /execute).
+static bool print_snapshot(struct transcribe_session* session, bool final_line,
+                           std::string* out_text = nullptr) {
     struct transcribe_stream_text text;
     transcribe_stream_text_init(&text);
     if (transcribe_stream_get_text(session, &text) != TRANSCRIBE_OK) return false;
 
-    const bool has_text = has_content(text.committed_text, text.committed_text_bytes) ||
-                          has_content(text.tentative_text, text.tentative_text_bytes);
+    const bool has_committed = has_content(text.committed_text, text.committed_text_bytes);
+    const bool has_tentative = has_content(text.tentative_text, text.tentative_text_bytes);
+    const bool has_text = has_committed || has_tentative;
+
+    if (out_text) {
+        if (has_committed) out_text->append(text.committed_text, text.committed_text_bytes);
+        if (has_tentative) out_text->append(text.tentative_text, text.tentative_text_bytes);
+    }
 
     std::lock_guard<std::mutex> lk(g_print_mu);
     if (final_line && !has_text) {
@@ -732,7 +888,8 @@ static void asr_feed(struct transcribe_session* session, const float* f32, bool 
     }
 }
 
-static bool finalize_utterance(struct transcribe_session* session) {
+static bool finalize_utterance(struct transcribe_session* session,
+                               std::string* out_text = nullptr) {
     struct transcribe_stream_update update;
     transcribe_stream_update_init(&update);
     transcribe_status s = transcribe_stream_finalize(session, &update);
@@ -740,7 +897,7 @@ static bool finalize_utterance(struct transcribe_session* session) {
         std::fprintf(stderr, "\ntranscribe_stream_finalize: %s\n",
                      transcribe_status_string(s));
     }
-    return print_snapshot(session, true);
+    return print_snapshot(session, true, out_text);
 }
 
 // ---------------------------------------------------------------------
@@ -768,8 +925,8 @@ int main() {
         std::fprintf(stderr, "Seguindo sem speaker embedding.\n");
     }
 
-    std::printf("Conectando ingestão de voz (orchestrator /voice/ingest)...\n");
-    g_voice_ingest.init();
+    std::printf("Conectando ao orchestrator (/voice/ingest + /execute)...\n");
+    g_orchestrator.init();
 
     std::printf("Carregando wake word (sherpa-onnx KWS)...\n");
     const bool wake_ok = g_wake.init();
@@ -914,10 +1071,13 @@ int main() {
                 if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
 
                 if (asr_open) {
-                    const bool printed = finalize_utterance(session);
+                    std::string utt_text;
+                    const bool printed = finalize_utterance(session, &utt_text);
                     if (printed) {
-                        // só vale a pena extrair embedding de frase que virou texto
-                        if (speaker_ok) submit_speaker(utt_pcm, silence_ms);
+                        // frase virou texto: fecha o turno de voz (embedding +
+                        // /execute; sem CAM++, só /execute). Frases curtas e
+                        // triviais são descartadas dentro do submit_turn.
+                        submit_turn(utt_text, utt_pcm, silence_ms, speaker_ok);
                     } else if (DEBUG_EMPTY) {
                         std::lock_guard<std::mutex> lk(g_print_mu);
                         std::printf("\033[2m[descartado: %d ms, %d frames de fala, prob. max %.2f]\033[0m\n",
@@ -945,13 +1105,15 @@ int main() {
 
     if (active) {
         if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
-        if (asr_open && finalize_utterance(session) && speaker_ok) {
-            submit_speaker(utt_pcm, silence_ms);
+        if (asr_open) {
+            std::string utt_text;
+            if (finalize_utterance(session, &utt_text))
+                submit_turn(utt_text, utt_pcm, silence_ms, speaker_ok);
         }
     }
     if (wake_ok) g_wake.shutdown();
     if (speaker_ok) g_speaker.shutdown();   // drena a fila antes de sair
-    g_voice_ingest.shutdown();              // drena ingestões pendentes
+    g_orchestrator.shutdown();              // drena ingestões/turnos pendentes
 
     if (g_dropped.load() > 0) {
         std::fprintf(stderr, "Aviso: %lu blocos de áudio descartados (inferência lenta demais?)\n",

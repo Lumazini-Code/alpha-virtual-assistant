@@ -12,6 +12,7 @@
 mod api;
 mod idle_watcher;
 mod mcp_manager;
+mod platform;
 mod process_manager;
 mod state;
 mod transcript;

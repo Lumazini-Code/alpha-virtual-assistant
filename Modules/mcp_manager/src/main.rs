@@ -2170,7 +2170,22 @@ async fn skills_select(
         "include_related": true,
     });
     let sel = st.mem_post_json("/tools/select", &body, 45.0).await.map_err(|e| {
-        http_err(502, format!("Seleção no grafo de tools falhou (memory_api offline?): {e}"))
+        // Mensagem diferenciada por tipo de falha: 401 é problema de AUTH
+        // (token ausente/errado no mcp_manager), não "API offline".
+        match &e {
+            MemErr::Status { code, .. } if *code == 401 => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou: memory_api rejeitou a auth (401) — verifique AVA_INTERNAL_TOKEN no mcp_manager."),
+            ),
+            MemErr::Status { code, .. } => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou: memory_api retornou HTTP {code}."),
+            ),
+            MemErr::Other { .. } => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou (memory_api offline?): {e}"),
+            ),
+        }
     })?;
 
     let matches: Vec<Value> = sel
@@ -2425,10 +2440,27 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let memory = reqwest::Client::builder()
+    // ── Auth interna (Plano 1): o cliente HTTP de memória carrega o
+    // AVA_INTERNAL_TOKEN como header padrão — sem isso TODA chamada ao
+    // memory_api (/tools/select, /write/batch, ...) volta 401 e o seletor
+    // de skills cai no fallback que libera todos os servidores.
+    let mut memory_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs_f64(REGISTER_TIMEOUT))
-        .pool_max_idle_per_host(2)
+        .pool_max_idle_per_host(2);
+    match std::env::var("AVA_INTERNAL_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(token) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("header Authorization inválido"),
+            );
+            memory_builder = memory_builder.default_headers(headers);
+        }
+        None => warn!("AVA_INTERNAL_TOKEN ausente no mcp_manager — chamadas ao memory_api vão 401 (fail-open do memory_api aceita sem token só em modo legado)."),
+    }
+    let memory = memory_builder
         .build()
         .expect("falha ao criar cliente HTTP");
     let port = cfg.port;

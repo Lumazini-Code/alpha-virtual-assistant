@@ -292,6 +292,8 @@ class ExecuteRequest(BaseModel):
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
+    # Telemetria: quem disparou o turno ("tui" = TUI, "voice" = pipeline de voz).
+    source:        Optional[Literal["tui", "voice"]] = None
     # Onde o áudio da resposta toca:
     #   client — orchestrator sintetiza via TTS /synthesize e DEVOLVE o WAV
     #            num evento SSE `audio` (a TUI toca no HOST — uniforme
@@ -2803,7 +2805,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
     t0 = time.perf_counter()
     eid = str(uuid.uuid4())
     sid = req.session_id or str(uuid.uuid4())
-    log.info(f"[{eid[:8]}] Executando (tool loop): '{req.input[:80]}'")
+    log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
     yield _sse("meta", {"execution_id": eid, "session_id": sid})
 

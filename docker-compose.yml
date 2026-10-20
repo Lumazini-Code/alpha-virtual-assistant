@@ -19,6 +19,14 @@ services:
       - ava-logs:/app/logs
       - ./graph_activation.py:/app/graph_activation.py
 
+    # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
+    # CRAWL4AI_API_TOKEN...). Carregados DIRETO pelo compose — sem depender
+    # do --env-file do docker-start.sh. O env_file injeta as variáveis NO
+    # container (visíveis no `docker exec ava env`), ao contrário da
+    # interpolação ${...}, que só roda no host antes do container existir.
+    env_file:
+      - Modules/.env
+
     environment:
       AVA_DEBUG: ""
       ONNX_PROVIDERS: "CPUExecutionProvider"

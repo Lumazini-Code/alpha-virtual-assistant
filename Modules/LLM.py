@@ -1747,6 +1747,11 @@ async def chat_stream(req: ChatRequest):
     (o turno não terminou — o caller executa as tools e continua o loop).
 
     Eventos SSE:
+      {"status": "preparing"}     — modo chat: emitido IMEDIATAMENTE (a conexão
+                                    SSE abre sem esperar a prep — Fase 3 TTFB);
+                                    a prep do prompt (memória LT/ST + idioma)
+                                    roda dentro do generator
+      {"status": "ready", "prep_ms": ...} — prep concluída; inferência vai começar
       {"reasoning": "..."}   — raciocínio (se stream_reasoning)
       {"delta": "..."}       — texto do content
       {"memory_correction": {"classification": ..., "evidence": "..."}}
@@ -1756,7 +1761,7 @@ async def chat_stream(req: ChatRequest):
                                 memória e retomada com prefill (ver
                                 CONFIDENCE_* no topo do arquivo)
       {"tool_calls": [...]}  — tool_calls completas (ao final, se houver)
-      {"done": true, "elapsed": ..., "prompt_cached_tokens": ..., "had_tool_calls": bool}
+      {"done": true, "elapsed": ..., "prep_ms": ..., "prompt_cached_tokens": ..., "had_tool_calls": bool}
       {"error": "...", "too_large": bool}  — aborta o stream
     """
     if req.messages is not None and (req.message or "").strip():
@@ -1768,11 +1773,10 @@ async def chat_stream(req: ChatRequest):
     # ── Resolução de modo ──────────────────────────────────────────────────
     tool_mode = req.messages is not None
     if tool_mode:
-        messages = [m.model_dump(exclude_none=True) for m in req.messages]
-        if not messages:
+        base_messages = [m.model_dump(exclude_none=True) for m in req.messages]
+        if not base_messages:
             raise HTTPException(status_code=400, detail="messages vazio.")
         user_input = None
-        lang = None
         temperature = req.temperature if req.temperature is not None else 0.3
     else:
         user_input = (req.message or "").strip()
@@ -1782,53 +1786,23 @@ async def chat_stream(req: ChatRequest):
                 detail="Envie `message` (modo chat) ou `messages` (modo tools).",
             )
 
-        # ── PARALLEL prep: detecção de idioma + leitura LT + leitura ST ────
-        lang_task = asyncio.ensure_future(
-            asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
-        )
-        memory_task = asyncio.ensure_future(
-            memory_read(
-                user_input,
-                session_id=req.session_id,
-                top_k=req.max_turns,
-                top_k_final=CHAT_RECALL_TOP_K_FINAL,
-                total_max_chars=CHAT_RECALL_TOTAL_MAX_CHARS,
-            )
-        )
-        memory_st_task = asyncio.ensure_future(
-            memory_read_st(req.session_id)
-        )
-        lang, memories, recent_turns = await asyncio.gather(lang_task, memory_task, memory_st_task)
-        if not lang:
-            lang = "pt"
-
-        messages = _build_messages(user_input, lang, memories, recent_turns)
         temperature = req.temperature if req.temperature is not None else 0.7
 
-    log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
+    # ── Estado mutável compartilhado endpoint ↔ generator ──────────────────
+    # Fase 3: a prep do prompt (memória LT/ST + idioma) roda DENTRO do
+    # generator — o StreamingResponse é devolvido imediatamente ao caller.
+    # `lang` só fica definitivo após a prep; _flush_tts_buf lê daqui por closure.
+    state = {"lang": "pt"}
 
-    # ── Payload OpenRouter (com tool calling nativo quando `tools` presente) ──
+    # ── Payload extras (independem de messages — computados fora) ──────────
     reasoning_extra = _reasoning_payload_extra(req.thinking_depth)
     if req.reasoning_effort:
         reasoning_extra = {"reasoning": {"effort": req.reasoning_effort}}
-
-    payload: dict = {
-        "messages":    messages,
-        "temperature": temperature,
-        **reasoning_extra,
-    }
-    if req.max_tokens is not None:
-        payload["max_tokens"] = req.max_tokens
-    if req.tools:
-        payload["tools"] = req.tools
-        payload["tool_choice"] = req.tool_choice or "auto"
 
     # ── Confidence-watch: pede logprobs por token ao OpenRouter ────────────
     # Só faz sentido no modo CHAT (precisa de session_id + query semântica
     # com sentido de conversa; no modo TOOLS o caller já gerencia o histórico).
     watch_confidence = req.watch_confidence and not tool_mode
-    if watch_confidence:
-        payload["logprobs"] = True
 
     # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
     
@@ -1851,11 +1825,77 @@ async def chat_stream(req: ChatRequest):
         nonlocal _tts_buf
         cleaned = _clean_for_tts(_tts_buf)
         if len(cleaned) >= 3:
-            _tts_queue.put_nowait((cleaned, req.voice, lang))
+            _tts_queue.put_nowait((cleaned, req.voice, state["lang"]))
         _tts_buf = ""
 
     async def generator():
         nonlocal _tts_buf
+
+        # ── FASE 3: prep do prompt DENTRO do stream ─────────────────────────
+        # O StreamingResponse já foi devolvido ao caller (headers SSE saem
+        # imediatamente; o orquestrador ignora eventos "status" desconhecidos).
+        # A leitura de memória LT/ST e a detecção de idioma — todas failure-safe
+        # (retornam []/"pt" em falha) — rodam aqui dentro.
+        t_prep_start = time.perf_counter()
+        if not tool_mode:
+            yield f"data: {json.dumps({'status': 'preparing'})}\n\n"
+            try:
+                lang_task = asyncio.ensure_future(
+                    asyncio.get_event_loop().run_in_executor(None, _safe_detect, user_input)
+                )
+                memory_task = asyncio.ensure_future(
+                    memory_read(
+                        user_input,
+                        session_id=req.session_id,
+                        top_k=req.max_turns,
+                        top_k_final=CHAT_RECALL_TOP_K_FINAL,
+                        total_max_chars=CHAT_RECALL_TOTAL_MAX_CHARS,
+                    )
+                )
+                memory_st_task = asyncio.ensure_future(
+                    memory_read_st(req.session_id)
+                )
+                lang, memories, recent_turns = await asyncio.gather(
+                    lang_task, memory_task, memory_st_task
+                )
+                if not lang:
+                    lang = "pt"
+                state["lang"] = lang
+
+                messages = _build_messages(user_input, lang, memories, recent_turns)
+            except Exception as e:
+                yield f"data: {json.dumps({'error': f'prep do prompt falhou: {e}'})}\n\n"
+                return
+            # ── FASE 4: tempo de PREPARAÇÃO (idioma + memória) separado ────
+            prep_elapsed = time.perf_counter() - t_prep_start
+            yield f"data: {json.dumps({'status': 'ready', 'prep_ms': round(prep_elapsed * 1000)})}\n\n"
+        else:
+            messages = base_messages
+            prep_elapsed = 0.0
+
+        log.info(
+            "tamanho do contexto do assistente: n_msgs=%d approx_chars=%d session=%s",
+            len(messages),
+            sum(len(str(m.get("content", ""))) for m in messages),
+            req.session_id,
+        )
+
+        # ── Payload OpenRouter (com tool calling nativo quando `tools` presente) ──
+        payload: dict = {
+            "messages":    messages,
+            "temperature": temperature,
+            **reasoning_extra,
+        }
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+        if req.tools:
+            payload["tools"] = req.tools
+            payload["tool_choice"] = req.tool_choice or "auto"
+        if watch_confidence:
+            payload["logprobs"] = True
+
+        # ── FASE 4: t0 marca o início da INFERÊNCIA — o `elapsed` do log
+        # final e do evento done EXCLUI o tempo de prep (reportado à parte).
         full_response = ""       # texto exposto ao usuário (sem os blocos <MEMORY_CORRECTION>)
         full_reasoning = ""
         tool_calls_acc: dict[int, dict] = {}   # index -> tool_call em montagem
@@ -1981,8 +2021,18 @@ async def chat_stream(req: ChatRequest):
                                     _tts_buf += content
                                     if not req.tools:
                                         buf_rstrip = _tts_buf.rstrip()
-                                        if (buf_rstrip and buf_rstrip[-1] in '.!?\n。') \
-                                           or len(_tts_buf) > 150:
+                                        # Flush imediato em pausa forte (.!?\n。).
+                                        # Flush em pausa curta (,;:) só com um mínimo
+                                        # de 40 chars acumulados — evita sínteses
+                                        # fragmentadas palavra a palavra a cada vírgula.
+                                        # Buffer cheio (>80 chars, antes 150) força o
+                                        # flush — reduz a latência percebida da voz.
+                                        if buf_rstrip and buf_rstrip[-1] in '.!?\n。':
+                                            _flush_tts_buf()
+                                        elif buf_rstrip and buf_rstrip[-1] in ',;:' \
+                                             and len(_tts_buf) > 40:
+                                            _flush_tts_buf()
+                                        elif len(_tts_buf) > 80:
                                             _flush_tts_buf()
 
                                 # ── VIGIA DE CONFIANÇA (logprobs) ───────────
@@ -2113,7 +2163,7 @@ async def chat_stream(req: ChatRequest):
 
         elapsed = time.perf_counter() - t0
         log.info(
-            f"[STREAM] {elapsed:.2f}s | {len(full_response)} chars | "
+            f"[STREAM] {elapsed:.2f}s (prep: {prep_elapsed:.2f}s) | {len(full_response)} chars | "
             f"reasoning: {len(full_reasoning)} chars | "
             f"tool_calls: {[tc['function']['name'] for tc in tool_calls_final] or 'nenhuma'} | "
             f"cached: {cached_tokens} tokens"
@@ -2135,7 +2185,7 @@ async def chat_stream(req: ChatRequest):
             # responder com role="tool".
             yield f"data: {json.dumps({'tool_calls': tool_calls_final})}\n\n"
 
-        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prompt_cached_tokens': cached_tokens, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prep_ms': round(prep_elapsed * 1000), 'prompt_cached_tokens': cached_tokens, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
 
         # Persistência pós-stream — apenas turno FINAL do modo chat
         if turno_final and (not tool_mode) and full_response:

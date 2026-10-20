@@ -11,7 +11,8 @@
 
 use crate::mcp_manager;
 use crate::process_manager;
-use crate::state::{McpStatus, ProcStatus, SharedState};
+use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
+use crate::transcript;
 use crate::UiCommand;
 use eframe::egui;
 use std::sync::mpsc;
@@ -30,6 +31,8 @@ pub struct TrayApp {
     docker_status: ProcStatus,
     mcp_status: McpStatus,
     mcp_installed: bool,
+    transcript_status: TranscriptStatus,
+    transcript_installed: bool,
 
     // Mensagens de feedback transitórias (ex: "Docker iniciado com sucesso").
     feedback: Option<String>,
@@ -49,6 +52,8 @@ impl TrayApp {
             docker_status: ProcStatus::Stopped,
             mcp_status: McpStatus::NotInstalled,
             mcp_installed: false,
+            transcript_status: TranscriptStatus::NotInstalled,
+            transcript_installed: false,
             feedback: None,
         }
     }
@@ -61,6 +66,10 @@ impl TrayApp {
         if let Ok(mcp) = self.state.mcp.try_lock() {
             self.mcp_status = mcp.status.clone();
             self.mcp_installed = mcp.binary.exists();
+        }
+        if let Ok(t) = self.state.transcript.try_lock() {
+            self.transcript_status = t.status.clone();
+            self.transcript_installed = t.binary.exists();
         }
     }
 
@@ -203,6 +212,54 @@ impl TrayApp {
             }
         });
 
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                transcript_status_dot(ui, &self.transcript_status);
+                ui.vertical(|ui| {
+                    ui.strong("Transcript (voz)");
+                    ui.label(self.transcript_status.label());
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let running = self.transcript_status == TranscriptStatus::Running;
+
+                if ui
+                    .add_enabled(
+                        self.transcript_installed && !running,
+                        egui::Button::new("Ligar"),
+                    )
+                    .clicked()
+                {
+                    self.spawn_start_transcript();
+                }
+
+                if ui
+                    .add_enabled(
+                        self.transcript_installed && running,
+                        egui::Button::new("Desligar"),
+                    )
+                    .clicked()
+                {
+                    self.spawn_stop_transcript();
+                }
+            });
+
+            if !self.transcript_installed {
+                ui.label(
+                    egui::RichText::new(
+                        "executável não encontrado — compile o pipeline de voz \
+                         (Modules/transcribe) ou defina AVA_TRANSCRIPT_BIN",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+        });
+
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);
@@ -258,6 +315,26 @@ impl TrayApp {
             }
         });
     }
+
+    fn spawn_start_transcript(&self) {
+        let state = self.state.clone();
+        self.rt.spawn(async move {
+            match transcript::start(&state).await {
+                Ok(()) => tracing::info!("Transcript iniciado (UI do tray)."),
+                Err(e) => tracing::error!("Erro ao iniciar transcript: {e:#}"),
+            }
+        });
+    }
+
+    fn spawn_stop_transcript(&self) {
+        let state = self.state.clone();
+        self.rt.spawn(async move {
+            match transcript::stop(&state).await {
+                Ok(()) => tracing::info!("Transcript encerrado (UI do tray)."),
+                Err(e) => tracing::error!("Erro ao parar transcript: {e:#}"),
+            }
+        });
+    }
 }
 
 fn status_dot(ui: &mut egui::Ui, status: &ProcStatus) {
@@ -277,6 +354,22 @@ fn mcp_status_dot(ui: &mut egui::Ui, status: &McpStatus) {
         McpStatus::Stopped | McpStatus::NotInstalled => egui::Color32::from_rgb(150, 150, 150),
         McpStatus::Starting | McpStatus::Stopping => egui::Color32::from_rgb(230, 180, 60),
         McpStatus::Crashed => egui::Color32::from_rgb(224, 80, 60),
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
+    ui.add_space(6.0);
+}
+
+fn transcript_status_dot(ui: &mut egui::Ui, status: &TranscriptStatus) {
+    let color = match status {
+        TranscriptStatus::Running => egui::Color32::from_rgb(90, 200, 100),
+        TranscriptStatus::Stopped | TranscriptStatus::NotInstalled => {
+            egui::Color32::from_rgb(150, 150, 150)
+        }
+        TranscriptStatus::Starting | TranscriptStatus::Stopping => {
+            egui::Color32::from_rgb(230, 180, 60)
+        }
+        TranscriptStatus::Crashed => egui::Color32::from_rgb(224, 80, 60),
     };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);

@@ -23,6 +23,7 @@
 //! start responde erro claro, health check não faz nada — nenhum spawn
 //! fantasma).
 
+use crate::platform::NoWindow;
 use crate::state::{ProcStatus, SharedState, TranscriptStatus};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -50,6 +51,7 @@ pub async fn pid_alive(pid: u32) -> bool {
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .no_window()
             .output()
             .await
             .map(|out| {
@@ -64,6 +66,7 @@ pub async fn pid_alive(pid: u32) -> bool {
             .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .no_window()
             .status()
             .await
             .map(|s| s.success())
@@ -142,9 +145,15 @@ pub async fn start(state: &SharedState) -> Result<()> {
     };
 
     if !binary.exists() {
+        let build_hint = if cfg!(target_os = "windows") {
+            "Build o módulo de voz em Modules/transcribe \
+             (cmake -B build && cmake --build build)."
+        } else {
+            "Compile o módulo de voz com ./Modules/transcribe/make.sh."
+        };
         bail!(
             "Executável do transcript não encontrado (procurado: {} — ou defina \
-             AVA_TRANSCRIPT_BIN). Compile o módulo de voz com ./Modules/transcribe/make.sh.",
+             AVA_TRANSCRIPT_BIN). {build_hint}",
             binary.display()
         );
     }
@@ -184,6 +193,7 @@ pub async fn start(state: &SharedState) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .no_window()
         .kill_on_drop(false);
     for (k, v) in &envs {
         cmd.env(k, v);
@@ -249,6 +259,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         } else {
@@ -256,6 +267,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .arg(pid.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         };
@@ -271,6 +283,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                     .args(["/IM", name, "/F"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
+                    .no_window()
                     .status()
                     .await;
             }
@@ -280,6 +293,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .arg(&binary)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await;
         }
