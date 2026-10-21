@@ -139,6 +139,21 @@
   static void init_console() {}
 #endif
 
+// ONNX Runtime: ORTCHAR_T é wchar_t no Windows e char no Linux — os
+// construtores de Ort::Session só aceitam o tipo nativo da plataforma.
+// O código usa paths UTF-8 (const char*); converte pro tipo certo.
+static std::basic_string<ORTCHAR_T> to_ort_path(const char* utf8_path) {
+#if defined(_WIN32)
+    if (!utf8_path || !*utf8_path) return {};
+    const int need = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, nullptr, 0);
+    std::wstring w(need > 1 ? static_cast<size_t>(need - 1) : 0u, L'\0');
+    if (need > 1) MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, w.data(), need);
+    return w;
+#else
+    return std::string(utf8_path ? utf8_path : "");
+#endif
+}
+
 #ifndef MSG_NOSIGNAL
   #define MSG_NOSIGNAL 0
 #endif
@@ -643,7 +658,8 @@ public:
             opts_.SetIntraOpNumThreads(SPK_THREADS);
             opts_.SetInterOpNumThreads(1);
             opts_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-            session_ = std::make_unique<Ort::Session>(env_, model_path, opts_);
+            const auto ort_path = to_ort_path(model_path);
+            session_ = std::make_unique<Ort::Session>(env_, ort_path.c_str(), opts_);
 
             Ort::AllocatorWithDefaultOptions alloc;
             in_name_ = session_->GetInputNameAllocated(0, alloc).get();
