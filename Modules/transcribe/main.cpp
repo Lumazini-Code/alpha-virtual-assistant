@@ -8,7 +8,7 @@
 //   - logo depois, o embedding do locutor daquela frase é extraído
 //
 // Arquitetura:
-//   callback do PortAudio  ->  ring buffer lock-free  ->  thread principal
+//   callback do miniaudio  ->  ring buffer lock-free  ->  thread principal
 //                                                     ->  thread de speaker ID
 // O callback de áudio só copia amostras (tempo real, sem inferência dentro
 // dele). VAD + transcribe_stream_* rodam todos na thread principal, então
@@ -36,16 +36,32 @@
 //     nem de speaker embedding.
 //   - WAKE_GATE_ASR = false: o ASR roda como antes e a wake word só anota.
 //
-// Deps: PortAudio, TEN VAD (ten_vad.h + libten_vad), transcribe.cpp, ONNX Runtime,
-//       sherpa-onnx (C API: sherpa-onnx/c-api/c-api.h)
+// Embed server on-demand (rota A do plano — cadastro de voz via /settings):
+//   - mini servidor HTTP (POSIX sockets) SÓ no loopback, TRANSCRIBE_HTTP_PORT
+//     (default 9100), numa thread dedicada: GET /health e POST /speaker/embed
+//     (body = PCM s16le mono; X-Sample-Rate, default 16000 — só 16k aceito).
+//   - o orchestrator (POST /voice/register) encaminha o áudio gravado pela
+//     TUI e persiste o embedding via /voice-dict/write na memory.
+//   - embed() é síncrono e serializado com a thread assíncrona via ort_mu_
+//     (Ort::Session + fbank_ compartilhados).
+//
+// Deps: miniaudio, TEN VAD (ten_vad.h + libten_vad), transcribe.cpp, ONNX Runtime,
+//       sherpa-onnx (C API: sherpa-onnx/c-api/c-api.h), httplib.h (cliente HTTP)
 
 #include <transcribe.h>
 #include <parakeet.h>
 
-#include <portaudio.h>
 #include <ten_vad.h>
 #include <onnxruntime_cxx_api.h>
 #include <c-api.h>
+
+// miniaudio: captura de áudio (header-only; a implementation é compilada
+// AQUI — este é o único TU que usa a lib).
+#define MINIAUDIO_IMPLEMENTATION
+#include <miniaudio.h>
+
+// cpp-httplib: cliente HTTP p/ o orchestrator (header-only, sem linking).
+#include <httplib.h>
 
 #include <algorithm>
 #include <array>
@@ -59,7 +75,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <curl/curl.h>
 #include <deque>
 #include <limits>
 #include <map>
@@ -68,6 +83,68 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// ---------------------------------------------------------------------
+// Compatibilidade Windows / Linux (embed server + console)
+// ---------------------------------------------------------------------
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <winsock2.h>      // ANTES de windows.h
+  #include <ws2tcpip.h>
+  #include <windows.h>
+
+  using socket_t = SOCKET;
+  static constexpr socket_t SOCK_INVALID = INVALID_SOCKET;
+  static inline bool sock_valid(socket_t s) { return s != INVALID_SOCKET; }
+  static inline void close_socket(socket_t s) { closesocket(s); }
+
+  static inline bool sock_init() {
+      WSADATA wsa;
+      return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+  }
+  static inline void sock_cleanup() { WSACleanup(); }
+
+  // Ativa ANSI (\033[...) e UTF-8 no console do Windows, mantendo os prints
+  // idênticos aos do Linux.
+  #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+  #endif
+  static void init_console() {
+      SetConsoleOutputCP(CP_UTF8);
+      SetConsoleCP(CP_UTF8);
+      HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+      if (h != INVALID_HANDLE_VALUE) {
+          DWORD mode = 0;
+          if (GetConsoleMode(h, &mode))
+              SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+      }
+  }
+#else
+  #include <arpa/inet.h>
+  #include <netinet/in.h>
+  #include <sys/socket.h>
+  #include <unistd.h>
+
+  using socket_t = int;
+  static constexpr socket_t SOCK_INVALID = -1;
+  static inline bool sock_valid(socket_t s) { return s >= 0; }
+  static inline void close_socket(socket_t s) { close(s); }
+  static inline bool sock_init() { return true; }
+  static inline void sock_cleanup() {}
+  static void init_console() {}
+#endif
+
+#ifndef MSG_NOSIGNAL
+  #define MSG_NOSIGNAL 0
+#endif
+#ifndef M_PI
+  #define M_PI 3.14159265358979323846
+#endif
 
 // ---- Config ----
 static constexpr const char* MODEL_PATH =
@@ -153,13 +230,12 @@ private:
 static Ring g_ring(SAMPLE_RATE * 10);                       // 10s de folga
 static std::atomic<unsigned long> g_dropped{0};
 
-static int audio_callback(const void* input, void*, unsigned long frame_count,
-                          const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags,
-                          void*) {
-    if (input && !g_ring.push(static_cast<const int16_t*>(input), frame_count)) {
+static void audio_data_callback(ma_device* pDevice, void* pOutput, const void* pInput,
+                                ma_uint32 frameCount) {
+    (void)pDevice; (void)pOutput;
+    if (pInput && !g_ring.push(static_cast<const int16_t*>(pInput), frameCount)) {
         g_dropped++;
     }
-    return paContinue;
 }
 
 // ---------------------------------------------------------------------
@@ -324,10 +400,34 @@ private:
 // session_id=null: o sistema é single-session — o orchestrator cacheia como
 // "__anon__" e o /execute consome essa entrada.
 // ---------------------------------------------------------------------
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
 class OrchestratorPoster {
 public:
     bool init() {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
         const char* port = std::getenv("ORCHESTRATOR_PORT");
         base_ = std::string("http://127.0.0.1:")
              + (port && *port ? port : "9000");
@@ -403,8 +503,27 @@ public:
         }
         cv_.notify_all();
         if (worker_.joinable()) worker_.join();
-        if (curl_) curl_easy_cleanup(curl_);
-        curl_global_cleanup();
+    }
+
+    // POST fire-and-forget para o MANAGER (tray, :9001): abre a janela direto
+    // na tela de chat assim que a wake word dispara — ANTES da transcrição
+    // terminar. Thread destacada: nunca bloqueia a thread de processamento
+    // de áudio.
+    void notify_ui_chat_open() {
+        std::thread([] {
+            const char* port = std::getenv("AVA_MANAGER_PORT");
+            const std::string base = std::string("http://127.0.0.1:")
+                 + (port && *port ? port : "9001");
+            httplib::Client cli(base);
+            cli.set_connection_timeout(0, 500000);   // 500ms
+            cli.set_read_timeout(1, 500000);         // ~1.5s no total
+            auto res = cli.Post("/ui/chat-open", "{}", "application/json");
+            if (!res) {
+                std::lock_guard<std::mutex> lk(g_print_mu);
+                std::fprintf(stderr, "\033[2m[ui chat-open: %s]\033[0m\n",
+                             httplib::to_string(res.error()).c_str());
+            }
+        }).detach();
     }
 
 private:
@@ -415,32 +534,6 @@ private:
         std::string text;
     };
 
-    static size_t _discard(char*, size_t size, size_t nmemb) { return size * nmemb; }
-
-    static std::string json_escape(const std::string& s) {
-        std::string out;
-        out.reserve(s.size() + 16);
-        for (char c : s) {
-            switch (c) {
-                case '"':  out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\b': out += "\\b";  break;
-                case '\f': out += "\\f";  break;
-                case '\n': out += "\\n";  break;
-                case '\r': out += "\\r";  break;
-                case '\t': out += "\\t";  break;
-                default:
-                    if ((unsigned char)c < 0x20) {
-                        char buf[8];
-                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                        out += buf;
-                    } else {
-                        out += c;
-                    }
-            }
-        }
-        return out;
-    }
 
     void loop() {
         for (;;) {
@@ -459,48 +552,35 @@ private:
 
     // Post genérico; retorna true em HTTP 200. `log_tag` mantém o padrão
     // [voice ingest: ...] / [voice exec: ...].
+    // `idle_timeout_s` é o watchdog: o read_timeout do httplib vale por
+    // recv() — aborta se a resposta ficar sem bytes por esse tempo, sem
+    // matar respostas longas que estão progredindo normalmente (SSE do
+    // /execute).
     bool post(const char* path, const std::string& body,
-              long timeout_ms, long low_speed_time,
-              const char* log_tag) {
-        if (!curl_) curl_ = curl_easy_init();
-        if (!curl_) return false;
+              long idle_timeout_s, const char* log_tag) {
+        httplib::Client cli(base_);
+        cli.set_connection_timeout(1, 0);            // 1s de connect
+        cli.set_read_timeout(idle_timeout_s, 0);     // watchdog por recv()
+        cli.set_write_timeout(30, 0);
 
-        curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        httplib::Headers hdrs;
+        hdrs.emplace("Content-Type", "application/json");
         if (!token_.empty())
-            hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + token_).c_str());
+            hdrs.emplace("Authorization", "Bearer " + token_);
 
-        const std::string url = base_ + path;
-        curl_easy_reset(curl_);
-        curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, (long)body.size());
-        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout_ms);
-        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
-        // Watchdog: aborta se a conexão estiver parada (sem bytes fluindo)
-        // por `low_speed_time` segundos — sem matar respostas longas que
-        // estão progredindo normalmente (SSE do /execute).
-        curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_LIMIT, 1L);
-        curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_TIME, low_speed_time);
-        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, _discard);
-
-        const CURLcode rc = curl_easy_perform(curl_);
-        curl_slist_free_all(hdrs);
-
-        long code = 0;
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
-        if (rc != CURLE_OK) {
+        const auto res = cli.Post(path, hdrs, body, "application/json");
+        if (!res) {
             std::lock_guard<std::mutex> lk(g_print_mu);
-            std::fprintf(stderr, "\033[2m[%s: %s]\033[0m\n", log_tag, curl_easy_strerror(rc));
-        } else if (code != 200) {
-            std::lock_guard<std::mutex> lk(g_print_mu);
-            std::fprintf(stderr, "\033[2m[%s: HTTP %ld]\033[0m\n", log_tag, code);
-        } else {
-            return true;
+            std::fprintf(stderr, "\033[2m[%s: %s]\033[0m\n", log_tag,
+                         httplib::to_string(res.error()).c_str());
+            return false;
         }
-        return false;
+        if (res->status != 200) {
+            std::lock_guard<std::mutex> lk(g_print_mu);
+            std::fprintf(stderr, "\033[2m[%s: HTTP %d]\033[0m\n", log_tag, res->status);
+            return false;
+        }
+        return true;
     }
 
     void post_ingest(const std::vector<float>& emb) {
@@ -516,7 +596,7 @@ private:
         }
         body += "]}";
 
-        if (post("/voice/ingest", body, 3000L, 3L, "voice ingest")) {
+        if (post("/voice/ingest", body, 3L, "voice ingest")) {
             std::lock_guard<std::mutex> lk(g_print_mu);
             std::printf("\033[2m[voice ingest: ok (%zu dims)]\033[0m\n", emb.size());
             std::fflush(stdout);
@@ -532,7 +612,7 @@ private:
 
         // /execute pode levar minutos (tool loop). Timeout longo (10 min) +
         // watchdog de inatividade (sem bytes por 60s aborta).
-        if (post("/execute", body, 600000L, 60L, "voice exec")) {
+        if (post("/execute", body, 60L, "voice exec")) {
             std::lock_guard<std::mutex> lk(g_print_mu);
             std::printf("\033[2m[voice exec: ok]\033[0m\n");
             std::fflush(stdout);
@@ -542,7 +622,6 @@ private:
     static constexpr size_t QUEUE_MAX = 4;
     std::string base_;
     std::string token_;
-    CURL* curl_ = nullptr;
     std::deque<Job> queue_;
     uint64_t seq_ = 0;
     std::map<uint64_t, std::string> pending_execute_;   // seq → texto aguardando o ingest
@@ -597,7 +676,51 @@ public:
         session_.reset();
     }
 
+    struct EmbedResult {
+        std::vector<float> emb;
+        bool degenerate = false;   // áudio curto demais (fbank < 10 frames)
+        std::string error;         // Ort::Exception (vazio = ok)
+    };
+
+    // Extração on-demand p/ cadastro de voz (rota /speaker/embed): síncrona
+    // e thread-safe. A Ort::Session e o fbank_ são compartilhados com a
+    // thread assíncrona — serializamos com ort_mu_ (infreqüente: só quando
+    // alguém cadastra uma voz, ~1s por gravação).
+    // pcm: s16le mono na SAMPLE_RATE (16k). Embeddings saem não-normalizados
+    // (o memory normaliza no write).
+    EmbedResult embed(const std::vector<int16_t>& pcm) {
+        std::lock_guard<std::mutex> lk(ort_mu_);
+        return embed_locked(pcm);
+    }
+
 private:
+    // Core sem o lock ort_mu_ — chamado por embed() e pelo loop assíncrono.
+    EmbedResult embed_locked(const std::vector<int16_t>& pcm) {
+        EmbedResult r;
+        const int frames = fbank_.compute(pcm.data(), pcm.size(), feats_);
+        if (frames < 10) {                       // áudio degenerado
+            r.degenerate = true;
+            return r;
+        }
+        try {
+            const std::array<int64_t, 3> shape{1, frames, Fbank::kNumBins};
+            Ort::Value input = Ort::Value::CreateTensor<float>(
+                mem_info_, feats_.data(), feats_.size(), shape.data(), shape.size());
+
+            const char* in_names[] = {in_name_.c_str()};
+            const char* out_names[] = {out_name_.c_str()};
+            auto outputs = session_->Run(Ort::RunOptions{nullptr}, in_names, &input, 1,
+                                         out_names, 1);
+
+            const float* emb = outputs[0].GetTensorData<float>();
+            const size_t dim = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+            r.emb.assign(emb, emb + dim);
+        } catch (const Ort::Exception& e) {
+            r.error = e.what();
+        }
+        return r;
+    }
+
     struct SpkJob { std::vector<int16_t> pcm; uint64_t seq; };
 
     void loop() {
@@ -617,52 +740,48 @@ private:
     void process(std::vector<int16_t>& pcm, uint64_t seq) {
         const auto t0 = std::chrono::steady_clock::now();
 
-        const int frames = fbank_.compute(pcm.data(), pcm.size(), feats_);
-        if (frames < 10) {                       // áudio degenerado: turno não roda
+        // fbanks/feats_ e a Ort::Session são compartilhados com o embed()
+        // on-demand (rota /speaker/embed) — ort_mu_ serializa os dois.
+        EmbedResult res;
+        {
+            std::lock_guard<std::mutex> lk(ort_mu_);
+            res = embed_locked(pcm);
+        }
+
+        if (res.degenerate) {                    // áudio degenerado: turno não roda
             g_orchestrator.drop_pending(seq);
             return;
         }
-
-        try {
-            const std::array<int64_t, 3> shape{1, frames, Fbank::kNumBins};
-            Ort::Value input = Ort::Value::CreateTensor<float>(
-                mem_info_, feats_.data(), feats_.size(), shape.data(), shape.size());
-
-            const char* in_names[] = {in_name_.c_str()};
-            const char* out_names[] = {out_name_.c_str()};
-            auto outputs = session_->Run(Ort::RunOptions{nullptr}, in_names, &input, 1,
-                                         out_names, 1);
-
-            const float* emb = outputs[0].GetTensorData<float>();
-            const size_t dim = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
-
-            // ---- ponto de extensão ----
-            // Aqui você pluga o tratamento (enrollment, cosine, diarização...).
-            // `emb` tem `dim` floats e é válido só até o fim deste escopo.
-            last_embedding_.assign(emb, emb + dim);
-
-            // Fase 2 — ingestão: dispara POST /voice/ingest com o embedding
-            // (fire-and-forget na thread do OrchestratorPoster; não bloqueia o CAM++).
-            g_orchestrator.submit_ingest(std::vector<float>(emb, emb + dim));
-
-            // O /execute só é enfileirado DEPOIS do ingest — a ordem no
-            // orchestrator fica garantida (contexto de voz disponível no turno).
-            g_orchestrator.take_and_execute(seq);
-
-            const double took_ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            const double audio_s = (double)pcm.size() / SAMPLE_RATE;
-
-            std::lock_guard<std::mutex> lk(g_print_mu);
-            std::printf("\033[2m[embedding gerado: %zu dims | %.2fs de fala | %.1f ms]\033[0m\n",
-                        dim, audio_s, took_ms);
-            std::fflush(stdout);
-        } catch (const Ort::Exception& e) {
-            // Embedding falhou: o turno segue mesmo assim, só sem contexto de voz.
+        if (res.emb.empty()) {
+            // Embedding falhou (Ort::Exception): o turno segue mesmo assim,
+            // só sem contexto de voz.
             g_orchestrator.take_and_execute(seq);
             std::lock_guard<std::mutex> lk(g_print_mu);
-            std::fprintf(stderr, "\nspeaker embedding: %s\n", e.what());
+            std::fprintf(stderr, "\nspeaker embedding: %s\n", res.error.c_str());
+            return;
         }
+
+        // ---- ponto de extensão ----
+        // Aqui você pluga o tratamento (enrollment, cosine, diarização...).
+        last_embedding_.assign(res.emb.begin(), res.emb.end());
+
+        // Fase 2 — ingestão: dispara POST /voice/ingest com o embedding
+        // (fire-and-forget na thread do OrchestratorPoster; não bloqueia o CAM++).
+        const size_t emb_dim = res.emb.size();
+        g_orchestrator.submit_ingest(std::move(res.emb));
+
+        // O /execute só é enfileirado DEPOIS do ingest — a ordem no
+        // orchestrator fica garantida (contexto de voz disponível no turno).
+        g_orchestrator.take_and_execute(seq);
+
+        const double took_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double audio_s = (double)pcm.size() / SAMPLE_RATE;
+
+        std::lock_guard<std::mutex> lk(g_print_mu);
+        std::printf("\033[2m[embedding gerado: %zu dims | %.2fs de fala | %.1f ms]\033[0m\n",
+                    emb_dim, audio_s, took_ms);
+        std::fflush(stdout);
     }
 
     Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "speaker"};
@@ -676,6 +795,8 @@ private:
     std::vector<float> feats_;          // reaproveitado entre frases
     std::vector<float> last_embedding_;
 
+    std::mutex ort_mu_;                 // serializa embed() (on-demand) vs thread assíncrona
+
     std::deque<SpkJob> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
@@ -684,6 +805,241 @@ private:
 };
 
 static SpeakerEmbedder g_speaker;
+
+// ---------------------------------------------------------------------
+// Mini servidor HTTP local (rota A do plano — embedding on-demand):
+//   GET  /health          → {"ok":true,"speaker":true|false}
+//   POST /speaker/embed   → body: PCM s16le mono (X-Sample-Rate, default 16000)
+//                           resp: {"ok":true,"dim":N,"embedding":[...]}
+// Uma thread dedicada, uma conexão por vez (cadastro é infreqüente).
+// Escuta SÓ no loopback — é consumido pelo orchestrator (que roda no
+// container ava com network_mode: host no Linux) pra gerar o embedding
+// de uma gravação feita pela TUI (/settings → cadastrar voz).
+// ---------------------------------------------------------------------
+class EmbedServer {
+public:
+    void init(SpeakerEmbedder* speaker) {
+        speaker_ = speaker;
+        const char* port_env = std::getenv("TRANSCRIBE_HTTP_PORT");
+        port_ = port_env && *port_env ? std::atoi(port_env) : 9100;
+        if (port_ <= 0 || port_ > 65535) port_ = 9100;
+
+        if (!sock_init()) {
+            std::fprintf(stderr, "embed server: WSAStartup falhou — cadastro on-demand indisponível\n");
+            return;
+        }
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (!sock_valid(listen_fd_)) {
+            std::fprintf(stderr, "embed server: socket() falhou — cadastro on-demand indisponível\n");
+            sock_cleanup();
+            return;
+        }
+        int one = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // só loopback
+        addr.sin_port        = htons((uint16_t)port_);
+
+        if (bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) != 0 ||
+            listen(listen_fd_, 4) != 0) {
+            std::fprintf(stderr, "embed server: bind/listen :%d falhou — cadastro on-demand indisponível\n", port_);
+            close_socket(listen_fd_);
+            listen_fd_ = SOCK_INVALID;
+            sock_cleanup();
+            return;
+        }
+        worker_ = std::thread(&EmbedServer::loop, this);
+        std::printf("Embed server on-demand: http://127.0.0.1:%d/speaker/embed\n", port_);
+    }
+
+    void shutdown() {
+        stop_ = true;
+        if (sock_valid(listen_fd_)) {
+#ifdef _WIN32
+            ::shutdown(listen_fd_, SD_BOTH);   // desbloqueia o accept()
+#else
+            ::shutdown(listen_fd_, SHUT_RDWR);   // desbloqueia o accept()
+#endif
+            close_socket(listen_fd_);
+            listen_fd_ = SOCK_INVALID;
+        }
+        if (worker_.joinable()) worker_.join();
+        sock_cleanup();
+    }
+
+private:
+    void loop() {
+        while (!stop_.load()) {
+            sockaddr_in peer{};
+            socklen_t peer_len = sizeof(peer);
+            const socket_t fd = accept(listen_fd_, (sockaddr*)&peer, &peer_len);
+            if (!sock_valid(fd)) {
+                if (stop_.load()) return;
+                continue;   // erro transitório (EINTR etc.)
+            }
+            handle(fd);
+            close_socket(fd);
+        }
+    }
+
+    // HTTP mínimo: request line + headers até \r\n\r\n, body por Content-Length.
+    // Uma requisição por conexão (Connection: close).
+    void handle(socket_t fd) {
+        std::string req;
+        char buf[4096];
+        const size_t kHeaderCap = 16 * 1024;
+        while (req.size() < kHeaderCap) {
+            const int n = recv(fd, buf, (int)sizeof(buf), 0);
+            if (n <= 0) return;
+            req.append(buf, (size_t)n);
+            if (req.find("\r\n\r\n") != std::string::npos) break;
+        }
+        const size_t header_end = req.find("\r\n\r\n");
+        if (header_end == std::string::npos) { respond(fd, 400, "{\"ok\":false,\"error\":\"request sem fim de headers\"}"); return; }
+
+        // request line: "POST /speaker/embed HTTP/1.1"
+        const size_t line_end = req.find("\r\n");
+        const std::string req_line = req.substr(0, line_end == std::string::npos ? req.size() : line_end);
+        const size_t sp1 = req_line.find(' ');
+        const size_t sp2 = req_line.find(' ', sp1 == std::string::npos ? 0 : sp1 + 1);
+        const std::string method = sp1 == std::string::npos ? "" : req_line.substr(0, sp1);
+        const std::string path   = (sp1 == std::string::npos || sp2 == std::string::npos)
+                                       ? "" : req_line.substr(sp1 + 1, sp2 - sp1 - 1);
+
+        // Content-Length (o body pode ter vindo parcialmente no 1º recv — recv_all cobre)
+        size_t content_length = 0;
+        {
+            size_t pos = req.find("\r\nContent-Length:", 0);
+            if (pos == std::string::npos) pos = req.find("\r\ncontent-length:", 0);
+            if (pos != std::string::npos) {
+                const size_t vstart = req.find(':', pos) + 1;
+                const size_t vend   = req.find("\r\n", vstart);
+                content_length = (size_t)std::strtoll(req.substr(vstart, vend - vstart).c_str(), nullptr, 10);
+            }
+        }
+
+        if (path == "/health" && method == "GET") {
+            char body[64];
+            std::snprintf(body, sizeof(body), "{\"ok\":true,\"speaker\":%s}",
+                          speaker_ ? "true" : "false");
+            respond(fd, 200, body);
+            return;
+        }
+        if (path == "/speaker/embed" && method == "POST") {
+            if (!speaker_) { respond(fd, 503, "{\"ok\":false,\"error\":\"speaker (CAM++) nao carregado\"}"); return; }
+
+            const size_t kBodyCap = 16000 * 2 * 180;   // teto: ~3min de PCM s16le mono 16k
+            if (content_length == 0 || content_length > kBodyCap) {
+                respond(fd, 400, "{\"ok\":false,\"error\":\"body vazio ou maior que o teto (PCM s16le mono)\"}");
+                return;
+            }
+
+            // X-Sample-Rate (o CAM++/fbank é treinado a 16k — recusa o resto)
+            int sample_rate = 16000;
+            {
+                size_t pos = req.find("\r\nX-Sample-Rate:");
+                if (pos != std::string::npos) {
+                    const size_t vstart = req.find(':', pos) + 1;
+                    const size_t vend   = req.find("\r\n", vstart);
+                    sample_rate = std::atoi(req.substr(vstart, vend - vstart).c_str());
+                }
+            }
+            if (sample_rate != SAMPLE_RATE) {
+                char body[128];
+                std::snprintf(body, sizeof(body),
+                              "{\"ok\":false,\"error\":\"sample_rate %d nao suportado (use %d)\"}", sample_rate, SAMPLE_RATE);
+                respond(fd, 400, body);
+                return;
+            }
+
+            // completa o body (o header end já consumido pode ter trazido bytes)
+            const size_t content_length_orig = content_length;
+            std::string body_bytes = req.substr(header_end + 4);
+            if (body_bytes.size() > content_length_orig) body_bytes.resize(content_length_orig);
+            size_t remaining = content_length_orig - body_bytes.size();
+            while (remaining > 0) {
+                const int n = recv(fd, buf, (int)std::min(sizeof(buf), remaining), 0);
+                if (n <= 0) break;
+                body_bytes.append(buf, (size_t)n);
+                remaining -= (size_t)n;
+            }
+            if (remaining > 0) {
+                respond(fd, 400, "{\"ok\":false,\"error\":\"body truncado\"}");
+                return;
+            }
+
+            // bytes → s16le mono (descarta byte ímpar final, se houver)
+            const size_t n_samples = body_bytes.size() / 2;
+            std::vector<int16_t> pcm(n_samples);
+            std::memcpy(pcm.data(), body_bytes.data(), n_samples * 2);
+
+            const auto res = speaker_->embed(pcm);
+            if (!res.emb.empty()) {
+                // {"ok":true,"dim":N,"embedding":[f1, f2, ...]}
+                std::string body;
+                body.reserve(res.emb.size() * 10 + 48);
+                body += "{\"ok\":true,\"dim\":";
+                body += std::to_string(res.emb.size());
+                body += ",\"embedding\":[";
+                char num[32];
+                for (size_t i = 0; i < res.emb.size(); i++) {
+                    std::snprintf(num, sizeof(num), "%.7g", res.emb[i]);
+                    if (i) body += ',';
+                    body += num;
+                }
+                body += "]}";
+                respond(fd, 200, body);
+            } else if (res.degenerate) {
+                respond(fd, 400, "{\"ok\":false,\"error\":\"audio muito curto/degenerado\"}");
+            } else {
+                std::string body = "{\"ok\":false,\"error\":\"embed falhou: ";
+                body += json_escape(res.error);
+                body += "\"}";
+                respond(fd, 500, body);
+            }
+            return;
+        }
+
+        respond(fd, 404, "{\"ok\":false,\"error\":\"nao encontrado\"}");
+    }
+
+    void respond(socket_t fd, int status, const std::string& body) {
+        const char* status_text = status == 200 ? "OK"
+                                : status == 400 ? "Bad Request"
+                                : status == 404 ? "Not Found"
+                                : status == 503 ? "Service Unavailable"
+                                : "Internal Server Error";
+        char head[128];
+        std::snprintf(head, sizeof(head),
+                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+                      "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                      status, status_text, body.size());
+        send_all(fd, head, std::strlen(head));
+        send_all(fd, body.data(), body.size());
+    }
+
+    static void send_all(socket_t fd, const void* data, size_t len) {
+        const char* p = (const char*)data;
+        while (len > 0) {
+            // MSG_NOSIGNAL: sem SIGPIPE se o cliente sumir no meio da resposta
+            // (no-op no Windows: lá send() não levanta SIGPIPE).
+            const int n = send(fd, p, (int)std::min(len, (size_t)65536), MSG_NOSIGNAL);
+            if (n <= 0) return;
+            p += n;
+            len -= (size_t)n;
+        }
+    }
+
+    SpeakerEmbedder* speaker_ = nullptr;
+    int port_ = 9100;
+    socket_t listen_fd_ = SOCK_INVALID;
+    std::atomic<bool> stop_{false};
+    std::thread worker_;
+};
+
+static EmbedServer g_embed_server;
 
 // Fecha o turno de voz: postura do embedding + disparo do /execute.
 //  - Com CAM++: o texto fica "palco" (staged) e o SpeakerEmbedder dispara o
@@ -902,7 +1258,11 @@ static bool finalize_utterance(struct transcribe_session* session,
 
 // ---------------------------------------------------------------------
 int main() {
+    init_console();
     std::signal(SIGINT, on_sigint);
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);   // embed server: cliente sumindo não pode matar o processo (POSIX)
+#endif
 
     transcribe_init_backends_default();
 
@@ -928,6 +1288,10 @@ int main() {
     std::printf("Conectando ao orchestrator (/voice/ingest + /execute)...\n");
     g_orchestrator.init();
 
+    // Rota /speaker/embed (cadastro on-demand p/ /settings da TUI) — sem
+    // CAM++ o servidor sobe mesmo assim e responde 503 nas tentativas.
+    g_embed_server.init(&g_speaker);
+
     std::printf("Carregando wake word (sherpa-onnx KWS)...\n");
     const bool wake_ok = g_wake.init();
     if (!wake_ok) {
@@ -941,37 +1305,49 @@ int main() {
         return 1;
     }
 
-    // ---- Áudio ----
-    PaError pe = Pa_Initialize();
-    if (pe != paNoError) {
-        std::fprintf(stderr, "Pa_Initialize: %s\n", Pa_GetErrorText(pe));
-        return 1;
-    }
-    PaStreamParameters in_params{};
-    in_params.device = Pa_GetDefaultInputDevice();
-    if (in_params.device == paNoDevice) {
-        std::fprintf(stderr, "Nenhum microfone padrão encontrado.\n");
-        return 1;
-    }
-    const PaDeviceInfo* dev = Pa_GetDeviceInfo(in_params.device);
-    in_params.channelCount = 1;
-    in_params.sampleFormat = paInt16;
-    in_params.suggestedLatency = dev->defaultLowInputLatency;
-
-    PaStream* pa_stream = nullptr;
-    pe = Pa_OpenStream(&pa_stream, &in_params, nullptr, SAMPLE_RATE, FRAME_SAMPLES,
-                       paNoFlag, audio_callback, nullptr);
-    if (pe != paNoError) {
-        std::fprintf(stderr, "Pa_OpenStream: %s\n", Pa_GetErrorText(pe));
-        return 1;
-    }
-    pe = Pa_StartStream(pa_stream);
-    if (pe != paNoError) {
-        std::fprintf(stderr, "Pa_StartStream: %s\n", Pa_GetErrorText(pe));
+    // ---- Áudio (miniaudio: captura do microfone padrão, s16le mono 16k) ----
+    static ma_context g_ma_ctx;
+    static ma_device  g_ma_dev;
+    ma_result mr = ma_context_init(nullptr, 0, nullptr, &g_ma_ctx);
+    if (mr != MA_SUCCESS) {
+        std::fprintf(stderr, "ma_context_init: %s\n", ma_result_description(mr));
         return 1;
     }
 
-    std::printf("Microfone: %s\n", dev->name);
+    // Enumera p/ mostrar o nome do dispositivo padrão de captura (índice 0).
+    ma_device_info* pCaptures = nullptr;
+    ma_uint32 captureCount = 0;
+    const char* dev_name = "padrão do sistema";
+    if (ma_context_get_devices(&g_ma_ctx, nullptr, nullptr,
+                               &pCaptures, &captureCount) == MA_SUCCESS &&
+        captureCount > 0) {
+        dev_name = pCaptures[0].name;
+    }
+
+    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+    cfg.capture.format       = ma_format_s16;
+    cfg.capture.channels     = 1;
+    cfg.sampleRate           = SAMPLE_RATE;
+    cfg.periodSizeInFrames   = FRAME_SAMPLES;   // 256 frames = 16ms por callback
+    cfg.periods              = 2;               // poucos períodos = baixa latência
+    cfg.dataCallback         = audio_data_callback;
+    // device.id zerado = microfone padrão do sistema.
+
+    mr = ma_device_init(&g_ma_ctx, &cfg, &g_ma_dev);
+    if (mr != MA_SUCCESS) {
+        std::fprintf(stderr, "ma_device_init: %s\n", ma_result_description(mr));
+        ma_context_uninit(&g_ma_ctx);
+        return 1;
+    }
+    mr = ma_device_start(&g_ma_dev);
+    if (mr != MA_SUCCESS) {
+        std::fprintf(stderr, "ma_device_start: %s\n", ma_result_description(mr));
+        ma_device_uninit(&g_ma_dev);
+        ma_context_uninit(&g_ma_ctx);
+        return 1;
+    }
+
+    std::printf("Microfone: %s\n", dev_name);
     std::printf("Escutando... fale algo (Ctrl+C pra sair)\n\n");
 
     // ---- Loop principal: VAD + transcrição ----
@@ -1012,6 +1388,9 @@ int main() {
             std::printf("\r\033[K\033[1;32m[wake word: %s]\033[0m\n", wake_name.c_str());
             std::fflush(stdout);
         }
+        // Abre a janela do tray na tela de chat já no disparo da wake word
+        // (fire-and-forget, thread destacada — nunca bloqueia o pipeline).
+        g_orchestrator.notify_ui_chat_open();
         if (!asr_open) open_asr_replay();
     };
 
@@ -1099,9 +1478,8 @@ int main() {
     }
 
     // ---- Encerramento ----
-    Pa_StopStream(pa_stream);
-    Pa_CloseStream(pa_stream);
-    Pa_Terminate();
+    ma_device_uninit(&g_ma_dev);
+    ma_context_uninit(&g_ma_ctx);
 
     if (active) {
         if (wake_ok && !woke && g_wake.flush(wake_name)) on_wake();
@@ -1112,6 +1490,7 @@ int main() {
         }
     }
     if (wake_ok) g_wake.shutdown();
+    g_embed_server.shutdown();              // para de aceitar antes de drenar o speaker
     if (speaker_ok) g_speaker.shutdown();   // drena a fila antes de sair
     g_orchestrator.shutdown();              // drena ingestões/turnos pendentes
 

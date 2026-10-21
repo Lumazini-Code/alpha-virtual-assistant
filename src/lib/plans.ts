@@ -1,5 +1,6 @@
 import { MEMORY_API_URL } from "./constants.js";
 import { logger } from "./logger.js";
+import { authHeaders } from "./auth.js";
 
 /**
  * Cliente da API REST de memória (porta 3000) — os endpoints de planos.
@@ -37,9 +38,13 @@ async function errorDetail(res: Response): Promise<string> {
 
 /** POST /plans/list — todos os planos (com steps para contagem). */
 export async function listPlans(): Promise<PlanEntry[]> {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    ...authHeaders({}),
+  });
   const res = await fetch(`${MEMORY_API_URL}/plans/list`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({}),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
@@ -62,7 +67,10 @@ export async function updatePlan(
 
   const res = await fetch(`${MEMORY_API_URL}/plans/update`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders({}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await errorDetail(res));

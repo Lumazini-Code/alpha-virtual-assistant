@@ -48,6 +48,10 @@ services:
       # O mcp_manager reescreve localhost/127.0.0.1 → host.docker.internal
       # (porta e path preservados) no momento da conexão.
       AVA_LOCALHOST_REWRITE: "http://host.docker.internal"
+      # Embedding on-demand (cadastro de voz): o transcribe (main.cpp) roda
+      # NO HOST (microfone) — dentro do container "localhost" não é o host.
+      # Mesmo tratamento do PROCESS_MANAGER_URL (extra_hosts já tem o gateway).
+      TRANSCRIBE_HTTP_URL: "http://host.docker.internal:9100"
 
     # ── DBs da memory em volume nomeado (fs Linux da VM) ──
     # SQLite + WAL sobre o bind mount do Docker Desktop (drvfs/9p) não é

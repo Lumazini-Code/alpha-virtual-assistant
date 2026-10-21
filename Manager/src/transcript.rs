@@ -1,10 +1,10 @@
 //! Supervisão do transcript (pipeline de voz) NO HOST.
 //!
 //! O `Modules/transcribe/transcript` é o binário C++ do pipeline de voz:
-//!   PortAudio (microfone) → TEN VAD → ASR streaming (nemotron 0.6B) →
+//!   miniaudio (microfone) → TEN VAD → ASR streaming (nemotron 0.6B) →
 //!   speaker embedding CAM++ → POST /voice/ingest no orchestrator.
 //!
-//! Ele precisa rodar NO HOST (abre o microfone via PortAudio — o container
+//! Ele precisa rodar NO HOST (abre o microfone via miniaudio — o container
 //! não tem device de áudio) e só faz sentido com o orchestrator de pé.
 //! Este módulo o supervisiona como o mcp_manager.rs faz com o manager MCP:
 //!
@@ -313,7 +313,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
 ///   Running sem pid vivo → Crashed;
 ///   Crashed → re-spawn — APENAS com o container de pé (o transcript só
 ///   tem propósito com o orchestrator respondendo /voice/ingest; sem
-///   container é ruído de curl error no log).
+///   container é ruído de erro HTTP (httplib) no log).
 pub async fn health_check(state: &SharedState) {
     let (status, binary) = {
         let t = state.transcript.lock().await;

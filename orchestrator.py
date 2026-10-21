@@ -104,6 +104,13 @@ MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://localhost:3000")
 TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
+# ── Embedding on-demand (rota A do plano — cadastro de voz via /settings) ────
+# Módulo transcribe (main.cpp no HOST, microfone local) expõe um mini servidor
+# HTTP com GET /health e POST /speaker/embed (PCM s16le mono → embedding CAM++
+# 192 dims). No Linux o container ava usa network_mode: host, então localhost
+# alcança o processo; no Windows injete http://host.docker.internal:9100 no
+# compose (docker-compose.windows.yml).
+TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://localhost:9100")
 # ── Fluxo vision_objects (vision.py :4002) ────────────────────────────────────
 # vision.py está desativado por enquanto (start.sh não sobe o serviço — a
 # forma com que ele foi projetado para ser usado, agente totalmente autônomo
@@ -286,14 +293,78 @@ log = logging.getLogger("ava.orchestrator")
 # Data Models
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Conversation Hub — espelho em memória dos turnos (chat do Manager)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConversationHub:
+    """Espelha eventos SSE de turnos voice/chat para o Manager.
+
+    - Ring buffer de eventos recentes (catch-up para reconexão do Manager).
+    - Broadcast asyncio para consumidores SSE conectados.
+    - NUNCA persiste em disco — vive só na RAM do orchestrator.
+    """
+
+    def __init__(self, buffer_max: int = 500):
+        self._lock = asyncio.Lock()
+        self._buffer: list[dict] = []
+        self._next_id = 1
+        self._buffer_max = buffer_max
+        self._subscribers: set[asyncio.Queue] = set()
+
+    async def publish(self, event_name: str, data: Any) -> None:
+        """Guarda no buffer e notifica todos os subscribers SSE."""
+        async with self._lock:
+            entry = {"id": self._next_id, "event": event_name, "data": data}
+            self._next_id += 1
+            self._buffer.append(entry)
+            if len(self._buffer) > self._buffer_max:
+                self._buffer = self._buffer[-self._buffer_max:]
+            queues = list(self._subscribers)
+        for q in queues:
+            try:
+                q.put_nowait(entry)
+            except asyncio.QueueFull:
+                pass  # subscriber lento — deixa cair (best-effort)
+
+    async def subscribe(self) -> asyncio.Queue:
+        """Registra um consumidor SSE e devolve a fila dele."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        async with self._lock:
+            self._subscribers.add(q)
+        return q
+
+    async def unsubscribe(self, q: asyncio.Queue) -> None:
+        async with self._lock:
+            self._subscribers.discard(q)
+
+    async def recent(self, after_id: int = 0) -> list[dict]:
+        """Eventos com id > after_id (catch-up para reconexão)."""
+        async with self._lock:
+            return [e for e in self._buffer if e["id"] > after_id]
+
+
+# Instância global (um hub por processo — a vida é a do orchestrator).
+CONVERSATION_HUB = ConversationHub()
+
+
+async def _mirror_conversation(hub: ConversationHub, name: str, data: Any) -> None:
+    """Espelha um evento SSE para o hub (fire-and-forget, nunca quebra o turno)."""
+    try:
+        await hub.publish(name, data)
+    except Exception:
+        pass  # erro no espelho jamais afeta o turno do usuário
+
+
 class ExecuteRequest(BaseModel):
     input:         str = Field(..., max_length=200_000)
     session_id:    Optional[str]  = None
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
-    # Telemetria: quem disparou o turno ("tui" = TUI, "voice" = pipeline de voz).
-    source:        Optional[Literal["tui", "voice"]] = None
+    # Telemetria: quem disparou o turno ("tui" = TUI, "voice" = pipeline de voz,
+    # "chat" = janela de chat do Manager/tray).
+    source:        Optional[Literal["tui", "voice", "chat"]] = None
     # Onde o áudio da resposta toca:
     #   client — orchestrator sintetiza via TTS /synthesize e DEVOLVE o WAV
     #            num evento SSE `audio` (a TUI toca no HOST — uniforme
@@ -343,6 +414,21 @@ class VoiceContextRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Sessão da TUI (None = anônimo)")
     embedding:  list[float] = Field(..., description="Embedding do locutor (CAM++ 192 dims)")
 
+class VoiceRegisterRequest(BaseModel):
+    # POST /voice/register — cadastro de locutor via /settings (TUI).
+    # Fluxo: a TUI grava ~5s do microfone do HOST (PCM s16le mono 16kHz) e
+    # envia audio_b64; o embedding CAM++ é gerado ON-DEMAND pelo módulo
+    # transcribe (rota /speaker/embed) e a pessoa é persistida via
+    # /voice-dict/write na memory — a descrição replica para a memória de
+    # longo prazo lá (source="voice_dict"). Também aceita embedding pronto.
+    person_name: str = Field(..., min_length=1, max_length=200)
+    description: str  = Field("",  max_length=2000)
+    embedding: Optional[list[float]] = Field(None, description="Embedding pronto (192 dims) — quando ausente, gera do áudio")
+    audio_b64:  Optional[str] = Field(None, max_length=64_000_000, description="PCM s16le mono em base64 (16kHz)")
+    sample_rate: int = Field(16000, ge=8000, le=48000)
+    source: str = Field("settings_ui", max_length=50)
+    confidence: float = Field(1.0, ge=0.0, le=1.0)
+
 class AlphaCodeRequest(BaseModel):
     task: str = Field(..., max_length=200_000, description="Descrição da tarefa em linguagem natural")
     session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
@@ -391,6 +477,10 @@ class AppState:
     # (/servers/{name}/tools) e execução (/servers/{name}/call) vão todos
     # por este client (ver _select_skills/_load_mcp_tools/_run_tool_loop).
     mcp_client: httpx.AsyncClient = field(default=None)
+    # transcribe (REST, HOST) — embedding on-demand p/ cadastro de voz:
+    # POST /speaker/embed no módulo transcribe (main.cpp, microfone do host).
+    # Uso raro (só no cadastro via /settings), timeout finito.
+    transcribe_client: httpx.AsyncClient = field(default=None)
 
 state = AppState()
 
@@ -460,13 +550,16 @@ async def lifespan(app: FastAPI):
     # mcp_manager: timeout LONGO (a execução de tools MCP pode demorar — o
     # teto real por tool é o asyncio.wait_for do loop, EXECUTOR_TIMEOUTS).
     state.mcp_client = _make_client(MCP_MANAGER_URL, 9999999.0)
+    # transcribe (host): /speaker/embed roda fbank + CAM++ (~200ms por
+    # gravação de 5s) — timeout finito e generoso.
+    state.transcribe_client = _make_client(TRANSCRIBE_HTTP_URL, 30.0)
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
     for c in (state.memory_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client,
               state.alpha_code_client, state.process_manager_client,
-              state.mcp_client):
+              state.mcp_client, state.transcribe_client):
         await c.aclose()
     log.info("AVA Orchestrator encerrado")
 
@@ -2807,7 +2900,14 @@ async def _execute_stream_generator(req: ExecuteRequest):
     sid = req.session_id or str(uuid.uuid4())
     log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
-    yield _sse("meta", {"execution_id": eid, "session_id": sid})
+    # Espelho no Conversation Hub: `meta` inclui a pergunta (o chat do Manager
+    # precisa dela para desenhar a bolha do usuário) e o `source` do turno.
+    await _mirror_conversation(CONVERSATION_HUB, "meta", {
+        "execution_id": eid, "session_id": sid,
+        "input": req.input, "source": req.source or "tui",
+    })
+    yield _sse("meta", {"execution_id": eid, "session_id": sid,
+                        "input": req.input, "source": req.source or "tui"})
 
     events_queue: asyncio.Queue = asyncio.Queue(
         maxsize=int(os.environ.get("AVA_EVENTS_QUEUE_MAX", "2000"))
@@ -2877,12 +2977,14 @@ async def _execute_stream_generator(req: ExecuteRequest):
             error_msg = data
             if tts_streamer is not None:
                 tts_streamer.cancel()
+            await _mirror_conversation(CONVERSATION_HUB, "error", {"error": error_msg})
             yield _sse("error", {"error": error_msg})
             break
         if name == "delta":
             # Fragmento incremental do content do LLM (streaming real, vem do
             # _llm_chat_stream durante o tool loop). A UI concatena; o `done`
             # final cura o texto visível com final_response.
+            await _mirror_conversation(CONVERSATION_HUB, "delta", data)
             yield _sse("delta", data)
             if tts_streamer is not None:
                 tts_streamer.feed(data)
@@ -2891,6 +2993,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 for payload in tts_streamer.drain():
                     yield _audio_frames(payload)
         elif name == "tool_call":
+            await _mirror_conversation(CONVERSATION_HUB, "tool_call", data)
             yield _sse("tool_call", data)
             # Turno terminou em tool call: zera o streamer — o preâmbulo
             # falado até aqui toca (já emitido), o resto é descartado; a
@@ -2898,10 +3001,13 @@ async def _execute_stream_generator(req: ExecuteRequest):
             if tts_streamer is not None:
                 tts_streamer.reset()
         elif name == "tool_result":
+            await _mirror_conversation(CONVERSATION_HUB, "step_done", data)
             yield _sse("step_done", data)
             res = data.get("result")
             if data.get("success") and res:
-                yield _sse("result", _result_to_text(res))
+                result_text = _result_to_text(res)
+                await _mirror_conversation(CONVERSATION_HUB, "result", result_text)
+                yield _sse("result", result_text)
 
     await task
 
@@ -2920,6 +3026,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
             tts_streamer.dispatch(final_chunk)
         for payload in await tts_streamer.wait_pending():
             yield _audio_frames(payload)
+        await _mirror_conversation(CONVERSATION_HUB, "audio_end", {})
         yield _sse("audio_end", {})
     elif req.tts and req.tts_output == "device" and final_response:
         # Modo device (opt-in): TTS toca dentro do container.
@@ -2937,6 +3044,11 @@ async def _execute_stream_generator(req: ExecuteRequest):
     if error_msg:
         errors.append(error_msg)
 
+    await _mirror_conversation(CONVERSATION_HUB, "done", {
+        "execution_id": eid, "final_response": final_response,
+        "steps": [s.model_dump() for s in step_results],
+        "total_latency_ms": lat, "errors": errors,
+    })
     yield _sse("done", {
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
@@ -3070,6 +3182,45 @@ app = FastAPI(title="AVA Orchestrator", version="4.0.0",
 
 install_internal_auth(app, service_name="orchestrator")
 
+
+# ── Conversation Hub: SSE + catch-up (espelho dos turnos voice/chat) ────────
+
+@app.get("/conversation/stream")
+async def conversation_stream():
+    """SSE ao vivo de todos os eventos dos turnos voice/chat."""
+    q = await CONVERSATION_HUB.subscribe()
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    entry = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"id: {entry['id']}\nevent: {entry['event']}\ndata: {_sse_data(entry['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # mantém a conexão viva
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await CONVERSATION_HUB.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/conversation/recent")
+async def conversation_recent(after_id: int = 0):
+    """Catch-up: eventos com id > after_id (para reconexão do Manager)."""
+    entries = await CONVERSATION_HUB.recent(after_id)
+    return {"events": entries}
+
+
+def _sse_data(data: Any) -> str:
+    """Serializa o payload do evento para o formato SSE (uma linha)."""
+    import json
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
 @app.post("/execute")
 async def execute(req: ExecuteRequest):
     async def stream_with_flush():
@@ -3140,6 +3291,101 @@ async def voice_ingest(req: VoiceContextRequest):
     próximo /execute da sessão. Latência crítica: esta chamada roda FORA do
     caminho do turno — o /execute só consome o cache, custo 0ms."""
     return await _ingest_voice_context(req.session_id, req.embedding)
+
+
+async def _transcribe_embed(pcm: bytes, sample_rate: int = 16000) -> Optional[list[float]]:
+    """POST /speaker/embed no módulo transcribe (HOST, rota A do plano) —
+    fbank + CAM++ sobre PCM s16le mono. Devolve o embedding (192 dims) ou
+    None quando o módulo está offline/falhou — o chamador vira isso em
+    HTTPException clara (nunca bloqueia nada além do cadastro em si)."""
+    try:
+        r = await state.transcribe_client.post(
+            "/speaker/embed",
+            content=pcm,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Sample-Rate": str(sample_rate),
+            },
+            timeout=30.0,
+        )
+    except Exception as e:
+        log.warning(f"transcribe /speaker/embed offline: {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        detail = ""
+        try:
+            detail = r.json().get("error", "")
+        except Exception:
+            pass
+        log.warning(f"transcribe /speaker/embed HTTP {r.status_code}: {detail}")
+        return None
+    try:
+        emb = r.json().get("embedding")
+    except Exception as e:
+        log.warning(f"transcribe /speaker/embed resposta inválida: {e}")
+        return None
+    return emb if isinstance(emb, list) and emb else None
+
+
+@app.post("/voice/register")
+async def voice_register(req: VoiceRegisterRequest):
+    """Cadastro de locutor via /settings (TUI).
+
+    1. Recebe o áudio cru (PCM s16le mono, microfone do HOST) em audio_b64
+       OU um embedding pronto (para reuso por outros clientes).
+    2. Sem embedding: gera on-demand via transcribe (/speaker/embed — rota A).
+    3. Persiste via /voice-dict/write na memory — a descrição replica para a
+       memória de longo prazo lá (source="voice_dict", nó no grafo Hebbiano).
+    """
+    person_name = req.person_name.strip()
+    if not person_name:
+        raise HTTPException(400, "person_name vazio")
+
+    embedding = req.embedding
+    if embedding is None:
+        if not req.audio_b64:
+            raise HTTPException(400, "envie embedding (192 dims) ou audio_b64 (PCM s16le mono)")
+        try:
+            pcm = base64.b64decode(req.audio_b64, validate=True)
+        except Exception as e:
+            raise HTTPException(400, f"audio_b64 inválido: {e}")
+
+        # ~2 bytes/amostra: teto de 3min e piso de ~0.5s de fala (abaixo disso
+        # o CAM++ não produz embedding confiável — o transcribe rejeitaria).
+        min_bytes = int(req.sample_rate * 2 * 0.5)
+        max_bytes = int(req.sample_rate * 2 * 180)
+        if len(pcm) < min_bytes:
+            raise HTTPException(400, f"áudio muito curto ({len(pcm) / (req.sample_rate * 2):.1f}s) — grave ao menos ~0.5s de fala")
+        if len(pcm) > max_bytes:
+            raise HTTPException(400, f"áudio longo demais ({len(pcm) / (req.sample_rate * 2):.1f}s) — teto de 180s")
+
+        embedding = await _transcribe_embed(pcm, req.sample_rate)
+        if embedding is None:
+            raise HTTPException(
+                502,
+                "transcribe (CAM++ /speaker/embed) indisponível ou falhou — "
+                "verifique se o módulo transcribe (main.cpp) está rodando no host",
+            )
+
+    if len(embedding) != 192:
+        raise HTTPException(400, f"embedding deve ter 192 dims (VO_EMBED_DIM), recebido {len(embedding)}")
+
+    try:
+        return await _memory_request("POST", "/voice-dict/write", {
+            "person_name": person_name,
+            "embedding": embedding,
+            "description": req.description.strip(),
+            "source": req.source,
+            "confidence": req.confidence,
+        })
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("error", str(e))
+        except Exception:
+            detail = str(e)
+        raise HTTPException(502, f"voice-dict/write falhou: {detail}")
+    except Exception as e:
+        raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):

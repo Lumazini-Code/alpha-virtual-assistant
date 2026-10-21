@@ -162,7 +162,7 @@ impl TranscriptStatus {
 }
 
 /// Estado do transcript no HOST — binário C++ (Modules/transcribe) que
-/// abre o microfone (PortAudio) e alimenta o orchestrator (/voice/ingest).
+/// abre o microfone (miniaudio) e alimenta o orchestrator (/voice/ingest).
 /// Não pode viver no container: precisa de device de áudio do host.
 #[derive(Debug, Clone)]
 pub struct TranscriptState {
