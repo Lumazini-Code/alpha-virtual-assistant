@@ -72,7 +72,7 @@ RERANK_THREADS     = max(1, int(os.getenv("ONNX_RERANK_THREADS", "2")))
 RERANK_MAX_BATCH   = max(8, int(os.getenv("ONNX_RERANK_MAX_BATCH", "32")))
 
 # Server
-SERVER_HOST        = "0.0.0.0"
+SERVER_HOST        = os.environ.get("AVA_BIND_HOST", "127.0.0.1")
 SERVER_PORT        = 2002
 
 # Thread pools — isolate embedding and reranker workloads.
@@ -528,6 +528,15 @@ app = FastAPI(
     description="Unified REST API for ONNX embedding and reranking models.",
     lifespan=lifespan,
 )
+
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
+install_internal_auth(app, service_name="onnxManager")
 
 
 # ── POST /v1/embed ─────────────────────────────────────────────────────────────

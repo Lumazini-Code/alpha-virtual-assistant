@@ -8,19 +8,21 @@
 //!
 //! Este módulo é o placeholder de ativação + supervisão no tray:
 //!   - discover():      no boot, vê se o binário existe e se o manager
-//!                      já está de pé (health :4008) — reaproveita.
+//!     já está de pé (health :4008) — reaproveita.
 //!   - start():         spawn do executável (cwd = raiz do projeto),
-//!                      aguarda o /health responder.
+//!     aguarda o /health responder.
 //!   - stop():          encerra o processo (graceful → kill).
 //!   - health_check():  tick periódico — Running sem /health vira Crashed;
-//!                      Crashed é re-espawnado (restart-on-fail).
+//!     Crashed é re-espawnado (restart-on-fail).
 //!
 //! Enquanto o executável não existir (find_mcp_manager_binary em
 //! state.rs), TUDO aqui é inerte: start responde erro claro de "não
 //! instalado" e o health check não faz nada — nenhum spawn fantasma.
 
+use crate::platform::NoWindow;
 use crate::state::{McpStatus, SharedState};
 use anyhow::{bail, Context, Result};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -33,14 +35,59 @@ const HEALTH_TIMEOUT_SECS: u64 = 3;
 /// Tenta o /health a cada 500ms durante o boot.
 const HEALTH_POLL_MS: u64 = 500;
 
+/// Variáveis que o mcp_manager consome do Modules/.env (mesma fonte dos
+/// demais serviços): token de auth interna + URL do memory_api + porta.
+const MCP_CHILD_ENV_KEYS: &[&str] = &["AVA_INTERNAL_TOKEN", "MEMORY_API_URL", "MCP_MANAGER_PORT"];
+
+/// Lê o Modules/.env do projeto e devolve APENAS as variáveis que o
+/// mcp_manager consome. O tray pode ter sido lançado sem essas vars
+/// exportadas — o .env é a mesma fonte que os demais serviços do host usam.
+/// Valores aqui SOBRESCREVEM o ambiente herdado. Arquivo ausente → vazio.
+/// (Espelho de load_env_for_child em transcript.rs.)
+fn load_env_for_child(project_root: &Path) -> Vec<(String, String)> {
+    let path = project_root.join("Modules").join(".env");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        if MCP_CHILD_ENV_KEYS.contains(&k) {
+            let v = v.trim().trim_matches('"').to_string();
+            if !v.is_empty() {
+                out.push((k.to_string(), v));
+            }
+        }
+    }
+    out
+}
+
 /// GET /health responde 200 com {"status":"ok"}? (qualquer 2xx vale —
 /// o corpo só interessa ao manager; aqui basta o liveness HTTP.)
 pub async fn healthy(state: &SharedState) -> bool {
     let url = { state.mcp.lock().await.health_url.clone() };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS))
-        .build();
-    let Ok(client) = client else { return false };
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS));
+    if let Ok(token) = std::env::var("AVA_INTERNAL_TOKEN") {
+        if !token.trim().is_empty() {
+            builder = builder.default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())) {
+                    h.insert(reqwest::header::AUTHORIZATION, v);
+                }
+                h
+            });
+        }
+    }
+    let Ok(client) = builder.build() else { return false };
     matches!(
         client.get(&url).send().await,
         Ok(resp) if resp.status().is_success()
@@ -108,12 +155,26 @@ pub async fn start(state: &SharedState) -> Result<()> {
     let cwd = state.project_root.clone();
     tracing::info!("MCP manager: spawn {} (cwd {})", binary.display(), cwd.display());
 
-    let child = Command::new(&binary)
-        .current_dir(&cwd)
+    // Auth interna: o mcp_manager precisa do AVA_INTERNAL_TOKEN para falar
+    // com o memory_api (/tools/select etc.) — sem ele o seletor de skills
+    // volta 401→502 e o orquestrador cai no fallback de liberar todas as
+    // tools. O tray pode ter sido lançado sem as vars exportadas, então
+    // lemos do Modules/.env (fonte única dos serviços do host).
+    let child_env = load_env_for_child(&cwd);
+    let injected: Vec<&str> = child_env.iter().map(|(k, _)| k.as_str()).collect();
+    tracing::info!("MCP manager: env injetado do Modules/.env: {:?}", injected);
+
+    let mut cmd = Command::new(&binary);
+    cmd.current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(false)
+        .no_window()
+        .kill_on_drop(false);
+    for (k, v) in child_env {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("Falha ao iniciar MCP manager ({})", binary.display()))?;
     let pid = child.id(); // Option<u32> — None se o filho morrer já na saída
@@ -162,6 +223,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         } else {
@@ -169,6 +231,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .arg(pid.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         };
@@ -184,6 +247,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                     .args(["/IM", name, "/F"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
+                    .no_window()
                     .status()
                     .await;
             }
@@ -193,6 +257,7 @@ pub async fn stop(state: &SharedState) -> Result<()> {
                 .arg(&binary)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await;
         }

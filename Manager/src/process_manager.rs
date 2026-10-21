@@ -3,7 +3,10 @@
 //! O docker continua sendo chamado via subprocess, exatamente como no
 //! script original (docker-start.bat / docker-start.sh).
 
-use crate::state::{ProcStatus, SharedState};
+use crate::mcp_manager;
+use crate::platform::NoWindow;
+use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
+use crate::transcript;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +17,23 @@ use tokio::process::Command;
 // ════════════════════════════════════════════════════════════════════════
 // DESCOBERTA: detecta processos que já estão rodando
 // ════════════════════════════════════════════════════════════════════════
+
+/// `--env-file` para os comandos `docker compose` chamados DIRETO pelo
+/// tray (descoberta, health check).
+///
+/// O compose resolve a interpolação (`${CRAWL4AI_API_TOKEN:?...}`) a
+/// partir do shell + `.env` da RAIZ do projeto — e `Modules/.env` (onde
+/// o install.sh grava os tokens) NÃO é lido automaticamente. Sem isso,
+/// `docker compose ps` falha de interpolação MESMO com o stack de pé e
+/// os checks reportam estado errado.
+fn compose_env_args(state: &SharedState) -> Vec<std::ffi::OsString> {
+    let env_file = state.project_root.join("Modules").join(".env");
+    if env_file.exists() {
+        vec!["--env-file".into(), env_file.into()]
+    } else {
+        Vec::new()
+    }
+}
 
 /// Descobre se o Docker já está rodando.
 async fn discover_docker(state: &SharedState) {
@@ -34,22 +54,28 @@ async fn discover_docker(state: &SharedState) {
     };
 
     // Roda `docker compose ps` para verificar se há containers rodando
-    let output = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "ps",
-            "--status",
-            "running",
-            "--format",
-            "{{.Name}}",
-        ])
+    let mut compose = Command::new("docker");
+    compose.arg("compose");
+    for arg in compose_env_args(state) {
+        compose.arg(arg);
+    }
+    compose.args([
+        "-f",
+        compose_file.to_str().unwrap_or("docker-compose.yml"),
+        "ps",
+        "--status",
+        "running",
+        "--format",
+        "{{.Name}}",
+    ]);
+    compose.no_window();
+    let output = compose
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await;
 
+    let mut containers_up = false;
     match output {
         Ok(out) if out.status.success() => {
             let running_containers = String::from_utf8_lossy(&out.stdout);
@@ -60,6 +86,7 @@ async fn discover_docker(state: &SharedState) {
 
             if count > 0 {
                 tracing::info!("Docker detectado! {} container(s) rodando.", count);
+                containers_up = true;
 
                 let mut docker = state.docker.lock().await;
                 docker.status = ProcStatus::Running;
@@ -78,6 +105,14 @@ async fn discover_docker(state: &SharedState) {
         Err(e) => {
             tracing::debug!("Não foi possível executar docker: {e}");
         }
+    }
+
+    // Container já carregado (tray reiniciou sem derrubar o docker) →
+    // auto-inicializa os serviços do HOST que dependem dele. Mesma
+    // semântica do start_docker: quem sobe o container também sobe o
+    // transcript de voz e o MCP manager, sem diferença para o usuário.
+    if containers_up {
+        spawn_auto_start_host_services(state);
     }
 }
 
@@ -120,6 +155,13 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
         tracing::info!("Docker já estava em execução — timer de inatividade resetado.");
         return Ok(());
     }
+    if docker.status == ProcStatus::Starting {
+        // `up -d` em andamento (chamada concorrente da TUI): NÃO spawne
+        // um segundo compose — espere o primeiro terminar. O chamador
+        // recebe Ok e o health check/start seguinte confirma de fato.
+        tracing::info!("Docker já está sendo iniciado — ignorando chamada repetida.");
+        return Ok(());
+    }
     drop(docker);   // solta antes das seções abaixo (cada uma re-locka)
 
     let script = &state.docker_start_script;
@@ -136,36 +178,72 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
 
     let script_dir = script.parent().unwrap_or(script);
 
-    // `up -d` (detached): o filho EXITA quando os containers sobem. Sem o
-    // -d, `docker compose up` ANEXA e roda pra sempre — o tray ficava com
-    // um filho vivo eternamente (e, se o filho morresse, os containers
-    // iam junto).
-    let child = if cfg!(target_os = "windows") {
+    // `up -d` (detached): o compose EXITA quando os containers sobem.
+    // Sem o -d, `docker compose up` ANEXA e roda pra sempre.
+    //
+    // Esperamos a SAÍDA (em vez de spawn + mem::forget): `up -d` num
+    // stack já construído leva segundos, e só assim o /docker/start
+    // reporta a verdade. Antes marcávamos Running às cegas — o compose
+    // podia morrer na interpolação (env ausente) e a TUI/Manager exibiam
+    // "iniciado" com NENHUM container de pé. Imagens novas baixando
+    // podem estourar o timeout de 15s da TUI — o aviso é best-effort e
+    // o health check corrige o estado no tick seguinte.
+    let compose = if cfg!(target_os = "windows") {
         Command::new(script)
             .args(["up", "-d"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .current_dir(script_dir)
-            .spawn()
-            .context("Falha ao iniciar docker-start.bat")?
+            .no_window()
+            .output()
+            .await
+            .context("Falha ao executar docker-start.bat")?
     } else {
         Command::new("bash")
             .arg(script)
             .args(["up", "-d"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .current_dir(script_dir)
-            .spawn()
-            .context("Falha ao iniciar docker-start.sh")?
+            .no_window()
+            .output()
+            .await
+            .context("Falha ao executar docker-start.sh")?
     };
 
-    let pid = child.id();
-    std::mem::forget(child);
+    if !compose.status.success() {
+        // Falha REAL do compose (env ausente, daemon fora do ar, erro de
+        // build): estado volta a Stopped e o erro vai para a TUI.
+        let detail = String::from_utf8_lossy(&compose.stderr);
+        let tail: String = detail
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        tracing::warn!("docker compose up falhou ({}): {tail}", compose.status);
+        let mut docker = state.docker.lock().await;
+        docker.status = ProcStatus::Stopped;
+        docker.pid = None;
+        docker.last_activity = None;
+        bail!("docker compose up falhou — detalhe: {tail}");
+    }
 
     let mut docker = state.docker.lock().await;
     docker.status = ProcStatus::Running;
-    docker.pid = pid;
+    // `up -d` é detached: o processo do compose já saiu — não há um PID
+    // único de "docker" para vigiar (a lógica é igual à da descoberta).
+    docker.pid = None;
     docker.last_activity = Some(Instant::now());
+
+    // Container carregado → auto-inicializa os serviços do HOST que
+    // dependem dele (transcript de voz + MCP manager), em background —
+    // o handler do /docker/start NÃO espera o boot deles.
+    spawn_auto_start_host_services(state);
 
     tracing::info!("Docker iniciado.");
     Ok(())
@@ -195,6 +273,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
+                .no_window()
                 .status()
                 .await
         } else {
@@ -204,6 +283,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .current_dir(script_dir)
+                .no_window()
                 .status()
                 .await
         }
@@ -215,6 +295,7 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(script_dir)
+            .no_window()
             .status()
             .await
     };
@@ -228,6 +309,10 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
     docker.pid = None;
     docker.last_activity = None;
 
+    // Container derrubado de propósito → os serviços do host também saem
+    // (em background — o stop deles não bloqueia a resposta do /docker/stop).
+    spawn_auto_stop_host_services(state);
+
     tracing::info!("Docker encerrado.");
     Ok(())
 }
@@ -238,6 +323,98 @@ pub async fn touch_docker_activity(state: &SharedState) {
     if docker.status == ProcStatus::Running {
         docker.last_activity = Some(Instant::now());
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Auto-inicialização dos serviços do HOST quando o container carrega
+// ════════════════════════════════════════════════════════════════════════
+
+/// Sobe, em background, os serviços do HOST que dependem do container:
+///   - transcript de voz (mic → ASR → /voice/ingest no orchestrator);
+///   - MCP manager (executável standalone no host).
+///
+/// Chamado sempre que o container é CARREGADO:
+///   - start_docker() com sucesso;
+///   - descoberta no boot com containers já rodando (tray reiniciou).
+///
+/// Ambos os starts são IDEMPOTENTES (reaproveitam processo vivo), então
+/// chamar de novo é barato e sem efeito colateral. Nada aqui bloqueia o
+/// chamador — o /docker/start responde sem esperar o boot dos serviços.
+///
+/// Nota: o Chrome de depuração NÃO entra aqui — por design ele é controle
+/// manual (/browser/start), pois a janela deve ficar aberta ao usuário.
+fn spawn_auto_start_host_services(state: &SharedState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Gate: só com o container de pé — sem o orchestrator não há para
+        // quem mandar embeddings (transcript) nem tools MCP funcionais.
+        let docker_running = {
+            let docker = state.docker.lock().await;
+            docker.status == ProcStatus::Running
+        };
+        if !docker_running {
+            tracing::debug!("Auto-init: docker não está Running — pulando serviços do host.");
+            return;
+        }
+
+        match transcript::start(&state).await {
+            Ok(()) => tracing::info!("Auto-init: transcript de voz ativo."),
+            Err(e) => tracing::warn!("Auto-init: transcript não subiu: {e:#}"),
+        }
+        match mcp_manager::start(&state).await {
+            Ok(()) => tracing::info!("Auto-init: MCP manager ativo."),
+            Err(e) => tracing::warn!("Auto-init: MCP manager não subiu: {e:#}"),
+        }
+    });
+}
+
+/// Derruba, em background, os serviços do HOST quando o container cai —
+/// o inverso do spawn_auto_start_host_services. Sem o orchestrator de pé,
+/// nem o transcript (não tem para quem mandar /voice/ingest) nem o MCP
+/// manager (tools sem o backend) têm propósito: de pé, só viram ruído.
+///
+/// Chamado sempre que o container SAI de Running:
+///   - stop_docker() (manual ou idle watcher dos 45 min);
+///   - health check detectando containers mortos / compose sem resposta.
+///
+/// Só encerra quem está de fato ativo (Running/Starting/Crashed):
+/// Stopped/NotInstalled permanecem como estão — ex., não rebaixa
+/// NotInstalled para Stopped (o que mentiria o "não instalado" na UI).
+/// A re-subida é automática: o próximo start_docker re-invoca
+/// spawn_auto_start_host_services.
+fn spawn_auto_stop_host_services(state: &SharedState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Transcript: para só se estava ativo (evita rebaixar NotInstalled).
+        let transcript_stop = {
+            let t = state.transcript.lock().await;
+            matches!(
+                t.status,
+                TranscriptStatus::Running | TranscriptStatus::Starting | TranscriptStatus::Crashed
+            )
+        };
+        if transcript_stop {
+            match transcript::stop(&state).await {
+                Ok(()) => tracing::info!("Auto-stop: transcript de voz encerrado."),
+                Err(e) => tracing::warn!("Auto-stop: transcript não parou: {e:#}"),
+            }
+        }
+
+        // MCP manager: mesma regra.
+        let mcp_stop = {
+            let m = state.mcp.lock().await;
+            matches!(
+                m.status,
+                McpStatus::Running | McpStatus::Starting | McpStatus::Crashed
+            )
+        };
+        if mcp_stop {
+            match mcp_manager::stop(&state).await {
+                Ok(()) => tracing::info!("Auto-stop: MCP manager encerrado."),
+                Err(e) => tracing::warn!("Auto-stop: MCP manager não parou: {e:#}"),
+            }
+        }
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -267,18 +444,23 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
         _ => return true, // Não conseguimos verificar, assume que está ok
     };
 
-    let output = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose_file.to_str().unwrap_or("docker-compose.yml"),
-            "ps",
-            "--status",
-            "running",
-            "--quiet",
-        ])
+    let mut compose = Command::new("docker");
+    compose.arg("compose");
+    for arg in compose_env_args(state) {
+        compose.arg(arg);
+    }
+    compose.args([
+        "-f",
+        compose_file.to_str().unwrap_or("docker-compose.yml"),
+        "ps",
+        "--status",
+        "running",
+        "--quiet",
+    ]);
+    compose.no_window();
+    let output = compose
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await;
 
@@ -291,11 +473,40 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
                 docker.status = ProcStatus::Stopped;
                 docker.pid = None;
                 docker.last_activity = None;
+                // Container caiu → derruba os serviços do host (em background).
+                spawn_auto_stop_host_services(state);
                 return false;
             }
             true
         }
-        _ => true, // Não conseguiu verificar, assume ok
+        Ok(out) => {
+            // compose ps FALHOU (daemon fora do ar, env de interpolação
+            // ausente...): NÃO é "assume ok" — antes o estado ficava
+            // "Running" mentindo para sempre. Marca Stopped; o próximo
+            // /docker/start tenta de novo e agora enxerga o erro real.
+            tracing::warn!(
+                "docker compose ps falhou no health check ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            let mut docker = state.docker.lock().await;
+            docker.status = ProcStatus::Stopped;
+            docker.pid = None;
+            docker.last_activity = None;
+            // Container sem resposta → mesmo tratamento de "caiu": derruba
+            // os serviços do host (em background).
+            spawn_auto_stop_host_services(state);
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Não foi possível executar docker no health check: {e}");
+            let mut docker = state.docker.lock().await;
+            docker.status = ProcStatus::Stopped;
+            docker.pid = None;
+            docker.last_activity = None;
+            spawn_auto_stop_host_services(state);
+            false
+        }
     }
 }
 
@@ -364,6 +575,14 @@ const PROFILE_EXCLUDED_FILES: &[&str] = &[
     "SingletonPid",
     "lockfile",
     "LOCK",
+    // Credenciais/sessões — NUNCA copiar para o perfil CDP (Plano 1 — T7).
+    // Contêm cookies, senhas salvas, autofill e dados de cartão.
+    "Cookies",
+    "Cookies-journal",
+    "Login Data",
+    "Login Data-journal",
+    "Web Data",
+    "Web Data-journal",
 ];
 
 /// Onde ficam os dados do Chrome do usuário ("User Data" — pai de
@@ -633,6 +852,7 @@ pub async fn stop_browser(state: &SharedState) -> Result<()> {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         } else {
@@ -640,6 +860,7 @@ pub async fn stop_browser(state: &SharedState) -> Result<()> {
                 .arg(pid.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         };
@@ -662,6 +883,7 @@ pub async fn stop_browser(state: &SharedState) -> Result<()> {
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         } else {
@@ -670,6 +892,7 @@ pub async fn stop_browser(state: &SharedState) -> Result<()> {
                 .arg(flag)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .no_window()
                 .status()
                 .await
         };

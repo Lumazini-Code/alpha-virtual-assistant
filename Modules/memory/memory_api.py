@@ -37,9 +37,20 @@ from fastapi.responses import JSONResponse
 
 import memory as mem
 
+# ── Auth interna — importar ANTES de qualquer uso em top-level ────────────────
+# REST_HOST abaixo chama internal_bind_host() no escopo do módulo: o import
+# precisa vir antes, senão NameError no boot (bug real: o bloco estava mais
+# abaixo, depois da criação do app, e a linha 42 rodava primeiro).
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 log = logging.getLogger("memory_api")
 
-REST_HOST = os.environ.get("MEMORY_REST_HOST", "0.0.0.0")
+REST_HOST = os.environ.get("MEMORY_REST_HOST", internal_bind_host())
 REST_PORT = int(os.environ.get("MEMORY_REST_PORT", "3000"))
 
 
@@ -58,6 +69,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+install_internal_auth(app, service_name="memory_api")
 
 
 # ── MemoryToolError → HTTP 400, uma vez só, para todas as rotas ───────────────

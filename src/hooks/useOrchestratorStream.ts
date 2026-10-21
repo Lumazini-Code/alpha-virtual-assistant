@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState, type MutableRefObject } from "react";
 import { existsSync, readFileSync } from "node:fs";
 import { ORCHESTRATOR_URL } from "../lib/constants.js";
+import { authHeaders } from "../lib/auth.js";
 import { ensureDockerStarted } from "../lib/processManager.js";
 import { waitForServicesReady } from "../lib/waitForServices.js";
 import { startAudioStream, pushAudioChunk, endAudioStream, cancelAudioStream, finishAudioStream } from "../lib/audio.js";
@@ -192,7 +193,10 @@ export function useOrchestratorStream() {
       try {
         const res = await fetch(`${ORCHESTRATOR_URL}${endpoint}`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...authHeaders({}),
+          },
           body: JSON.stringify(body),
           signal: controller.signal,
         });

@@ -1,4 +1,5 @@
 import { API_BASE } from "./constants.js";
+import { authHeaders } from "./auth.js";
 
 // Espelha SimpleResponse do api.rs: { ok: bool, message: string }.
 // IMPORTANTE: /docker/start e /docker/stop sempre respondem HTTP 200,
@@ -23,6 +24,7 @@ async function postAndCheck(path: string, body?: unknown): Promise<SimpleRespons
   try {
     const res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
+      headers: authHeaders({}),
       signal: controller.signal,
       ...(body !== undefined && {
         headers: { "Content-Type": "application/json" },

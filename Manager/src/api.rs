@@ -11,10 +11,16 @@
 //!                            detached) — só /browser/stop fecha.
 //!   POST /browser/stop    -> encerra o Chrome de depuração (controle manual)
 //!   GET  /browser/status  -> estado do Chrome + liveness do CDP
+//!   POST /transcript/start -> inicia o transcript de voz no host (mic +
+//!                            ASR + ingest no orchestrator). Também é
+//!                            AUTO-iniciado quando o container carrega.
+//!   POST /transcript/stop  -> encerra o transcript de voz
+//!   GET  /transcript/status -> estado do transcript + liveness por pid
 
 use crate::mcp_manager;
 use crate::process_manager;
 use crate::state::SharedState;
+use crate::transcript;
 use axum::{
     extract::State,
     response::{IntoResponse, Json},
@@ -25,7 +31,10 @@ use serde::Serialize;
 
 const API_PORT: u16 = 9001;
 
-pub async fn serve(state: SharedState) -> anyhow::Result<()> {
+pub async fn serve(
+    state: SharedState,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
+) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/status", get(get_status))
         .route("/docker/start", post(post_docker_start))
@@ -36,9 +45,19 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         .route("/mcp/start", post(post_mcp_start))
         .route("/mcp/stop", post(post_mcp_stop))
         .route("/mcp/status", get(get_mcp_status))
-        .with_state(state);
+        .route("/transcript/start", post(post_transcript_start))
+        .route("/transcript/stop", post(post_transcript_stop))
+        .route("/transcript/status", get(get_transcript_status))
+        // Chamado pelo transcribe (C++) na deteção da wake word: abre a
+        // janela do tray direto na tela de chat. Fire-and-forget.
+        .route("/ui/chat-open", post(post_ui_chat_open))
+        .with_state(state)
+        // Sender da UI para o /ui/chat-open (não vai no AppState — o canal
+        // nasce no main e é clonado aqui; Extension evita mudar o AppState).
+        .layer(axum::Extension(ui_tx));
 
-    let addr = format!("0.0.0.0:{API_PORT}");
+    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{bind_host}:{API_PORT}");
     tracing::info!("API REST escutando em http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -249,5 +268,87 @@ async fn get_mcp_status(State(state): State<SharedState>) -> impl IntoResponse {
         installed,
         healthy,
         binary,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Transcript (HOST) — pipeline de voz supervisionado pelo tray
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+struct TranscriptStatusResponse {
+    /// "não instalado" | "Inativo" | "Iniciando..." | "Ativo" |
+    /// "Encerrando..." | "Crash — reiniciando..."
+    status: String,
+    pid: Option<u32>,
+    /// Binário existe (build CMake do módulo de transcrição)?
+    installed: bool,
+    /// Processo vivo agora (liveness por pid)?
+    alive: bool,
+    binary: String,
+}
+
+async fn post_transcript_start(State(state): State<SharedState>) -> impl IntoResponse {
+    match transcript::start(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "Transcript iniciado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn post_transcript_stop(State(state): State<SharedState>) -> impl IntoResponse {
+    match transcript::stop(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "Transcript encerrado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn get_transcript_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (status, pid, installed, alive) = transcript::transcript_snapshot(&state).await;
+    let binary = { state.transcript.lock().await.binary.display().to_string() };
+
+    Json(TranscriptStatusResponse {
+        status: status.label().to_string(),
+        pid,
+        installed,
+        alive,
+        binary,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// UI — abertura automática da tela de chat na wake word
+// ════════════════════════════════════════════════════════════════════════
+
+/// Chamado pelo transcribe (C++) assim que a wake word é detectada — antes
+/// mesmo da transcrição terminar. Envia `UiCommand::ShowChat` para a thread
+/// da UI (eframe): abre/restore a janela já na tela de chat.
+///
+/// Fire-and-forget: o transcribe NÃO deve esperar por repaint de UI. Se a
+/// mpsc falhar (UI morta), só logamos — o turno de voz continua normal.
+async fn post_ui_chat_open(
+    axum::Extension(ui_tx): axum::Extension<
+        tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
+    >,
+) -> impl IntoResponse {
+    if let Err(e) = ui_tx.send(crate::UiCommand::ShowChat) {
+        tracing::warn!("ui/chat-open: falha ao enviar ShowChat (UI fechada?): {e}");
+    } else {
+        tracing::info!("ui/chat-open: wake word detectada — abrindo tela de chat");
+    }
+    Json(SimpleResponse {
+        ok: true,
+        message: "chat-open enviado".into(),
     })
 }

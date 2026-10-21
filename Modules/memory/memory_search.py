@@ -571,6 +571,7 @@ def _build_lt_entries(
         return []
     related_ids = related_ids or set()
     entries = []
+    touched_ids: list[int] = []          # NEW (Plano 3 / T4): batch update_access
     for row in state.lt_db.get_by_ids(ids_filtered):
         entries.append(MemoryEntry(
             id           = row["id"],
@@ -586,7 +587,10 @@ def _build_lt_entries(
             # ── NEW (Hebbian graph): id alcançado só via PPR vira "related" ──
             match_type   = "related" if row["id"] in related_ids else "primary",
         ))
-        loop.run_in_executor(None, state.lt_db.update_access, row["id"])
+        touched_ids.append(row["id"])
+    # NEW (Plano 3 / T4): N executor round-trips → 1 batch (1 executemany)
+    if touched_ids:
+        loop.run_in_executor(None, state.lt_db.batch_update_access, touched_ids)
     return entries
 
 
@@ -601,6 +605,7 @@ def _build_st_entries(
     if not ids_filtered:
         return []
     entries = []
+    touched_ids: list[int] = []          # NEW (Plano 3 / T4): batch update_access
     for row in state.st_db.get_by_ids(ids_filtered):
         score      = score_map[row["id"]]
         turns_data = json.loads(row["turns_json"])
@@ -629,7 +634,10 @@ def _build_st_entries(
             memory_type  = "short_term",
             session_id   = row["session_id"],
         ))
-        loop.run_in_executor(None, state.st_db.update_access, row["id"])
+        touched_ids.append(row["id"])
+    # NEW (Plano 3 / T4): N executor round-trips → 1 batch (1 executemany)
+    if touched_ids:
+        loop.run_in_executor(None, state.st_db.batch_update_access, touched_ids)
     return entries
 
 
@@ -708,6 +716,7 @@ def _build_if_entries(
     file_map = {row["id"]: row for row in file_rows}
 
     entries = []
+    touched_ids: list[int] = []          # NEW (Plano 3 / T4): batch update_access
     for fid, (score, chunk_row) in file_best.items():
         file_row = file_map.get(fid)
         if file_row is None:
@@ -735,8 +744,10 @@ def _build_if_entries(
             content_hash = file_row["content_hash"],
             file_hash    = file_row["file_hash"],
         ))
-        loop.run_in_executor(None, state.if_db.update_access, fid)
-
+        touched_ids.append(fid)
+    # NEW (Plano 3 / T4): N executor round-trips → 1 batch (1 executemany)
+    if touched_ids:
+        loop.run_in_executor(None, state.if_db.batch_update_access, touched_ids)
     return entries
 
 

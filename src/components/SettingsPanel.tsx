@@ -7,6 +7,14 @@ import { logger } from "../lib/logger.js";
 import { listPlans, updatePlan, type PlanEntry } from "../lib/plans.js";
 import { spawnPlanRecorder } from "../lib/planRecorder.js";
 import {
+  listVoices,
+  updateVoiceDescription,
+  deleteVoice,
+  registerVoice,
+  type VoiceEntry,
+} from "../lib/voices.js";
+import { recordMic } from "../lib/voiceRecorder.js";
+import {
   listMCPServers,
   installMCPServer,
   registerMCPServer,
@@ -18,7 +26,24 @@ import {
   type MCPServerEntry,
 } from "../lib/mcpServers.js";
 
-type View = "menu" | "plans" | "edit" | "record" | "mcp" | "mcp-install" | "mcp-delete";
+type View = "menu" | "plans" | "edit" | "record" | "mcp" | "mcp-install" | "mcp-delete"
+  | "voices" | "voice-record" | "voice-edit";
+type VoiceRecordStage =
+  | "name" // nome da pessoa
+  | "description" // descrição opcional (Enter inicia a gravação)
+  | "recording" // mic aberto — countdown
+  | "uploading" // embedding (transcribe) + /voice-dict/write
+  | "result" // sucesso + opção de gravar outro exemplo
+  | "error";
+type VoiceEditStage =
+  | "menu" // ações sobre a pessoa
+  | "description" // TextInput da descrição
+  | "saving"
+  | "saved"
+  | "confirm-delete"
+  | "deleting"
+  | "delete-done"
+  | "error";
 type MCPInstallKind = "npm" | "http" | "stdio";
 type MCPInstallStage =
   | "type" // escolha: pacote npm / URL externa / comando stdio
@@ -36,6 +61,10 @@ type RecordPhase = "input" | "running" | "result";
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
+
+/** Duração da gravação do cadastro de voz (~5s de fala é o mínimo que o
+ * CAM++ produz embedding confiável — SPK_MIN_MS=600ms, ideal 3-6s). */
+const RECORD_SECONDS = 5;
 
 interface Props {
   onClose: () => void;
@@ -89,6 +118,23 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const [mcpDeletePhase, setMcpDeletePhase] = useState<MCPDeletePhase>("list");
   const [mcpDeleteMsg, setMcpDeleteMsg] = useState<string | null>(null);
 
+  // ── Vozes (voice_dict via memory :3000 + /voice/register via orchestrator) ─
+  const [voices, setVoices] = useState<VoiceEntry[]>([]);
+  const [voicesLoading, setVoicesLoading] = useState(false);
+  const [voicesError, setVoicesError] = useState<string | null>(null);
+  const [voiceEditing, setVoiceEditing] = useState<VoiceEntry | null>(null);
+  const [voiceEditStage, setVoiceEditStage] = useState<VoiceEditStage>("menu");
+  const [voiceEditDesc, setVoiceEditDesc] = useState("");
+  const [voiceEditMsg, setVoiceEditMsg] = useState<string | null>(null);
+  const [recName, setRecName] = useState("");
+  const [recDesc, setRecDesc] = useState("");
+  const [recStage, setRecStage] = useState<VoiceRecordStage>("name");
+  const [recMsg, setRecMsg] = useState<string | null>(null);
+  const [recCountdown, setRecCountdown] = useState(0);
+
+  const recInFlightRef = useRef(false);
+  const recCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const backTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { stdin, isRawModeSupported, setRawMode } = useStdin() as {
     stdin?: { pause?: () => void; resume?: () => void };
@@ -99,6 +145,7 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   useEffect(() => {
     return () => {
       if (backTimerRef.current) clearTimeout(backTimerRef.current);
+      if (recCountdownTimerRef.current) clearInterval(recCountdownTimerRef.current);
     };
   }, []);
 
@@ -344,6 +391,141 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     }
   }, [mcpDeleting, loadMCPServers]);
 
+  // ── Vozes: listar / cadastrar (gravação + embedding on-demand) / editar ──
+  const loadVoices = useCallback(async () => {
+    setVoicesLoading(true);
+    setVoicesError(null);
+    try {
+      setVoices(await listVoices());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: GET /voice-dict/list falhou", { message: msg });
+      setVoicesError(`memory offline ou sem resposta: ${msg}`);
+    } finally {
+      setVoicesLoading(false);
+    }
+  }, []);
+
+  const enterVoices = useCallback(() => {
+    setView("voices");
+    void loadVoices();
+  }, [loadVoices]);
+
+  const startVoiceEdit = useCallback((voice: VoiceEntry) => {
+    setVoiceEditing(voice);
+    setVoiceEditDesc(voice.description);
+    setVoiceEditStage("menu");
+    setVoiceEditMsg(null);
+    setView("voice-edit");
+  }, []);
+
+  const saveVoiceEdit = useCallback(async () => {
+    if (!voiceEditing) return;
+    setVoiceEditStage("saving");
+    try {
+      await updateVoiceDescription(voiceEditing.person_id, voiceEditDesc);
+      logger.info("settings: descrição de voz salva", { personId: voiceEditing.person_id });
+      setVoiceEditMsg("✓ descrição salva");
+      setVoiceEditStage("saved");
+      void loadVoices();
+      if (backTimerRef.current) clearTimeout(backTimerRef.current);
+      backTimerRef.current = setTimeout(() => {
+        setVoiceEditing(null);
+        setVoiceEditStage("menu");
+        setVoiceEditMsg(null);
+        setView("voices");
+      }, 1200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: PATCH /voice-dict/{id} falhou", { message: msg });
+      setVoiceEditMsg(msg);
+      setVoiceEditStage("error");
+    }
+  }, [voiceEditing, voiceEditDesc, loadVoices]);
+
+  const confirmVoiceDelete = useCallback(async () => {
+    if (!voiceEditing) return;
+    setVoiceEditStage("deleting");
+    try {
+      await deleteVoice(voiceEditing.person_id);
+      logger.info("settings: voz removida", { personId: voiceEditing.person_id });
+      setVoiceEditMsg(`✓ ${voiceEditing.person_name} removida (embeddings apagados do DB + FAISS)`);
+      setVoiceEditStage("delete-done");
+      void loadVoices();
+      if (backTimerRef.current) clearTimeout(backTimerRef.current);
+      backTimerRef.current = setTimeout(() => {
+        setVoiceEditing(null);
+        setVoiceEditStage("menu");
+        setVoiceEditMsg(null);
+        setView("voices");
+      }, 1800);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: DELETE /voice-dict/{id} falhou", { message: msg });
+      setVoiceEditMsg(msg);
+      setVoiceEditStage("error");
+    }
+  }, [voiceEditing, loadVoices]);
+
+  /** Fase 2 do cadastro: grava RECORD_SECONDS de microfone (host) e envia o
+   * PCM em base64 ao orchestrator (/voice/register → transcribe/CAM++ →
+   * memory /voice-dict/write). Gravação roda em processo filho com stdout
+   * capturado — nada toca no terminal da TUI. */
+  const startVoiceRecording = useCallback(async () => {
+    if (recInFlightRef.current) return;
+    recInFlightRef.current = true;
+    setRecStage("recording");
+    setRecMsg(null);
+    setRecCountdown(RECORD_SECONDS);
+    if (recCountdownTimerRef.current) clearInterval(recCountdownTimerRef.current);
+    recCountdownTimerRef.current = setInterval(() => {
+      setRecCountdown((c) => (c > 1 ? c - 1 : 1));
+    }, 1000);
+
+    const res = await recordMic(RECORD_SECONDS);
+    if (recCountdownTimerRef.current) clearInterval(recCountdownTimerRef.current);
+
+    if (!res.ok || !res.audioB64) {
+      recInFlightRef.current = false;
+      setRecMsg(`✗ ${res.error ?? "gravação falhou"}`);
+      setRecStage("error");
+      return;
+    }
+
+    setRecStage("uploading");
+    setRecMsg(null);
+    try {
+      const result = await registerVoice({
+        person_name: recName.trim(),
+        description: recDesc.trim(),
+        audio_b64: res.audioB64,
+        sample_rate: 16000,
+      });
+      const who = result.new_person
+        ? "pessoa nova cadastrada"
+        : "exemplo adicional (reconhecimento fica mais preciso)";
+      const where = result.memory_id ? ` — descrição linkada à memória LT #${result.memory_id}` : "";
+      setRecMsg(`✓ embedding gravado (id ${result.embedding_id ?? "?"}) — ${who}${where}`);
+      setRecStage("result");
+      void loadVoices();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: POST /voice/register falhou", { message: msg });
+      setRecMsg(`✗ ${msg}`);
+      setRecStage("error");
+    } finally {
+      recInFlightRef.current = false;
+    }
+  }, [recName, recDesc, loadVoices]);
+
+  const resetVoiceWizard = useCallback(() => {
+    setRecName("");
+    setRecDesc("");
+    setRecStage("name");
+    setRecMsg(null);
+    setRecCountdown(0);
+  }, []);
+
   // ── Salvar edição (nome/descrição) via API do memory ────────────────────
   const saveEdit = useCallback(async () => {
     if (!editing) return;
@@ -406,6 +588,23 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
       setMcpDeletePhase("list");
       setMcpDeleting(null);
       setMcpDeleteMsg(null);
+    } else if (view === "voices") setView("menu");
+    else if (view === "voice-record") {
+      // gravação/upload em andamento não são interrompíveis
+      if (recStage === "recording" || recStage === "uploading") return;
+      resetVoiceWizard();
+      setView("voices");
+    } else if (view === "voice-edit") {
+      if (voiceEditStage === "saving" || voiceEditStage === "deleting") return;
+      if (voiceEditStage === "description" || voiceEditStage === "confirm-delete") {
+        setVoiceEditStage("menu");
+        setVoiceEditMsg(null);
+      } else {
+        setVoiceEditing(null);
+        setVoiceEditStage("menu");
+        setVoiceEditMsg(null);
+        setView("voices");
+      }
     }
   });
 
@@ -413,6 +612,7 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const menuItems = [
     { label: "▶  Gravar novo plano (plan_recorder.py)", value: "record" },
     { label: "≡  Planos existentes — ver/editar", value: "plans" },
+    { label: "🎙  Vozes — cadastrar/gerenciar locutores", value: "voices" },
     { label: "⤓  Servidores MCP — instalar/gerenciar", value: "mcp" },
     { label: "↩  Fechar (Esc)", value: "close" },
   ];
@@ -450,6 +650,8 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
                 enterPlans();
               } else if (item.value === "mcp") {
                 enterMcp();
+              } else if (item.value === "voices") {
+                enterVoices();
               } else {
                 onClose();
               }
@@ -753,6 +955,168 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
           )}
           {mcpDeletePhase === "error" && mcpDeleteMsg && (
             <Text color={COLORS.red}>✗ {mcpDeleteMsg}</Text>
+          )}
+        </Box>
+      )}
+
+      {view === "voices" && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={COLORS.gray}>
+            dicionário de voz (CAM++) · ↑/↓ navega · Enter gerencia · Esc volta
+          </Text>
+          {voicesLoading && <Text color={COLORS.dim}>carregando vozes…</Text>}
+          {voicesError && <Text color={COLORS.red}>✗ {voicesError}</Text>}
+          <SelectInput<VoiceEntry | string>
+            items={[
+              { label: "＋  Cadastrar voz (grava ~5s no microfone)", value: "record" },
+              ...voices.map((v) => ({
+                label:
+                  `${v.person_name} · ${v.examples_count} exemplo(s)` +
+                  (v.description ? ` — ${truncate(v.description, 42)}` : ""),
+                value: v,
+              })),
+              { label: "↺  Recarregar", value: "reload" },
+              { label: "↩  Voltar (Esc)", value: "back" },
+            ]}
+            onSelect={(item) => {
+              if (item.value === "record") {
+                resetVoiceWizard();
+                setView("voice-record");
+              } else if (item.value === "reload") {
+                void loadVoices();
+              } else if (typeof item.value !== "string") {
+                startVoiceEdit(item.value);
+              }
+            }}
+          />
+          {!voicesLoading && !voicesError && voices.length === 0 && (
+            <Text color={COLORS.dim}>nenhuma voz cadastrada — cadastre a primeira acima</Text>
+          )}
+        </Box>
+      )}
+
+      {view === "voice-record" && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={COLORS.gray}>
+            o embedding (CAM++ 192 dims) é gerado on-demand pelo módulo
+            transcribe (host) e persistido na memory via /voice-dict/write
+          </Text>
+          {recStage === "name" && (
+            <>
+              <Text>nome: </Text>
+              <TextInput
+                value={recName}
+                onChange={setRecName}
+                onSubmit={() => {
+                  if (recName.trim()) setRecStage("description");
+                }}
+                placeholder="ex.: eu / Felipe / Ana"
+              />
+              <Text color={COLORS.dim}>Enter p/ descrição · Esc volta</Text>
+            </>
+          )}
+          {recStage === "description" && (
+            <>
+              <Text color={COLORS.dim}>nome: {recName}</Text>
+              <Text>descrição (opcional): </Text>
+              <TextInput
+                value={recDesc}
+                onChange={setRecDesc}
+                onSubmit={() => void startVoiceRecording()}
+                placeholder={`quem é (Enter GRAVA ${RECORD_SECONDS}s de voz)`}
+              />
+              <Text color={COLORS.dim}>Enter inicia a gravação — fale continuamente · Esc volta</Text>
+            </>
+          )}
+          {recStage === "recording" && (
+            <Text color={COLORS.amber}>
+              ● gravando… fale naturalmente ({recCountdown}s restantes) — Esc desabilitado
+            </Text>
+          )}
+          {recStage === "uploading" && (
+            <Text color={COLORS.amber}>▶ gerando embedding (transcribe/CAM++) e salvando na memory…</Text>
+          )}
+          {recStage === "result" && recMsg && (
+            <>
+              <Text color={COLORS.green}>{recMsg}</Text>
+              <Text color={COLORS.dim}>
+                Esc volta · cadastre a mesma pessoa de novo p/ adicionar outro
+                exemplo (recomendado: ambientes/altura de voz diferentes)
+              </Text>
+            </>
+          )}
+          {recStage === "error" && recMsg && (
+            <Text color={COLORS.red}>{recMsg}</Text>
+          )}
+        </Box>
+      )}
+
+      {view === "voice-edit" && voiceEditing && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={COLORS.gray}>
+            {`#${voiceEditing.person_id} ${voiceEditing.person_name} · ${voiceEditing.examples_count} exemplo(s) · ${voiceEditing.access_count} acesso(s) · source ${voiceEditing.source}`}
+          </Text>
+          {voiceEditStage === "menu" && (
+            <SelectInput
+              items={[
+                { label: "✎  Editar descrição", value: "edit" },
+                { label: `✗  Remover "${voiceEditing.person_name}" + embeddings (DB + FAISS)`, value: "delete" },
+                { label: "↩  Voltar (Esc)", value: "back" },
+              ]}
+              onSelect={(item) => {
+                if (item.value === "edit") {
+                  setVoiceEditDesc(voiceEditing.description);
+                  setVoiceEditStage("description");
+                } else if (item.value === "delete") {
+                  setVoiceEditMsg(null);
+                  setVoiceEditStage("confirm-delete");
+                }
+              }}
+            />
+          )}
+          {voiceEditStage === "description" && (
+            <>
+              <Text>descrição: </Text>
+              <TextInput
+                value={voiceEditDesc}
+                onChange={setVoiceEditDesc}
+                onSubmit={() => void saveVoiceEdit()}
+                placeholder="quem é essa pessoa (Enter salva)"
+              />
+              <Text color={COLORS.dim}>{`Enter salva (PATCH /voice-dict/${voiceEditing.person_id}) · Esc volta`}</Text>
+            </>
+          )}
+          {voiceEditStage === "saving" && <Text color={COLORS.amber}>salvando…</Text>}
+          {voiceEditStage === "saved" && voiceEditMsg && (
+            <Text color={COLORS.green}>{voiceEditMsg}</Text>
+          )}
+          {voiceEditStage === "confirm-delete" && (
+            <>
+              <Text color={COLORS.red}>
+                {`remover "${voiceEditing.person_name}" e ${voiceEditing.examples_count} embedding(s)?`}
+              </Text>
+              <Text color={COLORS.dim}>a memória de longo prazo linkada (se houver) NÃO é removida</Text>
+              <SelectInput
+                items={[
+                  { label: "✗  Sim, remover", value: true as const },
+                  { label: "↩  Cancelar (Esc)", value: false as const },
+                ]}
+                onSelect={(item) => {
+                  if (item.value) void confirmVoiceDelete();
+                  else {
+                    setVoiceEditStage("menu");
+                    setVoiceEditMsg(null);
+                  }
+                }}
+              />
+            </>
+          )}
+          {voiceEditStage === "deleting" && <Text color={COLORS.amber}>▶ removendo…</Text>}
+          {voiceEditStage === "delete-done" && voiceEditMsg && (
+            <Text color={COLORS.green}>{voiceEditMsg}</Text>
+          )}
+          {voiceEditStage === "error" && voiceEditMsg && (
+            <Text color={COLORS.red}>✗ {voiceEditMsg}</Text>
           )}
         </Box>
       )}

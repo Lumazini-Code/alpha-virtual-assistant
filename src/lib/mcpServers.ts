@@ -1,4 +1,5 @@
 import { MCP_MANAGER_URL } from "./constants.js";
+import { authHeaders } from "./auth.js";
 
 /**
  * Cliente da API REST do mcp_manager (porta 4008) — instalação assistida de
@@ -58,7 +59,7 @@ async function errorDetail(res: Response): Promise<string> {
 
 /** GET /servers — servidores gerenciáveis (nativos como o playwright saem). */
 export async function listMCPServers(): Promise<MCPServerEntry[]> {
-  const res = await fetch(`${MCP_MANAGER_URL}/servers`);
+  const res = await fetch(`${MCP_MANAGER_URL}/servers`, { headers: authHeaders({}) });
   if (!res.ok) throw new Error(await errorDetail(res));
   const data = (await res.json()) as { servers: MCPServerEntry[] };
   return (data.servers ?? []).filter((s) => !NATIVE_SERVERS.has(s.name));
@@ -76,7 +77,10 @@ export async function installMCPServer(req: {
 }): Promise<{ name: string; synced: number }> {
   const res = await fetch(`${MCP_MANAGER_URL}/servers/install`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders({}),
+    },
     body: JSON.stringify(req),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
@@ -103,7 +107,10 @@ export async function registerMCPServer(req: {
 }): Promise<{ name: string; synced: number }> {
   const res = await fetch(`${MCP_MANAGER_URL}/servers`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders({}),
+    },
     body: JSON.stringify(req),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
@@ -117,6 +124,7 @@ export async function syncMCPServer(
 ): Promise<{ synced: number; registered: number; removed: number }> {
   const res = await fetch(`${MCP_MANAGER_URL}/servers/${encodeURIComponent(name)}/sync`, {
     method: "POST",
+    headers: authHeaders({}),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
   return (await res.json()) as SyncResponse;
@@ -126,6 +134,7 @@ export async function syncMCPServer(
 export async function deleteMCPServer(name: string): Promise<void> {
   const res = await fetch(`${MCP_MANAGER_URL}/servers/${encodeURIComponent(name)}`, {
     method: "DELETE",
+    headers: authHeaders({}),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
 }

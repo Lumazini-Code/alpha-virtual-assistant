@@ -8,7 +8,10 @@ um store com a interface do antigo índice FAISS + migração one-shot) e
 _chunk_text (chunking sobreposto com metadados de posição).
 """
 
+import math
 import threading
+from collections import OrderedDict
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +24,11 @@ from memory_config import (
     CHUNK_SIZE,
     EMBED_DIM,
     IF_MAX_CHUNKS,
+    IVF_MIN_ROWS,
+    IVF_NUM_SUB_VECTORS,
+    IVF_WAIT_TIMEOUT_S,
     LANCE_TABLE_PREFIX,
+    VECTOR_CACHE_MAX_ENTRIES,
     log,
 )
 
@@ -156,6 +163,49 @@ class LanceStore:
                 log.error(f"LanceDB: falha ao compactar vectors_{dim}: {e}")
                 return
             self._writes[dim] = 0
+            self._ensure_ann_index(dim)
+
+    def _ensure_ann_index(self, dim: int):
+        """NEW (Plano 3 / T1): cria índice ANN (IVF-PQ) na tabela `vectors_<dim>`
+        uma única vez, quando ela cruza `IVF_MIN_ROWS`. Sem índice, toda busca
+        é brute-force (scan completo) — acima de milhares de vetores isso vira
+        o gargalo dominante do recall. Guardas do plano:
+          * só cria com n_rows >= IVF_MIN_ROWS (abaixo disso o scan é mais
+            rápido e o PQ degrada recall de qualidade);
+          * se `create_index` falhar, apenas loga — a busca continua
+            funcionando como scan (LanceDB cai no flat scan sem índice);
+          * a busca NÃO precisa esperar: `wait_timeout` limita o bloqueio e o
+            índice fica usável assim que a construção terminar.
+        Chamado DEPOIS da compactação (novo fragmento já mergeado) — e o
+        `optimize()` das flushes seguintes mantém o índice atualizado com os
+        dados novos (não precisa recriar)."""
+        try:
+            tbl = self._tables.get(dim)
+            if tbl is None:
+                return
+            n_rows = tbl.count_rows()
+            if n_rows < IVF_MIN_ROWS:
+                return
+            existing = {i.name for i in tbl.list_indices()}
+            if "vector_idx" in existing or "vector" in existing:
+                return  # índice já existe — optimize() das flushes o mantém
+            num_partitions = max(1, int(math.sqrt(n_rows)))
+            tbl.create_index(
+                metric="cosine",
+                vector_column_name="vector",
+                index_type="IVF_PQ",
+                num_partitions=num_partitions,
+                num_sub_vectors=max(1, dim // IVF_NUM_SUB_VECTORS)
+                if dim % IVF_NUM_SUB_VECTORS == 0 else IVF_NUM_SUB_VECTORS,
+                wait_timeout=timedelta(seconds=IVF_WAIT_TIMEOUT_S),
+            )
+            log.info(
+                f"LanceDB: índice IVF-PQ criado em vectors_{dim} "
+                f"(n={n_rows}, particoes={num_partitions})"
+            )
+        except Exception as e:
+            # Fallback silencioso: sem índice, a busca segue como scan bruto.
+            log.warning(f"LanceDB: falha ao criar índice ANN em vectors_{dim} (seguindo com scan): {e}")
 
 
 class MemoryIndex:
@@ -192,6 +242,8 @@ class MemoryIndex:
         self._embed_dim   = embed_dim
         self._table       = store.table(embed_dim)
         self._filter      = f"memory_type = '{memory_type}'"
+        # NEW (Plano 3 / T5): cache LRU de vetores por id (ver get_vectors).
+        self._vector_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         if legacy_index_path:
             self._migrate_from_faiss(legacy_index_path, legacy_id_map_path)
         log.info(f"Índice LanceDB [{memory_type}] pronto — {self.total} vetores (dim={embed_dim})")
@@ -269,6 +321,9 @@ class MemoryIndex:
     def remove_ids(self, record_ids: set[int]):
         if not record_ids:
             return
+        cache = self._vector_cache  # T5: vetores removidos saem do cache tb
+        for i in record_ids:
+            cache.pop(int(i), None)
         id_list = ",".join(str(int(i)) for i in record_ids)
         with self._store.lock:
             self._table.delete(f"{self._filter} AND id IN ({id_list})")
@@ -276,6 +331,7 @@ class MemoryIndex:
         log.info(f"LanceDB: remoção de até {len(record_ids)} vetores [{self._memory_type}]")
 
     def reset(self):
+        self._vector_cache.clear()  # T5: reset invalida todo o cache
         with self._store.lock:
             self._table.delete(self._filter)
             self._store.note_write(self._embed_dim)
@@ -302,7 +358,15 @@ class MemoryIndex:
         self, query_embeddings: np.ndarray, top_k: int
     ) -> list[list[tuple[int, float]]]:
         """N queries (ex.: os segmentos de uma pergunta composta). N é pequeno
-        (SEGMENT_MAX_COUNT), então é um loop simples sobre search()."""
+        (SEGMENT_MAX_COUNT), então é um loop simples sobre search().
+
+        Plano 3 / T8: a API do LanceDB (v0.39.0) só aceita UM vetor por query
+        (`Table.search` — sem busca multi-vetor nativa nesta versão). Paralelizar
+        com threads/asyncio não traria ganho: cada query passa pelo mesmo
+        `self._store.lock`, então o loop já é serializado na prática. Com o
+        índice IVF-PQ ativo (n_rows >= IVF_MIN_ROWS) cada query do loop fica
+        barata; abaixo disso o scan bruto de N ≤ 4 queries é desprezível perto
+        do custo de embed."""
         n = query_embeddings.shape[0] if query_embeddings.ndim == 2 else 0
         return [self.search(query_embeddings[i], top_k) for i in range(n)]
 
@@ -322,22 +386,46 @@ class MemoryIndex:
         return self._query(q, f"{self._filter} AND id IN ({id_list})", min(top_k, len(record_ids)))
 
     def get_vectors(self, record_ids: list[int]) -> dict[int, np.ndarray]:
-        """Vetores armazenados dos ids pedidos (ids ausentes ficam de fora)."""
+        """Vetores armazenados dos ids pedidos (ids ausentes ficam de fora).
+
+        NEW (Plano 3 / T5): cache LRU por id. O MMR (inibição lateral) pede os
+        vetores dos ids "related" vindos do PPR a CADA recall — 1 query LanceDB
+        extra. Vetores são imutáveis (só saem da tabela junto com a memória,
+        ver remove_ids/reset), então um cache por id é seguro: hits repetidos
+        eliminam a query inteira. 384 dims float32 = 1.5KB/vetor → 4096
+        entradas ≈ 6MB."""
         if not record_ids:
             return {}
-        id_list = ",".join(str(int(i)) for i in record_ids)
+        cache = self._vector_cache
         with self._store.lock:
-            rows = (
-                self._table.search()
-                .where(f"{self._filter} AND id IN ({id_list})")
-                .select(["id", "vector"])
-                .limit(len(record_ids) * 2)
-                .to_list()
-            )
-        out: dict[int, np.ndarray] = {}
-        for r in rows:
-            out.setdefault(int(r["id"]), np.asarray(r["vector"], dtype=np.float32))
-        return out
+            hits: dict[int, np.ndarray] = {}
+            missing: list[int] = []
+            for i in record_ids:
+                rid = int(i)
+                if rid in cache:
+                    hits[rid] = cache.pop(rid)  # pop+reinsert = move p/ o fim (LRU)
+                    cache[rid] = hits[rid]
+                elif rid not in missing:
+                    missing.append(rid)
+            if missing:
+                id_list = ",".join(str(r) for r in missing)
+                rows = (
+                    self._table.search()
+                    .where(f"{self._filter} AND id IN ({id_list})")
+                    .select(["id", "vector"])
+                    .limit(len(missing) * 2)
+                    .to_list()
+                )
+                for r in rows:
+                    rid = int(r["id"])
+                    if rid in hits:  # dedup de linhas repetidas
+                        continue
+                    v = np.asarray(r["vector"], dtype=np.float32)
+                    hits[rid] = v
+                    cache[rid] = v
+            while len(cache) > VECTOR_CACHE_MAX_ENTRIES:  # evict LRU
+                cache.popitem(last=False)
+            return hits
 
     def flush(self):
         """Compacta os fragmentos gerados por adds/deletes desde a última

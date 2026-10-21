@@ -19,6 +19,14 @@ services:
       - ava-logs:/app/logs
       - ./graph_activation.py:/app/graph_activation.py
 
+    # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
+    # CRAWL4AI_API_TOKEN...). Carregados DIRETO pelo compose — sem depender
+    # do --env-file do docker-start.sh. O env_file injeta as variáveis NO
+    # container (visíveis no `docker exec ava env`), ao contrário da
+    # interpolação ${...}, que só roda no host antes do container existir.
+    env_file:
+      - Modules/.env
+
     environment:
       AVA_DEBUG: ""
       ONNX_PROVIDERS: "CPUExecutionProvider"
@@ -65,8 +73,9 @@ services:
     ports:
       - "127.0.0.1:11235:11235"
     environment:
-      # Token interno — sem ele o servidor só escuta no loopback do container
-      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:-ava-crawl4ai-internal}"
+      # Token interno — sem ele o servidor só escuta no loopback do container.
+      # Gerado pelo install.sh em Modules/.env (falha de boot se ausente).
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
 
   websearch-mcp:
     build:
@@ -76,9 +85,10 @@ services:
     container_name: ava-websearch-mcp
     volumes:
       - ./resource:/app/resource:ro
-      # Socket do Docker — crawl4ai on-demand (sobe/para quando o fetch
-      # estático não resolve; com TTL de inatividade economiza ~490MB de RAM)
-      - /var/run/docker.sock:/var/run/docker.sock
+      # crawl4ai on-demand via docker-socket-proxy (abaixo): o socket do host
+      # NÃO é mais montado aqui — o websearch só pode subir/parar o crawl4ai
+      # através da allowlist do proxy (sem exec/images/volumes/networks).
+      # DOCKER_HOST é lido automaticamente pelo docker.from_env().
     ports:
       - "127.0.0.1:4010:4010"
     environment:
@@ -89,7 +99,26 @@ services:
       # memory_write_batch: a tool de gravação de memórias fala com a
       # memory_api direto (mesmo contrato REST do LLM.py /write/batch)
       MEMORY_API_URL: "http://ava:3000"
-      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:-ava-crawl4ai-internal}"
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+
+  # ── Proxy do socket Docker — o websearch não tem acesso direto ao socket ──
+  # Allowlist mínima: apenas listar/inspecionar containers e start/stop do
+  # crawl4ai (on-demand, economia de ~490MB RAM). Tudo mais (exec, images,
+  # volumes, networks, build) fica bloqueado pelo HAProxy interno do proxy.
+  # Sem portas publicadas: só alcançável pela rede interna do compose.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: ava-docker-socket-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      POST: 1
+      VERSION: 1
+    restart: unless-stopped
 
 volumes:
   ava-cache:

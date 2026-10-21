@@ -10,15 +10,18 @@
 //! próprio loop de eventos e conversa com a UI via canal mpsc.
 
 mod api;
+mod chat;
 mod idle_watcher;
 mod mcp_manager;
+mod platform;
 mod process_manager;
 mod state;
+mod transcript;
 mod ui;
 
 use eframe::egui;
 use state::new_shared_state;
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIconBuilder, TrayIconEvent,
@@ -30,7 +33,13 @@ use tray_icon::{
 #[derive(Debug)]
 pub enum UiCommand {
     Show,
+    /// Abre a janela direto na tela de chat (wake word detectada —
+    /// POST /ui/chat-open do transcribe C++).
+    ShowChat,
     Quit,
+    /// Evento do Conversation Hub do orchestrator (delta/tool_call/done de um
+    /// turno voice/chat). A UI consome no repaint para atualizar o chat.
+    ChatEvent(chat::ConversationEvent),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -81,11 +90,28 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Sobe a API REST (axum) em background.
+    // Transcript (voz, host): descoberta em background pelo mesmo motivo —
+    // o liveness é só um pid check, mas nada aqui pode atrasar a tray.
     {
         let state = shared_state.clone();
         rt.spawn(async move {
-            if let Err(e) = api::serve(state).await {
+            transcript::discover(&state).await;
+        });
+    }
+
+    // ── Canal UiCommand: tray/API → UI (eframe, main thread) ──────────────
+    // Criado ANTES da API: o endpoint /ui/chat-open precisa do cmd_tx para
+    // pedir à UI que abra a janela na tela de chat (wake word detectada).
+    // Unbounded: /ui/chat-open é fire-and-forget — nunca pode bloquear a
+    // resposta HTTP (o transcribe não pode esperar por repaint de UI).
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+    // Sobe a API REST (axum) em background.
+    {
+        let state = shared_state.clone();
+        let tx = cmd_tx.clone();
+        rt.spawn(async move {
+            if let Err(e) = api::serve(state, tx).await {
                 tracing::error!("API REST encerrou com erro: {e}");
             }
         });
@@ -108,6 +134,9 @@ fn main() -> anyhow::Result<()> {
                 process_manager::health_check_docker(&state).await;
                 // MCP manager (host): Running sem /health → Crashed → respawn.
                 mcp_manager::health_check(&state).await;
+                // Transcript (host): Running sem pid → Crashed → respawn
+                // (com o container de pé).
+                transcript::health_check(&state).await;
             }
         });
     }
@@ -115,7 +144,67 @@ fn main() -> anyhow::Result<()> {
     // ── Tray icon numa thread secundária (GTK tem loop próprio) ───────────
     // Os handlers de evento enviam UiCommand pela mpsc; a UI (main thread,
     // presa no event loop winit) os consome no repaint.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+    // (O canal cmd_tx/cmd_rx já foi criado acima — a API também envia.)
+
+    // ── Task de SSE: consome o Conversation Hub do orchestrator ────────────
+    // Espelha os turnos voice/chat para a tela de chat da UI via cmd_tx.
+    {
+        let state = shared_state.clone();
+        let tx = cmd_tx.clone();
+        rt.spawn(async move {
+            let url = format!("{}/conversation/stream", chat::orchestrator_url());
+            let mut retries: u32 = 0;
+            loop {
+                let token = match chat::auth_header(&state).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("chat: token ausente — SSE não conectado: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        continue;
+                    }
+                };
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get(&url)
+                    .header("Authorization", &token)
+                    .send()
+                    .await;
+                match resp {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!("chat: SSE conectado ao Conversation Hub");
+                        retries = 0;
+                        let mut resp = resp;
+                        let mut buf: Vec<u8> = Vec::new();
+                        // chunk() não precisa de stream traits — apenas reqwest.
+                        while let Some(chunk) = resp.chunk().await.unwrap_or_default() {
+                            buf.extend_from_slice(&chunk);
+                            // Frames SSE são separados por \n\n — processa todos completos.
+                            while let Some(pos) = find_frame_end(&buf) {
+                                let frame_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+                                let frame = String::from_utf8_lossy(&frame_bytes);
+                                if let Some(event) = chat::parse_sse_frame(&frame) {
+                                    let _ = tx.send(UiCommand::ChatEvent(event));
+                                }
+                            }
+                        }
+                        tracing::warn!("chat: SSE encerrou — reconectando");
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            "chat: SSE falhou com status {} — retry em breve",
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("chat: SSE não conectou: {e}");
+                    }
+                }
+                retries += 1;
+                let delay = std::time::Duration::from_secs((5u64 * retries as u64).min(30));
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -145,7 +234,7 @@ fn main() -> anyhow::Result<()> {
 /// sempre — quem encerra o processo é a main thread (eframe) ao sair.
 /// O TrayIcon PRECISA ficar vivo durante o gtk::main (drop remove o ícone).
 #[cfg(target_os = "linux")]
-fn run_tray_gtk(tx: mpsc::Sender<UiCommand>) {
+fn run_tray_gtk(tx: mpsc::UnboundedSender<UiCommand>) {
     if let Err(e) = gtk::init() {
         tracing::error!("Falha ao inicializar GTK na thread do tray: {e}");
         return;
@@ -156,7 +245,7 @@ fn run_tray_gtk(tx: mpsc::Sender<UiCommand>) {
 
 /// Tray fora do Linux: sem loop GTK; mantém a thread viva com sleep.
 #[cfg(not(target_os = "linux"))]
-fn run_tray(tx: mpsc::Sender<UiCommand>) {
+fn run_tray(tx: mpsc::UnboundedSender<UiCommand>) {
     let _tray_icon = build_tray(tx);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -166,7 +255,7 @@ fn run_tray(tx: mpsc::Sender<UiCommand>) {
 /// Monta o ícone + menu do tray e registra os handlers de evento
 /// (enviam UiCommand pela mpsc). Retorna o TrayIcon — PRECISA ser
 /// guardado vivo: no Windows/Linux o ícone some se o objeto for dropado.
-fn build_tray(tx: mpsc::Sender<UiCommand>) -> TrayIconData {
+fn build_tray(tx: mpsc::UnboundedSender<UiCommand>) -> TrayIconData {
     let menu = Menu::new();
     let open_item = MenuItem::new("Abrir", true, None);
     let quit_item = MenuItem::new("Sair", true, None);
@@ -215,7 +304,7 @@ type TrayIconData = tray_icon::TrayIcon;
 fn run_ui(
     state: state::SharedState,
     rt_handle: tokio::runtime::Handle,
-    cmd_rx: mpsc::Receiver<UiCommand>,
+    cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<()> {
     // Debug: AVA_TRAY_START_VISIBLE=1 faz a janela nascer visível (testes
     // de automação do fluxo de close sem depender do clique no tray).
@@ -239,6 +328,13 @@ fn run_ui(
         Box::new(move |_cc| Ok(Box::new(ui::TrayApp::new(state, rt_handle, cmd_rx)))),
     )
     .map_err(|e| anyhow::anyhow!("Erro na janela: {e}"))
+}
+
+/// Procura o fim de um frame SSE ("\n\n") no buffer. Retorna o índice do
+/// primeiro byte do separador (tal que frame = buf[..pos+2]).
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
 }
 
 fn load_tray_icon() -> tray_icon::Icon {

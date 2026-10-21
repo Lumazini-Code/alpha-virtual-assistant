@@ -127,6 +127,25 @@ class MemoryDB(EdgeGraphMixin):
         except sqlite3.OperationalError:
             pass
 
+    def batch_update_access(self, memory_ids: list[int]):
+        """NEW (Plano 3 / T4): mesma matemática do update_access (LTP: reforço
+        saturante de confiança), mas para N memórias em UMA passagem — o /read
+        pode acessar dezenas de ids por recall e N executor round-trips viram 1.
+        IDs duplicados reforçam só 1x (mesma semântica do recall: cada
+        memória aparece uma vez no resultado)."""
+        if not memory_ids:
+            return
+        now = time.time()
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ?, "
+                    "confidence = confidence + ? * (1 - confidence) WHERE id = ?",
+                    [(now, LTP_ACCESS_BOOST, mid) for mid in set(memory_ids)],
+                )
+        except sqlite3.OperationalError:
+            pass
+
     def update(
         self,
         memory_id: int,
@@ -208,13 +227,18 @@ class MemoryDB(EdgeGraphMixin):
                 # ── NEW (Hebbian graph): antes de apagar as memórias
                 # expiradas, apaga as arestas que apontam pra elas — o
                 # grafo nunca mantém aresta pra linha morta.
-                expired = self._conn.execute(
+                # ── NEW (Plano 3 / T7): 1 statement com IN em vez de N
+                # deletes individuais (job roda a cada 3600s, fora do
+                # caminho crítico — simplifica e corta round-trips).
+                expired = [r["id"] for r in self._conn.execute(
                     "SELECT id FROM memories WHERE confidence < 0.01"
-                ).fetchall()
-                for expired_row in expired:
+                ).fetchall()]
+                if expired:
+                    ph = ",".join("?" * len(expired))
                     self._conn.execute(
-                        "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
-                        (expired_row["id"], expired_row["id"]),
+                        f"DELETE FROM memory_edges WHERE "
+                        f"memory_id_a IN ({ph}) OR memory_id_b IN ({ph})",
+                        [*expired, *expired],
                     )
                 self._conn.execute("DELETE FROM memories WHERE confidence < 0.01")
                 log.info(f"Decay aplicado em {len(updates)} memórias de longo prazo")
@@ -302,6 +326,21 @@ class ShortTermDB:
                 self._conn.execute(
                     "UPDATE turn_groups SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
                     (time.time(), group_id),
+                )
+        except sqlite3.OperationalError:
+            pass
+
+    def batch_update_access(self, group_ids: list[int]):
+        """NEW (Plano 3 / T4): update_access em lote — 1 executemany por
+        recall em vez de N writes individuais via executor."""
+        if not group_ids:
+            return
+        now = time.time()
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "UPDATE turn_groups SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                    [(now, gid) for gid in set(group_ids)],
                 )
         except sqlite3.OperationalError:
             pass
@@ -446,6 +485,22 @@ class IndexedFilesDB:
                     "UPDATE indexed_files SET access_count = access_count + 1, "
                     "last_accessed = ? WHERE id = ?",
                     (time.time(), file_id),
+                )
+        except sqlite3.OperationalError:
+            pass
+
+    def batch_update_access(self, file_ids: list[int]):
+        """NEW (Plano 3 / T4): update_access em lote para chunks/arquivos —
+        1 executemany por recall em vez de N writes individuais."""
+        if not file_ids:
+            return
+        now = time.time()
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "UPDATE indexed_files SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    [(now, fid) for fid in set(file_ids)],
                 )
         except sqlite3.OperationalError:
             pass

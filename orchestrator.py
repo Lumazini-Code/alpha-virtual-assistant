@@ -68,7 +68,9 @@ import json
 import asyncio
 import base64
 import logging
+import logging.handlers
 import os
+import queue
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -78,6 +80,9 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 import datetime
 import httpx
+import socket
+import ipaddress
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
@@ -99,6 +104,13 @@ MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://localhost:3000")
 TTS_URL              = "http://localhost:3004"
 LLM_URL              = "http://localhost:4003"
 VISION_URL           = "http://localhost:4002"
+# ── Embedding on-demand (rota A do plano — cadastro de voz via /settings) ────
+# Módulo transcribe (main.cpp no HOST, microfone local) expõe um mini servidor
+# HTTP com GET /health e POST /speaker/embed (PCM s16le mono → embedding CAM++
+# 192 dims). No Linux o container ava usa network_mode: host, então localhost
+# alcança o processo; no Windows injete http://host.docker.internal:9100 no
+# compose (docker-compose.windows.yml).
+TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://localhost:9100")
 # ── Fluxo vision_objects (vision.py :4002) ────────────────────────────────────
 # vision.py está desativado por enquanto (start.sh não sobe o serviço — a
 # forma com que ele foi projetado para ser usado, agente totalmente autônomo
@@ -223,10 +235,57 @@ THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     10: "This is a maximally complex task requiring deep, exhaustive reasoning. Think as carefully and thoroughly as possible before responding. Decompose every sub-problem, reason from first principles at each step, validate every intermediate conclusion, consider all relevant edge cases and counter-arguments, and synthesize a complete, precise, and well-justified response. Take as much reasoning space as needed — correctness and depth are the priority.",
 }
 
+# Logging assíncrono: writes nunca bloqueiam o event loop (queue + thread daemon).
+_log_queue = queue.SimpleQueue()
+_log_queue_handler = logging.handlers.QueueHandler(_log_queue)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log_listener = logging.handlers.QueueListener(
+    _log_queue, _console_handler, respect_handler_level=True
+)
+_log_listener.start()
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("AVA_DEBUG") else logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[_log_queue_handler],
+    force=True,
 )
+def _assert_public_url(url: str) -> None:
+    """
+    T6 — SSRF guard.
+    Resolve o hostname da URL e bloqueia IPs privados, loopback, link-local,
+    metadata (ex: 169.254.169.254), etc.
+    Raises HTTPException(400) se a URL for considerada insegura.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(400, "URL deve usar http ou https")
+        if not parsed.hostname:
+            raise HTTPException(400, "URL sem hostname")
+
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            infos = socket.getaddrinfo(parsed.hostname, port)
+        except socket.gaierror:
+            raise HTTPException(400, f"Não foi possível resolver hostname: {parsed.hostname}")
+
+        for info in infos:
+            ip_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+            # IPv4-mapped IPv6 (ex: ::ffff:127.0.0.1)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                raise HTTPException(400, f"URL resolve para IP bloqueado ({ip}) — SSRF suspeito")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Validação de URL falhou: {e}")
+
 log = logging.getLogger("ava.orchestrator")
 
 
@@ -234,12 +293,78 @@ log = logging.getLogger("ava.orchestrator")
 # Data Models
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Conversation Hub — espelho em memória dos turnos (chat do Manager)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConversationHub:
+    """Espelha eventos SSE de turnos voice/chat para o Manager.
+
+    - Ring buffer de eventos recentes (catch-up para reconexão do Manager).
+    - Broadcast asyncio para consumidores SSE conectados.
+    - NUNCA persiste em disco — vive só na RAM do orchestrator.
+    """
+
+    def __init__(self, buffer_max: int = 500):
+        self._lock = asyncio.Lock()
+        self._buffer: list[dict] = []
+        self._next_id = 1
+        self._buffer_max = buffer_max
+        self._subscribers: set[asyncio.Queue] = set()
+
+    async def publish(self, event_name: str, data: Any) -> None:
+        """Guarda no buffer e notifica todos os subscribers SSE."""
+        async with self._lock:
+            entry = {"id": self._next_id, "event": event_name, "data": data}
+            self._next_id += 1
+            self._buffer.append(entry)
+            if len(self._buffer) > self._buffer_max:
+                self._buffer = self._buffer[-self._buffer_max:]
+            queues = list(self._subscribers)
+        for q in queues:
+            try:
+                q.put_nowait(entry)
+            except asyncio.QueueFull:
+                pass  # subscriber lento — deixa cair (best-effort)
+
+    async def subscribe(self) -> asyncio.Queue:
+        """Registra um consumidor SSE e devolve a fila dele."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        async with self._lock:
+            self._subscribers.add(q)
+        return q
+
+    async def unsubscribe(self, q: asyncio.Queue) -> None:
+        async with self._lock:
+            self._subscribers.discard(q)
+
+    async def recent(self, after_id: int = 0) -> list[dict]:
+        """Eventos com id > after_id (catch-up para reconexão)."""
+        async with self._lock:
+            return [e for e in self._buffer if e["id"] > after_id]
+
+
+# Instância global (um hub por processo — a vida é a do orchestrator).
+CONVERSATION_HUB = ConversationHub()
+
+
+async def _mirror_conversation(hub: ConversationHub, name: str, data: Any) -> None:
+    """Espelha um evento SSE para o hub (fire-and-forget, nunca quebra o turno)."""
+    try:
+        await hub.publish(name, data)
+    except Exception:
+        pass  # erro no espelho jamais afeta o turno do usuário
+
+
 class ExecuteRequest(BaseModel):
-    input:         str
+    input:         str = Field(..., max_length=200_000)
     session_id:    Optional[str]  = None
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
+    # Telemetria: quem disparou o turno ("tui" = TUI, "voice" = pipeline de voz,
+    # "chat" = janela de chat do Manager/tray).
+    source:        Optional[Literal["tui", "voice", "chat"]] = None
     # Onde o áudio da resposta toca:
     #   client — orchestrator sintetiza via TTS /synthesize e DEVOLVE o WAV
     #            num evento SSE `audio` (a TUI toca no HOST — uniforme
@@ -255,7 +380,8 @@ class ExecuteRequest(BaseModel):
     # parte; com a flag em 1 é repassada ao vision service. Isso elimina o
     # problema de path resolution entre cliente e orchestrator (ex.:
     # orchestrator rodando em container sem o filesystem do host).
-    image_base64:  Optional[str]  = None
+    # Limite ~10MB de payload base64 (DoS guard — Plano 1, T10).
+    image_base64:  Optional[str]  = Field(None, max_length=10_000_000)
     search_pdfs:   bool           = False
     stream:        bool           = True
 
@@ -269,26 +395,65 @@ class ExecuteResponse(BaseModel):
     steps: list[StepResult]; total_latency_ms: float; errors: list[str]
 
 class DeepSearchRequest(BaseModel):
-    text: str = Field(..., description="Question or research objective")
+    text: str = Field(..., max_length=200_000, description="Question or research objective")
 
 class MemoryReadRequest(BaseModel):
-    query: str; top_k: int = DEFAULT_TOP_K; min_score: float = DEFAULT_MIN_SCORE; session_id: Optional[str] = None
+    query: str = Field(..., max_length=200_000); top_k: int = DEFAULT_TOP_K; min_score: float = DEFAULT_MIN_SCORE; session_id: Optional[str] = None
 
 class MemoryWriteRequest(BaseModel):
-    text: str; source: str = "chat"; confidence: float = 1.0
+    text: str = Field(..., max_length=200_000); source: str = "chat"; confidence: float = 1.0
     forgettable: bool = True
     ttl_days: Optional[float] = None
     action: Literal["create", "update"] = "create"
     memory_id: Optional[int] = None
 
+class VoiceContextRequest(BaseModel):
+    # POST /voice/ingest — main.cpp (transcribe) dispara isso assim que o
+    # speaker embedding (CAM++, 192 dims) fica pronto. Deve bater ANTES do
+    # /execute correspondente: o /execute só CONSOME o cache, nunca espera.
+    session_id: Optional[str] = Field(None, description="Sessão da TUI (None = anônimo)")
+    embedding:  list[float] = Field(..., description="Embedding do locutor (CAM++ 192 dims)")
+
+class VoiceRegisterRequest(BaseModel):
+    # POST /voice/register — cadastro de locutor via /settings (TUI).
+    # Fluxo: a TUI grava ~5s do microfone do HOST (PCM s16le mono 16kHz) e
+    # envia audio_b64; o embedding CAM++ é gerado ON-DEMAND pelo módulo
+    # transcribe (rota /speaker/embed) e a pessoa é persistida via
+    # /voice-dict/write na memory — a descrição replica para a memória de
+    # longo prazo lá (source="voice_dict"). Também aceita embedding pronto.
+    person_name: str = Field(..., min_length=1, max_length=200)
+    description: str  = Field("",  max_length=2000)
+    embedding: Optional[list[float]] = Field(None, description="Embedding pronto (192 dims) — quando ausente, gera do áudio")
+    audio_b64:  Optional[str] = Field(None, max_length=64_000_000, description="PCM s16le mono em base64 (16kHz)")
+    sample_rate: int = Field(16000, ge=8000, le=48000)
+    source: str = Field("settings_ui", max_length=50)
+    confidence: float = Field(1.0, ge=0.0, le=1.0)
+
 class AlphaCodeRequest(BaseModel):
-    task: str = Field(..., description="Descrição da tarefa em linguagem natural")
+    task: str = Field(..., max_length=200_000, description="Descrição da tarefa em linguagem natural")
     session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
     project_dir: Optional[str] = Field(None, description="Diretório alvo. None = BASE_DIR do scraping_client.")
     max_steps: int = Field(25, ge=1, le=100, description="Limite de iterações ReAct")
     temperature: float = Field(0.3, ge=0.0, le=2.0)
-    model_override: Optional[str] = Field(None, description="Força modelo para TODOS os steps. None = roteamento adaptativo.")
+    model_override: Optional[str] = Field(None, max_length=200, description="Força modelo para TODOS os steps. None = roteamento adaptativo.")
     stream: bool = Field(True, description="True = SSE streaming, False = síncrono")
+
+# ── Models para endpoints de busca/extração/chat (T10 — limites DoS) ────────
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., max_length=200_000)
+    max_results: int = Field(5, ge=1, le=50)
+    search_pdfs: bool = False
+    topic: str = Field("general", max_length=50)
+
+class ReadUrlRequest(BaseModel):
+    url: str = Field(..., max_length=2048, description="URL pública a extrair (bloqueia loopback/private via SSRF guard)")
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., max_length=200_000)
+    voice: str = Field("M1", max_length=20)
+    lang: str = Field("pt", max_length=20)
+    tts: bool = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -312,6 +477,10 @@ class AppState:
     # (/servers/{name}/tools) e execução (/servers/{name}/call) vão todos
     # por este client (ver _select_skills/_load_mcp_tools/_run_tool_loop).
     mcp_client: httpx.AsyncClient = field(default=None)
+    # transcribe (REST, HOST) — embedding on-demand p/ cadastro de voz:
+    # POST /speaker/embed no módulo transcribe (main.cpp, microfone do host).
+    # Uso raro (só no cadastro via /settings), timeout finito.
+    transcribe_client: httpx.AsyncClient = field(default=None)
 
 state = AppState()
 
@@ -348,7 +517,13 @@ async def lifespan(app: FastAPI):
         "mcp_manager": MCP_MANAGER_URL, "memory": MEMORY_API_URL,
         "process_manager": PROCESS_MANAGER_URL,
     }
-    async with httpx.AsyncClient(timeout=5.0) as probe:
+    from Modules.internal_auth import internal_token
+    _auth_headers: dict[str, str] = {}
+    _tok = internal_token()
+    if _tok:
+        _auth_headers = {"Authorization": f"Bearer {_tok}"}
+
+    async with httpx.AsyncClient(timeout=5.0, headers=_auth_headers) as probe:
         for name, url in service_urls.items():
             try:
                 r = await probe.get(f"{url}{HEALTH_PATHS.get(name, '/status')}")
@@ -360,7 +535,7 @@ async def lifespan(app: FastAPI):
     # microserviços HTTP acima, já entra no probe de health normal.
 
     def _make_client(base_url: str, timeout: float) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8))
+        return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout), limits=httpx.Limits(max_keepalive_connections=4, max_connections=8), headers=_auth_headers)
 
     state.memory_client = _make_client(MEMORY_API_URL, 30.0)
     state.tts_client = _make_client(TTS_URL, 9999999.0)
@@ -375,13 +550,16 @@ async def lifespan(app: FastAPI):
     # mcp_manager: timeout LONGO (a execução de tools MCP pode demorar — o
     # teto real por tool é o asyncio.wait_for do loop, EXECUTOR_TIMEOUTS).
     state.mcp_client = _make_client(MCP_MANAGER_URL, 9999999.0)
+    # transcribe (host): /speaker/embed roda fbank + CAM++ (~200ms por
+    # gravação de 5s) — timeout finito e generoso.
+    state.transcribe_client = _make_client(TRANSCRIBE_HTTP_URL, 30.0)
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
     for c in (state.memory_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client,
               state.alpha_code_client, state.process_manager_client,
-              state.mcp_client):
+              state.mcp_client, state.transcribe_client):
         await c.aclose()
     log.info("AVA Orchestrator encerrado")
 
@@ -790,10 +968,105 @@ async def _recall_plans(user_input: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+# ── Voice memory context (Fase 1 — cache de ingestão) ────────────────────────
+# main.cpp (transcribe) dispara POST /voice/ingest com o speaker embedding
+# (CAM++ 192 dims) logo no endpoint do VAD — em paralelo com o flush do ASR.
+# O orchestrator faz o kNN (/voice-dict/read) e guarda o resultado aqui,
+# com TTL curto. O /execute só CONSOME o cache: se o lookup chegou a tempo,
+# custo do turno = 0ms; se não chegou, seguimos sem memória de voz (degraded,
+# nunca bloqueia o tool loop).
+_VOICE_CONTEXT_TTL = 30.0            # segundos — frase típica: < 5s de gap
+_voice_context_cache: dict[str, tuple[dict, float]] = {}
+
+
+async def _ingest_voice_context(session_id: Optional[str], embedding: list[float]) -> dict:
+    """POST /voice/ingest — kNN na memória de voz e cacheia o resultado.
+    Nunca levanta: falha → dict vazio (o turno seguinte apenas ignora)."""
+    # 192 dims (VO_EMBED_DIM do memory_config) — valida aqui p/ dar erro claro
+    # ao produtor C++ sem tocar o kNN.
+    if not embedding or len(embedding) != 192:
+        return {"ok": False, "reason": f"embedding deve ter 192 dims, recebido {len(embedding) if embedding else 0}"}
+    try:
+        resp = await _memory_request("POST", "/voice-dict/read", {
+            "embedding": embedding,
+            "top_k": 3,
+            "min_score": 0.45,
+            "include_related": True,
+        })
+    except Exception as e:
+        log.warning(f"voice-dict/read falhou (seguindo sem memória de voz): {type(e).__name__}: {e}")
+        return {"ok": False, "reason": f"voice_dict_read: {type(e).__name__}: {e}"}
+
+    sid = session_id or "__anon__"
+    _voice_context_cache[sid] = (resp, time.time())
+    # Poda: cache é minúsculo (uma entrada por sessão falante ativa), mas
+    # evitamos acumular sessões mortas.
+    if len(_voice_context_cache) > 64:
+        now = time.time()
+        for k in [k for k, (_, ts) in _voice_context_cache.items() if now - ts > _VOICE_CONTEXT_TTL]:
+            _voice_context_cache.pop(k, None)
+    n_candidates = len(resp.get("results") or [])
+    n_related = len(resp.get("related") or [])
+    log.info(f"voice/ingest: cache={sid[:8]} candidatos={n_candidates} related={n_related}")
+    return {"ok": True, "results": n_candidates, "related": n_related}
+
+
+def _consume_voice_context(sid: str) -> Optional[dict]:
+    """Pop o cache de voz da sessão (TTL + consumo único — evita contaminação
+    entre turnos). Sem contexto ou expirado → None.
+
+    Fallback "__anon__": o produtor C++ (transcribe/main.cpp) não conhece o
+    session_id da TUI e envia session_id=null — o sistema é single-session,
+    então o /execute consome a entrada anônima quando não há uma para o sid.
+    """
+    entry = _voice_context_cache.pop(sid, None)
+    if not entry:
+        entry = _voice_context_cache.pop("__anon__", None)
+    if not entry:
+        return None
+    res, ts = entry
+    if time.time() - ts > _VOICE_CONTEXT_TTL:
+        return None
+    return res
+
+
+def _format_voice_context_block(voice_res: Optional[dict]) -> str:
+    """VoiceDictReadResponse → bloco de contexto p/ o system prompt.
+    Em inglês (língua do system prompt do tool loop). Retorna "" se vazio."""
+    if not voice_res:
+        return ""
+    candidates = voice_res.get("results") or []
+    if not candidates:
+        return ""
+    best = candidates[0]
+    lines = [
+        "## Speaker voice context (biometric identification, pre-fetched)",
+        f"- Most likely speaker: \"{best.get('person_name')}\""
+        f" (voice-match score {best.get('score', 0):.2f}, {best.get('confidence', 0):.2f} confidence).",
+    ]
+    if best.get("description"):
+        lines.append(f"- Who this is: {best['description']}")
+    for c in candidates[1:3]:
+        lines.append(f"- Other candidate: \"{c.get('person_name')}\""
+                     f" (score {c.get('score', 0):.2f}): {c.get('description') or 'no description'}")
+    related = voice_res.get("related") or []
+    rel_texts = [((m.get("text") or m.get("content") or "").strip()) for m in related]
+    rel_texts = [t for t in rel_texts if t][:3]
+    if rel_texts:
+        lines.append("- Memories associated with this speaker:")
+        lines.extend(f"  - {t}" for t in rel_texts)
+    lines.append("- Treat this speaker identity as high-priority context; address/personalize accordingly.")
+    return "\n".join(lines)
+
+
 async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     """Recall pré-loop: /read e /read-short-term EM PARALELO. Retorna
     (bloco de recall formatado, turnos ST saneados). Qualquer falha degrada
-    para vazio — nunca derruba o tool loop."""
+    para vazio — nunca derruba o tool loop.
+
+    O contexto de memória de voz NÃO é buscado aqui: já foi pré-buscado pelo
+    /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
+    com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
     read_res, st_turns = await asyncio.gather(
         _memory_read_semantic(
             query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
@@ -801,7 +1074,14 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
         _memory_read_st_raw(sid, ORCH_ST_PAIRS),
     )
     clean_turns = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
-    return _format_recall_block(read_res, clean_turns), clean_turns
+    recall_block = _format_recall_block(read_res, clean_turns)
+
+    # Injeção do contexto de voz (Fase 3 do plano) — custo O(1), se existir.
+    voice_block = _format_voice_context_block(_consume_voice_context(sid))
+    if voice_block:
+        recall_block = (voice_block + "\n\n" + recall_block) if recall_block else voice_block
+
+    return recall_block, clean_turns
 
 
 async def _extract_memories_via_llm(u: str, a: str, sid: str):
@@ -1812,13 +2092,24 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
     schema: list[dict] = []
     dispatch: dict[str, tuple[str, str]] = {}
     log.debug(f"[_load_mcp_tools] carregando tools dos servidores: {skill_names}")
-    for server in skill_names:
+
+    async def _load_server(server: str) -> tuple[str, list[dict] | None]:
         try:
             r = await state.mcp_client.get(f"/servers/{server}/tools", timeout=15.0)
             r.raise_for_status()
-            tools = r.json()["tools"]
+            return server, r.json()["tools"]
         except Exception as e:
             log.warning(f"MCP: falha ao carregar tools do servidor '{server}': {type(e).__name__}: {e}")
+            return server, None
+
+    # T5: requisições paralelas — gather preserva a ordem dos resultados.
+    results = await asyncio.gather(*(_load_server(s) for s in skill_names), return_exceptions=True)
+    for res in results:
+        if isinstance(res, BaseException):
+            log.warning(f"MCP: falha inesperada ao carregar tools de um servidor: {res}")
+            continue
+        server, tools = res
+        if tools is None:
             continue
         for tool in tools:
             schema.append(_mcp_tool_to_openai_schema(tool))
@@ -2130,7 +2421,7 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "to say before that (progress notes, findings so far, caveats) must ride along in "
         "the same message where you call your next tool.",
         "",
-        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
+        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d')}.",
         "",
         "Available tools:",
     ]
@@ -2259,6 +2550,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
 
+    # Hora exata vive aqui (mensagem user), não no system prompt — o prefixo
+    # cacheável do system prompt fica com data apenas (prompt caching).
+    time_hint = datetime.datetime.now().strftime('%H:%M:%S')
+    req.input = f"[Current local time: {time_hint}]\n\n{req.input}"
     user_content: str | list[dict] = req.input
     if req.image_base64:
         if VISION_OBJECTS_ENABLED:
@@ -2603,22 +2898,50 @@ async def _execute_stream_generator(req: ExecuteRequest):
     t0 = time.perf_counter()
     eid = str(uuid.uuid4())
     sid = req.session_id or str(uuid.uuid4())
-    log.info(f"[{eid[:8]}] Executando (tool loop): '{req.input[:80]}'")
+    log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
-    yield _sse("meta", {"execution_id": eid, "session_id": sid})
+    # Espelho no Conversation Hub: `meta` inclui a pergunta (o chat do Manager
+    # precisa dela para desenhar a bolha do usuário) e o `source` do turno.
+    await _mirror_conversation(CONVERSATION_HUB, "meta", {
+        "execution_id": eid, "session_id": sid,
+        "input": req.input, "source": req.source or "tui",
+    })
+    yield _sse("meta", {"execution_id": eid, "session_id": sid,
+                        "input": req.input, "source": req.source or "tui"})
 
-    events_queue: asyncio.Queue = asyncio.Queue()
+    events_queue: asyncio.Queue = asyncio.Queue(
+        maxsize=int(os.environ.get("AVA_EVENTS_QUEUE_MAX", "2000"))
+    )
+    dropped_events = 0
+
+    def _put_event_nowait(name, data):
+        # Produtor nunca bloqueia: se a fila encheu, aplica drop-oldest
+        # (o consumidor tolera eventos faltantes) e conta o drop.
+        nonlocal dropped_events
+        try:
+            events_queue.put_nowait((name, data))
+        except asyncio.QueueFull:
+            try:
+                events_queue.get_nowait()
+                dropped_events += 1
+                log.debug(f"[{eid[:8]}] events_queue cheia — drop-oldest (total: {dropped_events})")
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                events_queue.put_nowait((name, data))
+            except asyncio.QueueFull:
+                pass
 
     async def on_event(name, data):
-        await events_queue.put((name, data))
+        _put_event_nowait(name, data)
 
     async def run():
         try:
             sr, fr = await _run_tool_loop(req, eid, sid, on_event=on_event)
-            await events_queue.put(("__done__", (sr, fr)))
+            _put_event_nowait("__done__", (sr, fr))
         except Exception as e:
             log.exception(f"[{eid[:8]}] erro no tool loop")
-            await events_queue.put(("__error__", str(e)))
+            _put_event_nowait("__error__", str(e))
 
     task = asyncio.create_task(run())
 
@@ -2654,12 +2977,14 @@ async def _execute_stream_generator(req: ExecuteRequest):
             error_msg = data
             if tts_streamer is not None:
                 tts_streamer.cancel()
+            await _mirror_conversation(CONVERSATION_HUB, "error", {"error": error_msg})
             yield _sse("error", {"error": error_msg})
             break
         if name == "delta":
             # Fragmento incremental do content do LLM (streaming real, vem do
             # _llm_chat_stream durante o tool loop). A UI concatena; o `done`
             # final cura o texto visível com final_response.
+            await _mirror_conversation(CONVERSATION_HUB, "delta", data)
             yield _sse("delta", data)
             if tts_streamer is not None:
                 tts_streamer.feed(data)
@@ -2668,6 +2993,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 for payload in tts_streamer.drain():
                     yield _audio_frames(payload)
         elif name == "tool_call":
+            await _mirror_conversation(CONVERSATION_HUB, "tool_call", data)
             yield _sse("tool_call", data)
             # Turno terminou em tool call: zera o streamer — o preâmbulo
             # falado até aqui toca (já emitido), o resto é descartado; a
@@ -2675,10 +3001,13 @@ async def _execute_stream_generator(req: ExecuteRequest):
             if tts_streamer is not None:
                 tts_streamer.reset()
         elif name == "tool_result":
+            await _mirror_conversation(CONVERSATION_HUB, "step_done", data)
             yield _sse("step_done", data)
             res = data.get("result")
             if data.get("success") and res:
-                yield _sse("result", _result_to_text(res))
+                result_text = _result_to_text(res)
+                await _mirror_conversation(CONVERSATION_HUB, "result", result_text)
+                yield _sse("result", result_text)
 
     await task
 
@@ -2697,6 +3026,7 @@ async def _execute_stream_generator(req: ExecuteRequest):
             tts_streamer.dispatch(final_chunk)
         for payload in await tts_streamer.wait_pending():
             yield _audio_frames(payload)
+        await _mirror_conversation(CONVERSATION_HUB, "audio_end", {})
         yield _sse("audio_end", {})
     elif req.tts and req.tts_output == "device" and final_response:
         # Modo device (opt-in): TTS toca dentro do container.
@@ -2714,6 +3044,11 @@ async def _execute_stream_generator(req: ExecuteRequest):
     if error_msg:
         errors.append(error_msg)
 
+    await _mirror_conversation(CONVERSATION_HUB, "done", {
+        "execution_id": eid, "final_response": final_response,
+        "steps": [s.model_dump() for s in step_results],
+        "total_latency_ms": lat, "errors": errors,
+    })
     yield _sse("done", {
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
@@ -2834,9 +3169,57 @@ async def _alpha_code_stream_generator(req: AlphaCodeRequest):
 # FastAPI Application Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:  # fallback para execução fora do diretório raiz
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA Orchestrator", version="4.0.0",
               description="Tool-Calling Execution Engine (sem router MiniLM, sem CoT/DAG)",
               lifespan=lifespan)
+
+install_internal_auth(app, service_name="orchestrator")
+
+
+# ── Conversation Hub: SSE + catch-up (espelho dos turnos voice/chat) ────────
+
+@app.get("/conversation/stream")
+async def conversation_stream():
+    """SSE ao vivo de todos os eventos dos turnos voice/chat."""
+    q = await CONVERSATION_HUB.subscribe()
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    entry = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"id: {entry['id']}\nevent: {entry['event']}\ndata: {_sse_data(entry['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # mantém a conexão viva
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await CONVERSATION_HUB.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/conversation/recent")
+async def conversation_recent(after_id: int = 0):
+    """Catch-up: eventos com id > after_id (para reconexão do Manager)."""
+    entries = await CONVERSATION_HUB.recent(after_id)
+    return {"events": entries}
+
+
+def _sse_data(data: Any) -> str:
+    """Serializa o payload do evento para o formato SSE (uma linha)."""
+    import json
+    return json.dumps(data, ensure_ascii=False, default=str)
+
 
 @app.post("/execute")
 async def execute(req: ExecuteRequest):
@@ -2900,6 +3283,110 @@ async def deep_search(req: DeepSearchRequest):
     except Exception as e:
         raise HTTPException(502, f"Deep Search falhou: {e}")
 
+
+@app.post("/voice/ingest")
+async def voice_ingest(req: VoiceContextRequest):
+    """Recebe o speaker embedding do main.cpp (disparado no endpoint do VAD)
+    e pré-busca a memória de voz (kNN em /voice-dict/read) para injeção no
+    próximo /execute da sessão. Latência crítica: esta chamada roda FORA do
+    caminho do turno — o /execute só consome o cache, custo 0ms."""
+    return await _ingest_voice_context(req.session_id, req.embedding)
+
+
+async def _transcribe_embed(pcm: bytes, sample_rate: int = 16000) -> Optional[list[float]]:
+    """POST /speaker/embed no módulo transcribe (HOST, rota A do plano) —
+    fbank + CAM++ sobre PCM s16le mono. Devolve o embedding (192 dims) ou
+    None quando o módulo está offline/falhou — o chamador vira isso em
+    HTTPException clara (nunca bloqueia nada além do cadastro em si)."""
+    try:
+        r = await state.transcribe_client.post(
+            "/speaker/embed",
+            content=pcm,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Sample-Rate": str(sample_rate),
+            },
+            timeout=30.0,
+        )
+    except Exception as e:
+        log.warning(f"transcribe /speaker/embed offline: {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        detail = ""
+        try:
+            detail = r.json().get("error", "")
+        except Exception:
+            pass
+        log.warning(f"transcribe /speaker/embed HTTP {r.status_code}: {detail}")
+        return None
+    try:
+        emb = r.json().get("embedding")
+    except Exception as e:
+        log.warning(f"transcribe /speaker/embed resposta inválida: {e}")
+        return None
+    return emb if isinstance(emb, list) and emb else None
+
+
+@app.post("/voice/register")
+async def voice_register(req: VoiceRegisterRequest):
+    """Cadastro de locutor via /settings (TUI).
+
+    1. Recebe o áudio cru (PCM s16le mono, microfone do HOST) em audio_b64
+       OU um embedding pronto (para reuso por outros clientes).
+    2. Sem embedding: gera on-demand via transcribe (/speaker/embed — rota A).
+    3. Persiste via /voice-dict/write na memory — a descrição replica para a
+       memória de longo prazo lá (source="voice_dict", nó no grafo Hebbiano).
+    """
+    person_name = req.person_name.strip()
+    if not person_name:
+        raise HTTPException(400, "person_name vazio")
+
+    embedding = req.embedding
+    if embedding is None:
+        if not req.audio_b64:
+            raise HTTPException(400, "envie embedding (192 dims) ou audio_b64 (PCM s16le mono)")
+        try:
+            pcm = base64.b64decode(req.audio_b64, validate=True)
+        except Exception as e:
+            raise HTTPException(400, f"audio_b64 inválido: {e}")
+
+        # ~2 bytes/amostra: teto de 3min e piso de ~0.5s de fala (abaixo disso
+        # o CAM++ não produz embedding confiável — o transcribe rejeitaria).
+        min_bytes = int(req.sample_rate * 2 * 0.5)
+        max_bytes = int(req.sample_rate * 2 * 180)
+        if len(pcm) < min_bytes:
+            raise HTTPException(400, f"áudio muito curto ({len(pcm) / (req.sample_rate * 2):.1f}s) — grave ao menos ~0.5s de fala")
+        if len(pcm) > max_bytes:
+            raise HTTPException(400, f"áudio longo demais ({len(pcm) / (req.sample_rate * 2):.1f}s) — teto de 180s")
+
+        embedding = await _transcribe_embed(pcm, req.sample_rate)
+        if embedding is None:
+            raise HTTPException(
+                502,
+                "transcribe (CAM++ /speaker/embed) indisponível ou falhou — "
+                "verifique se o módulo transcribe (main.cpp) está rodando no host",
+            )
+
+    if len(embedding) != 192:
+        raise HTTPException(400, f"embedding deve ter 192 dims (VO_EMBED_DIM), recebido {len(embedding)}")
+
+    try:
+        return await _memory_request("POST", "/voice-dict/write", {
+            "person_name": person_name,
+            "embedding": embedding,
+            "description": req.description.strip(),
+            "source": req.source,
+            "confidence": req.confidence,
+        })
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("error", str(e))
+        except Exception:
+            detail = str(e)
+        raise HTTPException(502, f"voice-dict/write falhou: {detail}")
+    except Exception as e:
+        raise HTTPException(502, f"Memory falhou: {e}")
+
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):
     try:
@@ -2938,30 +3425,40 @@ async def memory_write_batch(reqs: list[MemoryWriteRequest]):
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/search")
-async def search(query: str, max_results: int = 5, search_pdfs: bool = False, topic: str = "general"):
+async def search(req: SearchRequest):
+    # T6 — SSRF guard: valida quaisquer URLs embutidas na query (o serviço de
+    # busca pode extrair/seguir URLs do texto da busca).
     try:
+        for m in re.finditer(r'https?://[^\s"\'<>]+', req.query):
+            _assert_public_url(m.group(0))
         r = await state.search_client.post("/search", json={
-            "query": query, "max_results": max_results, "use_cache": True,
-            "search_pdfs": search_pdfs, "topic": topic if topic in ("general", "news") else "general",
+            "query": req.query, "max_results": req.max_results, "use_cache": True,
+            "search_pdfs": req.search_pdfs, "topic": req.topic if req.topic in ("general", "news") else "general",
         })
         r.raise_for_status()
         return r.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Search falhou: {e}")
 
 @app.post("/read-url")
-async def read_url(url: str):
+async def read_url(req: ReadUrlRequest):
+    # T6 — SSRF guard: recusa URLs que resolvem para loopback/private/link-local
+    _assert_public_url(req.url)
     try:
-        r = await state.search_client.post("/extract", json={"urls": [url], "extract_depth": "basic"})
+        r = await state.search_client.post("/extract", json={"urls": [req.url], "extract_depth": "basic"})
         r.raise_for_status()
         return r.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Extract falhou: {e}")
 
 @app.post("/chat")
-async def chat(message: str, voice: str = "M1", lang: str = "pt", tts: bool = True):
+async def chat(req: ChatRequest):
     try:
-        r = await state.llm_client.post("/chat", json={"message": message, "voice": voice, "lang": lang, "max_turns": 10, "tts": tts})
+        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -3041,4 +3538,4 @@ async def list_voices():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=9000, log_level="info")
+    uvicorn.run("orchestrator:app", host=internal_bind_host(), port=9000, log_level="info")

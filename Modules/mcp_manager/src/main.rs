@@ -6,8 +6,10 @@
 //!
 //! ÚNICA adição em relação ao Python: a inicialização dos servidores MCP
 //! stdio (spawn) é compatível com Linux E Windows — ver `build_stdio_command`
-//! (resolução de `npx` → `npx.cmd` no Windows, ambiente herdado por
-//! plataforma, sem janela de console no Windows, grupo de processos no Unix).
+//! (resolução automática de `npx`/`node`/etc. pelo PATH E pelas instalações
+//! bem-conhecidas do usuário — nvm/volta/fnm/npm-global — em ambas as
+//! plataformas, ambiente herdado por plataforma, sem janela de console no
+//! Windows, grupo de processos no Unix).
 //!
 //! Rotas:
 //!   GET    /health
@@ -36,9 +38,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use axum::extract::DefaultBodyLimit;
 use indexmap::IndexMap;
 use regex::Regex;
 use rmcp::model::{CallToolRequestParam, RawContent};
@@ -242,6 +246,50 @@ impl Transport {
 fn d_true() -> bool {
     true
 }
+
+/// Allowlist de executáveis permitidos para servidores MCP stdio (Plano 1 — T5).
+/// Impede registro de `bash`, `sh`, `pwsh`, `cmd`, etc. (RCE via /servers).
+fn is_command_allowed(command: &str) -> bool {
+    const ALLOWED: &[&str] = &["npx", "uvx", "python3", "node", "python", "uv"];
+    let cmd = command.trim().to_lowercase();
+    // Windows: npx.cmd / npx.exe, etc.
+    let base = std::path::Path::new(&cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd)
+        .to_lowercase();
+    let stem = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".cmd"))
+        .or_else(|| base.strip_suffix(".bat"))
+        .unwrap_or(&base);
+    ALLOWED.iter().any(|a| *a == stem)
+}
+
+/// Bloqueia args que tentam executar shell/subprocess (Plano 1 — T5).
+/// NÃO inclui metacaracteres (`|`, `&&`, `${`): o spawn usa Command::new
+/// sem shell, então esses são literais. O vetor real é passar `sh -c` etc.
+/// para um wrapper que re-executa (npx/uvx aceitam `-c`).
+fn args_look_malicious(args: &[String]) -> bool {
+    const BAD_PATTERNS: &[&str] = &[
+        "sh -c",
+        "bash -c",
+        "bash -lc",
+        "sh -lc",
+        "cmd /c",
+        "cmd.exe /c",
+        "powershell -c",
+        "pwsh -c",
+        "/bin/sh",
+        "/bin/bash",
+        "eval(",
+    ];
+    args.iter().any(|a| {
+        let low = a.to_lowercase();
+        BAD_PATTERNS.iter().any(|p| low.contains(p))
+    })
+}
+
 fn d_stdio() -> Transport {
     Transport::Stdio
 }
@@ -327,6 +375,10 @@ struct ServerInstallRequest {
     always_on: bool,
     #[serde(default)]
     examples: IndexMap<String, Vec<String>>,
+    // Plano 1 — T5: token de admin (o mesmo AVA_INTERNAL_TOKEN) para instalar
+    // servidores npm — evita que qualquer cliente LAN instale pacotes arbitrários.
+    #[serde(default)]
+    admin_token: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -891,6 +943,11 @@ fn resolve_cdp_endpoint(args: &[String]) -> Vec<String> {
 //     (+ o `env` do servidor por cima) — o filho NÃO herda o ambiente inteiro.
 //   • Windows: `npx` é um shim `.cmd` — resolvido via PATH/PATHEXT (CreateProcess
 //     não o acha pelo nome puro); sem janela de console.
+//   • `npx`/`node` fora do PATH (manager iniciado pelo desktop/tray, sem shell —
+//     nvm/volta/fnm/npm-global não aparecem no PATH herdado): resolução
+//     automática varrendo instalações bem-conhecidas por plataforma, e o
+//     diretório do binário resolvido é injetado à frente do PATH herdado pelo
+//     filho (processos neto também acham o runtime).
 //   • Unix: o filho vira líder de grupo de processos, para o encerramento
 //     derrubar a árvore toda (npx → node), não só o wrapper.
 
@@ -927,16 +984,238 @@ fn default_environment() -> IndexMap<String, String> {
     env
 }
 
-#[cfg(windows)]
+// ── Resolução automática de executáveis (npx/node/uvx/…) ────────────────────
+//
+// O usuário registra servidores com `command: "npx"` — sem caminho absoluto.
+// O manager pode rodar iniciado pelo desktop/tray, fora de um shell, onde o
+// PATH nem sempre contém nvm/volta/fnm/npm-global. A resolução tenta, nesta
+// ordem:
+//   1. caminho explícito (contém separador `/` ou `\`) → usado como está;
+//   2. PATH do processo via `which` (Windows respeita PATHEXT → acha npx.cmd);
+//   3. fallback: varredura de instalações bem-conhecidas POR PLATAFORMA
+//      (nvm, volta, fnm, asdf, npm global, nodejs oficial, scoop,
+//      chocolatey…), da versão mais nova para a mais velha.
+// O resultado é cacheado por nome de comando (a varredura roda 1× por
+// processo) e o diretório do binário resolvido é injetado à frente do PATH
+// herdado pelo filho — ver `build_stdio_command`.
+
+static RESOLVED_EXECUTABLES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn resolve_executable(command: &str) -> String {
-    which::which(command)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| command.to_string())
+    // Caminho explícito (absoluto ou relativo) não precisa de resolução.
+    if command.contains('/') || command.contains('\\') {
+        return command.to_string();
+    }
+    if let Ok(cache) = RESOLVED_EXECUTABLES.lock() {
+        if let Some(hit) = cache.get(command) {
+            return hit.clone();
+        }
+    }
+    let resolved = resolve_executable_uncached(command);
+    if let Ok(mut cache) = RESOLVED_EXECUTABLES.lock() {
+        cache.insert(command.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+fn resolve_executable_uncached(command: &str) -> String {
+    // 1) PATH do processo (via crate `which`, válido nas duas plataformas).
+    if let Ok(p) = which::which(command) {
+        return p.to_string_lossy().into_owned();
+    }
+    // 2) Instalações bem-conhecidas (o PATH do processo não cobriu — caso
+    //    comum quando o manager é iniciado pelo desktop/tray, sem shell).
+    for dir in well_known_command_dirs() {
+        for candidate in command_suffixes(command) {
+            let p = dir.join(&candidate);
+            if is_executable_file(&p) {
+                info!(
+                    "MCP spawn: '{command}' não está no PATH — resolvido via instalação conhecida: {}",
+                    p.display()
+                );
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // 3) Não achou em lugar nenhum — devolve o nome puro e deixa o erro de
+    //    spawn acontece com a mensagem nativa (comportamento anterior).
+    command.to_string()
+}
+
+/// Sufixos tentados na varredura de fallback. Windows: `npx` vive como shim
+/// `.cmd` (e ferramentas podem ser `.exe`/`.bat`); Unix: nome exato.
+#[cfg(windows)]
+fn command_suffixes(command: &str) -> Vec<String> {
+    vec![
+        command.to_string(),
+        format!("{command}.cmd"),
+        format!("{command}.exe"),
+        format!("{command}.bat"),
+    ]
 }
 
 #[cfg(not(windows))]
-fn resolve_executable(command: &str) -> String {
-    command.to_string()
+fn command_suffixes(command: &str) -> Vec<String> {
+    vec![command.to_string()]
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    match std::fs::metadata(p) {
+        Ok(md) if md.is_file() => {
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(windows)]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Diretórios onde os gerenciadores de Node/npx comuns instalam os binários —
+/// usados quando o comando não está no PATH do processo.
+fn well_known_command_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let env_dir = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    let home = env_dir("HOME").or_else(|| env_dir("USERPROFILE"));
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env_dir("APPDATA") {
+            dirs.push(appdata.join("npm")); // npm global: npx.cmd vive aqui
+            dirs.push(appdata.join("nvm")); // nvm-windows: versão ativa
+            push_version_dirs(&mut dirs, &appdata.join("nvm"), ""); // todas as versões
+        }
+        if let Some(d) = env_dir("NVM_HOME") {
+            dirs.push(d.clone());
+            push_version_dirs(&mut dirs, &d, "");
+        }
+        if let Some(d) = env_dir("NVM_SYMLINK") {
+            dirs.push(d);
+        }
+        if let Some(local) = env_dir("LOCALAPPDATA") {
+            push_version_dirs(
+                &mut dirs,
+                &local.join("fnm").join("node-versions"),
+                "installation",
+            );
+            dirs.push(local.join("Volta").join("bin")); // shims volta
+            push_version_dirs(
+                &mut dirs,
+                &local
+                    .join("Volta")
+                    .join("tools")
+                    .join("image")
+                    .join("node"),
+                "",
+            );
+        }
+        if let Some(d) = env_dir("ProgramFiles") {
+            dirs.push(d.join("nodejs"));
+        }
+        if let Some(d) = env_dir("ProgramFiles(x86)") {
+            dirs.push(d.join("nodejs"));
+        }
+        if let Some(home) = &home {
+            dirs.push(home.join("scoop").join("apps").join("nodejs").join("current"));
+            dirs.push(home.join("scoop").join("shims"));
+        }
+        if let Some(d) = env_dir("ProgramData") {
+            dirs.push(d.join("chocolatey").join("bin"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = &home {
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".nvm").join("versions").join("node"),
+                "bin",
+            );
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".local").join("share").join("fnm").join("node-versions"),
+                "installation/bin",
+            );
+            push_version_dirs(
+                &mut dirs,
+                &home.join(".fnm").join("node-versions"),
+                "installation/bin",
+            );
+            dirs.push(home.join(".volta").join("bin"));
+            dirs.push(home.join(".asdf").join("shims"));
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join("bin"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push(PathBuf::from("/opt/homebrew/bin"));
+            dirs.push(PathBuf::from("/usr/local/opt/node/bin"));
+        }
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/opt/node/bin"));
+        dirs.push(PathBuf::from("/opt/nodejs/bin"));
+    }
+
+    dirs
+}
+
+/// Para gerenciadores de versão (nvm/fnm/volta): empurra `base/<versão>[/<sub>]`
+/// para cada subdiretório de `base` cujo nome começa com `v` ou dígito, da
+/// versão mais nova para a mais velha.
+fn push_version_dirs(out: &mut Vec<PathBuf>, base: &std::path::Path, sub: &str) {
+    let Ok(rd) = std::fs::read_dir(base) else { return };
+    let mut versions: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| {
+                        n.starts_with('v') || n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    versions.sort_by(|a, b| {
+        let ka = a.file_name().map(version_key).unwrap_or_default();
+        let kb = b.file_name().map(version_key).unwrap_or_default();
+        kb.cmp(&ka) // mais nova primeiro
+    });
+    for v in versions {
+        let mut d = v;
+        if !sub.is_empty() {
+            d.push(sub);
+        }
+        out.push(d);
+    }
+}
+
+/// Chave de ordenação de versão ("v22.11.0" → [22, 11, 0]) para ordenar as
+/// instalações dos gerenciadores de versão da mais nova para a mais velha.
+fn version_key(name: &std::ffi::OsStr) -> Vec<u64> {
+    name.to_string_lossy()
+        .trim_start_matches('v')
+        .split(['.', '-'])
+        .map(|seg| {
+            seg.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn build_stdio_command(
@@ -944,12 +1223,37 @@ fn build_stdio_command(
     args: &[String],
     env: &IndexMap<String, String>,
 ) -> process_wrap::tokio::TokioCommandWrap {
-    let mut cmd = tokio::process::Command::new(resolve_executable(command));
+    let resolved = resolve_executable(command);
+    let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args);
     // env = {**default_environment(), **server.env}
     let mut merged = default_environment();
     for (k, v) in env {
         merged.insert(k.clone(), v.clone());
+    }
+    // Se o executável foi resolvido (fora do PATH), injeta o diretório dele à
+    // frente do PATH herdado — processos neto (npx → node → binários do
+    // pacote) precisam achar o runtime também, mesmo sem shell de origem.
+    if (resolved.contains('/') || resolved.contains('\\')) && resolved != command {
+        if let Some(bin_dir) = std::path::Path::new(&resolved).parent() {
+            let bin_dir = bin_dir.to_path_buf();
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            let already = merged
+                .get("PATH")
+                .map(|existing| {
+                    existing
+                        .split(sep)
+                        .any(|p| std::path::Path::new(p.trim_matches('"')) == bin_dir)
+                })
+                .unwrap_or(false);
+            if !already {
+                let new_val = match merged.get("PATH") {
+                    Some(existing) => format!("{}{}{}", bin_dir.to_string_lossy(), sep, existing),
+                    None => bin_dir.to_string_lossy().into_owned(),
+                };
+                merged.insert("PATH".to_string(), new_val);
+            }
+        }
     }
     cmd.env_clear();
     cmd.envs(merged.iter());
@@ -1277,8 +1581,29 @@ async fn register_server(
             "Nome de servidor inválido: use [A-Za-z0-9_-], sem '__' (é o separador do graph_name das tools)",
         ));
     }
-    if req.transport == Transport::Stdio && req.command.as_deref().unwrap_or("").trim().is_empty() {
-        return Err(http_err(400, "transport='stdio' exige 'command'"));
+    if req.transport == Transport::Stdio {
+        let cmd = req.command.as_deref().unwrap_or("").trim().to_string();
+        if cmd.is_empty() {
+            return Err(http_err(400, "transport='stdio' exige 'command'"));
+        }
+        // Plano 1 — T5: restringe command a allowlist e bloqueia args de shell.
+        if !is_command_allowed(&cmd) {
+            return Err(http_err(
+                422,
+                "command fora da allowlist — executáveis permitidos: npx, uvx, python3, node, python, uv",
+            ));
+        }
+        if args_look_malicious(&req.args) {
+            return Err(http_err(
+                422,
+                "args contêm padrões de execução de shell (sh -c / bash -c / powershell) — bloqueado",
+            ));
+        }
+        for (k, _) in req.env.iter() {
+            if k.eq_ignore_ascii_case("PATH") || k.eq_ignore_ascii_case("LD_PRELOAD") {
+                return Err(http_err(422, "env não pode sobrescrever PATH/LD_PRELOAD"));
+            }
+        }
     }
     if req.transport == Transport::Http {
         let u = req.url.as_deref().unwrap_or("").trim();
@@ -1656,6 +1981,19 @@ async fn install_server(
     State(st): State<Arc<AppState>>,
     ApiJson(req): ApiJson<ServerInstallRequest>,
 ) -> ApiResult {
+    // Plano 1 — T5: instalação exige token de admin (o mesmo AVA_INTERNAL_TOKEN)
+    // quando configurado — evita que qualquer cliente na LAN instale pacotes npm.
+    if let Ok(required) = std::env::var("AVA_INTERNAL_TOKEN") {
+        let required = required.trim().to_string();
+        if !required.is_empty() {
+            let supplied = req.admin_token.as_deref().unwrap_or("").trim();
+            let equal = supplied.len() == required.len()
+                && supplied.bytes().zip(required.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+            if !equal {
+                return Err(http_err(401, "Token de admin (AVA_INTERNAL_TOKEN) inválido ou ausente para /servers/install"));
+            }
+        }
+    }
     let spec = req.package.trim().to_string();
     if spec.is_empty() || spec.contains(' ') || spec.starts_with('-') {
         return Err(http_err(
@@ -1832,7 +2170,22 @@ async fn skills_select(
         "include_related": true,
     });
     let sel = st.mem_post_json("/tools/select", &body, 45.0).await.map_err(|e| {
-        http_err(502, format!("Seleção no grafo de tools falhou (memory_api offline?): {e}"))
+        // Mensagem diferenciada por tipo de falha: 401 é problema de AUTH
+        // (token ausente/errado no mcp_manager), não "API offline".
+        match &e {
+            MemErr::Status { code, .. } if *code == 401 => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou: memory_api rejeitou a auth (401) — verifique AVA_INTERNAL_TOKEN no mcp_manager."),
+            ),
+            MemErr::Status { code, .. } => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou: memory_api retornou HTTP {code}."),
+            ),
+            MemErr::Other { .. } => http_err(
+                502,
+                format!("Seleção no grafo de tools falhou (memory_api offline?): {e}"),
+            ),
+        }
     })?;
 
     let matches: Vec<Value> = sel
@@ -1984,6 +2337,62 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/skills", get(skills))
         .route("/skills/select", post(skills_select))
         .with_state(state)
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .layer(DefaultBodyLimit::max(2_000_000))
+}
+
+/// Middleware de auth interna (Plano 1 — T3/T5).
+/// Exige `Authorization: Bearer <AVA_INTERNAL_TOKEN>` em todas as rotas
+/// exceto `/health` e `/status` (healthchecks do compose dependem).
+/// Fail-open quando AVA_INTERNAL_TOKEN ausente, a menos que AVA_REQUIRE_AUTH=1.
+async fn auth_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Isentar healthcheck e docs
+    if path == "/health"
+        || path == "/status"
+        || path == "/docs"
+        || path == "/openapi.json"
+        || path.starts_with("/docs/")
+    {
+        return next.run(req).await;
+    }
+
+    let token = std::env::var("AVA_INTERNAL_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        // Token ausente
+        if std::env::var("AVA_REQUIRE_AUTH").map(|v| v.trim() == "1").unwrap_or(false) {
+            // Fail-closed
+            let body = Json(serde_json::json!({ "detail": "Internal service requires AVA_INTERNAL_TOKEN" }));
+            return (StatusCode::UNAUTHORIZED, body).into_response();
+        }
+        // Fail-open: sem token => sem exigência (modo legado)
+        return next.run(req).await;
+    };
+
+    let auth = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(supplied) = auth.strip_prefix("Bearer ") {
+        // comparação em tempo constante para evitar timing attack
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Não vamos fazer fancy crypto aqui; comparação de strings com
+        // len igual é suficiente para o caso de uso (token de 32 bytes).
+        if supplied.len() == token.len()
+            && supplied
+                .bytes()
+                .zip(token.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+        {
+            return next.run(req).await;
+        }
+    }
+
+    let body = Json(serde_json::json!({ "detail": "Invalid or missing Bearer token" }));
+    (StatusCode::UNAUTHORIZED, body).into_response()
 }
 
 async fn shutdown_signal() {
@@ -2031,10 +2440,27 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let memory = reqwest::Client::builder()
+    // ── Auth interna (Plano 1): o cliente HTTP de memória carrega o
+    // AVA_INTERNAL_TOKEN como header padrão — sem isso TODA chamada ao
+    // memory_api (/tools/select, /write/batch, ...) volta 401 e o seletor
+    // de skills cai no fallback que libera todos os servidores.
+    let mut memory_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs_f64(REGISTER_TIMEOUT))
-        .pool_max_idle_per_host(2)
+        .pool_max_idle_per_host(2);
+    match std::env::var("AVA_INTERNAL_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(token) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("header Authorization inválido"),
+            );
+            memory_builder = memory_builder.default_headers(headers);
+        }
+        None => warn!("AVA_INTERNAL_TOKEN ausente no mcp_manager — chamadas ao memory_api vão 401 (fail-open do memory_api aceita sem token só em modo legado)."),
+    }
+    let memory = memory_builder
         .build()
         .expect("falha ao criar cliente HTTP");
     let port = cfg.port;
@@ -2077,14 +2503,19 @@ async fn main() {
         py_list(&names)
     );
 
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+    let bind_host = std::env::var("AVA_BIND_HOST")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let listener = match tokio::net::TcpListener::bind((bind_host.as_str(), port)).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Falha ao abrir 0.0.0.0:{port}: {e}");
+            tracing::error!("Falha ao abrir {bind_host}:{port}: {e}");
             std::process::exit(1);
         }
     };
-    info!("Escutando em http://0.0.0.0:{port}");
+    info!("Escutando em http://{bind_host}:{port}");
     if let Err(e) = axum::serve(listener, app(st.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await
