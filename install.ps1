@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-# install.sh — Instalador Alpha AI (Linux)
+# install.ps1 - Instalador Alpha AI (Windows)
 #
 # Espelha o fluxo do install.sh:
 #   1. Valida prereqs (Docker + compose v2)
@@ -14,203 +13,118 @@
 #   7. Adiciona tui\ ao PATH do usuario (comando `alpha-ai`)
 #   8. Auto-start do ava-tray.exe via HKCU\...\Run (+ inicia agora)
 #   9. Inicia a TUI
-
 #
-# Reinstalação é idempotente: sobrescreve arquivos, preserva Modules/.env com
-# chave válida e `up -d` não derruba containers já sadios.
+# Uso: powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 [-InstallDir DIR] [-SkipBuild] [-NoLaunch]
 
-set -euo pipefail
+param(
+  [string]$InstallDir = $env:ALPHA_INSTALL_DIR,
+  [switch]$KeepModelsZip,
+  [switch]$SkipBuild,
+  [switch]$NoLaunch
+)
 
-REPO="Lumazini-Code/alpha-virtual-assistant"
-DEFAULT_INSTALL_DIR="$HOME/.local/opt/alpha-ai"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest ~10x mais rapido
 
-# ── Re-execução a partir de cópia em /tmp ─────────────────────────────────────
-# O unzip abaixo sobrescreve install.sh no diretório de destino; se o usuário
-# rodou o script a partir de lá, o bash leria um arquivo mudando sob os pés.
-# Copiamos o script para /tmp e re-executamos antes de qualquer coisa.
-if [ -z "${_ALPHA_INSTALL_REEXEC:-}" ]; then
-  _SELF_TMP="$(mktemp -t alpha-install-XXXXXX.sh)"
-  cp -- "$0" "$_SELF_TMP"
-  chmod +x "$_SELF_TMP"
-  # export: o processo re-executado precisa herdá-la (o trap do EXIT a usa)
-  _SELF_TMP="$_SELF_TMP" _ALPHA_INSTALL_REEXEC=1 export _SELF_TMP _ALPHA_INSTALL_REEXEC
-  exec bash "$_SELF_TMP" "$@"
-fi
+$Repo = 'Lumazini-Code/alpha-virtual-assistant'
+if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\AlphaAI' }
 
-# ── Flags ─────────────────────────────────────────────────────────────────────
-KEEP_MODELS_ZIP=0
-SKIP_BUILD=0
-NO_LAUNCH=0
-INSTALL_DIR="${ALPHA_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
-
-usage() {
-  cat <<EOF
-Uso: install.sh [opções]
-
-  --install-dir DIR   Pasta de instalação (padrão: $DEFAULT_INSTALL_DIR)
-  --keep-models-zip   Não apaga Modules/Models.zip após extrair
-  --skip-build        Pula o build/up do Docker (útil para reinstalar)
-  --no-launch         Não abre a TUI ao final
-  -h, --help          Esta ajuda
-EOF
-  exit 0
+function Write-Info { param($m) Write-Host "[INFO] $m" }
+function Write-Ok   { param($m) Write-Host "[ OK ] $m" }
+function Write-Warn2 { param($m) Write-Host "[AVISO] $m" -ForegroundColor Yellow }
+function Die {
+  param($m)
+  Write-Host "[ERRO] $m" -ForegroundColor Red
+  Read-Host 'Pressione Enter para sair'
+  exit 1
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --install-dir)   INSTALL_DIR="$2"; shift 2 ;;
-    --keep-models-zip) KEEP_MODELS_ZIP=1; shift ;;
-    --skip-build)    SKIP_BUILD=1; shift ;;
-    --no-launch)     NO_LAUNCH=1; shift ;;
-    -h|--help)       usage ;;
-    *) echo "Opção desconhecida: $1"; usage ;;
-  esac
-done
+# -- 1. Prereqs ----------------------------------------------------------------
+Write-Info 'Validando pre-requisitos...'
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-info()  { printf '[INFO] %s\n' "$*"; }
-ok()    { printf '[ OK ] %s\n' "$*"; }
-warn()  { printf '[AVISO] %s\n' "$*"; }
-die()   { printf '[ERRO] %s\n' "$*" >&2; exit 1; }
-
-# ── 1. Prereqs ────────────────────────────────────────────────────────────────
-info "Validando pré-requisitos..."
-
-[ "$(uname -m)" = "x86_64" ] || die "Arquitetura $(uname -m) não suportada (binários são x86_64)."
-
-for cmd in curl unzip docker; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' não encontrado. Instale-o e rode novamente."
-done
-
-if ! docker compose version >/dev/null 2>&1; then
-  die "Plugin 'docker compose' (v2) ausente.
-       Instale com: sudo apt install docker-compose-plugin
-       (ou https://docs.docker.com/engine/install/ubuntu/#install-the-plugin-manually)"
-fi
-
-if ! docker info >/dev/null 2>&1; then
-  die "Docker indisponível (daemon parado ou sem permissão).
-       - Daemon parado:      sudo systemctl start docker
-       - Permissão:          sudo usermod -aG docker \$USER  (depois: newgrp docker ou relogin)"
-fi
-
-ok "Pré-requisitos validados."
-
-# ── 2. Download do último release ─────────────────────────────────────────────
-TMP_DIR="$(mktemp -d -t alpha-install-XXXXXX)"
-trap 'rm -rf "$TMP_DIR" "$_SELF_TMP"' EXIT
-
-info "Consultando último release de https://github.com/$REPO..."
-
-API_URL="https://api.github.com/repos/$REPO/releases/latest"
-RELEASE_JSON="$(curl -fsSL --max-time 30 "$API_URL" 2>/dev/null)" || \
-  die "Falha ao consultar a API do GitHub (sem releases publicados? sem internet?)"
-
-TAG="$(printf '%s' "$RELEASE_JSON" | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)" || true
-[ -n "$TAG" ] || die "Não encontrei tag_name no payload do release."
-
-ASSET_URL="$(printf '%s' "$RELEASE_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -i 'linux' | grep -i '\.zip$' | head -1)" || true
-[ -n "$ASSET_URL" ] || die "Release $TAG não tem asset *linux*.zip. Verifique: https://github.com/$REPO/releases"
-
-info "Release $TAG — baixando $(basename "$ASSET_URL")..."
-
-curl -fL --connect-timeout 15 --progress-bar -o "$TMP_DIR/alpha-ai.zip" "$ASSET_URL" || \
-  die "Download falhou. Verifique a conexão e tente de novo."
-
-ok "Download concluído."
-
-# ── 3. Extração ───────────────────────────────────────────────────────────────
-info "Extraindo em $INSTALL_DIR ..."
-mkdir -p "$INSTALL_DIR"
-unzip -oq "$TMP_DIR/alpha-ai.zip" -d "$INSTALL_DIR"
-
-[ -f "$INSTALL_DIR/Modules/Models.zip" ] || \
-  die "Modules/Models.zip não veio no zip do release — asset incompatível com esta versão do instalador."
-
-cd "$INSTALL_DIR"
-
-chmod +x tui/alpha-ai Manager/ava-tray docker-start.sh 2>/dev/null || true
-ok "Arquivos extraídos."
-
-# ── 4. Modelos ────────────────────────────────────────────────────────────────
-info "Extraindo Models.zip (~1,4 GB) para Modules/Models ..."
-unzip -oq Modules/Models.zip -d Modules/Models && \
-  ok "Modelos extraídos."
-
-if [ "$KEEP_MODELS_ZIP" -eq 0 ]; then
-  rm -f Modules/Models.zip
-  ok "Modules/Models.zip removido (economia de ~450 MB)."
-fi
-
-# ── 4b. Verificação de modelos ───────────────────────────────────────────────
-# Modelo truncado (download/extracão interrompida) deixa o onnxManager fora
-# do ar (INVALID_PROTOBUF). O verify confere tamanho mínimo e re-baixa o que
-# estiver corrompido. Best-effort: sem python no host, a validação acontece
-# dentro do container no boot (exit 78 + instrução no log).
-VERIFY="scripts/verify_models.py"
-if [ -f "$VERIFY" ] && command -v python3 >/dev/null 2>&1; then
-  info "Verificando integridade dos modelos (verify_models)..."
-  if python3 "$VERIFY" --quiet; then
-    ok "Modelos íntegros."
-  else
-    warn "Modelo inválido detectado — tentando re-download..."
-    if python3 "$VERIFY" --download; then
-      ok "Modelos reparados."
-    else
-      warn "Não foi possível reparar os modelos automaticamente — o boot do container vai indicar o arquivo exato."
-    fi
-  fi
-else
-  warn "python3/scripts indisponíveis no host — verificação de modelos será feita dentro do container no boot."
-fi
-
-# ── 5. API key (antes do up: LLM.py lê no import) ─────────────────────────────
-ENV_FILE="Modules/.env"
-
-# Lê o último valor de uma variável do .env (vazio se ausente)
-get_env_var() {
-  [ -f "$ENV_FILE" ] || return 0
-  grep -E "^${1}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+  Die "Docker nao encontrado. Instale o Docker Desktop (com WSL2) e rode novamente."
+}
+try { docker compose version | Out-Null } catch {
+  Die "Plugin 'docker compose' ausente - atualize o Docker Desktop."
+}
+# EAP=Stop + stderr de comando nativo redirecionado dispara NativeCommandError
+# (derruba o script exatamente quando o daemon esta desligado) - relaxa aqui.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+docker info *> $null
+$dockerOk = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEAP
+if (-not $dockerOk) {
+  Die "Docker indisponivel. Inicie o Docker Desktop e aguarde ele ficar 'running'."
 }
 
-# Define/substitui uma variável no .env sem duplicar nem apagar as demais
-set_env_var() {
-  local k="$1" v="$2" tmp
-  tmp="$(mktemp)"
-  { [ -f "$ENV_FILE" ] && grep -vE "^${k}=" "$ENV_FILE"; } > "$tmp" || true
-  printf '%s=%s\n' "$k" "$v" >> "$tmp"
-  cat "$tmp" > "$ENV_FILE"
-  rm -f "$tmp"
-  chmod 600 "$ENV_FILE"
+Write-Ok 'Pre-requisitos validados.'
+
+# -- 2. Download do ultimo release ---------------------------------------------
+Write-Info "Consultando ultimo release de https://github.com/$Repo..."
+
+try {
+  $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
+} catch {
+  Die "Falha ao consultar a API do GitHub (sem releases? sem internet?): $($_.Exception.Message)"
 }
 
-existing_key() {
-  [ -f "$ENV_FILE" ] && grep -E '^OPENROUTER_API_KEY=.+' "$ENV_FILE" >/dev/null 2>&1
+$Asset = $Release.assets | Where-Object { $_.name -match 'windows' -and $_.name -match '\.zip$' } | Select-Object -First 1
+if (-not $Asset) {
+  Die "Release $($Release.tag_name) nao tem asset *windows*.zip. Veja: https://github.com/$Repo/releases"
 }
 
-write_key() {
-  local key="$1"
-  set_env_var OPENROUTER_API_KEY "$key"
+$Tag = $Release.tag_name
+Write-Info "Release $Tag - baixando $($Asset.name) (~700 MB)..."
+
+$TmpZip = Join-Path $env:TEMP "alpha-ai-$Tag.zip"
+Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $TmpZip -UseBasicParsing
+Write-Ok 'Download concluido.'
+
+# -- 3. Extracao ---------------------------------------------------------------
+Write-Info "Extraindo em $InstallDir ..."
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Expand-Archive -Path $TmpZip -DestinationPath $InstallDir -Force
+Remove-Item -Force $TmpZip
+
+$ModelsZip = Join-Path $InstallDir 'Modules\Models.zip'
+if (-not (Test-Path $ModelsZip)) {
+  Die "Modules/Models.zip nao veio no zip do release - asset incompativel com esta versao do instalador."
+}
+Set-Location $InstallDir
+Write-Ok 'Arquivos extraidos.'
+
+# -- 4. Modelos ----------------------------------------------------------------
+Write-Info 'Extraindo Models.zip (~1,4 GB) para Modules/Models...'
+Expand-Archive -Path $ModelsZip -DestinationPath (Join-Path $InstallDir 'Modules\Models') -Force
+Write-Ok 'Modelos extraidos.'
+if (-not $KeepModelsZip) {
+  Remove-Item -Force $ModelsZip
+  Write-Ok 'Modules/Models.zip removido (economia de ~450 MB).'
 }
 
-prompt_key() {
-  local key
-  while :; do
-    printf 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys): '
-    if ! read -rs key; then
-      die "Entrada encerrada (EOF) — instalação abortada na etapa da API key."
-    fi
-    printf '\n'
-    # trim
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    [ -n "$key" ] || { warn "Chave vazia — tente de novo."; continue; }
-    case "$key" in
-      sk-or-*) ;;
-      *) warn "Chaves do OpenRouter normalmente começam com 'sk-or-'. Prosseguindo mesmo assim." ;;
-    esac
-    write_key "$key"
-    return 0
-  done
+# -- 4b. Verificacao de modelos ------------------------------------------------
+# Modelo truncado (download/extracao interrompida) deixa o onnxManager fora
+# do ar (INVALID_PROTOBUF). O verify confere tamanho minimo e re-baixa o que
+# estiver corrompido. Best-effort: sem python no host, a validacao acontece
+# dentro do container no boot (exit 78 + instrucao no log).
+$VerifyScript = Join-Path $InstallDir 'scripts\verify_models.py'
+$Py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $Py) { $Py = Get-Command python3 -ErrorAction SilentlyContinue }
+if ((Test-Path $VerifyScript) -and $Py) {
+  Write-Info 'Verificando integridade dos modelos (verify_models)...'
+  & $Py.Source $VerifyScript --quiet
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 'Modelo invalido detectado - tentando re-download...'
+    & $Py.Source $VerifyScript --download
+    if ($LASTEXITCODE -eq 0) { Write-Ok 'Modelos reparados.' }
+    else { Write-Warn2 'Nao foi possivel reparar os modelos automaticamente - o boot do container vai indicar o arquivo exato.' }
+  } else {
+    Write-Ok 'Modelos integros.'
+  }
+} else {
+  Write-Warn2 'python/scripts indisponiveis no host - verificacao de modelos sera feita dentro do container no boot.'
 }
 
 # -- 5. API key (antes do up) --------------------------------------------------
@@ -256,124 +170,27 @@ function Test-ExistingKey {
 function Write-Key {
   param([string]$Key)
   Set-EnvVar 'OPENROUTER_API_KEY' $Key
-
 }
 
-if existing_token; then
-  printf 'Já existe um AVA_INTERNAL_TOKEN em Modules/.env.\n'
-  printf 'Manter o token existente? [S/n] '
-  read -r ans || ans=""
-  case "$ans" in
-    n|N*) set_env_var AVA_INTERNAL_TOKEN "$(gen_token)" ;;
-  esac
-else
-  set_env_var AVA_INTERNAL_TOKEN "$(gen_token)"
-fi
-
-# Token usado nas chamadas ao mcp_manager (Authorization: Bearer)
-AVA_TOKEN="$(get_env_var AVA_INTERNAL_TOKEN)"
-[ -n "$AVA_TOKEN" ] || die "AVA_INTERNAL_TOKEN não encontrado em $ENV_FILE."
-
-ok "AVA_INTERNAL_TOKEN configurado em $ENV_FILE (chmod 600)."
-
-# ── 5b. Token do crawl4ai (CRAWL4AI_API_TOKEN) ───────────────────────────────
-# O compose exige esta variável (falha de boot se ausente). O websearch-mcp
-# e o crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
-
-if ! grep -qE '^CRAWL4AI_API_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
-  set_env_var CRAWL4AI_API_TOKEN "$(gen_token)"
-  ok "CRAWL4AI_API_TOKEN gerado em $ENV_FILE."
-else
-  ok "CRAWL4AI_API_TOKEN já existe em $ENV_FILE."
-fi
-
-# ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
-# Cadastra o @playwright/mcp no mcp_manager (:4008) logo após o `up` do stack.
-# O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
-# seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
-# retenta; se falhar de vez, só avisa (não aborta a instalação).
-MCP_MANAGER_URL="http://localhost:4008"
-
-register_playwright_mcp() {
-  local payload
-  payload='{
-  "name": "playwright",
-  "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
-  "transport": "stdio",
-  "command": "npx",
-  "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://localhost:9222"],
-  "env": {"DISPLAY": ":0"}
-}'
-
-  info "Registrando Playwright MCP no mcp_manager ($MCP_MANAGER_URL)..."
-  local registered=0 i
-  for i in $(seq 1 24); do
-    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
-         -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $AVA_TOKEN" -d "$payload" >/dev/null 2>&1; then
-      registered=1
-      break
-    fi
-    sleep 5
-  done
-  if [ "$registered" -ne 1 ]; then
-    warn "Não consegui cadastrar o Playwright MCP — manager não respondeu em 2 min."
-    warn "Cadastre manualmente depois (dois comandos):"
-    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -H "Authorization: Bearer $AVA_INTERNAL_TOKEN" -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
-    printf '  curl -X POST %s/servers/playwright/sync -H "Authorization: Bearer $AVA_INTERNAL_TOKEN"\n' "$MCP_MANAGER_URL"
-    return 1
-  fi
-
-  # /sync: exige a memory_api (:3000) de pé; o 1º sync baixa o pacote npm.
-  local synced=0
-  for i in $(seq 1 12); do
-    if curl -fsS --max-time 240 -X POST "$MCP_MANAGER_URL/servers/playwright/sync" \
-         -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
-      synced=1
-      break
-    fi
-    sleep 10
-  done
-  if [ "$synced" -ne 1 ]; then
-    warn "Playwright MCP cadastrado, mas o sync falhou (memory_api ainda bootando?)."
-    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/playwright/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
-    return 1
-  fi
-  ok "Playwright MCP registrado e sincronizado."
-}
-
-register_websearch_mcp() {
-  # URL do MCP do websearch (server.py). Se o manager rodar dentro do Docker,
-  # use o nome do serviço (http://websearch:4010/mcp) ou host.docker.internal.
-  local ws_url="${WEBSEARCH_MCP_URL:-http://localhost:4010/mcp}"
-  local payload
-  payload=$(cat <<EOF
-{
-  "name": "websearch",
-  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.",
-  "transport": "http",
-  "url": "$ws_url",
-  "enabled": true,
-  "always_on": false,
-  "examples": {
-    "web_search": [
-      "pesquise na internet sobre",
-      "qual é a notícia mais recente sobre",
-      "busque informações atuais de",
-      "procure na web"
-    ],
-    "memory_write_batch": [
-      "lembre que",
-      "guarde isso na memória",
-      "anote que",
-      "salve essa informação",
-      "lembre-se de que",
-      "memorize os fatos deste documento"
-    ]
+function Prompt-Key {
+  while ($true) {
+    $secure = Read-Host -Prompt 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys)' -AsSecureString
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+    $Key = $plain.Trim()
+    if (-not $Key) { Write-Warn2 'Chave vazia - tente de novo.'; continue }
+    if ($Key -notlike 'sk-or-*') { Write-Warn2 "Chaves do OpenRouter normalmente comecam com 'sk-or-'. Prosseguindo mesmo assim." }
+    Write-Key $Key
+    return
   }
 }
-EOF
-)
+
+if (Test-ExistingKey) {
+  $ans = Read-Host 'Ja existe uma OPENROUTER_API_KEY em Modules\.env. Manter a chave existente? [S/n]'
+  if ($ans -match '^[nN]') { Prompt-Key }
+} else {
+  Prompt-Key
+}
+Write-Ok "OPENROUTER_API_KEY configurada em $EnvFile"
 
 # -- 5a. Token de autenticacao interna (AVA_INTERNAL_TOKEN) -------------------
 # Todos os servicos internos (orchestrator, LLM, TTS, vision, memory, mcp_manager,
@@ -508,14 +325,51 @@ function Register-McpServer {
   }
   Write-Ok "$Label MCP registrado e sincronizado."
   return $true
-
 }
 
+function Register-WebsearchMcp {
+  # URL do MCP do websearch (server.py, streamable-http em :4010/mcp). O manager
+  # roda DENTRO do container: localhost seria ele mesmo, entao o default usa
+  # host.docker.internal (porta 4010 publicada no host). Se o websearch for um
+  # servico do mesmo compose, sobrescreva: $env:WEBSEARCH_MCP_URL = 'http://websearch:4010/mcp'
+  $wsUrl = if ($env:WEBSEARCH_MCP_URL) { $env:WEBSEARCH_MCP_URL } else { 'http://host.docker.internal:4010/mcp' }
+  return (Register-McpServer -Label 'websearch' -Name 'websearch' -SyncTimeoutSec 120 -Spec @{
+    name          = 'websearch'
+    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.'
+    transport     = 'http'
+    url           = $wsUrl
+    enabled       = $true
+    always_on     = $false
+    examples      = @{
+      web_search = @(
+        'pesquise na internet sobre',
+        'qual é a notícia mais recente sobre',
+        'busque informações atuais de',
+        'procure na web'
+      )
+      memory_write_batch = @(
+        'lembre que',
+        'guarde isso na memoria',
+        'anote que',
+        'salve essa informacao',
+        'lembre-se de que',
+        'memorize os fatos deste documento'
+      )
+    }
+  })
+}
 
-# ── 6. Build + first up ───────────────────────────────────────────────────────
-if [ "$SKIP_BUILD" -eq 0 ]; then
-  info "Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)..."
-  ./docker-start.sh build || die "docker compose build falhou — rode ./docker-start.sh build para ver o erro."
+function Register-DesktopCommanderMcp {
+  return (Register-McpServer -Label 'Desktop Commander' -Name 'desktop-commander' -SyncTimeoutSec 240 -Spec @{
+    name          = 'desktop-commander'
+    skill_summary = 'Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)'
+    transport     = 'stdio'
+    command       = 'npx'
+    args          = @('-y', '@wonderwhy-er/desktop-commander@latest')
+    enabled       = $true
+    always_on     = $false
+  })
+}
 
 # -- 5d. Manager (ava-tray.exe) - API REST em :9001 --------------------------
 # O Manager sobe/derruba o stack Docker e supervisiona o mcp_manager do host.
@@ -627,11 +481,33 @@ if (-not $SkipBuild) {
     Write-Warn2 'Orchestrator nao respondeu em 20 min. Veja: .\docker-start.bat logs -f ava'
   }
 
-  # Registro do Playwright MCP — logo após o up, quando o stack já está carregado.
-  register_playwright_mcp || true
-  register_websearch_mcp || true
-  register_desktop_commander_mcp || true
+  try {
+    $Status = Invoke-WebRequest -Uri $StatusUrl -UseBasicParsing -TimeoutSec 5
+    if ($Status.Content -match '"openrouter_key":\s*"missing"') {
+      Write-Warn2 'O orchestrator reportou openrouter_key: missing.'
+      $ans = Read-Host 'Deseja re-informar a chave agora? [S/n]'
+      if ($ans -notmatch '^[nN]') {
+        Prompt-Key
+        Write-Info 'Reiniciando container ava para reler a chave...'
+        & .\docker-start.bat restart ava
+      }
+    }
+  } catch { }
+} else {
+  Write-Info '-SkipBuild: pulei o build/up do Docker.'
+}
 
+# -- 7. PATH do usuario --------------------------------------------------------
+$TuiDir = Join-Path $InstallDir 'tui'
+$UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not $UserPath) { $UserPath = '' }
+if ($UserPath -notlike "*$TuiDir*") {
+  $NewPath = if ($UserPath) { "$UserPath;$TuiDir" } else { $TuiDir }
+  [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
+  Write-Ok "Comando instalado: alpha-ai (em $TuiDir). Reabra o terminal para valer."
+} else {
+  Write-Ok "Comando alpha-ai ja no PATH."
+}
 
 # -- 8. Auto-start do tray -----------------------------------------------------
 $TrayExe = Join-Path $InstallDir 'Manager\ava-tray.exe'
@@ -649,103 +525,15 @@ if (Test-Path $TrayExe) {
 } else {
   Write-Warn2 "ava-tray.exe nao encontrado em $TrayExe - auto-start pulado."
 }
-main
 
-  # Espera o /status do orchestrator (1º boot baixa Supertonic do HF)
-  STATUS_URL="http://localhost:9000/status"
-  MAX_WAIT=1200   # 20 min
-  ELAPSED=0
-  info "Aguardando orchestrator em $STATUS_URL (primeiro boot pode demorar)..."
-  while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
-    if curl -fsS --max-time 5 "$STATUS_URL" >/dev/null 2>&1; then
-      ok "Orchestrator respondeu após $((ELAPSED / 60)) min."
-      break
-    fi
-    if [ $((ELAPSED % 60)) -eq 0 ] && [ "$ELAPSED" -gt 0 ]; then
-      printf '  ...aguardando há %s min (logs: ./docker-start.sh logs -f ava)\n' "$((ELAPSED / 60))"
-    fi
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-  done
+# -- 9. Encerramento -----------------------------------------------------------
+Write-Host ''
+Write-Ok "Instalacao concluida ($InstallDir)"
+Write-Info 'Comandos uteis:'
+Write-Info '  alpha-ai                          # abre a TUI (novo terminal)'
+Write-Info "  $InstallDir\docker-start.bat logs -f ava   # logs do backend"
 
-  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-    warn "Orchestrator não respondeu em 20 min. Veja os logs: ./docker-start.sh logs -f ava"
-  fi
-
-  # Detecta chave ausente no /status (LLM.py expõe openrouter_key: "missing")
-  if curl -fsS --max-time 5 "$STATUS_URL" 2>/dev/null | grep -q '"openrouter_key": *"missing"'; then
-    warn "O orchestrator reportou openrouter_key: missing."
-    printf 'Deseja re-informar a chave agora? [S/n] '
-    read -r ans || ans=""
-    case "$ans" in
-      n|N*) ;;
-      *)
-        prompt_key || true
-        info "Reiniciando container ava para reler a chave..."
-        ./docker-start.sh restart ava || warn "restart falhou — rode manualmente: ./docker-start.sh restart ava"
-        ;;
-    esac
-  fi
-else
-  info "--skip-build: pulei o build/up do Docker."
-fi
-
-# ── 7. Comando do terminal ────────────────────────────────────────────────────
-mkdir -p "$HOME/.local/bin"
-ln -sf "$INSTALL_DIR/tui/alpha-ai" "$HOME/.local/bin/alpha-ai"
-ok "Comando instalado: alpha-ai -> $INSTALL_DIR/tui/alpha-ai"
-
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *)
-    warn "~/.local/bin não está no PATH."
-    printf 'Adicioná-lo ao ~/.bashrc? [S/n] '
-    read -r ans || ans=""
-    case "$ans" in
-      n|N*) ;;
-      *)
-        {
-          printf '\n# Alpha AI (instalador)\n'
-          printf 'export PATH="$HOME/.local/bin:$PATH"\n'
-        } >> "$HOME/.bashrc"
-        ok "Adicionado ao ~/.bashrc — reabra o terminal ou rode: export PATH=\"\$HOME/.local/bin:\$PATH\""
-        ;;
-    esac
-    ;;
-esac
-
-# ── 8. Auto-start do tray ─────────────────────────────────────────────────────
-AUTOSTART_DIR="$HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR"
-cat > "$AUTOSTART_DIR/alpha-ai-tray.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Alpha AI Tray
-Comment=Gerenciador Docker do Alpha AI (bandeja do sistema)
-Exec=$INSTALL_DIR/Manager/ava-tray
-Terminal=false
-StartupNotify=false
-X-GNOME-Autostart-enabled=true
-EOF
-ok "Auto-start configurado: $AUTOSTART_DIR/alpha-ai-tray.desktop"
-
-if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-  nohup "$INSTALL_DIR/Manager/ava-tray" >/dev/null 2>&1 &
-  disown || true
-  ok "ava-tray iniciado agora (ícone na bandeja)."
-else
-  info "Sem sessão gráfica — o tray vai subir no próximo login."
-fi
-
-# ── 9. Encerramento ───────────────────────────────────────────────────────────
-echo
-ok "Instalação concluída ($INSTALL_DIR)"
-info "Comandos úteis:"
-info "  alpha-ai                          # abre a TUI"
-info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
-info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
-
-if [ "$NO_LAUNCH" -eq 0 ] && [ -t 0 ]; then
-  info "Abrindo a TUI..."
-  exec "$HOME/.local/bin/alpha-ai"
-fi
+if (-not $NoLaunch) {
+  Write-Info 'Abrindo a TUI...'
+  Start-Process -FilePath (Join-Path $TuiDir 'alpha-ai.exe')
+}
