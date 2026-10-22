@@ -7,7 +7,9 @@
 #   4. Extrai Modules/Models.zip em Modules/Models
 #   5. Pede a OPENROUTER_API_KEY e grava em Modules\.env - ANTES do up,
 #      porque Modules/LLM.py le a chave no import
-#   6. Build + up via docker-start.bat e espera o /status responder
+#   6. Build; inicia o Manager (ava-tray.exe, API :9001), pede a ele o start do
+#      Docker (POST /docker/start) e garante o mcp_manager (/mcp/start); registra
+#      os MCPs e espera o /status responder (falha do Manager: docker-start.bat up -d)
 #   7. Adiciona tui\ ao PATH do usuario (comando `alpha-ai`)
 #   8. Auto-start do ava-tray.exe via HKCU\...\Run (+ inicia agora)
 #   9. Inicia a TUI
@@ -127,6 +129,37 @@ if ((Test-Path $VerifyScript) -and $Py) {
 
 # -- 5. API key (antes do up) --------------------------------------------------
 $EnvFile = Join-Path $InstallDir 'Modules\.env'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+# Le o ultimo valor de uma variavel do .env ($null se ausente)
+function Get-EnvVar {
+  param([string]$Name)
+  if (-not (Test-Path $EnvFile)) { return $null }
+  $m = [System.IO.File]::ReadAllLines($EnvFile) | Where-Object { $_ -match "^$([regex]::Escape($Name))=" } | Select-Object -Last 1
+  if (-not $m) { return $null }
+  return $m.Substring($Name.Length + 1)
+}
+
+# Define/substitui uma variavel no .env sem duplicar nem apagar as demais
+# (UTF-8 sem BOM - dotenv nao aceita BOM)
+function Set-EnvVar {
+  param([string]$Name, [string]$Value)
+  $lines = @()
+  if (Test-Path $EnvFile) {
+    $lines = @([System.IO.File]::ReadAllLines($EnvFile) | Where-Object { $_ -notmatch "^$([regex]::Escape($Name))=" })
+  }
+  $lines += "$Name=$Value"
+  [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), $Utf8NoBom)
+}
+
+# Token aleatorio de 32 bytes em hex (equivalente a `openssl rand -hex 32`)
+function New-RandomToken {
+  $bytes = New-Object byte[] 32
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $rng.GetBytes($bytes)
+  $rng.Dispose()
+  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
 
 function Test-ExistingKey {
   if (-not (Test-Path $EnvFile)) { return $false }
@@ -136,8 +169,7 @@ function Test-ExistingKey {
 
 function Write-Key {
   param([string]$Key)
-  # UTF-8 sem BOM (dotenv nao aceita BOM)
-  [System.IO.File]::WriteAllText($EnvFile, "OPENROUTER_API_KEY=$Key`n", (New-Object System.Text.UTF8Encoding($false)))
+  Set-EnvVar 'OPENROUTER_API_KEY' $Key
 }
 
 function Prompt-Key {
@@ -159,6 +191,32 @@ if (Test-ExistingKey) {
   Prompt-Key
 }
 Write-Ok "OPENROUTER_API_KEY configurada em $EnvFile"
+
+# -- 5a. Token de autenticacao interna (AVA_INTERNAL_TOKEN) -------------------
+# Todos os servicos internos (orchestrator, LLM, TTS, vision, memory, mcp_manager,
+# Manager) exigem `Authorization: Bearer <AVA_INTERNAL_TOKEN>`.
+if (Get-EnvVar 'AVA_INTERNAL_TOKEN') {
+  $ans = Read-Host 'Ja existe um AVA_INTERNAL_TOKEN em Modules\.env. Manter o token existente? [S/n]'
+  if ($ans -match '^[nN]') { Set-EnvVar 'AVA_INTERNAL_TOKEN' (New-RandomToken) }
+} else {
+  Set-EnvVar 'AVA_INTERNAL_TOKEN' (New-RandomToken)
+}
+Write-Ok "AVA_INTERNAL_TOKEN configurado em $EnvFile"
+
+# Token usado nas chamadas ao mcp_manager (Authorization: Bearer)
+$AvaToken = Get-EnvVar 'AVA_INTERNAL_TOKEN'
+if (-not $AvaToken) { Die "AVA_INTERNAL_TOKEN nao encontrado em $EnvFile." }
+$McpHeaders = @{ Authorization = "Bearer $AvaToken" }
+
+# -- 5b'. Token do crawl4ai (CRAWL4AI_API_TOKEN) ------------------------------
+# O compose exige esta variavel (falha de boot se ausente). O websearch-mcp e o
+# crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
+if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
+  Set-EnvVar 'CRAWL4AI_API_TOKEN' (New-RandomToken)
+  Write-Ok "CRAWL4AI_API_TOKEN gerado em $EnvFile"
+} else {
+  Write-Ok "CRAWL4AI_API_TOKEN ja existe em $EnvFile"
+}
 
 # -- 5b. Registro do Playwright MCP (dependencia direta do sistema) -----------
 # Cadastra o @playwright/mcp no mcp_manager (:4008) logo apos o `up` do stack.
@@ -183,7 +241,7 @@ function Register-PlaywrightMcp {
   for ($i = 0; $i -lt 24; $i++) {
     try {
       Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
-        -ContentType 'application/json' -Body $payload -TimeoutSec 10 | Out-Null
+        -ContentType 'application/json' -Body $payload -TimeoutSec 10 -Headers $McpHeaders | Out-Null
       $registered = $true
       break
     } catch {
@@ -192,7 +250,7 @@ function Register-PlaywrightMcp {
   }
   if (-not $registered) {
     Write-Warn2 'Nao consegui cadastrar o Playwright MCP - manager nao respondeu em 2 min.'
-    Write-Warn2 "Cadastre manualmente depois: POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/playwright/sync"
+    Write-Warn2 "Cadastre manualmente depois (header Authorization: Bearer <AVA_INTERNAL_TOKEN>): POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/playwright/sync"
     return $false
   }
 
@@ -200,7 +258,7 @@ function Register-PlaywrightMcp {
   $synced = $false
   for ($i = 0; $i -lt 12; $i++) {
     try {
-      Invoke-RestMethod -Uri "$McpManagerUrl/servers/playwright/sync" -Method Post -TimeoutSec 240 | Out-Null
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers/playwright/sync" -Method Post -TimeoutSec 240 -Headers $McpHeaders | Out-Null
       $synced = $true
       break
     } catch {
@@ -209,7 +267,7 @@ function Register-PlaywrightMcp {
   }
   if (-not $synced) {
     Write-Warn2 'Playwright MCP cadastrado, mas o sync falhou (memory_api ainda bootando?).'
-    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/playwright/sync"
+    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/playwright/sync -H `"Authorization: Bearer <AVA_INTERNAL_TOKEN de Modules\.env>`""
     return $false
   }
   Write-Ok 'Playwright MCP registrado e sincronizado.'
@@ -236,7 +294,7 @@ function Register-McpServer {
   for ($i = 0; $i -lt 24; $i++) {
     try {
       Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
-        -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10 | Out-Null
+        -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10 -Headers $McpHeaders | Out-Null
       $registered = $true
       break
     } catch {
@@ -245,7 +303,7 @@ function Register-McpServer {
   }
   if (-not $registered) {
     Write-Warn2 "Nao consegui cadastrar o $Label MCP - manager nao respondeu em 2 min."
-    Write-Warn2 "Cadastre manualmente depois: POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/$Name/sync"
+    Write-Warn2 "Cadastre manualmente depois (header Authorization: Bearer <AVA_INTERNAL_TOKEN>): POST $McpManagerUrl/servers + POST $McpManagerUrl/servers/$Name/sync"
     return $false
   }
 
@@ -253,7 +311,7 @@ function Register-McpServer {
   $synced = $false
   for ($i = 0; $i -lt 12; $i++) {
     try {
-      Invoke-RestMethod -Uri "$McpManagerUrl/servers/$Name/sync" -Method Post -TimeoutSec $SyncTimeoutSec | Out-Null
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers/$Name/sync" -Method Post -TimeoutSec $SyncTimeoutSec -Headers $McpHeaders | Out-Null
       $synced = $true
       break
     } catch {
@@ -262,7 +320,7 @@ function Register-McpServer {
   }
   if (-not $synced) {
     Write-Warn2 "$Label MCP cadastrado, mas o sync falhou (memory_api ou o proprio servidor ainda bootando?)."
-    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/$Name/sync"
+    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/$Name/sync -H `"Authorization: Bearer <AVA_INTERNAL_TOKEN de Modules\.env>`""
     return $false
   }
   Write-Ok "$Label MCP registrado e sincronizado."
@@ -313,17 +371,91 @@ function Register-DesktopCommanderMcp {
   })
 }
 
+# -- 5d. Manager (ava-tray.exe) - API REST em :9001 --------------------------
+# O Manager sobe/derruba o stack Docker e supervisiona o mcp_manager do host.
+# O instalador o inicia primeiro e pede o start do Docker pela API dele.
+$ManagerUrl = 'http://localhost:9001'
+
+function Test-ManagerUp {
+  try {
+    Invoke-RestMethod -Uri "$ManagerUrl/status" -TimeoutSec 5 -Headers $McpHeaders | Out-Null
+    return $true
+  } catch { return $false }
+}
+
+function Start-Manager {
+  if (Test-ManagerUp) { Write-Ok "Manager ja esta respondendo em $ManagerUrl."; return $true }
+  $exe = Join-Path $InstallDir 'Manager\ava-tray.exe'
+  if (-not (Test-Path $exe)) { Write-Warn2 "Manager nao encontrado em $exe."; return $false }
+
+  Write-Info 'Iniciando o Manager (ava-tray)...'
+  Start-Process -FilePath $exe -WorkingDirectory $InstallDir
+  for ($i = 0; $i -lt 30; $i++) {
+    if (Test-ManagerUp) { Write-Ok "Manager respondeu em $ManagerUrl."; return $true }
+    Start-Sleep -Seconds 2
+  }
+  Write-Warn2 'Manager nao respondeu em 60s.'
+  return $false
+}
+
+function Start-DockerViaManager {
+  Write-Info 'Pedindo ao Manager para iniciar o Docker (POST /docker/start)...'
+  try {
+    $r = Invoke-RestMethod -Uri "$ManagerUrl/docker/start" -Method Post -TimeoutSec 900 -Headers $McpHeaders
+    if ($r.ok) { Write-Ok 'Docker iniciado pelo Manager.'; return $true }
+    Write-Warn2 "Manager nao iniciou o Docker: $($r.message)"
+    return $false
+  } catch {
+    Write-Warn2 "Manager nao iniciou o Docker: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+# O mcp_manager (:4008) roda no host, supervisionado pelo Manager.
+function Ensure-McpManager {
+  if (-not (Test-ManagerUp)) { Write-Warn2 'Manager indisponivel - nao consegui garantir o mcp_manager.'; return $false }
+  try {
+    $s = Invoke-RestMethod -Uri "$ManagerUrl/mcp/status" -TimeoutSec 5 -Headers $McpHeaders
+    if ($s.healthy) { Write-Ok 'mcp_manager ja esta ativo.'; return $true }
+  } catch { }
+
+  Write-Info 'Pedindo ao Manager para iniciar o mcp_manager (POST /mcp/start)...'
+  try {
+    Invoke-RestMethod -Uri "$ManagerUrl/mcp/start" -Method Post -TimeoutSec 60 -Headers $McpHeaders | Out-Null
+  } catch {
+    Write-Warn2 "POST /mcp/start falhou: $($_.Exception.Message) - vou aguardar mesmo assim."
+  }
+  for ($i = 0; $i -lt 12; $i++) {
+    try {
+      $s = Invoke-RestMethod -Uri "$ManagerUrl/mcp/status" -TimeoutSec 5 -Headers $McpHeaders
+      if ($s.healthy) { Write-Ok 'mcp_manager ativo.'; return $true }
+    } catch { }
+    Start-Sleep -Seconds 5
+  }
+  Write-Warn2 "mcp_manager nao ficou saudavel em 1 min (veja GET $ManagerUrl/mcp/status)."
+  return $false
+}
+
 # -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
   & .\docker-start.bat build
   if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou - rode .\docker-start.bat build para ver o erro.' }
 
-  Write-Info 'Subindo o stack...'
-  & .\docker-start.bat up -d
-  if ($LASTEXITCODE -ne 0) { Die 'docker compose up falhou.' }
+  # Manager primeiro: e ele quem sobe o stack Docker (POST /docker/start).
+  # Se o Manager falhar, cai para o docker-start.bat.
+  $viaManager = (Start-Manager) -and (Start-DockerViaManager)
+  if (-not $viaManager) {
+    Write-Warn2 'Usando docker-start.bat como alternativa.'
+    Write-Info 'Subindo o stack...'
+    & .\docker-start.bat up -d
+    if ($LASTEXITCODE -ne 0) { Die 'docker compose up falhou.' }
+  }
 
-  # Registro do Playwright MCP - logo apos o up, quando o stack ja esta carregado.
+  # mcp_manager (host) ativo antes do cadastro dos MCPs
+  Ensure-McpManager | Out-Null
+
+  # Registro dos MCPs - logo apos o up, quando o stack ja esta carregado.
   Register-PlaywrightMcp | Out-Null
   Register-WebsearchMcp | Out-Null
   Register-DesktopCommanderMcp | Out-Null
@@ -381,10 +513,15 @@ if ($UserPath -notlike "*$TuiDir*") {
 $TrayExe = Join-Path $InstallDir 'Manager\ava-tray.exe'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if (Test-Path $TrayExe) {
-  Set-ItemProperty -Path $RunKey -Name 'AlphaAITray' -Value $TrayExe -Type String
+  # Aspas: caminho com espaco quebraria o auto-start no login
+  Set-ItemProperty -Path $RunKey -Name 'AlphaAITray' -Value "`"$TrayExe`"" -Type String
   Write-Ok 'Auto-start configurado: HKCU\...\Run\AlphaAITray'
-  Start-Process -FilePath $TrayExe
-  Write-Ok 'ava-tray iniciado agora.'
+  if (Test-ManagerUp) {
+    Write-Ok 'ava-tray ja esta em execucao.'
+  } else {
+    Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir
+    Write-Ok 'ava-tray iniciado agora.'
+  }
 } else {
   Write-Warn2 "ava-tray.exe nao encontrado em $TrayExe - auto-start pulado."
 }
