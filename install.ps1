@@ -1,7 +1,7 @@
 # install.ps1 - Instalador Alpha AI (Windows)
 #
 # Espelha o fluxo do install.sh:
-#   1. Valida prereqs (Docker + compose v2)
+#   1. Valida prereqs (Node 24 no host; Docker Desktop OU Docker Engine no WSL)
 #   2. Baixa o asset *windows*.zip do ultimo release no GitHub
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
 #   4. Extrai Modules/Models.zip em Modules/Models
@@ -9,7 +9,7 @@
 #      porque Modules/LLM.py le a chave no import
 #   6. Build; inicia o Manager (ava-tray.exe, API :9001), pede a ele o start do
 #      Docker (POST /docker/start) e garante o mcp_manager (/mcp/start); registra
-#      os MCPs e espera o /status responder (falha do Manager: docker-start.bat up -d)
+#      os MCPs e espera o /status responder (falha do Manager: compose up -d direto)
 #   7. Adiciona tui\ ao PATH do usuario (comando `alpha-ai`)
 #   8. Auto-start do ava-tray.exe via HKCU\...\Run (+ inicia agora)
 #   9. Inicia a TUI
@@ -39,27 +39,194 @@ function Die {
   exit 1
 }
 
+# -- 0. Feature do Windows: Virtual Machine Platform ----------------------------
+# WSL2 roda sobre o Hyper-V (VirtualMachinePlatform). Sem essa feature o
+# `wsl --import` da rota B falha. O `dism` exige elevation (UAC).
+Write-Info 'Verificando feature do Windows: VirtualMachinePlatform...'
+$VmpState = $null
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$DismQuery = (dism.exe /online /get-featureinfo /featurename:VirtualMachinePlatform 2>&1 | Out-String)
+$ErrorActionPreference = $prevEAP
+if ($DismQuery -match 'State\s*:\s*(\S+)') { $VmpState = $Matches[1] }
+
+if ($VmpState -eq 'Enabled') {
+  Write-Ok 'VirtualMachinePlatform ja esta habilitada.'
+} else {
+  Write-Warn2 'VirtualMachinePlatform desabilitada (ou sem permissao para consultar) - habilitando...'
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+  $dismCode = $LASTEXITCODE
+  $ErrorActionPreference = $prevEAP
+  if ($dismCode -ne 0) {
+    Die "Falha ao habilitar VirtualMachinePlatform (dism saiu com $dismCode). Rode o install.ps1 em um PowerShell como Administrador."
+  }
+  Write-Ok 'VirtualMachinePlatform habilitada (sem reinicio automatico).'
+  Write-Host ''
+  Write-Warn2 '>> REINICIE O COMPUTADOR para a feature ficar ativa. <<'
+  Write-Host '    Depois de reiniciar, execute o install.ps1 novamente - a instalacao'
+  Write-Host '    continua normalmente a partir daqui (essa etapa sera pulada).'
+  $ans = Read-Host 'Reiniciar agora? [s/N]'
+  if ($ans -match '^[sS]') {
+    Write-Info 'Reiniciando em 10 segundos (Ctrl+C para cancelar)...'
+    shutdown.exe /r /t 10
+  }
+  exit 0
+}
+
 # -- 1. Prereqs ----------------------------------------------------------------
 Write-Info 'Validando pre-requisitos...'
 
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-  Die "Docker nao encontrado. Instale o Docker Desktop (com WSL2) e rode novamente."
+# Helper: executa docker (via Docker Desktop ou via WSL Debian-slim)
+$script:UseWSLDocker = $false
+function Invoke-Docker {
+  if ($script:UseWSLDocker) { wsl -d Debian-slim -e docker @args; return $LASTEXITCODE }
+  docker @args
+  return $LASTEXITCODE
 }
-try { docker compose version | Out-Null } catch {
-  Die "Plugin 'docker compose' ausente - atualize o Docker Desktop."
+
+# Verifica se o daemon Docker responde (Docker Desktop ou WSL)
+function Test-DockerAlive {
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $code = Invoke-Docker info *> $null
+  $ErrorActionPreference = $prevEAP
+  return ($code -eq 0)
 }
-# EAP=Stop + stderr de comando nativo redirecionado dispara NativeCommandError
-# (derruba o script exatamente quando o daemon esta desligado) - relaxa aqui.
-$prevEAP = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-docker info *> $null
-$dockerOk = ($LASTEXITCODE -eq 0)
-$ErrorActionPreference = $prevEAP
-if (-not $dockerOk) {
-  Die "Docker indisponivel. Inicie o Docker Desktop e aguarde ele ficar 'running'."
+
+# Verifica o plugin 'docker compose' (v2)
+function Test-DockerCompose {
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  Invoke-Docker compose version *> $null
+  $ok = ($LASTEXITCODE -eq 0)
+  $ErrorActionPreference = $prevEAP
+  return $ok
+}
+
+# Testa o Docker Desktop (instalado no Windows)
+$DesktopDockerOk = $false
+if (Get-Command docker -ErrorAction SilentlyContinue) {
+  if (Test-DockerAlive) { $DesktopDockerOk = $true }
+}
+
+# Testa o Docker no WSL (Debian-slim)
+$WslDockerOk = $false
+if (-not $DesktopDockerOk) {
+  $wslCmd = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wslCmd) {
+    # Verifica se a distro Debian-slim ja existe
+    $distros = (wsl --list --quiet 2>$null) -replace "`0", '' | Where-Object { $_ }
+    if ($distros -contains 'Debian-slim') {
+      # Verifica se o docker responde dentro dela
+      if ((Invoke-Docker info *> $null) -eq 0) { $WslDockerOk = $true }
+    }
+  }
+}
+
+if ($DesktopDockerOk) {
+  Write-Ok 'Docker Desktop detectado.'
+} elseif ($WslDockerOk) {
+  $script:UseWSLDocker = $true
+  Write-Ok 'Docker no WSL (Debian-slim) detectado.'
+} else {
+  # Configura o Docker no WSL (Debian-slim) automaticamente
+  Write-Info 'Docker nao encontrado no Windows/WSL. Configurando WSL + Docker automaticamente...'
+  $wslCmd = Get-Command wsl -ErrorAction SilentlyContinue
+  if (-not $wslCmd) {
+    Die "WSL nao encontrado. Instale o WSL (ab PowerShell como Admin: 'wsl --install') e rode novamente."
+  }
+  $distros = (wsl --list --quiet 2>$null) -replace "`0", '' | Where-Object { $_ }
+  if ($distros -notcontains 'Debian-slim') {
+    Write-Info 'Importando Debian-slim no WSL...'
+    $RootFs = "$env:TEMP\debian-slim.tar.xz"
+    Invoke-WebRequest -Uri 'https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-amd64/trixie/slim/rootfs.tar.xz' -OutFile $RootFs -UseBasicParsing
+    New-Item -ItemType Directory -Force -Path 'C:\WSL\Debian-slim' | Out-Null
+    wsl --import Debian-slim C:\WSL\Debian-slim $RootFs --version 2
+    if ($LASTEXITCODE -ne 0) { Die 'Falha ao importar Debian-slim no WSL.' }
+    Remove-Item $RootFs -Force
+    Write-Ok 'Debian-slim importado.'
+  }
+  # Configura systemd, usuario e sudo
+  Write-Info 'Configurando systemd/usuario no Debian-slim...'
+  wsl -d Debian-slim -u root -- bash -c "apt update && apt install -y systemd systemd-sysv sudo curl ca-certificates && adduser --disabled-password --gecos '' alpha-ai && usermod -aG sudo alpha-ai && printf '[boot]\nsystemd=true\n[user]\ndefault=alpha-ai\n' > /etc/wsl.conf"
+  if ($LASTEXITCODE -ne 0) { Die 'Falha ao configurar systemd no Debian-slim.' }
+  wsl --shutdown
+  Start-Sleep -Seconds 5
+  # Instala o Docker Engine
+  Write-Info 'Instalando Docker Engine no Debian-slim...'
+  wsl -d Debian-slim -u root -- bash -c "curl -fsSL https://get.docker.com | sh && usermod -aG docker alpha-ai && systemctl enable --now docker"
+  if ($LASTEXITCODE -ne 0) { Die 'Falha ao instalar o Docker Engine no Debian-slim.' }
+  $script:UseWSLDocker = $true
+  if (-not (Test-DockerAlive)) { Die 'Docker no WSL nao respondeu apos instalacao.' }
+  Write-Ok 'Docker Engine instalado no WSL (Debian-slim).'
+}
+
+if (-not (Test-DockerCompose)) {
+  Die "Plugin 'docker compose' ausente - atualize o Docker (Desktop ou Engine no WSL)."
 }
 
 Write-Ok 'Pre-requisitos validados.'
+
+# -- 1b. Node 24 no host -------------------------------------------------------
+# Os MCPs Playwright e Desktop Commander sao spawnados pelo mcp_manager do host
+# via `npx` — sem Node 24 no Windows o registro falha na primeira pergunta.
+function Test-Node24 {
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) { return $false }
+  try {
+    $major = [int]((& node --version) -replace '^v', '').Split('.')[0]
+    return ($major -ge 24)
+  } catch { return $false }
+}
+
+if (Test-Node24) {
+  Write-Ok "Node 24+ ja presente no host ($(& node --version))."
+} else {
+  Write-Info 'Node 24 ausente no host - instalando automaticamente...'
+  $installed = $false
+
+  # Tentativa 1: winget (LTS atual = v24.x)
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Write-Info '  via winget (OpenJS.NodeJS.LTS)...'
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements --disable-interactivity *> $null
+    $ErrorActionPreference = $prevEAP
+    if ($LASTEXITCODE -eq 0) { $installed = $true }
+  }
+
+  # Tentativa 2: MSI oficial do nodejs.org (latest v24.x) com elevacao UAC
+  if (-not $installed) {
+    Write-Info '  winget indisponivel ou falhou - fallback: MSI oficial do nodejs.org...'
+    try {
+      $html = (Invoke-WebRequest -Uri 'https://nodejs.org/dist/latest-v24.x/' -UseBasicParsing).Content
+      $MsiName = [regex]::Match($html, 'node-v[\d\.]+-x64\.msi').Value
+      if (-not $MsiName) { throw 'MSI do Node 24 nao listado no indice do nodejs.org.' }
+      $MsiPath = Join-Path $env:TEMP $MsiName
+      Write-Info "  baixando $MsiName (~30 MB)..."
+      Invoke-WebRequest -Uri "https://nodejs.org/dist/latest-v24.x/$MsiName" -OutFile $MsiPath -UseBasicParsing
+      Write-Info '  instalando silenciosamente (confirme o UAC se pedir)...'
+      $msiProc = Start-Process msiexec -ArgumentList "/i `"$MsiPath`" /qn /norestart" -Verb RunAs -Wait -PassThru
+      if ($msiProc.ExitCode -eq 0) { $installed = $true }
+      else { Write-Warn2 "  msiexec saiu com codigo $($msiProc.ExitCode)." }
+      Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    } catch {
+      Write-Warn2 "  fallback MSI falhou: $($_.Exception.Message)"
+    }
+  }
+
+  # Novos terminais pegam o PATH atualizado pelo MSI; a sessao atual nao — injeta.
+  if (Test-Path 'C:\Program Files\nodejs') {
+    $env:Path = "$env:Path;C:\Program Files\nodejs"
+  }
+
+  if (-not (Test-Node24)) {
+    Die 'Node 24 nao ficou disponivel apos a instalacao. Instale manualmente (https://nodejs.org) e rode o instalador de novo.'
+  }
+  Write-Ok "Node 24 instalado no host ($(& node --version))."
+}
 
 # -- 2. Download do ultimo release ---------------------------------------------
 Write-Info "Consultando ultimo release de https://github.com/$Repo..."
@@ -436,19 +603,164 @@ function Ensure-McpManager {
   return $false
 }
 
+# -- 5e. Rede da rota B: relays socat na VM + portproxy no Windows -------------
+# Rota B = Docker Engine dentro do Debian-slim. O compose publica as portas em
+# 127.9.12.22 DENTRO da VM — o Windows nao enxerga esse loopback (o auto-forward
+# do WSL2 cobre apenas 127.0.0.1, issue microsoft/WSL#11034). Ponte em 3 camadas:
+#   (1) VM:      socat 0.0.0.0:PORTA -> 127.9.12.22:PORTA (stack, 16 portas)
+#                socat 0.0.0.0:PORTA -> GW_WSL:PORTA      (servicos do HOST)
+#   (2) Windows: portproxy 127.9.12.22:PORTA -> IP_VM:PORTA  (host -> containers)
+#   (3) Windows: portproxy GW_WSL:9001/9222/9100 -> loopback (containers -> host)
+# A porta 4008 fica FORA: o mcp_manager roda no HOST e publicar a porta colidiria.
+# Rota A (Docker Desktop) nao precisa de nada disso: ele publica no loopback do
+# Windows e host.docker.internal ja aponta para o host.
+if ($script:UseWSLDocker) {
+  Write-Info 'Rota B: instalando relays socat no Debian-slim...'
+
+  # (1a) socat dentro da VM
+  wsl -d Debian-slim -u root -- bash -c "command -v socat >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq socat; }"
+  if ($LASTEXITCODE -ne 0) { Die 'Falha ao instalar o socat no Debian-slim.' }
+
+  # Script de relay: alvos do stack sao fixos (127.9.12.22 na VM); os do HOST
+  # dependem do gateway do WSL (vEthernet do Windows) — resolvido a cada boot.
+  $RelaySh = @'
+#!/bin/bash
+# Alpha AI - relays socat da rota WSL (gerado pelo install.ps1)
+# (a) stack: 0.0.0.0:PORTA -> 127.9.12.22:PORTA (publicacao do docker na VM)
+# (b) host:  0.0.0.0:PORTA -> GW:PORTA          (tray/CDP/transcribe no Windows)
+GW="$(ip route show default | awk '{print $3}' | head -n1)"
+APP_PORTS="3000 4005 4003 3003 3001 2002 3002 3004 4002 9000 3005 2001 8081 6379 11235 4010"
+HOST_PORTS="9001 9222 9100"
+for p in $APP_PORTS; do
+  socat "TCP-LISTEN:$p,bind=0.0.0.0,fork,reuseaddr" "TCP:127.9.12.22:$p" &
+done
+for p in $HOST_PORTS; do
+  socat "TCP-LISTEN:$p,bind=0.0.0.0,fork,reuseaddr" "TCP:$GW:$p" &
+done
+wait -n
+'@
+  $RelaySh = $RelaySh -replace "`r`n", "`n"
+  $RelayTmp = Join-Path $env:TEMP 'alpha-ai-relay.sh'
+  [System.IO.File]::WriteAllText($RelayTmp, $RelaySh, (New-Object System.Text.UTF8Encoding($false)))
+  $RelayWsl = ((wsl -d Debian-slim -- wslpath -a $RelayTmp | Out-String) -replace "`0", '').Trim()
+  if (-not $RelayWsl) { Die 'Nao consegui converter o caminho do relay para o WSL (wslpath).' }
+
+  $SvcTmp = Join-Path $env:TEMP 'alpha-ai-relay.service'
+  if ((wsl -d Debian-slim -u root -- bash -c "test -d /run/systemd/system && echo yes || echo no").Trim() -eq 'yes') {
+    # Com systemd: servico garante os relays a cada boot do WSL
+    $RelaySvc = @'
+[Unit]
+Description=Alpha AI relay (socat) - rota WSL
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/alpha-ai-relay.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+'@
+    $RelaySvc = $RelaySvc -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($SvcTmp, $RelaySvc, (New-Object System.Text.UTF8Encoding($false)))
+    $SvcWsl = ((wsl -d Debian-slim -- wslpath -a $SvcTmp | Out-String) -replace "`0", '').Trim()
+    wsl -d Debian-slim -u root -- bash -c "cp '$RelayWsl' /usr/local/bin/alpha-ai-relay.sh && chmod 755 /usr/local/bin/alpha-ai-relay.sh && cp '$SvcWsl' /etc/systemd/system/alpha-ai-relay.service && systemctl daemon-reload && systemctl enable --now alpha-ai-relay.service"
+    if ($LASTEXITCODE -ne 0) { Die 'Falha ao registrar o servico alpha-ai-relay no Debian-slim.' }
+    Write-Ok 'Relays socat ativos (systemd: alpha-ai-relay.service).'
+  } else {
+    # Sem systemd: relays soltos via nohup (morrem em wsl --shutdown)
+    Write-Warn2 'systemd inativo no Debian-slim - relays via nohup (morrem em wsl --shutdown).'
+    wsl -d Debian-slim -u root -- bash -c "pkill -f alpha-ai-relay.sh 2>/dev/null; cp '$RelayWsl' /usr/local/bin/alpha-ai-relay.sh && chmod 755 /usr/local/bin/alpha-ai-relay.sh && nohup /usr/local/bin/alpha-ai-relay.sh >/var/log/alpha-ai-relay.log 2>&1 & sleep 1; pgrep -f alpha-ai-relay.sh >/dev/null"
+    if ($LASTEXITCODE -ne 0) { Die 'Falha ao iniciar os relays socat no Debian-slim.' }
+  }
+  Remove-Item $RelayTmp, $SvcTmp -Force -ErrorAction SilentlyContinue
+
+  # (2)+(3) portproxy no Windows — exige admin; eleva via UAC quando necessario
+  Write-Info 'Rota B: criando regras netsh portproxy no Windows (pode pedir UAC)...'
+  $VmIp = ((wsl -d Debian-slim -- hostname -I | Out-String) -replace "`0", '').Trim().Split(' ')[0]
+  if (-not $VmIp) { Die 'Nao consegui obter o IP da VM Debian-slim (hostname -I).' }
+  $GwIp = [regex]::Match(((wsl -d Debian-slim -- ip route show default | Out-String) -replace "`0", ''), 'default via (\S+)').Groups[1].Value
+  if (-not $GwIp) { Die 'Nao consegui obter o gateway do WSL (IP do vEthernet).' }
+
+  $PortProxyPs1 = @'
+# Regras netsh portproxy da rota B do Alpha AI (gerado pelo install.ps1)
+# (2) host -> containers: 127.9.12.22 (loopback Windows) -> IP da VM (socat)
+$appPorts = @(3000,4005,4003,3003,3001,2002,3002,3004,4002,9000,3005,2001,8081,6379,11235,4010)
+foreach ($p in $appPorts) {
+  netsh interface portproxy delete v4tov4 listenaddress=127.9.12.22 listenport=$p | Out-Null
+  netsh interface portproxy add v4tov4 listenaddress=127.9.12.22 listenport=$p connectaddress=VMIP connectport=$p | Out-Null
+}
+# (3) containers -> HOST: tray :9001 (bind 127.9.12.22), Chrome CDP :9222 e
+# transcribe :9100 (bind 127.0.0.1). O container chega pelo gateway do WSL.
+$gw = 'GWIP'
+foreach ($r in @(@(9001,'127.9.12.22'), @(9222,'127.0.0.1'), @(9100,'127.0.0.1'))) {
+  netsh interface portproxy delete v4tov4 listenaddress=$gw listenport=$($r[0]) | Out-Null
+  netsh interface portproxy add v4tov4 listenaddress=$gw listenport=$($r[0]) connectaddress=$($r[1]) connectport=$($r[0]) | Out-Null
+}
+# Firewall: libera a VM alcancar as portas de servicos do host via vEthernet
+netsh advfirewall firewall delete rule name="Alpha AI WSL relay" | Out-Null
+netsh advfirewall firewall add rule name="Alpha AI WSL relay" dir=in action=allow protocol=TCP localip=$gw localport=9001,9222,9100 | Out-Null
+'@
+  $PortProxyPs1 = $PortProxyPs1.Replace('VMIP', $VmIp).Replace('GWIP', $GwIp)
+  $PpTmp = Join-Path $env:TEMP 'alpha-ai-portproxy.ps1'
+  [System.IO.File]::WriteAllText($PpTmp, $PortProxyPs1, (New-Object System.Text.UTF8Encoding($false)))
+
+  $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  try {
+    if ($IsAdmin) {
+      & $PpTmp
+    } else {
+      Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PpTmp`"")
+    }
+  } catch {
+    Die "Falha ao criar as regras de portproxy (UAC recusado?): $($_.Exception.Message)"
+  }
+
+  $ppShow = (netsh interface portproxy show v4tov4 | Out-String)
+  if ($ppShow -notmatch '127\.9\.12\.22') {
+    Die 'As regras de portproxy nao foram criadas (precisa de admin). Rode o install.ps1 como Administrador.'
+  }
+  Remove-Item $PpTmp -Force -ErrorAction SilentlyContinue
+  Write-Ok 'Portproxy criado: 127.9.12.22 -> VM (stack) e gateway WSL -> loopback (host).'
+  Write-Warn2 'Nota: o IP da VM pode mudar apos reiniciar o WSL/PC - se os servicos nao responderem, rode o install.ps1 novamente.'
+  Write-Info 'Nota (rota B): o tray supervisiona o docker via CLI do host - nessa rota ele nao vera o stack; o instalador sobe o stack direto via compose.'
+}
+
+# Wrapper de compose com suporte as duas rotas:
+#   A (Docker Desktop): docker-start.bat no host, como sempre.
+#   B (Docker Engine no Debian-slim): compose roda DENTRO da VM — nao existe
+#      CLI docker no host. O caminho do projeto e traduzido via wslpath.
+function Invoke-Compose {
+  if ($script:UseWSLDocker) {
+    $wslDir = ((wsl -d Debian-slim -- wslpath -a $InstallDir | Out-String) -replace "`0", '').Trim()
+    $envArgs = @()
+    if (Test-Path (Join-Path $InstallDir 'Modules\.env')) { $envArgs = @('--env-file', 'Modules/.env') }
+    wsl -d Debian-slim --cd $wslDir -- docker compose @envArgs -f docker-compose.yml -f docker-compose.windows.yml @args
+    return $LASTEXITCODE
+  }
+  & .\docker-start.bat @args
+  return $LASTEXITCODE
+}
+$script:LogsHint = if ($script:UseWSLDocker) {
+  "wsl -d Debian-slim --cd `"$InstallDir`" -- docker compose logs -f ava"
+} else {
+  "$InstallDir\docker-start.bat logs -f ava"
+}
+
 # -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
-  & .\docker-start.bat build
-  if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou - rode .\docker-start.bat build para ver o erro.' }
+  Invoke-Compose build
+  if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou - rode o build novamente para ver o erro.' }
 
   # Manager primeiro: e ele quem sobe o stack Docker (POST /docker/start).
-  # Se o Manager falhar, cai para o docker-start.bat.
+  # Se o Manager falhar, cai para o compose direto.
   $viaManager = (Start-Manager) -and (Start-DockerViaManager)
   if (-not $viaManager) {
-    Write-Warn2 'Usando docker-start.bat como alternativa.'
-    Write-Info 'Subindo o stack...'
-    & .\docker-start.bat up -d
+    Write-Warn2 'Subindo o stack diretamente via compose...'
+    Invoke-Compose up -d
     if ($LASTEXITCODE -ne 0) { Die 'docker compose up falhou.' }
   }
 
@@ -471,14 +783,14 @@ if (-not $SkipBuild) {
       break
     } catch {
       if (($Elapsed % 60) -eq 0 -and $Elapsed -gt 0) {
-        Write-Info "  ...aguardando ha $([int]($Elapsed / 60)) min (logs: .\docker-start.bat logs -f ava)"
+        Write-Info "  ...aguardando ha $([int]($Elapsed / 60)) min (logs: $script:LogsHint)"
       }
       Start-Sleep -Seconds 5
       $Elapsed += 5
     }
   }
   if ($Elapsed -ge $MaxWait) {
-    Write-Warn2 'Orchestrator nao respondeu em 20 min. Veja: .\docker-start.bat logs -f ava'
+    Write-Warn2 "Orchestrator nao respondeu em 20 min. Veja: $script:LogsHint"
   }
 
   try {
@@ -489,7 +801,7 @@ if (-not $SkipBuild) {
       if ($ans -notmatch '^[nN]') {
         Prompt-Key
         Write-Info 'Reiniciando container ava para reler a chave...'
-        & .\docker-start.bat restart ava
+        Invoke-Compose restart ava
       }
     }
   } catch { }
@@ -531,7 +843,7 @@ Write-Host ''
 Write-Ok "Instalacao concluida ($InstallDir)"
 Write-Info 'Comandos uteis:'
 Write-Info '  alpha-ai                          # abre a TUI (novo terminal)'
-Write-Info "  $InstallDir\docker-start.bat logs -f ava   # logs do backend"
+Write-Info "  $script:LogsHint   # logs do backend"
 
 if (-not $NoLaunch) {
   Write-Info 'Abrindo a TUI...'

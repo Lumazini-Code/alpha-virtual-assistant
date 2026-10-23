@@ -12,6 +12,11 @@ logs/*
 Modules/logs/**
 compiler/
 Modules/memory/**
+# mcp_manager (Rust) roda NO HOST — nunca entra no container.
+# O Dockerfile não copia nada daqui, mas sem exclusão a pasta inteira
+# (953MB, quase todo target/ de build Rust) vai como contexto de build.
+# O bind mount ./Modules:/app/Modules não é afetado pelo .dockerignore.
+Modules/mcp_manager/**
 .venv/*
 # IDE
 .vscode/*

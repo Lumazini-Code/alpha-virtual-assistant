@@ -2,7 +2,7 @@
 # install.sh — Instalador Alpha AI (Linux)
 #
 # Fluxo:
-#   1. Valida prereqs (Docker + compose v2, curl, unzip, x86_64)
+#   1. Valida/instala prereqs (Node 24, Docker Engine + compose v2, curl, unzip, x86_64)
 #   2. Baixa o asset `*linux*.zip` do último release no GitHub
 #   3. Extrai em ~/.local/opt/alpha-ai (override: ALPHA_INSTALL_DIR ou --install-dir)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
@@ -78,20 +78,158 @@ info "Validando pré-requisitos..."
 
 [ "$(uname -m)" = "x86_64" ] || die "Arquitetura $(uname -m) não suportada (binários são x86_64)."
 
-for cmd in curl unzip docker; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' não encontrado. Instale-o e rode novamente."
+# Gerenciador de pacotes da distro (usado para instalar o que faltar)
+PKG=""
+for c in apt-get dnf dnf5 yum pacman; do
+  if command -v "$c" >/dev/null 2>&1; then PKG="$c"; break; fi
 done
 
-if ! docker compose version >/dev/null 2>&1; then
-  die "Plugin 'docker compose' (v2) ausente.
-       Instale com: sudo apt install docker-compose-plugin
-       (ou https://docs.docker.com/engine/install/ubuntu/#install-the-plugin-manually)"
+# Executa um comando como root (via sudo, salvo se já for root)
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "Preciso de root para '$*' e não há sudo. Rode o instalador como root (ou instale o sudo)."
+  fi
+}
+
+# 1a. curl e unzip (necessários para baixar/instalar o resto)
+for cmd in curl unzip; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    info "'$cmd' não encontrado — instalando..."
+    [ -n "$PKG" ] || die "'$cmd' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
+    case "$PKG" in
+      apt-get) as_root apt-get update -qq && as_root apt-get install -y -qq "$cmd" ;;
+      dnf|dnf5) as_root "$PKG" install -y "$cmd" ;;
+      yum)      as_root yum install -y "$cmd" ;;
+      pacman)   as_root pacman -S --noconfirm --needed "$cmd" ;;
+    esac
+    command -v "$cmd" >/dev/null 2>&1 || die "Falha ao instalar '$cmd'. Instale-o manualmente e rode novamente."
+  fi
+done
+ok "curl e unzip disponíveis."
+
+# 1b. Docker Engine (+ compose v2) — instala automaticamente se ausente
+# Testa o daemon: direto (usuário já no grupo docker) ou via sg (grupo
+# recém-adicionado, ainda não ativo na sessão atual).
+docker_alive() {
+  docker info >/dev/null 2>&1 && return 0
+  [ -S /var/run/docker.sock ] && command -v sg >/dev/null 2>&1 && \
+    sg docker -c "docker info" >/dev/null 2>&1
+}
+
+install_docker() {
+  info "Docker não encontrado — instalando Docker Engine automaticamente..."
+  info "(vai pedir a senha do sudo; pode levar alguns minutos)"
+  case "$PKG" in
+    apt-get|dnf|dnf5|yum)
+      # get.docker.com adiciona o repositório oficial da distro e instala
+      # docker-ce + plugin compose v2 — funciona em Debian/Ubuntu/Fedora/RHEL.
+      curl -fsSL https://get.docker.com | as_root sh || \
+        die "Instalação do Docker Engine falhou. Instale manualmente: https://docs.docker.com/engine/install/"
+      ;;
+    pacman)
+      as_root pacman -Sy --noconfirm --needed docker docker-compose || \
+        die "Instalação do Docker Engine falhou. Instale manualmente: sudo pacman -S docker docker-compose"
+      ;;
+    *)
+      die "Docker não encontrado e não identifiquei o gerenciador de pacotes.
+           Instale o Docker Engine manualmente: https://docs.docker.com/engine/install/"
+      ;;
+  esac
+  # Serviço no boot + usuário atual no grupo docker (sem exigir relogin:
+  # docker_alive cobre via sg)
+  if command -v systemctl >/dev/null 2>&1; then
+    as_root systemctl enable --now docker 2>/dev/null || true
+  else
+    as_root service docker start 2>/dev/null || true
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    as_root usermod -aG docker "$(id -un)" 2>/dev/null || \
+      warn "Não consegui adicionar $(id -un) ao grupo docker (rode: sudo usermod -aG docker \$USER)."
+  fi
+  ok "Docker Engine instalado."
+}
+
+if command -v docker >/dev/null 2>&1; then
+  # Docker já existe — só garante o plugin compose v2
+  if ! docker compose version >/dev/null 2>&1; then
+    info "Plugin 'docker compose' (v2) ausente — instalando..."
+    case "$PKG" in
+      apt-get|dnf|dnf5|yum)
+        curl -fsSL https://get.docker.com | as_root sh || \
+          die "Falha ao instalar docker-compose-plugin.
+               Manual: sudo apt install docker-compose-plugin (Ubuntu/Debian)"
+        ;;
+      pacman)
+        as_root pacman -S --noconfirm --needed docker-compose || \
+          die "Falha ao instalar docker-compose."
+        ;;
+      *)
+        die "Plugin 'docker compose' (v2) ausente.
+             Instale com: sudo apt install docker-compose-plugin
+             (ou https://docs.docker.com/engine/install/ubuntu/#install-the-plugin-manually)"
+        ;;
+    esac
+    docker compose version >/dev/null 2>&1 || die "Plugin 'docker compose' (v2) continua ausente."
+  fi
+  ok "Docker + compose v2 disponíveis."
+else
+  install_docker
 fi
 
-if ! docker info >/dev/null 2>&1; then
+if ! docker_alive; then
   die "Docker indisponível (daemon parado ou sem permissão).
        - Daemon parado:      sudo systemctl start docker
-       - Permissão:          sudo usermod -aG docker \$USER  (depois: newgrp docker ou relogin)"
+       - Permissão:          sudo usermod -aG docker \$USER  (depois: relogin)"
+fi
+ok "Daemon Docker respondendo."
+
+# 1c. Node.js no host — os MCPs Playwright/Desktop Commander são spawnados
+# pelo mcp_manager do host via `npx`; sem node/npm o registro falha.
+node_major() {
+  node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1
+}
+
+if command -v node >/dev/null 2>&1; then
+  if [ "$(node_major)" -ge 24 ] 2>/dev/null; then
+    ok "Node $(node --version) disponível no host."
+  else
+    warn "Node $(node --version) é mais antigo que a v24 (recomendado para os MCPs)."
+  fi
+else
+  info "Node.js não encontrado no host — instalando Node 24 (NodeSource)..."
+  case "$PKG" in
+    apt-get)
+      curl -fsSL https://deb.nodesource.com/setup_24.x | as_root bash - && \
+        as_root apt-get install -y -qq nodejs || \
+        die "Falha ao instalar o Node.js. Instale manualmente: https://nodejs.org (v24+)"
+      ;;
+    dnf|dnf5)
+      curl -fsSL https://rpm.nodesource.com/setup_24.x | as_root bash - && \
+        as_root "$PKG" install -y nodejs || \
+        die "Falha ao instalar o Node.js. Instale manualmente: https://nodejs.org (v24+)"
+      ;;
+    yum)
+      curl -fsSL https://rpm.nodesource.com/setup_24.x | as_root bash - && \
+        as_root yum install -y nodejs || \
+        die "Falha ao instalar o Node.js. Instale manualmente: https://nodejs.org (v24+)"
+      ;;
+    pacman)
+      # Arch não tem NodeSource — o repo oficial traz a versão mais recente
+      as_root pacman -S --noconfirm --needed nodejs npm || \
+        die "Falha ao instalar o Node.js. Instale manualmente: sudo pacman -S nodejs npm"
+      ;;
+    *)
+      die "Node.js não encontrado e não identifiquei o gerenciador de pacotes.
+           Instale manualmente: https://nodejs.org (v24+)"
+      ;;
+  esac
+  command -v node >/dev/null 2>&1 || \
+    die "Node.js não ficou disponível após a instalação. Instale manualmente: https://nodejs.org (v24+)"
+  ok "Node $(node --version) instalado no host."
 fi
 
 ok "Pré-requisitos validados."

@@ -65,7 +65,7 @@ Modules/mcp_manager/db/
 AGENTS.md
 
 *.so
+Modules/transcribe/linux/
+Modules/transcribe/windows/
 
-Modules/transcribe/windows/*.dll
-Modules/transcribe/windows/*.exe
-Modules/transcribe/windows/*.pdb
+
