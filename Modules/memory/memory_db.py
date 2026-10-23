@@ -260,6 +260,10 @@ class ShortTermDB:
         self._create_tables()
 
     def _create_tables(self):
+        # ATENÇÃO: o índice idx_st_person NÃO entra aqui — em bancos criados
+        # antes do campo person_id existir, a tabela não é recriada (IF NOT
+        # EXISTS) e o CREATE INDEX falharia com "no such column: person_id".
+        # Ele é criado no fim deste método, DEPOIS da migração abaixo.
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS turn_groups (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -273,7 +277,6 @@ class ShortTermDB:
             );
             CREATE INDEX IF NOT EXISTS idx_st_session  ON turn_groups(session_id);
             CREATE INDEX IF NOT EXISTS idx_st_accessed ON turn_groups(last_accessed);
-            CREATE INDEX IF NOT EXISTS idx_st_person   ON turn_groups(person_id);
         """)
         # ── NEW (people cards): migração leve — bancos criados antes do campo
         # person_id existir não têm a coluna; adiciona como NULL (sem vínculo)
@@ -281,9 +284,11 @@ class ShortTermDB:
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(turn_groups)")}
         if "person_id" not in cols:
             self._conn.execute("ALTER TABLE turn_groups ADD COLUMN person_id INTEGER")
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_st_person ON turn_groups(person_id)"
-            )
+        # Índice criado SEMPRE aqui (coluna garantida acima): cobre tanto os
+        # bancos novos (coluna nasce com a tabela) quanto os migrados.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_st_person ON turn_groups(person_id)"
+        )
 
     def insert(self, session_id: str, turns: list[Turn], embed_text: str,
                person_id: Optional[int] = None) -> int:
@@ -1456,6 +1461,10 @@ class PlansDB:
         self._create_tables()
 
     def _create_tables(self):
+        # ATENÇÃO: o índice idx_plans_person NÃO entra aqui — em bancos criados
+        # antes do campo person_id existir, a tabela não é recriada (IF NOT
+        # EXISTS) e o CREATE INDEX falharia com "no such column: person_id".
+        # Ele é criado no fim deste método, DEPOIS da migração abaixo.
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS plans (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1471,16 +1480,17 @@ class PlansDB:
                 updated_at       REAL    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_plans_key ON plans(name_key);
-            CREATE INDEX IF NOT EXISTS idx_plans_person ON plans(person_id);
         """)
         # ── NEW: migração leve — bancos criados antes de person_id/tools_json
         # existirem não têm as colunas; adiciona sem quebrar instalações em uso.
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(plans)")}
         if "person_id" not in cols:
             self._conn.execute("ALTER TABLE plans ADD COLUMN person_id INTEGER")
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_plans_person ON plans(person_id)"
-            )
+        # Índice criado SEMPRE aqui (coluna garantida acima): cobre tanto os
+        # bancos novos (coluna nasce com a tabela) quanto os migrados.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plans_person ON plans(person_id)"
+        )
         if "tools_json" not in cols:
             self._conn.execute(
                 "ALTER TABLE plans ADD COLUMN tools_json TEXT NOT NULL DEFAULT '[]'"

@@ -37,7 +37,9 @@
 //   - WAKE_GATE_ASR = false: o ASR roda como antes e a wake word só anota.
 //
 // Embed server on-demand (rota A do plano — cadastro de voz via /settings):
-//   - mini servidor HTTP (POSIX sockets) SÓ no loopback, TRANSCRIBE_HTTP_PORT
+//   - mini servidor HTTP (POSIX sockets) em TRANSCRIBE_HTTP_HOST (default
+//     127.9.12.22 — loopback alternativo reservado ao stack; é o endereço
+//     que o orchestrator usa em TRANSCRIBE_HTTP_URL) e TRANSCRIBE_HTTP_PORT
 //     (default 9100), numa thread dedicada: GET /health e POST /speaker/embed
 //     (body = PCM s16le mono; X-Sample-Rate, default 16000 — só 16k aceito).
 //   - o orchestrator (POST /voice/register) encaminha o áudio gravado pela
@@ -840,6 +842,12 @@ public:
         port_ = port_env && *port_env ? std::atoi(port_env) : 9100;
         if (port_ <= 0 || port_ > 65535) port_ = 9100;
 
+        // Endereço de bind: default 127.9.12.22 (loopback alternativo reservado
+        // ao stack Alpha AI — o orchestrator aponta TRANSCRIBE_HTTP_URL para cá).
+        // Sobreponível via TRANSCRIBE_HTTP_HOST.
+        const char* host_env = std::getenv("TRANSCRIBE_HTTP_HOST");
+        bind_host_ = (host_env && *host_env) ? host_env : "127.9.12.22";
+
         if (!sock_init()) {
             std::fprintf(stderr, "embed server: WSAStartup falhou — cadastro on-demand indisponível\n");
             return;
@@ -855,19 +863,29 @@ public:
 
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // só loopback
+        // bind_host_ default: 127.9.12.22 (antes era só loopback 127.0.0.1 —
+        // o orchestrator dentro do container no Windows/WSL não alcança
+        // 127.0.0.1 do host; o socat/portproxy publica 9100 em 127.9.12.22).
+        if (inet_pton(AF_INET, bind_host_.c_str(), &addr.sin_addr) != 1) {
+            std::fprintf(stderr, "embed server: TRANSCRIBE_HTTP_HOST inválido (%s) — usando 127.9.12.22\n",
+                         bind_host_.c_str());
+            bind_host_ = "127.9.12.22";
+            addr.sin_addr.s_addr = inet_addr("127.9.12.22");
+        }
         addr.sin_port        = htons((uint16_t)port_);
 
         if (bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) != 0 ||
             listen(listen_fd_, 4) != 0) {
-            std::fprintf(stderr, "embed server: bind/listen :%d falhou — cadastro on-demand indisponível\n", port_);
+            std::fprintf(stderr, "embed server: bind/listen %s:%d falhou — cadastro on-demand indisponível\n",
+                         bind_host_.c_str(), port_);
             close_socket(listen_fd_);
             listen_fd_ = SOCK_INVALID;
             sock_cleanup();
             return;
         }
         worker_ = std::thread(&EmbedServer::loop, this);
-        std::printf("Embed server on-demand: http://127.9.12.22:%d/speaker/embed\n", port_);
+        std::printf("Embed server on-demand: http://%s:%d/speaker/embed\n",
+                    bind_host_.c_str(), port_);
     }
 
     void shutdown() {
@@ -1049,6 +1067,7 @@ private:
     }
 
     SpeakerEmbedder* speaker_ = nullptr;
+    std::string bind_host_ = "127.9.12.22";
     int port_ = 9100;
     socket_t listen_fd_ = SOCK_INVALID;
     std::atomic<bool> stop_{false};
