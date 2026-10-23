@@ -469,6 +469,68 @@ class VoiceDictUpdateRequest(BaseModel):
     additional_info: Optional[str] = None
 
 
+# ── NEW: Modelos — People Card (card textual de pessoa, sem embeddings) ───────
+#
+# O card unificado (PeopleDB) já é o modelo de dados das pessoas do sistema
+# (face-dict e voice-dict usam a mesma tabela `people`). Esses modelos expõem
+# o card PELA PRIMEIRA VEZ como endpoint textual puro — sem exigir embedding
+# biométrico — para o MCP websearch criar/editar pessoas pela conversa.
+# Metadados idênticos aos de FaceDict/VoiceDict: o mesmo person_id continua
+# recebendo embeddings dos pipelines de visão/áudio normalmente.
+
+class PeopleCardWriteRequest(BaseModel):
+    person_name:     str   = Field(min_length=1)
+    description:     str   = ""          # quem é a pessoa (relação, contexto)
+    likes:           str   = ""          # gostos/preferências
+    religion:        str   = ""          # crenças/religião
+    additional_info: str   = ""          # informações adicionais
+    # "criar" (default) ou "atualizar" um card existente. Em "update" os
+    # campos enviados sobrescrevem os do card (texto vazio = apaga o campo;
+    # não envie o campo para mantê-lo — mesmo contrato do UpdateRequest).
+    # Em "create" com nome já existente → stored=False, reason="duplicate".
+    action:          Literal["create", "update"] = "create"
+    person_id:       Optional[int] = None  # só relevante em action="update"
+    # replica o card na memória de longo prazo ("Nome: descrição",
+    # source="people_card") → nó de identidade no grafo Hebbiano. Default True:
+    # sem o nó, /read com person_id e a busca por grafo não funcionam.
+    link_to_memory:  bool  = True
+
+class PeopleCardWriteResponse(BaseModel):
+    stored:       bool
+    reason:       str
+    person_id:    Optional[int] = None
+    memory_id:    Optional[int] = None   # nó de identidade em `memories`, se linkado
+    new_person:   bool = False
+
+class PeopleCardEntry(BaseModel):
+    person_id:      int
+    person_name:    str
+    description:    str
+    likes:          str
+    religion:       str
+    additional_info: str
+    source:         str
+    confidence:     float
+    memory_id:      Optional[int] = None
+    face_examples_count: int = 0
+    voice_examples_count: int = 0
+    created_at:     float
+    access_count:   int
+
+class PeopleCardUpdateRequest(BaseModel):
+    """Edita campos do card de pessoa SEM embedding. Campos não enviados
+    (None) NÃO são alterados — só os campos presentes são atualizados.
+    Campos enviados como string vazia limpam o campo no card."""
+    person_name:     Optional[str] = None
+    description:     Optional[str] = None
+    likes:           Optional[str] = None
+    religion:        Optional[str] = None
+    additional_info: Optional[str] = None
+    # renomear/atualizar a descrição também regenera a memória de identidade
+    # LT quando o card já tem uma (textos LT antigos ficam como histórico).
+    relink_memory:   bool = True
+
+
 # ── NEW: Modelos — retrieval de tools (tool selection dinâmica) ───────────────
 
 class ToolRegisterRequest(BaseModel):
@@ -669,6 +731,10 @@ __all__ = [
     'PlanDeleteResponse',
     'PlanEntry',
     'PlanListResponse',
+    'PeopleCardEntry',
+    'PeopleCardUpdateRequest',
+    'PeopleCardWriteRequest',
+    'PeopleCardWriteResponse',
     'PlanReadRequest',
     'PlanReadResponse',
     'PlanStep',

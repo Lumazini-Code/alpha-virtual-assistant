@@ -9,6 +9,16 @@ Tools MCP expostas:
     fatos de um documento ou fonte que o usuário pediu para memorizar).
     Mesmo contrato de gravação do extrator de LLM.py (_MEMORY_EXTRACTION_SCHEMA):
     fatos semânticos, forgettable=False, source=tool:memory_write_batch.
+  - `memory_people_card_create(person_name, ...)` → cria um card de pessoa
+    (people card) na memória — nome, descrição, gostos, religião e
+    informações adicionais. Card textual puro sobre a mesma tabela unificada
+    `people` dos dicionários de rosto/voz; recusa duplicado por nome.
+  - `memory_people_card_edit(person_id, ...)` → edita campos de um card
+    existente (só os campos enviados; None mantém o valor atual).
+  - `memory_people_card_list()` → lista os cards para o modelo descobrir
+    person_ids e evitar duplicados antes de criar.
+    Mesma autenticação do write LT: client persistente com Bearer token
+    interno (Modules.internal_auth / AVA_INTERNAL_TOKEN).
 
 Fluxo da busca web:
   1. Cache de busca no Valkey (hash da query, TTL de horas) → hit retorna direto
@@ -815,6 +825,153 @@ async def memory_write_batch(facts: list[str]) -> str:
         f"{stored}/{len(cleaned)} fato(s) gravados na memória de longo prazo (permanente):\n"
         + "\n".join(lines)
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# People Cards — criar/editar cards de pessoa na memória (mesma auth do write)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MemoryToolError(Exception):
+    """Erro de negócio devolvido pela memory_api (HTTP 400, JSON {"error": ...}).
+    O `detail` vira o texto de erro da tool — mesmo espírito do
+    MemoryToolError da camada de memória, mas definido aqui para o servidor
+    MCP não depender do pacote Modules."""  # noqa: matching-memory-models-name
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+async def _memory_api_request(method: str, path: str, payload: dict | None = None) -> dict:
+    """Request autenticada à memory_api (mesmo client/Bearer do write LT).
+    Levanta MemoryToolError com o `detail` do servidor em erro 400."""
+    r = await _get_memory_client().request(method, path, json=payload)
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError:
+        detail = None
+        try:
+            detail = r.json().get("error") or r.json().get("detail")
+        except Exception:
+            pass
+        raise MemoryToolError(detail or f"memory_api respondeu HTTP {r.status_code}")
+    return r.json()
+
+
+def _format_card(c: dict) -> str:
+    """Card de pessoa em linha compacta: '#id Nome — descrição (gostos/religião/info)'."""
+    extra = " / ".join(
+        f"{label}: {c[label]}" for label in ("likes", "religion", "additional_info")
+        if c.get(label)
+    )
+    desc = c.get("description") or "sem descrição"
+    return f"#{c['person_id']} {c['person_name']} — {desc}" + (f" ({extra})" if extra else "")
+
+
+@mcp.tool()
+async def memory_people_card_create(
+    person_name: str,
+    description: str = "",
+    likes: str = "",
+    religion: str = "",
+    additional_info: str = "",
+) -> str:
+    """Cria um card de pessoa na memória do usuário (Pessoas). Use ao aprender
+    sobre alguém novo e estável na vida do usuário — quem é a pessoa
+    (`description`), gostos/preferências (`likes`), crenças (`religion`) e
+    outros fatos persistentes (`additional_info`). NÃO crie cards para fatos
+    soltos sobre pessoas sem relevância duradoura — para isso use
+    memory_write_batch. Se a pessoa já existir, o servidor recusa a criação:
+    use memory_people_card_list para descobrir o person_id e
+    memory_people_card_edit para atualizar o card dela."""
+    if not person_name.strip():
+        return "Erro: person_name vazio."
+    try:
+        data = await _memory_api_request("POST", "/people-card/write", {
+            "person_name":     person_name.strip(),
+            "description":     description.strip(),
+            "likes":           likes.strip(),
+            "religion":        religion.strip(),
+            "additional_info": additional_info.strip(),
+            "link_to_memory":  True,
+        })
+    except MemoryToolError as e:
+        return f"Erro ao criar card de pessoa: {e.detail}"
+    except Exception as e:
+        log.exception("memory_people_card_create falhou")
+        return f"Erro ao criar card de pessoa: {e}"
+    if not data.get("stored"):
+        if data.get("reason") == "duplicate":
+            pid = data.get("person_id")
+            return (
+                f"Card duplicado: '{person_name.strip()}' já existe "
+                f"(person_id={pid}). Use memory_people_card_edit para atualizar "
+                f"o card dela."
+            )
+        return f"Card não criado ({data.get('reason')})."
+    log.info(f"[people] card criado: #{data.get('person_id')} '{person_name.strip()}'")
+    return (
+        f"Card de pessoa criado (person_id={data.get('person_id')}, "
+        f"identity_memory_id={data.get('memory_id')}): "
+        f"{_format_card({'person_id': data.get('person_id'), 'person_name': person_name.strip(), 'description': description, 'likes': likes, 'religion': religion, 'additional_info': additional_info})}"
+    )
+
+
+@mcp.tool()
+async def memory_people_card_edit(
+    person_id: int,
+    person_name: str | None = None,
+    description: str | None = None,
+    likes: str | None = None,
+    religion: str | None = None,
+    additional_info: str | None = None,
+) -> str:
+    """Edita um card de pessoa existente por person_id (descubra com
+    memory_people_card_list). Campos enviados SOBRESCREVEM o valor atual
+    (string vazia limpa o campo); campos deixados em None NÃO são alterados.
+    Mudar description ou person_name também atualiza a memória de identidade
+    da pessoa na memória de longo prazo. Use ao corrigir/complementar
+    informações de alguém já cadastrado — para fatos soltos prefira
+    memory_write_batch."""
+    payload = {
+        k: v for k, v in {
+            "person_name":     person_name,
+            "description":     description,
+            "likes":           likes,
+            "religion":        religion,
+            "additional_info": additional_info,
+        }.items() if v is not None
+    }
+    if not payload:
+        return "Erro: nenhum campo para editar (todos em None)."
+    try:
+        c = await _memory_api_request("PATCH", f"/people-card/{person_id}", payload)
+    except MemoryToolError as e:
+        return f"Erro ao editar card de pessoa: {e.detail}"
+    except Exception as e:
+        log.exception("memory_people_card_edit falhou")
+        return f"Erro ao editar card de pessoa: {e}"
+    log.info(f"[people] card editado: #{person_id}")
+    return f"Card atualizado: {_format_card(c)}"
+
+
+@mcp.tool()
+async def memory_people_card_list() -> str:
+    """Lista todas as pessoas cadastradas na memória do usuário (people cards).
+    Use antes de memory_people_card_create para descobrir se a pessoa já
+    existe (evitar duplicado) e obter o person_id para edição. Retorna uma
+    linha por pessoa: '#person_id Nome — descrição (extras)'."""
+    try:
+        data = await _memory_api_request("GET", "/people-card/list")
+    except MemoryToolError as e:
+        return f"Erro ao listar cards de pessoa: {e.detail}"
+    except Exception as e:
+        log.exception("memory_people_card_list falhou")
+        return f"Erro ao listar cards de pessoa: {e}"
+    people = data.get("people", [])
+    if not people:
+        return "Nenhuma pessoa cadastrada."
+    lines = [_format_card(c) for c in people]
+    return f"{len(people)} pessoa(s) cadastrada(s):\n" + "\n".join(lines)
 
 
 if __name__ == "__main__":

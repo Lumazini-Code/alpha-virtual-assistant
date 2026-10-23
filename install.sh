@@ -406,6 +406,95 @@ else
   ok "CRAWL4AI_API_TOKEN já existe em $ENV_FILE."
 fi
 
+# ── 5b-2. Token da extensão do Playwright (PLAYWRIGHT_MCP_EXTENSION_TOKEN) ───
+# O @playwright/mcp roda com --extension e pareia com a extensão oficial do
+# Chrome via este token. O token NÃO é gerado pelo instalador: a própria
+# extensão o cria (base64url de 32 bytes) e persiste em localStorage
+# ('auth-token') na origem chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm
+# quando a página status.html é aberta. Extraímos o valor do LevelDB de
+# Local Storage do perfil do navegador. Se a extensão ainda não estiver
+# instalada, a extração é refeita na etapa 5c, após abrir a Chrome Web Store.
+
+PLAYWRIGHT_EXTENSION_URL="https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm"
+PLAYWRIGHT_EXTENSION_STATUS_URL="chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status.html"
+
+# Procura o 'auth-token' da extensão no LevelDB de Local Storage dos perfis
+# dos navegadores Chromium instalados e imprime o token (43 chars base64url).
+# A página status.html renderiza o token via React — o valor confiável está no
+# localStorage persistido, não no HTML estático.
+extract_playwright_token() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - <<'PY'
+import glob, os, re, sys
+
+home = os.path.expanduser('~')
+leveldb_globs = [
+    home + '/.config/google-chrome/*/Local Storage/leveldb',
+    home + '/.config/chromium/*/Local Storage/leveldb',
+    home + '/.config/microsoft-edge/*/Local Storage/leveldb',
+    home + '/.config/BraveSoftware/Brave-Browser/*/Local Storage/leveldb',
+    home + '/snap/chromium/common/chromium/*/Local Storage/leveldb',
+    home + '/.var/app/org.chromium.Chromium/config/chromium/*/Local Storage/leveldb',
+]
+# Token: 32 bytes em base64url sem padding = 43 chars de [A-Za-z0-9_-]
+token_re = re.compile(r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])')
+needle_utf8 = b'auth-token'
+needle_utf16 = 'auth-token'.encode('utf-16-le')
+
+files = []
+for pattern in leveldb_globs:
+    for d in glob.glob(pattern):
+        files.extend(
+            os.path.join(d, name) for name in os.listdir(d)
+            if name.endswith(('.ldb', '.log'))
+        )
+# Arquivo mais recente primeiro: se o usuário regenerou o token, o valor
+# atual costuma estar no WAL (.log) ou no .ldb mais novo.
+files.sort(key=os.path.getmtime, reverse=True)
+
+for path in files:
+    try:
+        with open(path, 'rb') as fh:
+            raw = fh.read()
+    except OSError:
+        continue
+    if needle_utf8 not in raw and needle_utf16 not in raw:
+        continue
+    # O valor pode estar gravado em UTF-8 ou UTF-16LE no LevelDB —
+    # decodifica o arquivo nas duas visões e procura o padrão.
+    for view in (raw.decode('utf-8', errors='ignore'),
+                 raw.decode('utf-16-le', errors='ignore')):
+        match = token_re.search(view)
+        if match:
+            print(match.group(0))
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+open_url() {
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$1" >/dev/null 2>&1 || true
+  elif command -v sensible-browser >/dev/null 2>&1; then
+    sensible-browser "$1" >/dev/null 2>&1 || true
+  else
+    return 1
+  fi
+}
+
+if ! grep -qE '^PLAYWRIGHT_MCP_EXTENSION_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
+  info "Procurando token da extensão Playwright no perfil do navegador..."
+  if token="$(extract_playwright_token)"; then
+    set_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN "$token"
+    ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN extraído do status.html da extensão → $ENV_FILE."
+  else
+    warn "Extensão Playwright ainda não instalada (token não encontrado no perfil)."
+    warn "A instalação abrirá a Chrome Web Store na etapa 5c e extrairá o token após a instalação."
+  fi
+else
+  ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN já existe em $ENV_FILE."
+fi
+
 # ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
 # Cadastra o @playwright/mcp no mcp_manager (:4008) logo após o `up` do stack.
 # O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
@@ -420,9 +509,40 @@ register_playwright_mcp() {
   "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
   "transport": "stdio",
   "command": "npx",
-  "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://127.9.12.22:9222"],
+  "args": ["-y", "@playwright/mcp@latest", "--extension"],
   "env": {"DISPLAY": ":0"}
 }'
+
+  # A extensão precisa ser instalada manualmente na Chrome Web Store —
+  # o Playwright MCP no modo --extension conecta a ela via bridge.
+  info "Abrindo a Chrome Web Store para instalar a extensão do Playwright..."
+  info "$PLAYWRIGHT_EXTENSION_URL"
+  open_url "$PLAYWRIGHT_EXTENSION_URL" || {
+    warn "Não encontrei um opener de URLs — instale a extensão manualmente:"
+    printf '  %s\n' "$PLAYWRIGHT_EXTENSION_URL"
+  }
+
+  # Se o token ainda não foi extraído (extensão instalada agora), abre a
+  # status.html — a extensão então grava o token no localStorage do perfil —
+  # e extrai o valor do LevelDB de Local Storage. Pausa para dar tempo do
+  # usuário concluir a instalação na loja e o Chrome gravar em disco.
+  if ! grep -qE '^PLAYWRIGHT_MCP_EXTENSION_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
+    printf 'Instale a extensão na janela aberta e pressione ENTER para continuar... '
+    read -r || true
+    info "Abrindo a página de status da extensão (${PLAYWRIGHT_EXTENSION_STATUS_URL})..."
+    open_url "$PLAYWRIGHT_EXTENSION_STATUS_URL" || true
+    info "Aguardando o Chrome persistir o token (30 s)... "
+    sleep 30
+    if token="$(extract_playwright_token)"; then
+      set_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN "$token"
+      ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN extraído do status.html da extensão → $ENV_FILE."
+    else
+      warn "Não consegui extrair o token automaticamente."
+      warn "Abra a página de status da extensão, copie o token e adicione ao $ENV_FILE:"
+      printf '  %s\n' "$PLAYWRIGHT_EXTENSION_STATUS_URL"
+      printf '  PLAYWRIGHT_MCP_EXTENSION_TOKEN=<token>\n'
+    fi
+  fi
 
   info "Registrando Playwright MCP no mcp_manager ($MCP_MANAGER_URL)..."
   local registered=0 i

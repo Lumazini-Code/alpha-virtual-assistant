@@ -252,6 +252,32 @@ async def voice_dict_delete(person_id: int):
     return await mem.voice_dict_delete(person_id)
 
 
+# ── NEW: People Card — card textual de pessoa (MCP websearch) ───────────────────
+#
+# Card textual puro (sem embedding biométrico) sobre a mesma tabela `people`
+# unificada (PeopleDB). Usado pelo MCP websearch para criar/editar pessoas
+# pela conversa; face-dict e voice-dict continuam cuidando dos embeddings.
+
+@app.post("/people-card/write", response_model=mem.PeopleCardWriteResponse)
+async def people_card_write(req: mem.PeopleCardWriteRequest):
+    return await mem.people_card_write(req)
+
+
+@app.get("/people-card/list")
+async def people_card_list():
+    return await mem.people_card_list()
+
+
+@app.get("/people-card/{person_id}")
+async def people_card_get(person_id: int):
+    return await mem.people_card_get(person_id)
+
+
+@app.patch("/people-card/{person_id}")
+async def people_card_update(person_id: int, req: mem.PeopleCardUpdateRequest):
+    return await mem.people_card_update(person_id, req)
+
+
 # ── RAG de seleção de tools ──────────────────────────────────────────────────────
 
 @app.post("/tools/register", response_model=mem.ToolRegisterResponse)

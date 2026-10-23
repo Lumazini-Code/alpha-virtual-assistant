@@ -36,6 +36,10 @@ from memory_models import (
     FaceDictWriteRequest,
     FaceDictWriteResponse,
     MemoryToolError,
+    PeopleCardEntry,
+    PeopleCardUpdateRequest,
+    PeopleCardWriteRequest,
+    PeopleCardWriteResponse,
     RelatedMemory,
     VisualDictCandidate,
     VisualDictEntry,
@@ -713,6 +717,204 @@ async def voice_dict_delete(person_id: int):
     }
 
 
+# ── NEW: People Card — card textual de pessoa (sem embeddings) ────────────────
+#
+# O card unificado (PeopleDB) já centraliza os metadados ricos das pessoas
+# (nome, descrição, gostos, religião, informações adicionais) — é a mesma
+# tabela `people` que face-dict e voice-dict usam. Estes handlers expõem o
+# card como recurso TEXTUAL puro: o MCP websearch (LLM, sem câmera/microfone)
+# cria e edita pessoas pela conversa. O mesmo person_id continua recebendo
+# embeddings dos pipelines de visão/áudio normalmente.
+#
+# O card ganha um nó de identidade no grafo Hebbiano (memória LT
+# source="people_card", id guardado em memory_id) — é por ele que /read com
+# person_id injeta semente no PPR e memórias sobre a pessoa vêm como "related".
+
+_pc_write_lock = asyncio.Lock()  # guarda o check-then-insert no PeopleDB
+
+
+def _people_card_entry(row: sqlite3.Row) -> PeopleCardEntry:
+    return PeopleCardEntry(
+        person_id=row["id"],
+        person_name=row["person_name"],
+        description=row["description"],
+        likes=row["likes"],
+        religion=row["religion"],
+        additional_info=row["additional_info"],
+        source=row["source"],
+        confidence=row["confidence"],
+        memory_id=row["memory_id"],
+        face_examples_count=state.pd_db.count_examples(row["id"], "face"),
+        voice_examples_count=state.pd_db.count_examples(row["id"], "voice"),
+        created_at=row["created_at"],
+        access_count=row["access_count"],
+    )
+
+
+async def _card_identity_memory(
+    person_id: int, person_name: str, description: str,
+    current: Optional[int],
+) -> Optional[int]:
+    """Cria/atualiza a memória de identidade LT do card ("Nome: descrição",
+    source="people_card") e garante o memory_id atualizado no card.
+
+    Card com memória existente → o texto é atualizado in-place (action=
+    "update", mesmo memory_id — o nó de identidade permanece estável no
+    grafo). Falha no update → mantém o vínculo atual (o nó antigo continua
+    válido). Card sem memória → cria o nó e grava o id no card."""
+    text = f"{person_name}: {description.strip() or 'sem descrição'}"
+    if current is not None:
+        stored, _, memory_id, _ = await _store_long_term_text(
+            text, "people_card", 1.0, False,
+            action="update", memory_id=current,
+        )
+        if stored:
+            return memory_id
+        log.warning(
+            f"people: update da memória de identidade do card #{person_id} "
+            f"recusado — vínculo atual mantido"
+        )
+        return current
+    stored, reason, memory_id, _ = await _store_long_term_text(
+        text, "people_card", 1.0, False,
+    )
+    if not stored or memory_id is None:
+        log.warning(
+            f"people: falha ao criar memória de identidade do card "
+            f"#{person_id} ({reason}) — card criado sem nó de identidade"
+        )
+        return None
+    state.pd_db.set_memory_id(person_id, memory_id)
+    return memory_id
+
+
+async def people_card_write(req: PeopleCardWriteRequest):
+    """Cria (action="create") ou edita (action="update") um card de pessoa
+    pelo nome — fluxo textual puro, sem embedding.
+
+    update: campos AUSENTES do JSON não alteram o card; campos enviados
+    sobrescrevem (string vazia limpa o campo) — o POST explicita só o que
+    mudou. O card é localizado por person_id (quando enviado) ou pelo nome.
+    create: nome já cadastrado → stored=False, reason="duplicate" (o chamador
+    decide editar o card existente em vez de criar um duplicado)."""
+    person_name = req.person_name.strip()
+    if not person_name:
+        return PeopleCardWriteResponse(stored=False, reason="empty_person_name")
+
+    async with _pc_write_lock:
+        if req.action == "update":
+            row = (state.pd_db.get_person_by_id(req.person_id)
+                   if req.person_id is not None
+                   else state.pd_db.get_by_name(person_name))
+            if row is None:
+                return PeopleCardWriteResponse(stored=False, reason="not_found")
+            person_id = row["id"]
+            # só os campos explicitamente enviados no JSON são alterados
+            sent = set(req.model_fields_set)
+            state.pd_db.update_card(
+                person_id,
+                description=req.description if "description" in sent else None,
+                likes=req.likes if "likes" in sent else None,
+                religion=req.religion if "religion" in sent else None,
+                additional_info=req.additional_info if "additional_info" in sent else None,
+            )
+            if req.link_to_memory:
+                row = state.pd_db.get_person_by_id(person_id)
+                await _card_identity_memory(
+                    person_id, row["person_name"], row["description"], row["memory_id"],
+                )
+            log.info(f"People-card: card #{person_id} ('{row['person_name']}') atualizado")
+            return PeopleCardWriteResponse(
+                stored=True, reason="ok", person_id=person_id,
+                memory_id=state.pd_db.get_person_by_id(person_id)["memory_id"],
+                new_person=False,
+            )
+
+        # create — nome já cadastrado é recusado (evita card duplicado)
+        existing = state.pd_db.get_by_name(person_name)
+        if existing is not None:
+            return PeopleCardWriteResponse(
+                stored=False, reason="duplicate", person_id=existing["id"],
+                memory_id=existing["memory_id"], new_person=False,
+            )
+
+        memory_id = None
+        if req.link_to_memory:
+            # nó de identidade LT criado ANTES do insert (insert_person já
+            # grava o memory_id) — o card ainda não existe, set_memory_id
+            # não teria a quem aplicar.
+            stored, reason, memory_id, _ = await _store_long_term_text(
+                f"{person_name}: {req.description.strip() or 'sem descrição'}",
+                "people_card", 1.0, False,
+            )
+            if not stored:
+                memory_id = None  # dedup/erro — card criado mesmo assim, sem nó
+        try:
+            person_id = state.pd_db.insert_person(
+                person_name=person_name,
+                description=req.description.strip(),
+                likes=req.likes.strip(),
+                religion=req.religion.strip(),
+                additional_info=req.additional_info.strip(),
+                source="people_card", confidence=1.0, memory_id=memory_id,
+            )
+        except sqlite3.IntegrityError:
+            # Corrida: outro write criou a mesma person_key nesse meio-tempo.
+            existing = state.pd_db.get_by_name(person_name)
+            if existing is None:
+                raise
+            return PeopleCardWriteResponse(
+                stored=False, reason="duplicate", person_id=existing["id"],
+                memory_id=existing["memory_id"], new_person=False,
+            )
+
+    log.info(
+        f"People-card: card #{person_id} criado — '{person_name}' "
+        f"(memory_id={memory_id})"
+    )
+    return PeopleCardWriteResponse(
+        stored=True, reason="ok", person_id=person_id,
+        memory_id=memory_id, new_person=True,
+    )
+
+
+async def people_card_update(person_id: int, req: PeopleCardUpdateRequest):
+    """Edita campos do card de pessoa SEM embedding. Campos não enviados
+    (None) NÃO são alterados. Renomear ou mudar a descrição atualiza a
+    memória de identidade LT in-place (relink_memory=True)."""
+    row = state.pd_db.get_person_by_id(person_id)
+    if row is None:
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
+    state.pd_db.update_card(
+        person_id,
+        description=req.description,
+        likes=req.likes,
+        religion=req.religion,
+        additional_info=req.additional_info,
+        person_name=req.person_name.strip() if req.person_name else None,
+    )
+    row = state.pd_db.get_person_by_id(person_id)
+    if req.relink_memory and ((req.person_name or "").strip() or req.description is not None):
+        await _card_identity_memory(
+            person_id, row["person_name"], row["description"], row["memory_id"],
+        )
+        row = state.pd_db.get_person_by_id(person_id)
+    return _people_card_entry(row)
+
+
+async def people_card_get(person_id: int):
+    row = state.pd_db.get_person_by_id(person_id)
+    if row is None:
+        raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
+    return _people_card_entry(row)
+
+
+async def people_card_list():
+    rows = state.pd_db.list_people()
+    people = [_people_card_entry(row).model_dump() for row in rows]
+    return {"total": len(people), "people": people}
+
+
 __all__ = [
     '_fd_write_lock',
     '_vd_write_lock',
@@ -723,6 +925,10 @@ __all__ = [
     'face_dict_read',
     'face_dict_update',
     'face_dict_write',
+    'people_card_get',
+    'people_card_list',
+    'people_card_update',
+    'people_card_write',
     'visual_dict_delete',
     'visual_dict_get',
     'visual_dict_list',

@@ -375,6 +375,89 @@ $AvaToken = Get-EnvVar 'AVA_INTERNAL_TOKEN'
 if (-not $AvaToken) { Die "AVA_INTERNAL_TOKEN nao encontrado em $EnvFile." }
 $McpHeaders = @{ Authorization = "Bearer $AvaToken" }
 
+# -- 5b''. Token da extensão do Playwright (PLAYWRIGHT_MCP_EXTENSION_TOKEN) ---
+# O @playwright/mcp roda com --extension e pareia com a extensão oficial do
+# Chrome via este token. O token NAO e gerado pelo instalador: a propria
+# extensao o cria (base64url de 32 bytes) e persiste em localStorage
+# ('auth-token') na origem chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm
+# quando a pagina status.html e aberta. Extraimos o valor do LevelDB de
+# Local Storage do perfil do navegador. Se a extensao ainda nao estiver
+# instalada, a extracao e refeita na etapa 5b, apos abrir a Chrome Web Store.
+
+$PlaywrightExtensionUrl = 'https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm'
+$PlaywrightExtensionStatusUrl = 'chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status.html'
+
+# Procura o 'auth-token' da extensao no LevelDB de Local Storage dos perfis
+# dos navegadores Chromium instalados e imprime o token (43 chars base64url).
+# A pagina status.html renderiza o token via React - o valor confiavel esta no
+# localStorage persistido, nao no HTML estatico.
+function Get-PlaywrightExtensionToken {
+  $leveldbRoots = @(
+    (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'),
+    (Join-Path $env:LOCALAPPDATA 'Chromium\User Data'),
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'),
+    (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data')
+  )
+  # Token: 32 bytes em base64url sem padding = 43 chars de [A-Za-z0-9_-]
+  $tokenRegex = [regex]'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])'
+  $needleUtf8 = [System.Text.Encoding]::UTF8.GetBytes('auth-token')
+  $needleUtf16 = [System.Text.Encoding]::Unicode.GetBytes('auth-token')
+
+  $files = @()
+  foreach ($root in $leveldbRoots) {
+    if (-not (Test-Path $root)) { continue }
+    $files += Get-ChildItem -Path $root -Filter '*' -Directory -ErrorAction SilentlyContinue |
+      ForEach-Object { Join-Path $_.FullName 'Local Storage\leveldb' } |
+      Where-Object { Test-Path $_ } |
+      ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } |
+      Where-Object { $_.Extension -in @('.ldb', '.log') }
+  }
+  # Arquivo mais recente primeiro: se o usuario regenerou o token, o valor
+  # atual costuma estar no WAL (.log) ou no .ldb mais novo.
+  $files = $files | Sort-Object LastWriteTime -Descending
+
+  foreach ($file in $files) {
+    try { $raw = [System.IO.File]::ReadAllBytes($file.FullName) } catch { continue }
+    if (-not (Contains-Bytes $raw $needleUtf8) -and -not (Contains-Bytes $raw $needleUtf16)) { continue }
+    # O valor pode estar gravado em UTF-8 ou UTF-16LE no LevelDB -
+    # decodifica o arquivo nas duas visoes e procura o padrao.
+    $utf8View = [System.Text.Encoding]::UTF8.GetString($raw)
+    $utf16View = [System.Text.Encoding]::Unicode.GetString($raw)
+    foreach ($view in @($utf8View, $utf16View)) {
+      $m = $tokenRegex.Match($view)
+      if ($m.Success) { return $m.Value }
+    }
+  }
+  return $null
+}
+
+# Busca sequencial de bytes (Array.IndexOf nao aceita padrao multi-byte)
+function Contains-Bytes {
+  param([byte[]]$Haystack, [byte[]]$Needle)
+  for ($i = 0; $i -le $Haystack.Length - $Needle.Length; $i++) {
+    $match = $true
+    for ($j = 0; $j -lt $Needle.Length; $j++) {
+      if ($Haystack[$i + $j] -ne $Needle[$j]) { $match = $false; break }
+    }
+    if ($match) { return $true }
+  }
+  return $false
+}
+
+if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
+  Write-Info 'Procurando token da extensao Playwright no perfil do navegador...'
+  $token = Get-PlaywrightExtensionToken
+  if ($token) {
+    Set-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN' $token
+    Write-Ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN extraido do status.html da extensao -> $EnvFile"
+  } else {
+    Write-Warn2 'Extensao Playwright ainda nao instalada (token nao encontrado no perfil).'
+    Write-Warn2 'A instalacao abrira a Chrome Web Store na etapa 5b e extraira o token apos a instalacao.'
+  }
+} else {
+  Write-Ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN ja existe em $EnvFile"
+}
+
 # -- 5b'. Token do crawl4ai (CRAWL4AI_API_TOKEN) ------------------------------
 # O compose exige esta variavel (falha de boot se ausente). O websearch-mcp e o
 # crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
@@ -400,8 +483,39 @@ function Register-PlaywrightMcp {
     skill_summary  = 'Automação de navegador (navegar, clicar, extrair conteúdo)'
     transport      = 'stdio'
     command        = 'npx'
-    args           = @('-y', '@playwright/mcp@latest', '--cdp-endpoint', 'http:/127.9.12.22:9222')
+    args           = @('-y', '@playwright/mcp@latest', '--extension')
   } | ConvertTo-Json -Depth 3
+
+  # A extensao precisa ser instalada manualmente na Chrome Web Store -
+  # o Playwright MCP no modo --extension conecta a ela via bridge.
+  Write-Info 'Abrindo a Chrome Web Store para instalar a extensao do Playwright...'
+  Write-Info $PlaywrightExtensionUrl
+  try { Start-Process $PlaywrightExtensionUrl } catch {
+    Write-Warn2 'Nao consegui abrir o navegador - instale a extensao manualmente:'
+    Write-Warn2 $PlaywrightExtensionUrl
+  }
+
+  # Se o token ainda nao foi extraido (extensao instalada agora), abre a
+  # status.html - a extensao entao grava o token no localStorage do perfil -
+  # e extrai o valor do LevelDB de Local Storage. Pausa para dar tempo do
+  # usuario concluir a instalacao na loja e o Chrome gravar em disco.
+  if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
+    Read-Host 'Instale a extensao na janela aberta e pressione ENTER para continuar' | Out-Null
+    Write-Info "Abrindo a pagina de status da extensao ($PlaywrightExtensionStatusUrl)..."
+    try { Start-Process $PlaywrightExtensionStatusUrl } catch {}
+    Write-Info 'Aguardando o Chrome persistir o token (30 s)...'
+    Start-Sleep -Seconds 30
+    $token = Get-PlaywrightExtensionToken
+    if ($token) {
+      Set-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN' $token
+      Write-Ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN extraido do status.html da extensao -> $EnvFile"
+    } else {
+      Write-Warn2 'Nao consegui extrair o token automaticamente.'
+      Write-Warn2 'Abra a pagina de status da extensao, copie o token e adicione ao Modules\.env:'
+      Write-Warn2 "  $PlaywrightExtensionStatusUrl"
+      Write-Warn2 '  PLAYWRIGHT_MCP_EXTENSION_TOKEN=<token>'
+    }
+  }
 
   Write-Info "Registrando Playwright MCP no mcp_manager ($McpManagerUrl)..."
   $registered = $false
