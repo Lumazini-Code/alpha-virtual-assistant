@@ -34,3 +34,5 @@ Manager/ava-tray
 .env
 
 *.pyc
+
+Modules/__pycache__/
