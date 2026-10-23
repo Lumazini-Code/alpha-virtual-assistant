@@ -88,7 +88,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # memory.py — onde o dicionário visual (e a memória normal) é lido/escrito
-MEMORY_API_URL = _env_str("VISION_MEMORY_API_URL", "http://localhost:3001")
+MEMORY_API_URL = _env_str("VISION_MEMORY_API_URL", "http://127.9.12.22:3001")
 
 # Componentes carregados: "all" (default) ou CSV — ex.: "depth,sam,embedder,faces".
 # Desligar um componente aqui NUNCA carrega seus modelos (~410MB no total do

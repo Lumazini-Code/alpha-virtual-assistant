@@ -14,21 +14,21 @@ services:
       # NUNCA publicar 9001 (tray) nem 9222 (Chrome CDP) — são serviços do
       # HOST: publicar faz o proxy do Docker Desktop capturar a porta e
       # sombrear o serviço local (TUI recebia "socket closed" no tray).
-      # Prefixo 127.0.0.1: em TODAS as portas — sem ele o Docker Desktop
+      # Prefixo 127.9.12.22: em TODAS as portas — sem ele o Docker Desktop
       # publica em 0.0.0.0 e a LAN inteira alcança os serviços (Plano 1 — T9).
-      - "127.0.0.1:3000:3000"
-      - "127.0.0.1:4005:4005"
-      - "127.0.0.1:4003:4003"
-      - "127.0.0.1:3003:3003"
-      - "127.0.0.1:3001:3001"
-      - "127.0.0.1:2002:2002"
-      - "127.0.0.1:3002:3002"
-      - "127.0.0.1:3004:3004"
-      - "127.0.0.1:4002:4002"
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:3005:3005"
-      - "127.0.0.1:2001:2001"
-      - "127.0.0.1:4008:4008"
+      - "127.9.12.22:3000:3000"
+      - "127.9.12.22:4005:4005"
+      - "127.9.12.22:4003:4003"
+      - "127.9.12.22:3003:3003"
+      - "127.9.12.22:3001:3001"
+      - "127.9.12.22:2002:2002"
+      - "127.9.12.22:3002:3002"
+      - "127.9.12.22:3004:3004"
+      - "127.9.12.22:4002:4002"
+      - "127.9.12.22:9000:9000"
+      - "127.9.12.22:3005:3005"
+      - "127.9.12.22:2001:2001"
+      - "127.9.12.22:4008:4008"
 
     # Container → serviços do host (tray :9001, Chrome CDP :9222).
     # No Windows/WSL2 `localhost` dentro do container NÃO é o host —
@@ -45,7 +45,7 @@ services:
       AVA_CDP_ENDPOINT: "http://host.docker.internal:9222"
       # Servidores MCP http cadastrados como http://localhost:PORTA pela
       # TUI no HOST — dentro do container "localhost" é o próprio container.
-      # O mcp_manager reescreve localhost/127.0.0.1 → host.docker.internal
+      # O mcp_manager reescreve localhost/127.9.12.22 → host.docker.internal
       # (porta e path preservados) no momento da conexão.
       AVA_LOCALHOST_REWRITE: "http://host.docker.internal"
       # Embedding on-demand (cadastro de voz): o transcribe (main.cpp) roda

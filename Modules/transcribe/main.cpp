@@ -444,7 +444,7 @@ class OrchestratorPoster {
 public:
     bool init() {
         const char* port = std::getenv("ORCHESTRATOR_PORT");
-        base_ = std::string("http://127.0.0.1:")
+        base_ = std::string("http://127.9.12.22:")
              + (port && *port ? port : "9000");
         const char* tok = std::getenv("AVA_INTERNAL_TOKEN");
         if (tok && *tok) token_ = tok;
@@ -527,7 +527,7 @@ public:
     void notify_ui_chat_open() {
         std::thread([] {
             const char* port = std::getenv("AVA_MANAGER_PORT");
-            const std::string base = std::string("http://127.0.0.1:")
+            const std::string base = std::string("http://127.9.12.22:")
                  + (port && *port ? port : "9001");
             httplib::Client cli(base);
             cli.set_connection_timeout(0, 500000);   // 500ms
@@ -867,7 +867,7 @@ public:
             return;
         }
         worker_ = std::thread(&EmbedServer::loop, this);
-        std::printf("Embed server on-demand: http://127.0.0.1:%d/speaker/embed\n", port_);
+        std::printf("Embed server on-demand: http://127.9.12.22:%d/speaker/embed\n", port_);
     }
 
     void shutdown() {

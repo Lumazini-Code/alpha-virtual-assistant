@@ -52,8 +52,8 @@ def require_auth() -> bool:
 
 def internal_bind_host() -> str:
     """Host de bind dos serviços internos. Default: 127.0.0.1 (loopback)."""
-    host = os.environ.get("AVA_BIND_HOST", "").strip()
-    return host or "127.0.0.1"
+    host = os.environ.get("AVA_BIND_HOST", "127.9.12.22").strip()
+    return host or "127.9.12.22"
 
 
 def _warn_missing_token(service_name: str) -> None:

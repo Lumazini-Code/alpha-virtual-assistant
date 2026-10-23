@@ -258,7 +258,7 @@ async def face_dict_write(req: FaceDictWriteRequest):
     loop = asyncio.get_event_loop()
 
     async with _fd_write_lock:
-        existing = state.fd_db.get_by_name(person_name)
+        existing = state.pd_db.get_by_name(person_name)
         new_person = existing is None
 
         memory_id: Optional[int] = None
@@ -268,14 +268,14 @@ async def face_dict_write(req: FaceDictWriteRequest):
             # se veio uma descrição não-vazia num cadastro de exemplo adicional,
             # atualiza/completa a descrição já salva (permite corrigir depois)
             if description:
-                state.fd_db.update_description(person_id, description)
+                state.pd_db.update_card(person_id, description)
                 # NEW: pessoa já cadastrada SEM link + link pedido → "promove"
                 if req.link_to_memory and memory_id is None:
                     stored, _, memory_id, _ = await _store_long_term_text(
                         f"{person_name}: {description}", "face_dict", req.confidence,
                     )
                     if stored:
-                        state.fd_db.set_memory_id(person_id, memory_id)
+                        state.pd_db.set_memory_id(person_id, memory_id)
                     else:
                         memory_id = None
         else:
@@ -287,18 +287,20 @@ async def face_dict_write(req: FaceDictWriteRequest):
                 if not stored:
                     memory_id = None  # dedup/erro — pessoa cadastrada mesmo assim, sem link
             try:
-                person_id = state.fd_db.insert_person(
+                person_id = state.pd_db.insert_person(
                     person_name=person_name, description=description,
+                    likes=req.likes.strip(), religion=req.religion.strip(),
+                    additional_info=req.additional_info.strip(),
                     source=req.source, confidence=req.confidence, memory_id=memory_id,
                 )
             except sqlite3.IntegrityError:
                 # Corrida: outro write criou a mesma person_key nesse meio-tempo.
-                existing = state.fd_db.get_by_name(person_name)
+                existing = state.pd_db.get_by_name(person_name)
                 if existing is None:
                     raise
                 person_id, memory_id, new_person = existing["id"], existing["memory_id"], False
 
-        embedding_id = state.fd_db.insert_embedding(person_id)
+        embedding_id = state.pd_db.insert_embedding(person_id, "face")
         await loop.run_in_executor(None, state.fd_index.add, vec, embedding_id)
 
     log.info(
@@ -327,7 +329,7 @@ async def face_dict_read(req: FaceDictReadRequest):
 
     best_score_by_person: dict[int, float] = {}
     for embedding_id, score in hits:
-        person_id = state.fd_db.get_person_id_by_embedding(embedding_id)
+        person_id = state.pd_db.get_person_id_by_embedding(embedding_id, "face")
         if person_id is None:
             continue
         if person_id not in best_score_by_person or score > best_score_by_person[person_id]:
@@ -339,10 +341,10 @@ async def face_dict_read(req: FaceDictReadRequest):
     for person_id, score in ranked:
         if score < req.min_score:
             continue
-        row = state.fd_db.get_person_by_id(person_id)
+        row = state.pd_db.get_person_by_id(person_id)
         if row is None:
             continue
-        state.fd_db.update_access(person_id)
+        state.pd_db.update_access(person_id)
         results.append(FaceCandidate(
             person_id=row["id"],
             person_name=row["person_name"],
@@ -371,16 +373,19 @@ async def face_dict_read(req: FaceDictReadRequest):
 
 
 async def face_dict_list():
-    rows = state.fd_db.list_people()
+    rows = state.pd_db.list_people()
     people = [
         FaceDictEntry(
             person_id=row["id"],
             person_name=row["person_name"],
             description=row["description"],
+            likes=row["likes"],
+            religion=row["religion"],
+            additional_info=row["additional_info"],
             source=row["source"],
             confidence=row["confidence"],
             memory_id=row["memory_id"],
-            examples_count=row["examples_count"],
+            examples_count=row["face_examples_count"],
             created_at=row["created_at"],
             access_count=row["access_count"],
         ).model_dump()
@@ -390,57 +395,82 @@ async def face_dict_list():
 
 
 async def face_dict_get(person_id: int):
-    row = state.fd_db.get_person_by_id(person_id)
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
     return FaceDictEntry(
         person_id=row["id"],
         person_name=row["person_name"],
         description=row["description"],
+        likes=row["likes"],
+        religion=row["religion"],
+        additional_info=row["additional_info"],
         source=row["source"],
         confidence=row["confidence"],
         memory_id=row["memory_id"],
-        examples_count=state.fd_db.count_examples(person_id),
+        examples_count=state.pd_db.count_examples(person_id, "face"),
         created_at=row["created_at"],
         access_count=row["access_count"],
     )
 
 
 async def face_dict_update(person_id: int, req: FaceDictUpdateRequest):
-    """Edita só a descrição de uma pessoa já cadastrada, sem precisar
-    mandar um novo embedding junto."""
-    row = state.fd_db.get_person_by_id(person_id)
+    """Edita campos do card de pessoa já cadastrado, sem precisar mandar um
+    novo embedding junto. Campos não enviados (None) NÃO são alterados."""
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
-    state.fd_db.update_description(person_id, req.description.strip())
-    row = state.fd_db.get_person_by_id(person_id)
+    state.pd_db.update_card(
+        person_id,
+        description=req.description.strip() or None,
+        likes=req.likes,
+        religion=req.religion,
+        additional_info=req.additional_info,
+    )
+    row = state.pd_db.get_person_by_id(person_id)
     return FaceDictEntry(
         person_id=row["id"],
         person_name=row["person_name"],
         description=row["description"],
+        likes=row["likes"],
+        religion=row["religion"],
+        additional_info=row["additional_info"],
         source=row["source"],
         confidence=row["confidence"],
         memory_id=row["memory_id"],
-        examples_count=state.fd_db.count_examples(person_id),
+        examples_count=state.pd_db.count_examples(person_id, "face"),
         created_at=row["created_at"],
         access_count=row["access_count"],
     )
 
 
 async def face_dict_delete(person_id: int):
-    """Remove uma pessoa e todos os seus embeddings de rosto (DB + FAISS)."""
-    row = state.fd_db.get_person_by_id(person_id)
+    """Remove um card de pessoa e todos os seus embeddings (DB + índices).
+
+    Unificação: o card é único (PeopleDB), então deletar a pessoa remove
+    os embeddings de rosto E de voz do banco (CASCADE) e dos dois índices
+    vetoriais — sem isso, o índice de voz ficaria com vetores órfãos."""
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
 
-    embedding_ids = state.fd_db.get_embedding_ids_by_person(person_id)
-    if embedding_ids:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, state.fd_index.remove_ids, set(embedding_ids))
+    face_ids  = state.pd_db.get_embedding_ids_by_person(person_id, "face")
+    voice_ids = state.pd_db.get_embedding_ids_by_person(person_id, "voice")
+    loop = asyncio.get_event_loop()
+    if face_ids:
+        await loop.run_in_executor(None, state.fd_index.remove_ids, set(face_ids))
+    if voice_ids:
+        await loop.run_in_executor(None, state.vo_index.remove_ids, set(voice_ids))
 
-    deleted = state.fd_db.delete_person(person_id)
-    log.info(f"Face-dict: pessoa #{person_id} removida ({len(embedding_ids)} embeddings)")
-    return {"deleted": deleted, "person_id": person_id, "embeddings_removed": len(embedding_ids)}
+    deleted = state.pd_db.delete_person(person_id)
+    log.info(
+        f"Face-dict: card de pessoa #{person_id} removido "
+        f"({len(face_ids)} emb. rosto, {len(voice_ids)} emb. voz)"
+    )
+    return {
+        "deleted": deleted, "person_id": person_id,
+        "embeddings_removed": len(face_ids) + len(voice_ids),
+    }
 
 
 # ── NEW: Dicionário de Voz — endpoints usados pelo pipeline de áudio ────────────
@@ -470,7 +500,7 @@ async def voice_dict_write(req: VoiceDictWriteRequest):
     loop = asyncio.get_event_loop()
 
     async with _vo_write_lock:
-        existing = state.vo_db.get_by_name(person_name)
+        existing = state.pd_db.get_by_name(person_name)
         new_person = existing is None
 
         if existing is not None:
@@ -479,7 +509,7 @@ async def voice_dict_write(req: VoiceDictWriteRequest):
             # se veio uma descrição não-vazia num cadastro de exemplo adicional,
             # atualiza/completa a descrição já salva
             if description:
-                state.vo_db.update_description(person_id, description)
+                state.pd_db.update_card(person_id, description)
         else:
             memory_id = None
             if description:
@@ -493,18 +523,20 @@ async def voice_dict_write(req: VoiceDictWriteRequest):
                     memory_id = None  # dedup/erro — a pessoa ainda é cadastrada,
                                         # só sem o link pra memória
             try:
-                person_id = state.vo_db.insert_person(
+                person_id = state.pd_db.insert_person(
                     person_name=person_name, description=description,
+                    likes=req.likes.strip(), religion=req.religion.strip(),
+                    additional_info=req.additional_info.strip(),
                     source=req.source, confidence=req.confidence, memory_id=memory_id,
                 )
             except sqlite3.IntegrityError:
                 # Corrida: outro write criou a mesma person_key nesse meio-tempo.
-                existing = state.vo_db.get_by_name(person_name)
+                existing = state.pd_db.get_by_name(person_name)
                 if existing is None:
                     raise
                 person_id, memory_id, new_person = existing["id"], existing["memory_id"], False
 
-        embedding_id = state.vo_db.insert_embedding(person_id)
+        embedding_id = state.pd_db.insert_embedding(person_id, "voice")
         await loop.run_in_executor(None, state.vo_index.add, vec, embedding_id)
 
     log.info(
@@ -533,7 +565,7 @@ async def voice_dict_read(req: VoiceDictReadRequest):
 
     best_score_by_person: dict[int, float] = {}
     for embedding_id, score in hits:
-        person_id = state.vo_db.get_person_id_by_embedding(embedding_id)
+        person_id = state.pd_db.get_person_id_by_embedding(embedding_id, "voice")
         if person_id is None:
             continue
         if person_id not in best_score_by_person or score > best_score_by_person[person_id]:
@@ -545,10 +577,10 @@ async def voice_dict_read(req: VoiceDictReadRequest):
     for person_id, score in ranked:
         if score < req.min_score:
             continue
-        row = state.vo_db.get_person_by_id(person_id)
+        row = state.pd_db.get_person_by_id(person_id)
         if row is None:
             continue
-        state.vo_db.update_access(person_id)
+        state.pd_db.update_access(person_id)
         results.append(VoiceCandidate(
             person_id=row["id"],
             person_name=row["person_name"],
@@ -577,16 +609,19 @@ async def voice_dict_read(req: VoiceDictReadRequest):
 
 
 async def voice_dict_list():
-    rows = state.vo_db.list_people()
+    rows = state.pd_db.list_people()
     people = [
         VoiceDictEntry(
             person_id=row["id"],
             person_name=row["person_name"],
             description=row["description"],
+            likes=row["likes"],
+            religion=row["religion"],
+            additional_info=row["additional_info"],
             source=row["source"],
             confidence=row["confidence"],
             memory_id=row["memory_id"],
-            examples_count=row["examples_count"],
+            examples_count=row["voice_examples_count"],
             created_at=row["created_at"],
             access_count=row["access_count"],
         ).model_dump()
@@ -596,61 +631,86 @@ async def voice_dict_list():
 
 
 async def voice_dict_get(person_id: int):
-    row = state.vo_db.get_person_by_id(person_id)
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
     return VoiceDictEntry(
         person_id=row["id"],
         person_name=row["person_name"],
         description=row["description"],
+        likes=row["likes"],
+        religion=row["religion"],
+        additional_info=row["additional_info"],
         source=row["source"],
         confidence=row["confidence"],
         memory_id=row["memory_id"],
-        examples_count=state.vo_db.count_examples(person_id),
+        examples_count=state.pd_db.count_examples(person_id, "voice"),
         created_at=row["created_at"],
         access_count=row["access_count"],
     )
 
 
 async def voice_dict_update(person_id: int, req: VoiceDictUpdateRequest):
-    """Edita só a descrição de uma pessoa já cadastrada, sem precisar
-    mandar um novo embedding junto."""
-    row = state.vo_db.get_person_by_id(person_id)
+    """Edita campos do card de pessoa já cadastrado, sem precisar mandar um
+    novo embedding junto. Campos não enviados (None) NÃO são alterados."""
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
-    state.vo_db.update_description(person_id, req.description.strip())
-    row = state.vo_db.get_person_by_id(person_id)
+    state.pd_db.update_card(
+        person_id,
+        description=req.description.strip() or None,
+        likes=req.likes,
+        religion=req.religion,
+        additional_info=req.additional_info,
+    )
+    row = state.pd_db.get_person_by_id(person_id)
     return VoiceDictEntry(
         person_id=row["id"],
         person_name=row["person_name"],
         description=row["description"],
+        likes=row["likes"],
+        religion=row["religion"],
+        additional_info=row["additional_info"],
         source=row["source"],
         confidence=row["confidence"],
         memory_id=row["memory_id"],
-        examples_count=state.vo_db.count_examples(person_id),
+        examples_count=state.pd_db.count_examples(person_id, "voice"),
         created_at=row["created_at"],
         access_count=row["access_count"],
     )
 
 
 async def voice_dict_delete(person_id: int):
-    """Remove uma pessoa e todos os seus embeddings de voz (DB + FAISS).
+    """Remove um card de pessoa e todos os seus embeddings (DB + índices).
+
+    Unificação: o card é único (PeopleDB), então deletar a pessoa remove
+    os embeddings de voz E de rosto do banco (CASCADE) e dos dois índices
+    vetoriais — sem isso, o índice de rosto ficaria com vetores órfãos.
 
     A memória de longo prazo linkada (descrição gravada na criação) NÃO é
     removida — a remoção explícita lá continua sendo responsabilidade de
     quem gerencia `memories` (mesma política do visual-dict)."""
-    row = state.vo_db.get_person_by_id(person_id)
+    row = state.pd_db.get_person_by_id(person_id)
     if row is None:
         raise MemoryToolError(f"Pessoa #{person_id} não encontrada")
 
-    embedding_ids = state.vo_db.get_embedding_ids_by_person(person_id)
-    if embedding_ids:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, state.vo_index.remove_ids, set(embedding_ids))
+    voice_ids = state.pd_db.get_embedding_ids_by_person(person_id, "voice")
+    face_ids  = state.pd_db.get_embedding_ids_by_person(person_id, "face")
+    loop = asyncio.get_event_loop()
+    if voice_ids:
+        await loop.run_in_executor(None, state.vo_index.remove_ids, set(voice_ids))
+    if face_ids:
+        await loop.run_in_executor(None, state.fd_index.remove_ids, set(face_ids))
 
-    deleted = state.vo_db.delete_person(person_id)
-    log.info(f"Voice-dict: pessoa #{person_id} removida ({len(embedding_ids)} embeddings)")
-    return {"deleted": deleted, "person_id": person_id, "embeddings_removed": len(embedding_ids)}
+    deleted = state.pd_db.delete_person(person_id)
+    log.info(
+        f"Voice-dict: card de pessoa #{person_id} removido "
+        f"({len(voice_ids)} emb. voz, {len(face_ids)} emb. rosto)"
+    )
+    return {
+        "deleted": deleted, "person_id": person_id,
+        "embeddings_removed": len(voice_ids) + len(face_ids),
+    }
 
 
 __all__ = [

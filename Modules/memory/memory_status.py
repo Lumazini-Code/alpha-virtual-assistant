@@ -172,18 +172,18 @@ def _gather_status_sync() -> dict:
             "top_k":           VD_TOP_K,
             "ambiguous_margin": VD_AMBIGUOUS_MARGIN,
         },
-        # ── NEW: Face dictionary status ──
+        # ── Unificação: Face dictionary status (card de pessoa) ──
         "face_dict": {
-            "people_total":     state.fd_db.count(),
+            "people_total":     state.pd_db.count(),
             "embeddings_total": state.fd_index.total,
             "embed_dim":        FD_EMBED_DIM,
             "min_score":        FD_MIN_SCORE,
             "top_k":            FD_TOP_K,
             "ambiguous_margin": FD_AMBIGUOUS_MARGIN,
         },
-        # ── NEW: Voice dictionary status ──
+        # ── Unificação: Voice dictionary status (card de pessoa) ──
         "voice_dict": {
-            "people_total":     state.vo_db.count(),
+            "people_total":     state.pd_db.count(),
             "embeddings_total": state.vo_index.total,
             "embed_dim":        VO_EMBED_DIM,
             "min_score":        VO_MIN_SCORE,

@@ -52,8 +52,8 @@ from urllib.parse import urlparse
 import httpx
 
 # ── Config default ────────────────────────────────────────────────────────────
-MCP_MANAGER_URL = "http://localhost:4008"
-MEMORY_API_URL = "http://localhost:3000"
+MCP_MANAGER_URL = "http://127.9.12.22:4008"
+MEMORY_API_URL = "http://127.9.12.22:3000"
 PLAYWRIGHT_SERVER = "playwright"
 CALL_TIMEOUT = 120.0
 

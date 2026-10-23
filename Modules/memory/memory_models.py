@@ -71,6 +71,11 @@ class WriteRequest(BaseModel):
     # exata/semântica (>= DEDUP_THRESHOLD) continua sendo recusada.
     link_to:     Optional[int] = None
     link_type:   Optional[Literal["co_activation", "temporal_precedence", "contradicts", "updates"]] = None
+    # ── NEW (people cards): vincula a memória a um card de pessoa (people.id).
+    # A memória nova ganha uma aresta co_activation com o nó de identidade do
+    # card no grafo Hebbiano — o PPR espalha ativação entre a pessoa e as
+    # memórias sobre ela. person_id inválido → warning e grava sem vínculo.
+    person_id:   Optional[int] = None
 
 class WriteBatchRequest(BaseModel):
     # ── NEW (solução 1): grava várias memórias em uma única chamada,
@@ -86,6 +91,9 @@ class WriteBatchRequest(BaseModel):
 class WriteSTRequest(BaseModel):
     session_id: str
     turns:      list[Turn]
+    # ── NEW (people cards): vincula o grupo de turnos a um card de pessoa
+    # (people.id) — FK direta, filtrável no /read_st. Invalido → warning.
+    person_id:  Optional[int] = None
 
 class ReadRequest(BaseModel):
     query:      str
@@ -101,6 +109,10 @@ class ReadRequest(BaseModel):
     # (READ_TOP_K_FINAL_MAX / READ_TOTAL_MAX_CHARS_MAX). None = usa o default.
     top_k_final:     Optional[int] = None
     total_max_chars: Optional[int] = None
+    # ── NEW (people cards): leitura centrada em uma pessoa. O nó de
+    # identidade do card é injetado como semente extra no PPR — memórias
+    # relacionadas à pessoa vêm como "related" mesmo sem match semântico.
+    person_id:   Optional[int] = None
 
 class WriteResponse(BaseModel):
     stored:    bool
@@ -133,6 +145,8 @@ class WriteSTResponse(BaseModel):
 class ReadSTRequest(BaseModel):
     session_id: str
     n_pairs:    int = ST_READ_DEFAULT_PAIRS
+    # ── NEW (people cards): filtra os grupos de turnos por card de pessoa.
+    person_id:  Optional[int] = None
 
 class ReadSTResponse(BaseModel):
     session_id:     str
@@ -336,6 +350,9 @@ class FaceDictWriteRequest(BaseModel):
     person_name: str                 # nome da pessoa, ex.: "eu" / "Fulano"
     embedding:   list[float]         # embedding do rosto alinhado (EdgeFace)
     description: str   = ""          # quem é essa pessoa (relação, contexto etc.)
+    likes:           str = ""       # NEW (unificação): gostos/preferências
+    religion:        str = ""       # NEW (unificação): crenças/religião
+    additional_info: str = ""       # NEW (unificação): informações adicionais
     source:      str   = "vision_pipeline"
     confidence:  float = 1.0
     # ── NEW: replica a descrição na memória de longo prazo (source="face_dict"),
@@ -377,6 +394,9 @@ class FaceDictEntry(BaseModel):
     person_id:      int
     person_name:    str
     description:    str
+    likes:          str = ""   # NEW (unificação): gostos/preferências
+    religion:       str = ""   # NEW (unificação): crenças
+    additional_info: str = ""  # NEW (unificação): informações adicionais
     source:         str
     confidence:     float
     memory_id:      Optional[int] = None   # NEW
@@ -392,6 +412,9 @@ class VoiceDictWriteRequest(BaseModel):
     embedding:   list[float]         # embedding do locutor (CAM++ etc.), normalizado ou não
     description: str   = ""          # quem é essa pessoa (relação, contexto etc.) —
                                      # também gravada na memória de longo prazo
+    likes:           str = ""       # NEW (unificação): gostos/preferências
+    religion:        str = ""       # NEW (unificação): crenças/religião
+    additional_info: str = ""       # NEW (unificação): informações adicionais
     source:      str   = "voice_pipeline"
     confidence:  float = 1.0
 
@@ -427,6 +450,9 @@ class VoiceDictEntry(BaseModel):
     person_id:      int
     person_name:    str
     description:    str
+    likes:          str = ""   # NEW (unificação): gostos/preferências
+    religion:       str = ""   # NEW (unificação): crenças
+    additional_info: str = ""  # NEW (unificação): informações adicionais
     source:         str
     confidence:     float
     memory_id:      Optional[int] = None
@@ -435,7 +461,12 @@ class VoiceDictEntry(BaseModel):
     access_count:   int
 
 class VoiceDictUpdateRequest(BaseModel):
-    description: str
+    """Edita campos do card de pessoa. Campos não enviados (None) NÃO são
+    alterados — só os campos presentes na requisição são atualizados."""
+    description:     str = ""
+    likes:           Optional[str] = None
+    religion:        Optional[str] = None
+    additional_info: Optional[str] = None
 
 
 # ── NEW: Modelos — retrieval de tools (tool selection dinâmica) ───────────────
@@ -518,11 +549,21 @@ class PlanStep(BaseModel):
     max_actions: int = Field(default=PLANS_MAX_ACTIONS_MODEL, ge=1, le=50)
     # descrição humana do passo (log/plano legível)
     description: str = ""
+    # ── NEW (tools ↔ planos): nome da tool MCP que este step executa.
+    # macro: normalmente a tool Playwright; modelo: a tool que o LLM tende a
+    # usar. Os tool_names distintos do plano são resolvidos para tool_ids na
+    # ToolsDB e gravados em `tools_json` — os tools do plano ganham arestas
+    # no grafo de co-uso (temporal_precedence na ordem dos steps + co_activation
+    # entre todos), reforçando a seleção dinâmica de tools.
+    tool_name: Optional[str] = None
 
 class PlanCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
     steps: list[PlanStep] = Field(min_length=1, max_length=PLANS_MAX_STEPS)
+    # ── NEW (people cards): card de pessoa ao qual o plano se relaciona.
+    # Invalido → warning e grava sem vínculo (não bloqueia).
+    person_id: Optional[int] = None
 
 class PlanCreateResponse(BaseModel):
     plan_id: int
@@ -540,6 +581,9 @@ class PlanUpdateRequest(BaseModel):
     steps: Optional[list[PlanStep]] = Field(default=None, max_length=PLANS_MAX_STEPS)
     # merge ou replace das correções acumuladas ({step_index: seletor corrigido})
     corrections: Optional[dict[str, str]] = None
+    # ── NEW (people cards): novo vínculo com card de pessoa. None = mantém
+    # o vínculo atual (o update_plan preserva o valor existente).
+    person_id: Optional[int] = None
 
 class PlanUpdateResponse(BaseModel):
     plan_id: int
@@ -553,6 +597,13 @@ class PlanEntry(BaseModel):
     version:    int
     steps:      list[PlanStep]
     corrections: dict[str, str] = {}
+    # ── NEW (people cards): card de pessoa ao qual este plano se relaciona
+    # (ex.: "plano que paga a conta da pessoa X"). Opcional — None = sem vínculo.
+    person_id:  Optional[int] = None
+    # ── NEW (tools ↔ planos): tool_ids distintos usados pelos steps do plano,
+    # resolvidos a partir de `tool_name` em PlanStep. Esse conjunto alimenta as
+    # arestas de co-uso no grafo de tools (ver memory_ops_plans.py).
+    tool_ids:   list[int] = []
     created_at: float
     updated_at: float
 
@@ -588,7 +639,12 @@ class MemoryToolError(Exception):
 
 
 class FaceDictUpdateRequest(BaseModel):
-    description: str
+    """Edita campos do card de pessoa. Campos não enviados (None) NÃO são
+    alterados — só os campos presentes na requisição são atualizados."""
+    description:     str = ""
+    likes:           Optional[str] = None
+    religion:        Optional[str] = None
+    additional_info: Optional[str] = None
 
 
 __all__ = [

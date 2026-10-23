@@ -223,7 +223,7 @@ if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
 # O POST /servers e upsert idempotente e o /sync tem no-op por doc_hash -
 # seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
 # retenta; se falhar de vez, so avisa (nao aborta a instalacao).
-$McpManagerUrl = 'http://localhost:4008'
+$McpManagerUrl = 'http://127.9.12.22:4008'
 
 function Register-PlaywrightMcp {
   # No Windows nao ha X server (DISPLAY) e o Chrome CDP roda no host
@@ -233,7 +233,7 @@ function Register-PlaywrightMcp {
     skill_summary  = 'Automação de navegador (navegar, clicar, extrair conteúdo)'
     transport      = 'stdio'
     command        = 'npx'
-    args           = @('-y', '@playwright/mcp@latest', '--cdp-endpoint', 'http://host.docker.internal:9222')
+    args           = @('-y', '@playwright/mcp@latest', '--cdp-endpoint', 'http:/127.9.12.22:9222')
   } | ConvertTo-Json -Depth 3
 
   Write-Info "Registrando Playwright MCP no mcp_manager ($McpManagerUrl)..."
@@ -374,7 +374,7 @@ function Register-DesktopCommanderMcp {
 # -- 5d. Manager (ava-tray.exe) - API REST em :9001 --------------------------
 # O Manager sobe/derruba o stack Docker e supervisiona o mcp_manager do host.
 # O instalador o inicia primeiro e pede o start do Docker pela API dele.
-$ManagerUrl = 'http://localhost:9001'
+$ManagerUrl = 'http://127.9.12.22:9001'
 
 function Test-ManagerUp {
   try {
@@ -460,7 +460,7 @@ if (-not $SkipBuild) {
   Register-WebsearchMcp | Out-Null
   Register-DesktopCommanderMcp | Out-Null
 
-  $StatusUrl = 'http://localhost:9000/status'
+  $StatusUrl = 'http://127.9.12.22:9000/status'
   $MaxWait = 1200  # 20 min
   $Elapsed = 0
   Write-Info "Aguardando orchestrator em $StatusUrl (primeiro boot baixa Supertonic do HF)..."

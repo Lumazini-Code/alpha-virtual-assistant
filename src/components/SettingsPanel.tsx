@@ -14,6 +14,7 @@ import {
   type VoiceEntry,
 } from "../lib/voices.js";
 import { recordMic } from "../lib/voiceRecorder.js";
+import { getPersona, setPersona } from "../lib/persona.js";
 import {
   listMCPServers,
   installMCPServer,
@@ -27,7 +28,7 @@ import {
 } from "../lib/mcpServers.js";
 
 type View = "menu" | "plans" | "edit" | "record" | "mcp" | "mcp-install" | "mcp-delete"
-  | "voices" | "voice-record" | "voice-edit";
+  | "voices" | "person-card" | "voice-edit" | "persona";
 type VoiceRecordStage =
   | "name" // nome da pessoa
   | "description" // descrição opcional (Enter inicia a gravação)
@@ -118,7 +119,8 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const [mcpDeletePhase, setMcpDeletePhase] = useState<MCPDeletePhase>("list");
   const [mcpDeleteMsg, setMcpDeleteMsg] = useState<string | null>(null);
 
-  // ── Vozes (voice_dict via memory :3000 + /voice/register via orchestrator) ─
+  // ── Cards de pessoa (PeopleDB unificado via memory :3000 + /voice/register
+  // via orchestrator) — o cadastro de voz é a etapa final da criação do card ─
   const [voices, setVoices] = useState<VoiceEntry[]>([]);
   const [voicesLoading, setVoicesLoading] = useState(false);
   const [voicesError, setVoicesError] = useState<string | null>(null);
@@ -134,6 +136,13 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
 
   const recInFlightRef = useRef(false);
   const recCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Persona (system prompt editável via GET/PUT /persona no orchestrator) ─
+  const [persona, setPersonaState] = useState("");
+  const [personaDefault, setPersonaDefault] = useState("");
+  const [personaValue, setPersonaValue] = useState("");
+  const [personaStage, setPersonaStage] = useState<"edit" | "saving" | "saved" | "error">("edit");
+  const [personaMsg, setPersonaMsg] = useState<string | null>(null);
 
   const backTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { stdin, isRawModeSupported, setRawMode } = useStdin() as {
@@ -391,7 +400,7 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     }
   }, [mcpDeleting, loadMCPServers]);
 
-  // ── Vozes: listar / cadastrar (gravação + embedding on-demand) / editar ──
+  // ── Cards de pessoa: listar / criar (card + gravação de voz) / editar ──
   const loadVoices = useCallback(async () => {
     setVoicesLoading(true);
     setVoicesError(null);
@@ -410,6 +419,47 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     setView("voices");
     void loadVoices();
   }, [loadVoices]);
+
+  // ── Persona: carregar (GET) / salvar (PUT /persona) ──────────────────────
+  const enterPersona = useCallback(async () => {
+    setView("persona");
+    setPersonaStage("edit");
+    setPersonaMsg(null);
+    try {
+      const info = await getPersona();
+      setPersonaState(info.persona);
+      setPersonaDefault(info.default);
+      setPersonaValue(info.persona);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: GET /persona falhou", { message: msg });
+      setPersonaStage("error");
+      setPersonaMsg(`orchestrator offline ou sem resposta: ${msg}`);
+    }
+  }, []);
+
+  const savePersona = useCallback(async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      setPersonaStage("error");
+      setPersonaMsg("a persona não pode ficar vazia");
+      return;
+    }
+    setPersonaStage("saving");
+    setPersonaMsg(null);
+    try {
+      const info = await setPersona(trimmed);
+      setPersonaState(info.persona);
+      setPersonaValue(info.persona);
+      setPersonaStage("saved");
+      setPersonaMsg("persona salva — vale a partir do próximo turno");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: PUT /persona falhou", { message: msg });
+      setPersonaStage("error");
+      setPersonaMsg(msg);
+    }
+  }, []);
 
   const startVoiceEdit = useCallback((voice: VoiceEntry) => {
     setVoiceEditing(voice);
@@ -467,10 +517,11 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     }
   }, [voiceEditing, loadVoices]);
 
-  /** Fase 2 do cadastro: grava RECORD_SECONDS de microfone (host) e envia o
-   * PCM em base64 ao orchestrator (/voice/register → transcribe/CAM++ →
-   * memory /voice-dict/write). Gravação roda em processo filho com stdout
-   * capturado — nada toca no terminal da TUI. */
+  /** Etapa final da criação do card: grava RECORD_SECONDS de microfone (host)
+   * e envia o PCM em base64 ao orchestrator (/voice/register → transcribe/CAM++ →
+   * memory /voice-dict/write). O embedding de voz fica vinculado ao card da
+   * pessoa (person_id) junto com nome/descrição já preenchidos. Gravação roda
+   * em processo filho com stdout capturado — nada toca no terminal da TUI. */
   const startVoiceRecording = useCallback(async () => {
     if (recInFlightRef.current) return;
     recInFlightRef.current = true;
@@ -525,6 +576,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     setRecMsg(null);
     setRecCountdown(0);
   }, []);
+
+  /** Abre o wizard de criação de card de pessoa (voz embutida no cadastro). */
+  const startPersonCard = useCallback(() => {
+    resetVoiceWizard();
+    setView("person-card");
+  }, [resetVoiceWizard]);
 
   // ── Salvar edição (nome/descrição) via API do memory ────────────────────
   const saveEdit = useCallback(async () => {
@@ -589,7 +646,10 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
       setMcpDeleting(null);
       setMcpDeleteMsg(null);
     } else if (view === "voices") setView("menu");
-    else if (view === "voice-record") {
+    else if (view === "persona") {
+      if (personaStage === "saving") return;
+      setView("menu");
+    } else if (view === "person-card") {
       // gravação/upload em andamento não são interrompíveis
       if (recStage === "recording" || recStage === "uploading") return;
       resetVoiceWizard();
@@ -612,8 +672,9 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const menuItems = [
     { label: "▶  Gravar novo plano (plan_recorder.py)", value: "record" },
     { label: "≡  Planos existentes — ver/editar", value: "plans" },
-    { label: "🎙  Vozes — cadastrar/gerenciar locutores", value: "voices" },
+    { label: "👤  Cards de Pessoa — cadastro unificado (voz + dados)", value: "voices" },
     { label: "⤓  Servidores MCP — instalar/gerenciar", value: "mcp" },
+    { label: "✎  Persona — editar o system prompt", value: "persona" },
     { label: "↩  Fechar (Esc)", value: "close" },
   ];
 
@@ -652,6 +713,8 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
                 enterMcp();
               } else if (item.value === "voices") {
                 enterVoices();
+              } else if (item.value === "persona") {
+                void enterPersona();
               } else {
                 onClose();
               }
@@ -678,6 +741,34 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
                 else setView("menu");
               }}
             />
+          )}
+        </Box>
+      )}
+
+      {view === "persona" && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={COLORS.gray}>
+            persona: 1ª linha do system prompt (o orchestrator anexa a
+            cláusula de tools). Enter salva · Esc volta
+          </Text>
+          {personaStage === "error" && <Text color={COLORS.red}>✗ {personaMsg}</Text>}
+          {personaStage === "saved" && <Text color={COLORS.green}>✓ {personaMsg}</Text>}
+          {personaStage === "saving" && <Text color={COLORS.dim}>salvando…</Text>}
+          {personaStage === "edit" && (
+            <>
+              <Text>persona: </Text>
+              <TextInput
+                value={personaValue}
+                onChange={setPersonaValue}
+                onSubmit={(value) => void savePersona(value)}
+              />
+              <Text color={COLORS.dim}>
+                atual: {truncate(persona, 64)}
+              </Text>
+              {personaDefault && persona !== personaDefault && (
+                <Text color={COLORS.dim}>default: {truncate(personaDefault, 64)}</Text>
+              )}
+            </>
           )}
         </Box>
       )}
@@ -968,7 +1059,7 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
           {voicesError && <Text color={COLORS.red}>✗ {voicesError}</Text>}
           <SelectInput<VoiceEntry | string>
             items={[
-              { label: "＋  Cadastrar voz (grava ~5s no microfone)", value: "record" },
+              { label: "＋  Criar card de pessoa (grava ~5s de voz no microfone)", value: "record" },
               ...voices.map((v) => ({
                 label:
                   `${v.person_name} · ${v.examples_count} exemplo(s)` +
@@ -980,8 +1071,7 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
             ]}
             onSelect={(item) => {
               if (item.value === "record") {
-                resetVoiceWizard();
-                setView("voice-record");
+                startPersonCard();
               } else if (item.value === "reload") {
                 void loadVoices();
               } else if (typeof item.value !== "string") {
@@ -990,20 +1080,21 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
             }}
           />
           {!voicesLoading && !voicesError && voices.length === 0 && (
-            <Text color={COLORS.dim}>nenhuma voz cadastrada — cadastre a primeira acima</Text>
+            <Text color={COLORS.dim}>nenhum card de pessoa — crie o primeiro acima</Text>
           )}
         </Box>
       )}
 
-      {view === "voice-record" && (
+      {view === "person-card" && (
         <Box flexDirection="column" marginTop={1}>
           <Text color={COLORS.gray}>
+            cadastro unificado do card de pessoa: nome + descrição + voz.
             o embedding (CAM++ 192 dims) é gerado on-demand pelo módulo
             transcribe (host) e persistido na memory via /voice-dict/write
           </Text>
           {recStage === "name" && (
             <>
-              <Text>nome: </Text>
+              <Text>nome do card: </Text>
               <TextInput
                 value={recName}
                 onChange={setRecName}
@@ -1017,31 +1108,31 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
           )}
           {recStage === "description" && (
             <>
-              <Text color={COLORS.dim}>nome: {recName}</Text>
-              <Text>descrição (opcional): </Text>
+              <Text color={COLORS.dim}>card: {recName}</Text>
+              <Text>descrição do card (opcional): </Text>
               <TextInput
                 value={recDesc}
                 onChange={setRecDesc}
                 onSubmit={() => void startVoiceRecording()}
-                placeholder={`quem é (Enter GRAVA ${RECORD_SECONDS}s de voz)`}
+                placeholder={`quem é (Enter GRAVA ${RECORD_SECONDS}s de voz e fecha o card)`}
               />
-              <Text color={COLORS.dim}>Enter inicia a gravação — fale continuamente · Esc volta</Text>
+              <Text color={COLORS.dim}>Enter inicia a gravação de voz (etapa final do card) — fale continuamente · Esc volta</Text>
             </>
           )}
           {recStage === "recording" && (
             <Text color={COLORS.amber}>
-              ● gravando… fale naturalmente ({recCountdown}s restantes) — Esc desabilitado
+              ● gravando a voz do card… fale naturalmente ({recCountdown}s restantes) — Esc desabilitado
             </Text>
           )}
           {recStage === "uploading" && (
-            <Text color={COLORS.amber}>▶ gerando embedding (transcribe/CAM++) e salvando na memory…</Text>
+            <Text color={COLORS.amber}>▶ gerando embedding (transcribe/CAM++) e salvando o card de pessoa na memory…</Text>
           )}
           {recStage === "result" && recMsg && (
             <>
               <Text color={COLORS.green}>{recMsg}</Text>
               <Text color={COLORS.dim}>
-                Esc volta · cadastre a mesma pessoa de novo p/ adicionar outro
-                exemplo (recomendado: ambientes/altura de voz diferentes)
+                Esc volta · crie o mesmo card de novo p/ adicionar outro
+                exemplo de voz (recomendado: ambientes/altura de voz diferentes)
               </Text>
             </>
           )}

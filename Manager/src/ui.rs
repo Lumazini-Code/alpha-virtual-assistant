@@ -171,9 +171,13 @@ impl TrayApp {
 
         match ev.event.as_str() {
             "meta" => {
-                // Novo turno: troca para o chat e abre a janela se estiver oculta.
+                // Novo turno: registra a pergunta no histórico. A troca
+                // automática de tela + foco da janela acontece SÓ para turnos
+                // com tts=true (pipeline de voz / wake word). Turnos digitados
+                // na TUI ou no próprio chat do Manager chegam com tts=false e
+                // não devem roubar o foco da janela do Manager.
+                let should_open = ev.tts_flag();
                 let changed_screen = self.screen != Screen::Chat;
-                self.screen = Screen::Chat;
                 if let Some(input) = ev.input_text() {
                     self.chat_history.push(ChatMessage {
                         role: ChatRole::User,
@@ -190,10 +194,12 @@ impl TrayApp {
                     });
                     self.chat_running = true;
                 }
-                // Traz a janela para frente SÓ quando um novo turno de voz/chat
-                // começa — requisito: acionamento automático da tela.
-                if changed_screen {
-                    tracing::info!("ui: novo turno (voice/chat) — abrindo tela de chat");
+                // Traz a janela para frente SÓ quando um novo turno de voz
+                // começa (tts=true). Para turnos de texto a tela do chat é
+                // atualizada silenciosamente em segundo plano.
+                if should_open && changed_screen {
+                    tracing::info!("ui: novo turno de voz (tts=true) — abrindo tela de chat");
+                    self.screen = Screen::Chat;
                     self.window_visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));

@@ -264,6 +264,7 @@ class ShortTermDB:
             CREATE TABLE IF NOT EXISTS turn_groups (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id    TEXT    NOT NULL,
+                person_id     INTEGER,                  -- NEW (people cards): card vinculado
                 turns_json    TEXT    NOT NULL,
                 embed_text    TEXT    NOT NULL,
                 created_at    REAL    NOT NULL,
@@ -272,15 +273,26 @@ class ShortTermDB:
             );
             CREATE INDEX IF NOT EXISTS idx_st_session  ON turn_groups(session_id);
             CREATE INDEX IF NOT EXISTS idx_st_accessed ON turn_groups(last_accessed);
+            CREATE INDEX IF NOT EXISTS idx_st_person   ON turn_groups(person_id);
         """)
+        # ── NEW (people cards): migração leve — bancos criados antes do campo
+        # person_id existir não têm a coluna; adiciona como NULL (sem vínculo)
+        # sem quebrar instalações já em uso.
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(turn_groups)")}
+        if "person_id" not in cols:
+            self._conn.execute("ALTER TABLE turn_groups ADD COLUMN person_id INTEGER")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_st_person ON turn_groups(person_id)"
+            )
 
-    def insert(self, session_id: str, turns: list[Turn], embed_text: str) -> int:
+    def insert(self, session_id: str, turns: list[Turn], embed_text: str,
+               person_id: Optional[int] = None) -> int:
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO turn_groups (session_id, turns_json, embed_text, created_at, last_accessed) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (session_id, json.dumps([t.model_dump() for t in turns]), embed_text, now, now),
+                "INSERT INTO turn_groups (session_id, person_id, turns_json, embed_text, created_at, last_accessed) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, person_id, json.dumps([t.model_dump() for t in turns]), embed_text, now, now),
             )
             return cur.lastrowid
 
@@ -292,29 +304,49 @@ class ShortTermDB:
             f"SELECT * FROM turn_groups WHERE id IN ({ph})", ids
         ).fetchall()
 
-    def get_recent_turns_text(self, session_id: str, n_groups: int) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT turns_json FROM turn_groups "
-            "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-            (session_id, n_groups),
-        ).fetchall()
+    def get_recent_turns_text(self, session_id: str, n_groups: int,
+                              person_id: Optional[int] = None) -> list[str]:
+        """NEW (people cards): `person_id` filtra os grupos por card de pessoa
+        (None = sem filtro, comportamento anterior)."""
+        if person_id is not None:
+            rows = self._conn.execute(
+                "SELECT turns_json FROM turn_groups "
+                "WHERE session_id = ? AND person_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, person_id, n_groups),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT turns_json FROM turn_groups "
+                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, n_groups),
+            ).fetchall()
         lines: list[str] = []
         for row in reversed(rows):
             for t in json.loads(row["turns_json"]):
                 lines.append(f"{t['role']}: {t['content']}")
         return lines
 
-    def get_recent_turn_groups(self, session_id: str, n_groups: int) -> tuple[list[dict], int]:
+    def get_recent_turn_groups(self, session_id: str, n_groups: int,
+                               person_id: Optional[int] = None) -> tuple[list[dict], int]:
         """
         Leitura crua (sem busca semântica) das N duplas pergunta-resposta mais
         recentes de uma sessão, em ordem cronológica (mais antiga primeiro).
         Usada pelo /read_st — contexto de conversa direto, sem embeddings.
+        NEW (people cards): `person_id` filtra os grupos por card de pessoa
+        (None = sem filtro, comportamento anterior).
         """
-        rows = self._conn.execute(
-            "SELECT turns_json FROM turn_groups "
-            "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-            (session_id, n_groups),
-        ).fetchall()
+        if person_id is not None:
+            rows = self._conn.execute(
+                "SELECT turns_json FROM turn_groups "
+                "WHERE session_id = ? AND person_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, person_id, n_groups),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT turns_json FROM turn_groups "
+                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, n_groups),
+            ).fetchall()
         turns: list[dict] = []
         for row in reversed(rows):
             turns.extend(json.loads(row["turns_json"]))
@@ -1021,6 +1053,208 @@ class VoiceDictDB:
         ).fetchone()[0]
 
 
+# ── NEW: Unificação — PeopleDB (Card de Pessoa) ────────────────────────────────
+
+class PeopleDB:
+    """
+    Persiste as pessoas cadastradas em um único "card" (People Card),
+    unificando os dicionários de voz (VoiceDictDB) e de rosto (FaceDictDB).
+
+    Uma pessoa tem:
+    - Metadados ricos (nome completo, descrição, gostos, religião, etc.) na
+      tabela `people` (o card em si).
+    - N embeddings de voz (CAM++ etc.) na tabela `voice_embeddings`.
+    - N embeddings de rosto (EdgeFace etc.) na tabela `face_embeddings`.
+    - Ambos os conjuntos de embeddings apontam para o mesmo `person_id`.
+
+    Os vetores em si moram nos índices vetoriais (LanceDB/FAISS); aqui fica
+    o mapeamento embedding_id → person_id para ambos os tipos.
+    """
+
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
+        self._create_tables()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS people (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_name   TEXT    NOT NULL,
+                person_key    TEXT    NOT NULL UNIQUE,   -- nome normalizado (lower/strip)
+                description   TEXT    NOT NULL DEFAULT '',  -- quem é a pessoa (relação/contexto)
+                likes         TEXT    NOT NULL DEFAULT '',  -- gostos/preferências
+                religion      TEXT    NOT NULL DEFAULT '',  -- crenças/religião
+                additional_info TEXT  NOT NULL DEFAULT '',  -- informações adicionais
+                source        TEXT    NOT NULL DEFAULT 'people_card',
+                confidence    REAL    NOT NULL DEFAULT 1.0,
+                memory_id     INTEGER,                    -- FK lógica p/ memories.id
+                created_at    REAL    NOT NULL,
+                last_accessed REAL    NOT NULL,
+                access_count  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_p_key ON people(person_key);
+
+            CREATE TABLE IF NOT EXISTS voice_embeddings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id  INTEGER NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_ve_person ON voice_embeddings(person_id);
+
+            CREATE TABLE IF NOT EXISTS face_embeddings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id  INTEGER NOT NULL,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fe_person ON face_embeddings(person_id);
+        """)
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    # ── Person operations ──
+
+    def insert_person(
+        self, person_name: str, description: str = "", likes: str = "",
+        religion: str = "", additional_info: str = "",
+        source: str = "people_card", confidence: float = 1.0,
+        memory_id: Optional[int] = None,
+    ) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO people "
+                "(person_name, person_key, description, likes, religion, additional_info, "
+                "source, confidence, memory_id, created_at, last_accessed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (person_name, self._normalize_key(person_name), description, likes,
+                 religion, additional_info, source, confidence, memory_id, now, now),
+            )
+            return cur.lastrowid
+
+    def set_memory_id(self, person_id: int, memory_id: Optional[int]):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE people SET memory_id = ? WHERE id = ?", (memory_id, person_id)
+            )
+
+    def get_by_name(self, person_name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM people WHERE person_key = ?",
+            (self._normalize_key(person_name),),
+        ).fetchone()
+
+    def get_person_by_id(self, person_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM people WHERE id = ?", (person_id,)
+        ).fetchone()
+
+    def update_card(
+        self, person_id: int, description: Optional[str] = None,
+        likes: Optional[str] = None, religion: Optional[str] = None,
+        additional_info: Optional[str] = None, person_name: Optional[str] = None,
+    ):
+        """Atualiza campos do card de pessoa. Apenas campos não-nulos são alterados.
+        Permite editar o card sem precisar mandar um novo embedding."""
+        with self._lock:
+            updates = []
+            params = []
+            if person_name is not None and person_name.strip():
+                updates.append("person_name = ?, person_key = ?")
+                params.extend([person_name.strip(), self._normalize_key(person_name)])
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if likes is not None:
+                updates.append("likes = ?")
+                params.append(likes)
+            if religion is not None:
+                updates.append("religion = ?")
+                params.append(religion)
+            if additional_info is not None:
+                updates.append("additional_info = ?")
+                params.append(additional_info)
+            if not updates:
+                return
+            params.append(person_id)
+            self._conn.execute(
+                f"UPDATE people SET {', '.join(updates)} WHERE id = ?", params
+            )
+
+    def update_access(self, person_id: int):
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE people SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), person_id),
+                )
+        except sqlite3.OperationalError:
+            pass
+
+    def delete_person(self, person_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM people WHERE id = ?", (person_id,))
+            return cur.rowcount
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+
+    def list_people(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT p.*, "
+            "(SELECT COUNT(*) FROM voice_embeddings e WHERE e.person_id = p.id) "
+            "AS voice_examples_count, "
+            "(SELECT COUNT(*) FROM face_embeddings f WHERE f.person_id = p.id) "
+            "AS face_examples_count "
+            "FROM people p ORDER BY p.last_accessed DESC"
+        ).fetchall()
+
+    # ── Embedding-row operations (mapeamento embedding_id → person_id) ──
+
+    def insert_embedding(self, person_id: int, kind: str) -> int:
+        """Insere um embedding de voz ('voice') ou de rosto ('face') na tabela
+        correspondente, ambos apontando para o mesmo person_id."""
+        table = "voice_embeddings" if kind == "voice" else "face_embeddings"
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO {table} (person_id, created_at) VALUES (?, ?)",
+                (person_id, time.time()),
+            )
+            return cur.lastrowid
+
+    def get_person_id_by_embedding(self, embedding_id: int, kind: str) -> Optional[int]:
+        table = "voice_embeddings" if kind == "voice" else "face_embeddings"
+        row = self._conn.execute(
+            f"SELECT person_id FROM {table} WHERE id = ?",
+            (embedding_id,),
+        ).fetchone()
+        return row["person_id"] if row else None
+
+    def get_embedding_ids_by_person(self, person_id: int, kind: str) -> list[int]:
+        table = "voice_embeddings" if kind == "voice" else "face_embeddings"
+        rows = self._conn.execute(
+            f"SELECT id FROM {table} WHERE person_id = ?", (person_id,)
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def count_examples(self, person_id: int, kind: str) -> int:
+        table = "voice_embeddings" if kind == "voice" else "face_embeddings"
+        return self._conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE person_id = ?",
+            (person_id,),
+        ).fetchone()[0]
+
+
 # ── NEW: Banco de tools (RAG de tool selection) ────────────────────────────────
 
 class ToolsDB(EdgeGraphMixin):
@@ -1231,23 +1465,41 @@ class PlansDB:
                 version          INTEGER NOT NULL DEFAULT 1,
                 steps_json       TEXT    NOT NULL,         -- lista de PlanStep serializada
                 corrections_json TEXT    NOT NULL DEFAULT '{}',  -- {step_index: seletor corrigido}
+                person_id        INTEGER,                 -- NEW (people cards): card vinculado
+                tools_json       TEXT    NOT NULL DEFAULT '[]',  -- NEW (tools ↔ planos): tool_ids
                 created_at       REAL    NOT NULL,
                 updated_at       REAL    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_plans_key ON plans(name_key);
+            CREATE INDEX IF NOT EXISTS idx_plans_person ON plans(person_id);
         """)
+        # ── NEW: migração leve — bancos criados antes de person_id/tools_json
+        # existirem não têm as colunas; adiciona sem quebrar instalações em uso.
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(plans)")}
+        if "person_id" not in cols:
+            self._conn.execute("ALTER TABLE plans ADD COLUMN person_id INTEGER")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plans_person ON plans(person_id)"
+            )
+        if "tools_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE plans ADD COLUMN tools_json TEXT NOT NULL DEFAULT '[]'"
+            )
 
     @staticmethod
     def _normalize_key(name: str) -> str:
         return re.sub(r"\s+", " ", name.strip().lower())
 
-    def insert_plan(self, name: str, description: str, steps_json: str) -> int:
+    def insert_plan(self, name: str, description: str, steps_json: str,
+                    person_id: Optional[int] = None,
+                    tools_json: str = "[]") -> int:
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO plans (name, name_key, description, steps_json, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (name, self._normalize_key(name), description, steps_json, now, now),
+                "INSERT INTO plans (name, name_key, description, steps_json, person_id, tools_json, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, self._normalize_key(name), description, steps_json,
+                 person_id, tools_json, now, now),
             )
             return cur.lastrowid
 
@@ -1263,11 +1515,15 @@ class PlansDB:
 
     def update_plan(self, plan_id: int, description: Optional[str],
                     steps_json: Optional[str], corrections_json: Optional[str],
-                    name: Optional[str] = None) -> int:
+                    name: Optional[str] = None, person_id: Optional[int] = None,
+                    tools_json: Optional[str] = None) -> int:
         """Atualiza o plano e incrementa a versão. Campos None preservam o
         valor atual. `name` renomeia o plano (name_key recalculado — a
         checagem de duplicidade fica na camada de handlers, sob o mesmo lock;
         aqui um UNIQUE violado ainda assim levanta sqlite3.IntegrityError).
+        NEW (people cards / tools ↔ planos): `person_id` vincula o plano a um
+        card de pessoa e `tools_json` regrava o conjunto de tool_ids usados
+        pelos steps (None = mantém o atual).
         Retorna a nova versão (0 se o plano não existe)."""
         row = self._conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         if row is None:
@@ -1281,6 +1537,8 @@ class PlansDB:
                 "description      = ?, "
                 "steps_json       = ?, "
                 "corrections_json = ?, "
+                "person_id        = ?, "
+                "tools_json       = ?, "
                 "version          = ?, "
                 "updated_at       = ? "
                 "WHERE id = ?",
@@ -1290,6 +1548,8 @@ class PlansDB:
                     description if description is not None else row["description"],
                     steps_json if steps_json is not None else row["steps_json"],
                     corrections_json if corrections_json is not None else row["corrections_json"],
+                    person_id if person_id is not None else row["person_id"],
+                    tools_json if tools_json is not None else row["tools_json"],
                     new_version,
                     time.time(),
                     plan_id,
@@ -1316,6 +1576,7 @@ __all__ = [
     'FaceDictDB',
     'IndexedFilesDB',
     'MemoryDB',
+    'PeopleDB',
     'PlansDB',
     'ShortTermDB',
     'ToolsDB',

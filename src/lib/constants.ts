@@ -1,23 +1,49 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 // Equivalente às constantes do topo do UI.py original.
 // Em Ink as cores viram hex direto na prop `color` dos componentes <Text>.
 
-export const API_BASE = process.env.AVA_API_BASE ?? "http://localhost:9001";
+// ── Descoberta do host de bind (Modules/.env) ─────────────────────────────
+// O install.sh grava AVA_BIND_HOST no Modules/.env — fonte da verdade do
+// endereço dos serviços. A TUI carrega o valor daqui em vez de manter um
+// IP fixo: trocar o bind no .env basta para realinhar TUI e serviços.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(__dirname, "..", "..");
+const FALLBACK_HOST = "127.9.12.22";
+
+let bindHost = FALLBACK_HOST;
+try {
+  const envContent = readFileSync(
+    path.join(projectRoot, "Modules", ".env"),
+    "utf-8",
+  );
+  const match = envContent.match(/^AVA_BIND_HOST=(.+)$/m);
+  if (match) {
+    bindHost = match[1].trim();
+  }
+} catch {
+  // Modules/.env ausente — mantém o fallback padrão.
+}
+
+export const API_BASE = process.env.AVA_API_BASE ?? `http://${bindHost}:9001`;
 export const ORCHESTRATOR_URL =
-  process.env.AVA_ORCHESTRATOR_URL ?? "http://localhost:9000";
+  process.env.AVA_ORCHESTRATOR_URL ?? `http://${bindHost}:9000`;
 
 // Visualizador do grafo Hebbiano (graph_activation.py — roda no container
 // ava com network_mode: host, então localhost:8777 funciona da máquina host
 // quando o docker está de pé).
 export const GRAPH_VIEWER_URL =
-  process.env.AVA_GRAPH_URL ?? "http://localhost:8777";
+  process.env.AVA_GRAPH_URL ?? `http://${bindHost}:8777`;
 
 // API REST de memória (planos: POST /plans/list, PATCH /plans/update).
 export const MEMORY_API_URL =
-  process.env.AVA_MEMORY_URL ?? "http://localhost:3000";
+  process.env.AVA_MEMORY_URL ?? `http://${bindHost}:3000`;
 
 // MCP Manager (porta 4008 — instalação/remoção/registry de servidores MCP).
 export const MCP_MANAGER_URL =
-  process.env.AVA_MCP_MANAGER_URL ?? "http://localhost:4008";
+  process.env.AVA_MCP_MANAGER_URL ?? `http://${bindHost}:4008`;
 
 export const COLORS = {
   blue: "#1243E4",

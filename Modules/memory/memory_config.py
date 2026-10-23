@@ -38,7 +38,7 @@ PLANS_MAX_ACTIONS_MODEL = 15       # default de ações de browser por step "mod
 # Logger compartilhado por todos os módulos memory_*
 # ── Configuração ───────────────────────────────────────────────────────────────
 
-ONNX_SERVING_URL = "http://localhost:2002"
+ONNX_SERVING_URL = "http://127.9.12.22:2002"
 
 # ── Prefixos E5 (multilingual-e5-small/base/large e primos) ─────────────────
 # Modelos da família E5 são treinados com prefixos textuais fixos — sem eles,
@@ -127,6 +127,15 @@ VO_MIN_SCORE         = 0.45    # cosine similarity — CALIBRE em cima dos seus 
                                 # bastante com microfone, ruído e distância da boca)
 VO_TOP_K             = 3
 VO_AMBIGUOUS_MARGIN  = 0.05
+
+# ── Unificação: Card de Pessoa (PeopleDB — Voice + Face) ──────────────────────
+# Banco unificado de pessoas. Uma única tabela `people` guarda os metadados
+# ricos do card (nome completo, descrição, gostos, religião, etc.), enquanto
+# os embeddings de voz (tabela `voice_embeddings`) e de rosto (tabela
+# `face_embeddings`) referenciam o mesmo person_id. Os índices vetoriais
+# permanecem separados (FD_/VO_FAISS_INDEX_PATH) porque as dimensões dos
+# embeddings de rosto (EdgeFace) e de voz (CAM++) são diferentes.
+PD_DB_PATH           = str(_DB_DIR / "ava_people.db")
 
 # ── NEW: LanceDB (substitui FAISS + .npy de id-map) ───────────────────────────
 # Um único diretório LanceDB guarda os vetores de TODOS os stores (longo prazo,
@@ -286,17 +295,6 @@ AUTO_LINK_MIN_CROSS      = float(os.getenv("AUTO_LINK_MIN_CROSS", "0.25"))
 AUTO_LINK_INITIAL_WEIGHT = float(os.getenv("AUTO_LINK_INITIAL_WEIGHT", "0.5"))
 AUTO_LINK_MAX_EDGES      = int(os.getenv("AUTO_LINK_MAX_EDGES", "3"))
                                   # teto de arestas criadas por escrita (anti-hub)
-
-# ── Backfill no boot ("sono" do memory) ───────────────────────────────────────
-# Na inicialização, consolida retroativamente o grafo: liga memórias que já
-# estavam gravadas ANTES do auto-link existir (ou sob thresholds antigos) —
-# analogia ao sono consolidando memórias do dia. Fire-and-forget, com delay
-# para o ONNX serving terminar de subir. Roda a CADA boot (idempotente: arestas
-# existentes são apenas reforçadas, com crescimento saturante até 1.0).
-AUTO_LINK_BACKFILL          = os.getenv("AUTO_LINK_BACKFILL", "1") == "1"
-AUTO_LINK_BACKFILL_DELAY_S  = float(os.getenv("AUTO_LINK_BACKFILL_DELAY_S", "10"))
-AUTO_LINK_BACKFILL_MAX_NODES = int(os.getenv("AUTO_LINK_BACKFILL_MAX_NODES", "5000"))
-AUTO_LINK_BACKFILL_BATCH    = int(os.getenv("AUTO_LINK_BACKFILL_BATCH", "64"))
 
 # ── NEW (solução 2): faixa de similaridade "provável correção" ────────────────
 # Entre UPDATE_SIM_THRESHOLD e DEDUP_THRESHOLD, um texto novo não é nem uma
@@ -469,10 +467,6 @@ __all__ = [
     'AUTO_LINK_MIN_CROSS',
     'AUTO_LINK_INITIAL_WEIGHT',
     'AUTO_LINK_MAX_EDGES',
-    'AUTO_LINK_BACKFILL',
-    'AUTO_LINK_BACKFILL_DELAY_S',
-    'AUTO_LINK_BACKFILL_MAX_NODES',
-    'AUTO_LINK_BACKFILL_BATCH',
     'EDGE_UPDATES',
     'EMBED_DIM',
     'EMBED_PASSAGE_PREFIX',
