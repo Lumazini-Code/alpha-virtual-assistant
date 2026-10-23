@@ -21,7 +21,10 @@ Uso:
 
 from __future__ import annotations
 
+import base64
+import ctypes
 import io
+import os
 import re
 import sys
 import time
@@ -48,7 +51,10 @@ from supertonic import TTS
 DEFAULT_VOICE    = "M1"
 DEFAULT_LANG     = "pt"
 SAMPLE_RATE      = 48000
-NUM_WORKERS      = 3
+# 1 worker = 1 cópia do Supertonic (~470MB de pesos+arena). A fila de fala é
+# sequencial de qualquer forma (sentenças em ordem), então workers extras
+# só multiplicam RAM sem ganho perceptível. Antes: 3 → ~1.4GB de RSS.
+NUM_WORKERS      = max(1, int(os.getenv("TTS_NUM_WORKERS", "1")))
 WORKER_TIMEOUT   = 30.0
 
 # Playback
@@ -456,19 +462,33 @@ class HeapPlayer:
 
                 required_frames = yield output.tobytes()
 
-        try:
-            with miniaudio.PlaybackDevice(
-                output_format   = miniaudio.SampleFormat.SIGNED16,
-                nchannels       = 1,
-                sample_rate     = SAMPLE_RATE,
-                buffersize_msec = BUFFER_MS,
-            ) as device:
-                gen = _stream_gen()
-                next(gen)
-                device.start(gen)
-                threading.Event().wait()
-        except Exception as e:
-            log.error(f"[PLAY] Erro fatal no playback: {e}", exc_info=True)
+        # Backoff: falha de device (sem /dev/snd, ALSA sem card — caso do
+        # container no Windows/WSLg) NÃO mata a thread de playback: avisa
+        # uma vez com traceback, re-tenta com backoff crescente (10s → 60s)
+        # e retoma sozinho se o device aparecer. A API segue de pé (o modo
+        # client de áudio nem usa este path).
+        fail_n = 0
+        while True:
+            try:
+                with miniaudio.PlaybackDevice(
+                    output_format   = miniaudio.SampleFormat.SIGNED16,
+                    nchannels       = 1,
+                    sample_rate     = SAMPLE_RATE,
+                    buffersize_msec = BUFFER_MS,
+                ) as device:
+                    gen = _stream_gen()
+                    next(gen)
+                    device.start(gen)
+                    fail_n = 0
+                    threading.Event().wait()
+            except Exception as e:
+                fail_n += 1
+                if fail_n == 1:
+                    log.error(f"[PLAY] Erro fatal no playback: {e}", exc_info=True)
+                    log.error("[PLAY] playback local indisponível — re-tentando com backoff (o modo client de áudio não é afetado)")
+                else:
+                    log.info(f"[PLAY] device ainda indisponível (retry {fail_n}, {e})")
+                time.sleep(min(10.0 * fail_n, 60.0))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -545,6 +565,11 @@ class TTSWorker(threading.Thread):
             finally:
                 done_event.set()
                 self._task_q.task_done()
+                # Devolve buffers do ORT/numpy ao OS na hora (padrão do watchdog)
+                try:
+                    _libc.malloc_trim(0)
+                except Exception:
+                    pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -647,6 +672,11 @@ class SpeakRequest(BaseModel):
     voice: str   = DEFAULT_VOICE
     lang:  str   = DEFAULT_LANG
     speed: float = 1.0
+    # Formato do áudio devolvido pelo /synthesize:
+    #   wav — WAV mono 16-bit completo (header incluído; um arquivo tocável)
+    #   pcm — PCM cru s16le SEM header (chunks de streaming — a TUI abre o
+    #         player uma vez e empurra os chunks no stdin; gapless)
+    format: str  = "wav"
 
 class SpeakResponse(BaseModel):
     duration_s: float
@@ -669,6 +699,31 @@ class VoicesResponse(BaseModel):
     default: str
 
 
+def _malloc_trim_watchdog(interval_s: float = 60.0) -> None:
+    """Thread daemon: devolve ao OS o heap glibc liberado pelo free().
+
+    Medição real no container: após sintetizar e liberar sessões ORT, ~305MB
+    ficavam presos em arenas glibc (free() não devolve ao OS exceto nas pontas
+    do heap). malloc_trim(0) devolve — TTS idle cai de ~530MB para ~120MB."""
+    global _libc
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except Exception:
+        _libc = None
+        return
+
+    def _loop():
+        while True:
+            time.sleep(interval_s)
+            try:
+                _libc.malloc_trim(0)
+            except Exception:
+                return
+
+    threading.Thread(target=_loop, daemon=True, name="malloc-trim").start()
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # LIFESPAN
 # ════════════════════════════════════════════════════════════════════════════
@@ -676,6 +731,8 @@ class VoicesResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA TTS API...")
+
+    _malloc_trim_watchdog()
 
     state.player = HeapPlayer()
     state.player.start()
@@ -695,7 +752,15 @@ async def lifespan(app: FastAPI):
 # APP
 # ════════════════════════════════════════════════════════════════════════════
 
+try:
+    from Modules.internal_auth import install_internal_auth, internal_bind_host
+except ImportError:
+    import internal_auth as _ia
+    install_internal_auth = _ia.install_internal_auth
+    internal_bind_host = _ia.internal_bind_host
+
 app = FastAPI(title="AVA TTS API", lifespan=lifespan)
+install_internal_auth(app, service_name="TTS")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -827,6 +892,88 @@ async def stream(req: StreamRequest):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# POST /synthesize — áudio RETORNADO (sem player local)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _wav_bytes(pcms: list[np.ndarray]) -> bytes:
+    """Empacota chunks PCM int16 mono num único WAV (RIFF/fmt PCM 16-bit
+    @ SAMPLE_RATE — mesmo formato do tts_to_bytes)."""
+    import struct
+
+    buf       = io.BytesIO()
+    data_size = sum(p.nbytes for p in pcms)
+    byte_rate = SAMPLE_RATE * 2
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, byte_rate, 2, 16))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    for p in pcms:
+        buf.write(p.tobytes())
+    return buf.getvalue()
+
+
+@app.post("/synthesize")
+async def synthesize(req: SpeakRequest):
+    """Sintetiza e DEVOLVE o áudio (WAV mono 16-bit, base64) — NÃO toca no
+    player local. É o caminho do modo tts_output=client: o orchestrator
+    embute o payload num evento SSE `audio` e a TUI toca no HOST (uniforme
+    Linux/Windows — o container não precisa de device de áudio; o playback
+    local via miniaudio vira opt-in). Chunks sintetizados EM SEQUÊNCIA num
+    único executor call — ordem determinística num só WAV."""
+    texto = normalizar_texto(req.text.strip())
+    if not texto:
+        raise HTTPException(status_code=400, detail="texto vazio após normalização")
+    if req.voice not in AVAILABLE_VOICES:
+        raise HTTPException(status_code=400, detail=f"voz inválida — use: {AVAILABLE_VOICES}")
+    if req.format not in ("wav", "pcm"):
+        raise HTTPException(status_code=400, detail="format inválido — use 'wav' ou 'pcm'")
+
+    chunks = split_chunks(texto) or [texto]
+    t0   = time.perf_counter()
+    loop = asyncio.get_event_loop()
+
+    def _synth_all() -> tuple[list[np.ndarray], float]:
+        pcms: list[np.ndarray] = []
+        total = 0.0
+        for i, c in enumerate(chunks):
+            wav, dur = state.pool.synthesize(c, req.voice, req.lang, req.speed, seq_idx=i)
+            wav = np.asarray(wav, dtype=np.float32).squeeze()
+            pcms.append((np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16))
+            total += float(dur)
+        return pcms, total
+
+    try:
+        pcms, total_dur = await loop.run_in_executor(None, _synth_all)
+    except Exception as e:
+        log.error(f"[SYNTH] erro: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"falha na síntese: {e}") from e
+
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    log.info(f"[SYNTH] {len(chunks)} chunk(s), {total_dur:.2f}s de áudio em {latency_ms}ms")
+
+    if req.format == "pcm":
+        raw = b"".join(p.tobytes() for p in pcms)
+        audio_b64 = base64.b64encode(raw).decode("ascii")
+        mime = "audio/pcm"
+    else:
+        audio_b64 = base64.b64encode(_wav_bytes(pcms)).decode("ascii")
+        mime = "audio/wav"
+
+    return {
+        "mime":        mime,
+        "sample_rate": SAMPLE_RATE,
+        "duration_s":  round(total_dur, 3),
+        "latency_ms":  latency_ms,
+        "text":        texto,
+        "chunks":      len(chunks),
+        "audio_b64":   audio_b64,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # POST /cancel
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -895,4 +1042,4 @@ def tts_to_bytes(text: str, voice: str = DEFAULT_VOICE) -> bytes:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3004, log_level="info")
+    uvicorn.run(app, host=internal_bind_host(), port=3004, log_level="info")

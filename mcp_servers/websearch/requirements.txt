@@ -1,0 +1,7 @@
+mcp>=2.1.0
+httpx>=0.25.0
+rank-bm25>=0.2.2
+redis>=5.0.0
+trafilatura>=1.12.0
+uvicorn>=0.24.0
+docker>=7.0.0

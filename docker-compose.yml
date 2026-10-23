@@ -1,33 +1,34 @@
 services:
 
-  # ─────────────────────────────────────────────
-  # CPU profile
-  # ─────────────────────────────────────────────
-  ava-cpu:
-    profiles: ["cpu"]
+  ava:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: cpu
-        BASE_IMAGE: ubuntu:22.04
-    image: ava:cpu
-    container_name: ava-cpu
-    restart: unless-stopped
+    image: ava:latest
+    container_name: ava
 
     volumes:
+      - ./mcp_servers:/app/mcp_servers
       - ./start.sh:/app/start.sh
       - ./Modules/Models:/app/Modules/Models:ro
-      - ./Ctxbin:/app/Ctxbin:ro
       - ./resource:/app/resource
       - ./Modules:/app/Modules
       - ./orchestrator.py:/app/orchestrator.py
       - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
+      - ava-cache:/root/.cache
+      - ava-logs:/app/logs
+      - ./graph_activation.py:/app/graph_activation.py
+
+    # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
+    # CRAWL4AI_API_TOKEN...). Carregados DIRETO pelo compose — sem depender
+    # do --env-file do docker-start.sh. O env_file injeta as variáveis NO
+    # container (visíveis no `docker exec ava env`), ao contrário da
+    # interpolação ${...}, que só roda no host antes do container existir.
+    env_file:
+      - Modules/.env
 
     environment:
-      AVA_N_GPU_LAYERS: "0"
+      AVA_DEBUG: ""
       ONNX_PROVIDERS: "CPUExecutionProvider"
       PYTHONUNBUFFERED: "1"
       HF_HOME: "/root/.cache/huggingface"
@@ -36,114 +37,93 @@ services:
       HF_HUB_ETAG_TIMEOUT: "600"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      test: ["CMD", "curl", "-f", "http://127.9.12.22:9000/status"]
       interval: 30s
       timeout: 10s
       start_period: 240s
       retries: 5
 
-  # ─────────────────────────────────────────────
-  # CUDA profile
-  # ─────────────────────────────────────────────
-  ava-cuda:
-    profiles: ["cuda"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: cuda
-        BASE_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
-    image: ava:cuda
-    container_name: ava-cuda
-    restart: unless-stopped
+  # ── Pipeline de busca web (websearch-mcp consome os três abaixo) ──────────
+  # Portas publicadas só em 127.9.12.22: o ava roda com network_mode: host no
+  # override linux e alcança tudo via localhost; nada fica exposto na rede.
 
+  searxng:
+    image: searxng/searxng:latest
+    container_name: ava-searxng
     volumes:
-      - ./start.sh:/app/start.sh
-      - ./Modules/Models:/app/Modules/Models:ro
-      - ./Ctxbin:/app/Ctxbin:ro
-      - ./resource:/app/resource
-      - ./Modules:/app/Modules
-      - ./orchestrator.py:/app/orchestrator.py
-      - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
-
+      - ./resource/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "127.9.12.22:8081:8080"
     environment:
-      AVA_N_GPU_LAYERS: "99"
-      ONNX_PROVIDERS: "CUDAExecutionProvider,CPUExecutionProvider"
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: "/root/.cache/huggingface"
-      HF_HUB_TIMEOUT: "600"
-      HF_HUB_DOWNLOAD_TIMEOUT: "600"
-      HF_HUB_ETAG_TIMEOUT: "600"
+      SEARXNG_BASE_URL: "http://127.9.12.22:8081/"
 
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
-      interval: 30s
-      timeout: 10s
-      start_period: 240s
-      retries: 5
-
-  # ─────────────────────────────────────────────
-  # Vulkan profile
-  # ─────────────────────────────────────────────
-  ava-vulkan:
-    profiles: ["vulkan"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LLAMA_BACKEND: vulkan
-        BASE_IMAGE: ubuntu:22.04
-    image: ava:vulkan
-    container_name: ava-vulkan
-    restart: unless-stopped
-
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: ava-valkey
+    ports:
+      - "127.9.12.22:6379:6379"
     volumes:
-      - ./start.sh:/app/start.sh
-      - ./Modules/Models:/app/Modules/Models:ro
-      - ./Ctxbin:/app/Ctxbin:ro
-      - ./resource:/app/resource
-      - ./Modules:/app/Modules
-      - ./orchestrator.py:/app/orchestrator.py
-      - ./scraping_client.py:/app/scraping_client.py
-      - ava-cache-vulkan:/root/.cache
-      - ava-logs-vulkan:/app/logs
+      - websearch-cache:/data
+    command: ["valkey-server", "--appendonly", "no", "--save", ""]
 
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: ava-crawl4ai
+    shm_size: 1g
+    ports:
+      - "127.9.12.22:11235:11235"
     environment:
-      AVA_N_GPU_LAYERS: "99"
-      ONNX_PROVIDERS: "CPUExecutionProvider"
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: "/root/.cache/huggingface"
-      HF_HUB_TIMEOUT: "600"
-      HF_HUB_DOWNLOAD_TIMEOUT: "600"
-      HF_HUB_ETAG_TIMEOUT: "600"
+      # Token interno — sem ele o servidor só escuta no loopback do container.
+      # Gerado pelo install.sh em Modules/.env (falha de boot se ausente).
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
 
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
-      interval: 30s
-      timeout: 10s
-      start_period: 240s
-      retries: 5
+  websearch-mcp:
+    build:
+      context: ./mcp_servers/websearch
+      dockerfile: Dockerfile
+    image: ava-websearch-mcp:latest
+    container_name: ava-websearch-mcp
+    volumes:
+      - ./resource:/app/resource:ro
+      # crawl4ai on-demand via docker-socket-proxy (abaixo): o socket do host
+      # NÃO é mais montado aqui — o websearch só pode subir/parar o crawl4ai
+      # através da allowlist do proxy (sem exec/images/volumes/networks).
+      # DOCKER_HOST é lido automaticamente pelo docker.from_env().
+    ports:
+      - "127.9.12.22:4010:4010"
+    environment:
+      WEBSEARCH_CONFIG: "/app/resource/websearch/config.json"
+      SEARXNG_URL: "http://searxng:8080"
+      CRAWL4AI_URL: "http://crawl4ai:11235"
+      VALKEY_URL: "redis://valkey:6379/0"
+      # memory_write_batch: a tool de gravação de memórias fala com a
+      # memory_api direto (mesmo contrato REST do LLM.py /write/batch)
+      MEMORY_API_URL: "http://ava:3000"
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+
+  # ── Proxy do socket Docker — o websearch não tem acesso direto ao socket ──
+  # Allowlist mínima: apenas listar/inspecionar containers e start/stop do
+  # crawl4ai (on-demand, economia de ~490MB RAM). Tudo mais (exec, images,
+  # volumes, networks, build) fica bloqueado pelo HAProxy interno do proxy.
+  # Sem portas publicadas: só alcançável pela rede interna do compose.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: ava-docker-socket-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      POST: 1
+      VERSION: 1
+    restart: unless-stopped
 
 volumes:
-  ava-cache-cpu:
+  ava-cache:
     driver: local
-  ava-cache-cuda:
+  ava-logs:
     driver: local
-  ava-cache-vulkan:
-    driver: local
-  ava-logs-cpu:
-    driver: local
-  ava-logs-cuda:
-    driver: local
-  ava-logs-vulkan:
+  websearch-cache:
     driver: local

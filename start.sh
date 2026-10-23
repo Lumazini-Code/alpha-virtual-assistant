@@ -11,6 +11,21 @@
 # ─────────────────────────────────────────
 _shutting_down=0
 export ALPHA_ENABLE_GIT=0
+
+# ── Otimização de memória/CPU (onnxManager, TTS, vision) ──────────────────────
+# MALLOC_ARENA_MAX=2 — glibc aloca 1 arena heap por thread; serviços ONNX têm
+#   dezenas de threads e isso inflava o RSS (regiões anônimas fantasma).
+# SUPERTONIC_INTRA_OP_THREADS=2 — o default do ORT usa TODOS os cores por
+#   sessão; com workers + warmup isso causava spike de CPU no boot.
+# OMP_NUM_THREADS — teto de segurança para libs que consultam OpenMP.
+export MALLOC_ARENA_MAX=2
+export SUPERTONIC_INTRA_OP_THREADS=2
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+
+# cwd fixo do Memory Server — isolado do resto do script (nenhum outro `cd`
+# depende dele nem é afetado por ele; ver uso em `restart_on_fail` abaixo).
+MEMORY_API_CWD="/app/Modules/memory"
+
 _cleanup() {
     if [ "$_shutting_down" -eq 1 ]; then return; fi
     _shutting_down=1
@@ -30,14 +45,24 @@ except Exception as e: print(f'⚠ Supertonic: {e}')
 "
 echo "🚀 Iniciando AVA..."
 
-# Função que reinicia serviços que caem
+# Função que reinicia serviços que caem.
+# Exit code 78 (EX_CONFIG) = falha irrecuperável de config/dados (ex.:
+# modelo ONNX corrompido detectado pelo onnxManager) — reiniciar em loop
+# NÃO resolve; para e grita no log. Correção: rodar
+# `python3 scripts/verify_models.py` e reiniciar o container.
 restart_on_fail() {
     local name="$1"
     local cmd="$2"
     while true; do
         echo "  [START] $name"
         eval "$cmd"
-        echo "  [WARN] $name caiu — reiniciando em 5s..."
+        local rc=$?
+        if [ "$rc" -eq 78 ]; then
+            echo "  [FATAL] $name saiu com código 78 (config/dados inválidos) — SEM auto-restart."
+            echo "  [FATAL] Rode python3 scripts/verify_models.py dentro do container e reinicie."
+            return 78
+        fi
+        echo "  [WARN] $name caiu (rc=$rc) — reiniciando em 5s..."
         sleep 5
     done
 }
@@ -48,39 +73,38 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
+restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py" &
+sleep 1
+
+
+
 cd /app/Modules
 
 echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
 
-echo "  • CoT Generator..."
-restart_on_fail "CoT" "python3 'CoT generator.py'" &
-
-echo "  • Deep Search..."
-restart_on_fail "Deep Search" "python3 deep_search.py" &
+# Deep Search removido — busca web agora é um servidor MCP próprio
+# (mcp_servers/websearch, serviço websearch-mcp no docker-compose).
 
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &
 
-echo "  • Memory API..."
-restart_on_fail "Memory" "python3 memory.py" &
+# Desativando o TTS por enquanto — a forma com que ele foi projetado para ser usado (agente totalmente outônomo, com fala constante) ainda não é suportada.
 
-echo "  • Search API..."
-restart_on_fail "Search" "python3 Search_api.py" &
-
-echo "  • TTS API..."
+#echo "  • TTS API..."
 restart_on_fail "TTS" "python3 TTS.py" &
 
-echo "  • VQA..."
-restart_on_fail "VQA" "python3 VQA.py" &
+# Desativando o Vision API por enquanto — A forma com que ele foi projetado para ser usado (agente totalmente outônomo, com visão constante) ainda não é suportada.
 
-echo "  • Local Scraping & Client..."
-restart_on_fail "Local Scraping" "python3 local_scraping.py" &
+#echo "  • Vision API..."
+#restart_on_fail "Vision" "python3 vision.py" &
 
-echo "  • Alpha-code Agent..."
-# Alpha-code roda na porta 4006. É um script plano (sem submódulos/imports
-# relativos), então roda igual aos outros serviços em /app/Modules.
-restart_on_fail "alpha_code" "python3 alpha_code.py" &
+
+
+
+echo "  • Memory Server..."
+restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
+
 
 echo "✓ Todos os serviços iniciados"
 echo ""

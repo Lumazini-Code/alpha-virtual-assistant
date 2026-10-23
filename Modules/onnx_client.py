@@ -12,6 +12,7 @@ Thread-safe: a single client instance can be shared across the application.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -21,7 +22,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONN
 log = logging.getLogger("ava.onnx_client")
 
 # Default ONNX serving endpoint
-DEFAULT_ONNX_BASE_URL = "http://localhost:2002"
+DEFAULT_ONNX_BASE_URL = "http://127.9.12.22:2002"
+
+
+def _auth_headers() -> dict[str, str]:
+    """Headers de auth interna (AVA_INTERNAL_TOKEN).
+
+    O onnxManager instala o middleware de auth (install_internal_auth) e
+    rejeita com 401 qualquer POST sem `Authorization: Bearer <token>`.
+    Usa Modules.internal_auth quando disponível; fallback: env var direta
+    (o onnx_client também roda standalone fora do pacote Modules).
+    """
+    try:
+        from Modules.internal_auth import internal_token
+        tok = internal_token()
+    except Exception:
+        tok = os.environ.get("AVA_INTERNAL_TOKEN", "").strip() or None
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
 
 
 # ── Embedding Client ──────────────────────────────────────────────────────────
@@ -52,7 +69,7 @@ class EmbeddingClient:
                 max_connections=max_connections,
                 max_keepalive_connections=max_connections // 2,
             ),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **_auth_headers()},
         )
 
     # ── Core embed ───────────────────────────────────────────────────────────
@@ -151,7 +168,7 @@ class RerankerClient:
                 max_connections=max_connections,
                 max_keepalive_connections=max_connections // 2,
             ),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **_auth_headers()},
         )
 
     # ── Core methods ─────────────────────────────────────────────────────────

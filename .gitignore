@@ -7,8 +7,6 @@ Modules/Models/*
 
 semanticSearch_onnx/*
 
-Modules/llama-cpp/*
-
 resource/Vosk_Model/*
 
 test/*
@@ -28,6 +26,11 @@ Manager/incremental/**
 Manager/.fingerprint/**
 Manager/ava-tray
 
+.opencode
+
+Modules/llama-cpp
+
+graphify-out
 
 .venv/**
 
@@ -36,3 +39,27 @@ Manager/ava-tray
 *.pyc
 
 Modules/__pycache__/
+=======
+*.cpython-311.pyc
+
+node_modules/
+
+cache/
+
+Modules/transcribe/build
+
+Modules/memory/db/*
+
+Modules/.playwright-mcp
+
+.graphifyignore
+
+resource/Alpha icon.xcf
+
+Modules/mcp_manager/target
+
+Modules/mcp_manager/db/
+
+.graphifyignore
+
+AGENTS.md

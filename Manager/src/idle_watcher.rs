@@ -1,23 +1,39 @@
 //! Monitor de inatividade.
 //!
 //! Roda em background (task tokio separada) e verifica periodicamente
-//! há quanto tempo cada processo está sem atividade. Se passar do limite,
+//! há quanto tempo o docker está sem atividade. Se passar do limite,
 //! derruba o processo automaticamente.
 //!
-//!   - llama-server: 15 minutos sem atividade -> stop
-//!   - docker:       45 minutos sem atividade -> stop
+//!   - docker: 45 min sem atividade -> stop (AVA_DOCKER_IDLE_MINUTES
+//!     sobrescreve)
 //!
-//! "Atividade" é atualizada via `touch_llama_activity` / `touch_docker_activity`
-//! em process_manager.rs, que deve ser chamado pelo proxy de requisições da
-//! API (toda vez que uma chamada de inferência passar pelo llama-server)
-//! e/ou por ações manuais do usuário na GUI.
+//! "Atividade" = cada chamada a POST /docker/start (a TUI faz uma por
+//! pergunta). O touch acontece em process_manager::start_docker mesmo
+//! quando o docker "já estava ativo" — sem isso o timer era de VIDA,
+//! não de inatividade, e matava o docker em uso contínuo.
 
 use crate::process_manager;
 use crate::state::{ProcStatus, SharedState};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const LLAMA_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const DOCKER_IDLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// Timeout de inatividade. Default 45 min; configurável via
+/// AVA_DOCKER_IDLE_MINUTES (parse uma vez no primeiro uso).
+///
+/// "Atividade" = cada POST /docker/start (a TUI chama a cada pergunta —
+/// ver process_manager::start_docker).
+fn docker_idle_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let minutes = std::env::var("AVA_DOCKER_IDLE_MINUTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(45);
+        tracing::info!("Timer de inatividade do docker: {minutes} min.");
+        Duration::from_secs(minutes * 60)
+    })
+}
 
 /// Intervalo de checagem. Não precisa ser fino — checar a cada 30s é
 /// suficiente e barato.
@@ -31,33 +47,18 @@ pub async fn run(state: SharedState) {
     loop {
         interval.tick().await;
 
-        check_llama_idle(&state).await;
         check_docker_idle(&state).await;
-    }
-}
-
-async fn check_llama_idle(state: &SharedState) {
-    let should_stop = {
-        let llama = state.llama.lock().await;
-        is_idle(llama.status.clone(), llama.last_activity, LLAMA_IDLE_TIMEOUT)
-    };
-
-    if should_stop {
-        tracing::info!("llama-server inativo há mais de 15 min — encerrando automaticamente.");
-        if let Err(e) = process_manager::stop_llama(state).await {
-            tracing::error!("Falha ao encerrar llama-server por inatividade: {e}");
-        }
     }
 }
 
 async fn check_docker_idle(state: &SharedState) {
     let should_stop = {
         let docker = state.docker.lock().await;
-        is_idle(docker.status.clone(), docker.last_activity, DOCKER_IDLE_TIMEOUT)
+        is_idle(docker.status.clone(), docker.last_activity, docker_idle_timeout())
     };
 
     if should_stop {
-        tracing::info!("Docker inativo há mais de 45 min — encerrando automaticamente.");
+        tracing::info!("Docker inativo além do limite de inatividade — encerrando automaticamente.");
         if let Err(e) = process_manager::stop_docker(state).await {
             tracing::error!("Falha ao encerrar docker por inatividade: {e}");
         }

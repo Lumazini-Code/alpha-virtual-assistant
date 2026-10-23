@@ -5,13 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
-RUN chmod +x /app/start.sh
-
 RUN apt update
 
-RUN apt install -y pulseaudio-utils alsa-utils 
+RUN apt install -y pulseaudio-utils alsa-utils portaudio19-dev libc++1 libvulkan1 mesa-vulkan-drivers
 
 RUN apt-get install -y ripgrep
 

@@ -1,38 +1,63 @@
 //! Servidor REST exposto em localhost:9001.
 //!
 //! Endpoints:
-//!   GET  /status        -> status atual do llama-server e do docker
-//!   POST /llama/start    -> inicia (ou troca) o llama-server { "model": "...", "mmproj_used": true }
-//!   POST /llama/stop      -> encerra o llama-server
-//!   POST /docker/start     -> inicia o ambiente docker
-//!   POST /docker/stop       -> encerra o ambiente docker
-//!   GET  /models              -> lista os modelos .gguf disponíveis em ./Models
+//!   GET  /status          -> status atual do docker
+//!   POST /docker/start    -> inicia o ambiente docker
+//!   POST /docker/stop     -> encerra o ambiente docker
+//!   POST /browser/start   -> copia o perfil do Chrome e abre o Chrome em
+//!                            modo depuração (CDP :9222) — usado pelo
+//!                            orchestrator antes de tools do Playwright.
+//!                            O Chrome fica ABERTO depois (processo do host,
+//!                            detached) — só /browser/stop fecha.
+//!   POST /browser/stop    -> encerra o Chrome de depuração (controle manual)
+//!   GET  /browser/status  -> estado do Chrome + liveness do CDP
+//!   POST /transcript/start -> inicia o transcript de voz no host (mic +
+//!                            ASR + ingest no orchestrator). Também é
+//!                            AUTO-iniciado quando o container carrega.
+//!   POST /transcript/stop  -> encerra o transcript de voz
+//!   GET  /transcript/status -> estado do transcript + liveness por pid
 
-use crate::models::scan_models;
+use crate::mcp_manager;
 use crate::process_manager;
 use crate::state::SharedState;
+use crate::transcript;
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 const API_PORT: u16 = 9001;
 
-pub async fn serve(state: SharedState) -> anyhow::Result<()> {
+pub async fn serve(
+    state: SharedState,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
+) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/status", get(get_status))
-        .route("/models", get(get_models))
-        .route("/llama/start", post(post_llama_start))
-        .route("/llama/stop", post(post_llama_stop))
         .route("/docker/start", post(post_docker_start))
         .route("/docker/stop", post(post_docker_stop))
-        .with_state(state);
+        .route("/browser/start", post(post_browser_start))
+        .route("/browser/stop", post(post_browser_stop))
+        .route("/browser/status", get(get_browser_status))
+        .route("/mcp/start", post(post_mcp_start))
+        .route("/mcp/stop", post(post_mcp_stop))
+        .route("/mcp/status", get(get_mcp_status))
+        .route("/transcript/start", post(post_transcript_start))
+        .route("/transcript/stop", post(post_transcript_stop))
+        .route("/transcript/status", get(get_transcript_status))
+        // Chamado pelo transcribe (C++) na deteção da wake word: abre a
+        // janela do tray direto na tela de chat. Fire-and-forget.
+        .route("/ui/chat-open", post(post_ui_chat_open))
+        .with_state(state)
+        // Sender da UI para o /ui/chat-open (não vai no AppState — o canal
+        // nasce no main e é clonado aqui; Extension evita mudar o AppState).
+        .layer(axum::Extension(ui_tx));
 
-    let addr = format!("0.0.0.0:{API_PORT}");
+    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.9.12.22".to_string());
+    let addr = format!("{bind_host}:{API_PORT}");
     tracing::info!("API REST escutando em http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -46,18 +71,7 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
 
 #[derive(Serialize)]
 struct StatusResponse {
-    llama: LlamaStatusDto,
     docker: DockerStatusDto,
-}
-
-#[derive(Serialize)]
-struct LlamaStatusDto {
-    status: String,
-    pid: Option<u32>,
-    model: Option<String>,
-    mmproj: Option<String>,
-    port: u16,
-    idle_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -67,23 +81,29 @@ struct DockerStatusDto {
     idle_seconds: Option<u64>,
 }
 
-#[derive(Deserialize)]
-struct LlamaStartRequest {
-    /// Caminho absoluto ou relativo do .gguf a carregar.
-    model: String,
-    /// Se true, tenta usar o mmproj encontrado junto ao modelo.
-    #[serde(default)]
-    mmproj_used: bool,
-    /// Caminho do modelo draft MTP a usar. Se None, start_llama tenta
-    /// descobrir automaticamente na pasta do modelo (find_mtp_draft_model).
-    #[serde(default)]
-    mtp_draft_path: Option<String>,
-}
-
 #[derive(Serialize)]
 struct SimpleResponse {
     ok: bool,
     message: String,
+}
+
+#[derive(Serialize)]
+struct BrowserStartResponse {
+    ok: bool,
+    message: String,
+    /// URL do CDP para o --cdp-endpoint do Playwright MCP.
+    cdp_url: Option<String>,
+    pid: Option<u32>,
+    profile_dir: String,
+}
+
+#[derive(Serialize)]
+struct BrowserStatusResponse {
+    running: bool,
+    pid: Option<u32>,
+    cdp_alive: bool,
+    cdp_url: String,
+    profile_dir: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -91,98 +111,27 @@ struct SimpleResponse {
 // ════════════════════════════════════════════════════════════════════════
 
 async fn get_status(State(state): State<SharedState>) -> impl IntoResponse {
-    let llama = state.llama.lock().await;
-    let docker = state.docker.lock().await;
-
-    let resp = StatusResponse {
-        llama: LlamaStatusDto {
-            status: llama.status.label().to_string(),
-            pid: llama.pid,
-            model: llama.model_path.clone(),
-            mmproj: llama.mmproj_path.clone(),
-            port: llama.port,
-            idle_seconds: llama.last_activity.map(|t| t.elapsed().as_secs()),
-        },
-        docker: DockerStatusDto {
+    // try_lock: o /status é polado pela TUI e pelo health check — se o
+    // Mutex do docker estiver retido (start/stop demorando, ou qualquer
+    // bug que retenha o lock), responde "Ocupado" na hora em vez de
+    // enfileirar. Um lock preso nunca mais pode congelar o painel de
+    // status (e, com ele, o fluxo inteiro da TUI).
+    let docker_dto = match state.docker.try_lock() {
+        Ok(docker) => DockerStatusDto {
             status: docker.status.label().to_string(),
             pid: docker.pid,
             idle_seconds: docker.last_activity.map(|t| t.elapsed().as_secs()),
         },
+        Err(_busy) => DockerStatusDto {
+            status: "Ocupado".to_string(),
+            pid: None,
+            idle_seconds: None,
+        },
     };
+
+    let resp = StatusResponse { docker: docker_dto };
 
     Json(resp)
-}
-
-async fn get_models(State(state): State<SharedState>) -> impl IntoResponse {
-    match scan_models(&state.models_dir) {
-        Ok(models) => Json(models).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SimpleResponse {
-                ok: false,
-                message: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn post_llama_start(
-    State(state): State<SharedState>,
-    Json(req): Json<LlamaStartRequest>,
-) -> impl IntoResponse {
-    // Resolve o mmproj automaticamente a partir da pasta de modelos,
-    // igual ao find_mmproj() do script original — só usa se mmproj_used = true.
-    let mmproj = if req.mmproj_used {
-        scan_models(&state.models_dir)
-            .ok()
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|m| m.path == req.model)
-                    .and_then(|m| m.mmproj_path)
-            })
-    } else {
-        None
-    };
-
-    match process_manager::start_llama(
-        &state,
-        &req.model,
-        mmproj.as_deref(),
-        req.mtp_draft_path.as_deref(),
-        state.llama_log.clone(),
-    )
-    .await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(SimpleResponse {
-                ok: true,
-                message: "llama-server iniciado (ou já estava ativo com este modelo).".into(),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SimpleResponse {
-                ok: false,
-                message: e.to_string(),
-            }),
-        ),
-    }
-}
-
-async fn post_llama_stop(State(state): State<SharedState>) -> impl IntoResponse {
-    match process_manager::stop_llama(&state).await {
-        Ok(()) => Json(SimpleResponse {
-            ok: true,
-            message: "llama-server encerrado.".into(),
-        }),
-        Err(e) => Json(SimpleResponse {
-            ok: false,
-            message: e.to_string(),
-        }),
-    }
 }
 
 async fn post_docker_start(State(state): State<SharedState>) -> impl IntoResponse {
@@ -209,4 +158,197 @@ async fn post_docker_stop(State(state): State<SharedState>) -> impl IntoResponse
             message: e.to_string(),
         }),
     }
+}
+
+async fn post_browser_start(State(state): State<SharedState>) -> impl IntoResponse {
+    match process_manager::start_browser(&state).await {
+        Ok(info) => Json(BrowserStartResponse {
+            ok: true,
+            message: if info.already_running {
+                "Chrome CDP já estava ativo — reaproveitado.".into()
+            } else {
+                // Nota sobre a cópia do perfil (pode ser inconsistente se o
+                // Chrome real estava aberto durante a cópia).
+                "Chrome aberto em modo depuração (cópia do perfil). Se o Chrome \
+                 real estava aberto, alguns dados da cópia podem estar \
+                 inconsistentes — feche-o antes de novas sessões."
+                    .into()
+            },
+            cdp_url: Some(info.cdp_url),
+            pid: info.pid,
+            profile_dir: info.profile_dir.display().to_string(),
+        }),
+        Err(e) => Json(BrowserStartResponse {
+            ok: false,
+            message: e.to_string(),
+            cdp_url: None,
+            pid: None,
+            profile_dir: String::new(),
+        }),
+    }
+}
+
+async fn post_browser_stop(State(state): State<SharedState>) -> impl IntoResponse {
+    match process_manager::stop_browser(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "Chrome de depuração encerrado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn get_browser_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (running, pid, cdp_alive, profile_dir) = process_manager::browser_status(&state).await;
+
+    let port = { state.browser.lock().await.cdp_port };
+
+    Json(BrowserStatusResponse {
+        running,
+        pid,
+        cdp_alive,
+        cdp_url: format!("http://localhost:{port}"),
+        profile_dir: profile_dir.display().to_string(),
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MCP manager (HOST) — ativação + supervisão do executável standalone
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    /// "não instalado" | "Inativo" | "Iniciando..." | "Ativo" | "Encerrando..."
+    /// | "Crash — reiniciando..."
+    status: String,
+    pid: Option<u32>,
+    /// Executável encontrado na raiz do projeto (ou AVA_MCP_MANAGER_BIN)?
+    installed: bool,
+    /// GET /health (:4008) respondeu 2xx agora?
+    healthy: bool,
+    binary: String,
+}
+
+async fn post_mcp_start(State(state): State<SharedState>) -> impl IntoResponse {
+    match mcp_manager::start(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "MCP manager iniciado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn post_mcp_stop(State(state): State<SharedState>) -> impl IntoResponse {
+    match mcp_manager::stop(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "MCP manager encerrado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn get_mcp_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (status, pid, installed, healthy) = mcp_manager::mcp_snapshot(&state).await;
+    let binary = { state.mcp.lock().await.binary.display().to_string() };
+
+    Json(McpStatusResponse {
+        status: status.label().to_string(),
+        pid,
+        installed,
+        healthy,
+        binary,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Transcript (HOST) — pipeline de voz supervisionado pelo tray
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+struct TranscriptStatusResponse {
+    /// "não instalado" | "Inativo" | "Iniciando..." | "Ativo" |
+    /// "Encerrando..." | "Crash — reiniciando..."
+    status: String,
+    pid: Option<u32>,
+    /// Binário existe (build CMake do módulo de transcrição)?
+    installed: bool,
+    /// Processo vivo agora (liveness por pid)?
+    alive: bool,
+    binary: String,
+}
+
+async fn post_transcript_start(State(state): State<SharedState>) -> impl IntoResponse {
+    match transcript::start(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "Transcript iniciado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn post_transcript_stop(State(state): State<SharedState>) -> impl IntoResponse {
+    match transcript::stop(&state).await {
+        Ok(()) => Json(SimpleResponse {
+            ok: true,
+            message: "Transcript encerrado.".into(),
+        }),
+        Err(e) => Json(SimpleResponse {
+            ok: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+async fn get_transcript_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (status, pid, installed, alive) = transcript::transcript_snapshot(&state).await;
+    let binary = { state.transcript.lock().await.binary.display().to_string() };
+
+    Json(TranscriptStatusResponse {
+        status: status.label().to_string(),
+        pid,
+        installed,
+        alive,
+        binary,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// UI — abertura automática da tela de chat na wake word
+// ════════════════════════════════════════════════════════════════════════
+
+/// Chamado pelo transcribe (C++) assim que a wake word é detectada — antes
+/// mesmo da transcrição terminar. Envia `UiCommand::ShowChat` para a thread
+/// da UI (eframe): abre/restore a janela já na tela de chat.
+///
+/// Fire-and-forget: o transcribe NÃO deve esperar por repaint de UI. Se a
+/// mpsc falhar (UI morta), só logamos — o turno de voz continua normal.
+async fn post_ui_chat_open(
+    axum::Extension(ui_tx): axum::Extension<
+        tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
+    >,
+) -> impl IntoResponse {
+    if let Err(e) = ui_tx.send(crate::UiCommand::ShowChat) {
+        tracing::warn!("ui/chat-open: falha ao enviar ShowChat (UI fechada?): {e}");
+    } else {
+        tracing::info!("ui/chat-open: wake word detectada — abrindo tela de chat");
+    }
+    Json(SimpleResponse {
+        ok: true,
+        message: "chat-open enviado".into(),
+    })
 }
