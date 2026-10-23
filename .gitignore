@@ -63,3 +63,9 @@ Modules/mcp_manager/db/
 .graphifyignore
 
 AGENTS.md
+
+*.so
+
+Modules/transcribe/windows/*.dll
+Modules/transcribe/windows/*.exe
+Modules/transcribe/windows/*.pdb
