@@ -72,7 +72,7 @@ RERANK_THREADS     = max(1, int(os.getenv("ONNX_RERANK_THREADS", "2")))
 RERANK_MAX_BATCH   = max(8, int(os.getenv("ONNX_RERANK_MAX_BATCH", "32")))
 
 # Server
-SERVER_HOST        = os.environ.get("AVA_BIND_HOST", "127.0.0.1")
+SERVER_HOST        = os.environ.get("AVA_BIND_HOST", "127.9.12.22")
 SERVER_PORT        = 2002
 
 # Thread pools — isolate embedding and reranker workloads.

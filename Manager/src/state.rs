@@ -130,7 +130,7 @@ impl Default for McpManagerState {
             status: McpStatus::NotInstalled,
             pid: None,
             binary: PathBuf::new(),
-            health_url: format!("http://localhost:{MCP_MANAGER_DEFAULT_PORT}/health"),
+            health_url: format!("http://127.9.12.22:{MCP_MANAGER_DEFAULT_PORT}/health"),
         }
     }
 }
@@ -433,7 +433,7 @@ pub fn new_shared_state() -> SharedState {
             },
             pid: None,
             binary: mcp_binary,
-            health_url: format!("http://localhost:{mcp_port}/health"),
+            health_url: format!("http://127.9.12.22:{mcp_port}/health"),
         })),
         transcript: Arc::new(TokioMutex::new(TranscriptState {
             status: if transcript_binary.exists() {

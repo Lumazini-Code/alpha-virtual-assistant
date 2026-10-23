@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONN
 log = logging.getLogger("ava.onnx_client")
 
 # Default ONNX serving endpoint
-DEFAULT_ONNX_BASE_URL = "http://localhost:2002"
+DEFAULT_ONNX_BASE_URL = "http://127.9.12.22:2002"
 
 
 def _auth_headers() -> dict[str, str]:

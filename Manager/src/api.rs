@@ -56,7 +56,7 @@ pub async fn serve(
         // nasce no main e é clonado aqui; Extension evita mudar o AppState).
         .layer(axum::Extension(ui_tx));
 
-    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.9.12.22".to_string());
     let addr = format!("{bind_host}:{API_PORT}");
     tracing::info!("API REST escutando em http://{addr}");
 

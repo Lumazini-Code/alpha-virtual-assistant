@@ -1,12 +1,12 @@
 {
   "searxng": {
-    "url": "http://127.0.0.1:8081",
+    "url": "http://127.9.12.22:8081",
     "results": 15,
     "timeout_s": 3.0,
     "language": "pt-BR"
   },
   "crawl4ai": {
-    "url": "http://127.0.0.1:11235",
+    "url": "http://127.9.12.22:11235",
     "concurrency": 5,
     "timeout_s": 15.0
   },
@@ -15,7 +15,7 @@
     "min_chars": 400
   },
   "valkey": {
-    "url": "redis://127.0.0.1:6379/0",
+    "url": "redis://127.9.12.22:6379/0",
     "search_ttl_s": 21600,
     "page_ttl_s": 86400
   },

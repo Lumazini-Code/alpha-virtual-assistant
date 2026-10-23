@@ -104,7 +104,7 @@ impl Config {
         Config {
             port: env_parse("MCP_MANAGER_PORT", 4008u16),
             memory_api_url: std::env::var("MEMORY_API_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string()),
+                .unwrap_or_else(|_| "http://127.9.12.22:3000".to_string()),
             db_dir,
             db_path,
             connect_timeout: env_parse("MCP_CONNECT_TIMEOUT", 45.0f64),
@@ -923,10 +923,10 @@ fn resolve_cdp_endpoint(args: &[String]) -> Vec<String> {
             pending = true;
         } else if a.starts_with("--cdp-endpoint=") {
             out.push(format!("--cdp-endpoint={endpoint}"));
-        } else if a.contains("://localhost:9222") {
+        } else if a.contains("://127.9.12.22:9222") {
             out.push(
-                a.replace("http://localhost:9222", endpoint)
-                    .replace("https://localhost:9222", endpoint),
+                a.replace("http://127.9.12.22:9222", endpoint)
+                    .replace("https://127.9.12.22:9222", endpoint),
             );
         } else {
             out.push(a.clone());
@@ -2507,7 +2507,7 @@ async fn main() {
         .ok()
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+        .unwrap_or_else(|| "127.9.12.22".to_string());
     let listener = match tokio::net::TcpListener::bind((bind_host.as_str(), port)).await {
         Ok(l) => l,
         Err(e) => {

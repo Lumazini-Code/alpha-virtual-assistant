@@ -2,7 +2,7 @@
 
 Rodar: python test_pipeline.py   (precisa de rank-bm25/trafilatura instalados)
 O servidor em si precisa dos serviços de rede (SearXNG etc.) — para teste
-end-to-end use o cliente MCP: python test_mcp_client.py http://127.0.0.1:4010/mcp
+end-to-end use o cliente MCP: python test_mcp_client.py http://127.9.12.22:4010/mcp
 """
 
 import importlib.util

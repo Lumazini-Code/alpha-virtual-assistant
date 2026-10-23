@@ -153,7 +153,7 @@ export function useOrchestratorStream() {
             session_id: sessionIdRef.current ?? null,
             voice: "M1",
             lang: "pt",
-            tts: true,
+            tts: false,
             // Áudio tocado NA TUI (host) — o orchestrator devolve o WAV no
             // evento SSE `audio`. "device" (player dentro do container,
             // miniaudio) é opt-in via env AVA_TTS_OUTPUT=device.

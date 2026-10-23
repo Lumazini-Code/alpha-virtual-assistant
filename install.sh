@@ -230,7 +230,7 @@ ok "OPENROUTER_API_KEY configurada em $ENV_FILE (chmod 600)."
 
 # ── 5a. Token de autenticação interna (AVA_INTERNAL_TOKEN) ───────────────────
 # Todos os serviços internos (orchestrator, LLM, TTS, vision, memory, mcp_manager, Manager)
-# escutam em 127.0.0.1 e exigem `Authorization: Bearer <AVA_INTERNAL_TOKEN>`.
+# escutam em 127.9.12.22 e exigem `Authorization: Bearer <AVA_INTERNAL_TOKEN>`.
 
 existing_token() {
   [ -f "$ENV_FILE" ] && grep -E '^AVA_INTERNAL_TOKEN=.+' "$ENV_FILE" >/dev/null 2>&1
@@ -273,7 +273,7 @@ fi
 # O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
 # seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
 # retenta; se falhar de vez, só avisa (não aborta a instalação).
-MCP_MANAGER_URL="http://localhost:4008"
+MCP_MANAGER_URL="http://127.9.12.22:4008"
 
 register_playwright_mcp() {
   local payload
@@ -282,7 +282,7 @@ register_playwright_mcp() {
   "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
   "transport": "stdio",
   "command": "npx",
-  "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://localhost:9222"],
+  "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://127.9.12.22:9222"],
   "env": {"DISPLAY": ":0"}
 }'
 

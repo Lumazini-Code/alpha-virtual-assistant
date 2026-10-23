@@ -48,7 +48,8 @@ Arquitetura (v2 — polling de diff):
                             "nodes": {"added": [...], "updated": [...], "removed": [id,...]},
                             "edges": {"added": [...], "updated": [...],
                                       "removed": ["a|b|type", ...]}}
-      — nós de tools têm id string "t{id}" e kind="tool"; os de memória, id int.
+      — nós de tools têm id string "t{id}", kind="tool"; planos "p{id}",
+        kind="plan"; pessoas "u{id}", kind="person"; memórias têm id int.
 
   Endpoints:
     GET /                  → UI (vis-network, overhaul: cores/setas/weights por
@@ -187,12 +188,15 @@ def _tool_edge_public(row: sqlite3.Row) -> dict:
 
 def _plan_node_public(row: sqlite3.Row) -> dict:
     """Nó público de um plano de execução (PlansDB: ava_plans.db). Id STRING
-    com prefixo "p" — planos não têm arestas (nós soltos no espaço visual):
-    entram no grafo só para acompanhar criação/edição em tempo real (o
-    /plans/update da memory versiona, e o diff acende "updated")."""
+    com prefixo "p" — liga-se por arestas virtuais ao card de pessoa
+    (plans.person_id) e às tools do plano (plans.tools_json)."""
     name = (row["name"] or "").strip()
     desc = (row["description"] or "").strip()
     steps_count = len(json.loads(row["steps_json"] or "[]"))
+    try:
+        tool_ids = json.loads(row["tools_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        tool_ids = []
     return {
         "id":          f"p{row['id']}",
         "kind":        "plan",
@@ -203,9 +207,41 @@ def _plan_node_public(row: sqlite3.Row) -> dict:
         "description": desc,
         "version":     row["version"],
         "steps_count": steps_count,
+        # ── NEW (people cards / tools ↔ planos): vínculos persistidos
+        "person_id":   row["person_id"],
+        "tool_ids":    tool_ids,
         "created_at":  row["created_at"],
         "updated_at":  row["updated_at"],
         "source":      "plan",
+    }
+
+
+def _person_node_public(row: sqlite3.Row) -> dict:
+    """Nó público de um card de pessoa (PeopleDB: ava_people.db). Id STRING
+    com prefixo "u" — t/p/m já estão ocupados. O card liga-se por arestas
+    virtuais à memória de identidade (people.memory_id) e aos planos que o
+    citam (plans.person_id). voice_count/face_count vêm de subselects."""
+    name = (row["person_name"] or "").strip()
+    desc = (row["description"] or "").strip()
+    return {
+        "id":          f"u{row['id']}",
+        "kind":        "person",
+        "label":       name[:40] + ("…" if len(name) > 40 else ""),
+        "title":       html.escape(desc[:400]),
+        "text":        f"{name}. {desc}".strip(),   # p/ busca (nome + descrição)
+        "name":        name,
+        "description": desc,
+        "likes":       row["likes"],
+        "religion":    row["religion"],
+        "additional_info": row["additional_info"],
+        "memory_id":   row["memory_id"],     # nó de identidade no grafo de memórias
+        "voice_count": row["voice_count"],   # exemplos de voz (CAM++)
+        "face_count":  row["face_count"],    # exemplos de rosto (EdgeFace)
+        "confidence":  round(row["confidence"], 4),
+        "access_count": row["access_count"],
+        "created_at":  row["created_at"],
+        "last_accessed": row["last_accessed"],
+        "source":      row["source"],
     }
 
 
@@ -213,28 +249,40 @@ class GraphState:
     """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
     completo cobre criação, atualização E remoção (decay job) sem depender
-    de surrogate keys. Cobre QUATRO grafos no mesmo espaço visual:
+    de surrogate keys. Cobre CINCO grafos no mesmo espaço visual:
       - memórias LT (ava_memory.db) — ids inteiros, kind="memory";
       - tools (ava_tools.db) — ids string "t{id}", kind="tool"; o DB é
         opcional (memory process pode não tê-lo criado ainda);
-      - planos (ava_plans.db) — ids string "p{id}", kind="plan"; nós
-        soltos (sem arestas), também opcional;
+      - planos (ava_plans.db) — ids string "p{id}", kind="plan"; também
+        opcional;
+      - pessoas/cards (ava_people.db) — ids string "u{id}", kind="person";
+        opcional; liga-se às memórias pela memória de identidade;
       - MCP registry (mcp_manager Rust no HOST: Modules/mcp_manager/db/
         ava_mcp_servers.db) — opcional; FUSÃO por graph_name com as tools
         da ToolsDB: conteúdo (snippet/core/enabled/transporte) vem daqui,
         ids t{N} e arestas ficam na ToolsDB; tools só-MCP entram como
-        "m{servidor__tool}"."""
+        "m{servidor__tool}".
+
+    Correlações ENTRE grafos (NEW people cards / tools ↔ planos): arestas
+    virtuais derivadas dos metadados dos nós, recomputadas a cada scan —
+      person_identity: card u{N} → memória de identidade (people.memory_id);
+      plan_person:     plano p{N} ↔ card u{N}          (plans.person_id);
+      plan_tool:       plano p{N} ↔ tool t{N}          (plans.tools_json)."""
 
     TOOL_ID_PREFIX = "t"
     PLAN_ID_PREFIX = "p"
     MCP_ID_PREFIX = "m"
+    PERSON_ID_PREFIX = "u"
+    VIRTUAL_EDGE_WEIGHT = 0.5   # peso fixo das arestas virtuais entre grafos
 
     def __init__(self, db_path: str, tools_db_path: str = "",
-                 plans_db_path: str = "", mcp_db_path: str = ""):
+                 plans_db_path: str = "", mcp_db_path: str = "",
+                 people_db_path: str = ""):
         self.db_path = db_path
         self.tools_db_path = tools_db_path
         self.plans_db_path = plans_db_path
         self.mcp_db_path = mcp_db_path
+        self.people_db_path = people_db_path
         self.lock = threading.Lock()
         self.nodes: dict = {}                                  # id -> node público (int | "tN" | "pN" | "m...")
         self.nodes_sig: dict = {}                              # id -> sig por tipo
@@ -286,7 +334,7 @@ class GraphState:
                 edges.update(tedges)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # tools DB ainda não existe / sem tabelas — só memórias
-        # ── Grafo de planos (opcional): nós soltos, sem arestas ──
+        # ── Grafo de planos (opcional): nós soltos + vínculos persistidos ──
         if self.plans_db_path:
             try:
                 pconn = _open_ro(self.plans_db_path)
@@ -295,7 +343,7 @@ class GraphState:
                         f"{self.PLAN_ID_PREFIX}{r['id']}": _plan_node_public(r)
                         for r in pconn.execute(
                             "SELECT id, name, description, version, steps_json, "
-                            "created_at, updated_at FROM plans"
+                            "person_id, tools_json, created_at, updated_at FROM plans"
                         )
                     }
                 finally:
@@ -303,6 +351,29 @@ class GraphState:
                 nodes.update(pnodes)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # plans DB ainda não existe / sem tabela — ignora
+        # ── NEW (people cards): grafo de pessoas/cards (opcional) ──
+        if self.people_db_path:
+            try:
+                peconn = _open_ro(self.people_db_path)
+                try:
+                    unodes = {
+                        f"{self.PERSON_ID_PREFIX}{r['id']}": _person_node_public(r)
+                        for r in peconn.execute(
+                            "SELECT p.id, p.person_name, p.description, p.likes, "
+                            "p.religion, p.additional_info, p.source, p.confidence, "
+                            "p.memory_id, p.created_at, p.last_accessed, p.access_count, "
+                            "(SELECT COUNT(*) FROM voice_embeddings v "
+                            " WHERE v.person_id = p.id) AS voice_count, "
+                            "(SELECT COUNT(*) FROM face_embeddings f "
+                            " WHERE f.person_id = p.id) AS face_count "
+                            "FROM people p"
+                        )
+                    }
+                finally:
+                    peconn.close()
+                nodes.update(unodes)
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # people DB ainda não existe / sem tabela — ignora
         # ── MCP registry (opcional): fusão por graph_name ─────────────────
         # 1. Enriquece t-nodes da ToolsDB cujo name existe na MCP DB — o
         #    id t{N} MANTÉM (arestas de co-uso intactas) e o CONTEÚDO passa
@@ -357,6 +428,48 @@ class GraphState:
                     nodes[mnode["id"]] = mnode
             except (sqlite3.Error, FileNotFoundError):
                 pass   # MCP DB ainda não existe / vazia — ToolsDB cobre
+        # ── NEW (correlações entre grafos): arestas virtuais derivadas dos
+        # metadados dos nós — não moram em tabela de arestas; são recomputadas
+        # a cada scan e o diff detecta criação/remoção naturalmente (sem
+        # back-edges fantasmas quando um plano/pessoa é apagado).
+        #   person_identity: card u{N} → memória de identidade (people.memory_id)
+        #   plan_person:     plano p{N} ↔ card u{N}            (plans.person_id)
+        #   plan_tool:       plano p{N} ↔ tool t{N}            (plans.tools_json)
+        # Aresta só nasce se AMBOS os nós existirem (identidade ainda sem
+        # memória, plano sem card, tool não cadastrada → sem aresta).
+        virtual: dict[str, dict] = {}
+        w = self.VIRTUAL_EDGE_WEIGHT
+        for node in nodes.values():
+            kind = node.get("kind")
+            if kind == "person":
+                mid = node.get("memory_id")
+                if mid is not None and mid in nodes:
+                    key = f"{node['id']}|{mid}|person_identity"
+                    virtual[key] = {
+                        "key": key, "from": node["id"], "to": mid,
+                        "type": "person_identity", "weight": w,
+                        "count": 1, "last": node.get("last_accessed") or time.time(),
+                    }
+            elif kind == "plan":
+                pid = node.get("person_id")
+                if pid is not None and f"{self.PERSON_ID_PREFIX}{pid}" in nodes:
+                    puid = f"{self.PERSON_ID_PREFIX}{pid}"
+                    key = f"{node['id']}|{puid}|plan_person"
+                    virtual[key] = {
+                        "key": key, "from": node["id"], "to": puid,
+                        "type": "plan_person", "weight": w,
+                        "count": 1, "last": node.get("updated_at") or time.time(),
+                    }
+                for tid in node.get("tool_ids") or []:
+                    tuid = f"{self.TOOL_ID_PREFIX}{tid}"
+                    if tuid in nodes:
+                        key = f"{node['id']}|{tuid}|plan_tool"
+                        virtual[key] = {
+                            "key": key, "from": node["id"], "to": tuid,
+                            "type": "plan_tool", "weight": w,
+                            "count": 1, "last": node.get("updated_at") or time.time(),
+                        }
+        edges.update(virtual)
         return nodes, edges
 
     def refresh(self) -> dict:
@@ -385,7 +498,9 @@ class GraphState:
 
         with self.lock:
             for nid, node in db_nodes.items():
-                # sig por tipo de nó — memórias, tools e planos têm campos distintos
+                # sig por tipo de nó — memórias, tools, planos e pessoas têm
+                # campos distintos; mudança em person_id/tools_json do plano
+                # vira update do nó (as arestas virtuais mudam junto)
                 if node["kind"] == "tool":
                     # enabled = campo da MCP registry (t-nodes enriquecidos e
                     # m-nodes; t-nodes sem MCP DB usam o default True)
@@ -393,7 +508,11 @@ class GraphState:
                            node["use_count"], node["last_used"],
                            node.get("enabled", True))
                 elif node["kind"] == "plan":
-                    sig = (node["name"], node["text"], node["version"])
+                    sig = (node["name"], node["text"], node["version"],
+                           node.get("person_id"), tuple(node.get("tool_ids") or []))
+                elif node["kind"] == "person":
+                    sig = (node["name"], node["text"], node["memory_id"],
+                           node["voice_count"], node["face_count"], node["access_count"])
                 else:
                     sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
                 old_sig = self.nodes_sig.get(nid)
@@ -765,12 +884,22 @@ const TYPE_STYLE = {
   temporal_precedence: { color: '#4dabf7', directed: true,  dashes: false, name: 'temporal' },
   updates:             { color: '#ff922b', directed: true,  dashes: false, name: 'updates' },
   contradicts:         { color: '#ff6b6b', directed: false, dashes: [6, 4], name: 'contradicts' },
+  // ── NEW (people cards / correlações entre grafos): arestas virtuais
+  // derivadas dos metadados — tracejadas pra diferenciar das arestas
+  // "reais" do banco Hebbiano/ToolsDB.
+  person_identity:     { color: '#63e6be', directed: true,  dashes: [2, 3], name: 'identidade' },
+  plan_person:         { color: '#f783ac', directed: false, dashes: [2, 3], name: 'plano↔pessoa' },
+  plan_tool:           { color: '#74c0fc', directed: false, dashes: [2, 3], name: 'plano→tool' },
 };
 const BASE_NODE_BG = '#33384a', BASE_NODE_BORDER = '#54607a';
 // Tools (nativas + MCP): hexágonos verdes — distinguem de memória à primeira vista
 const TOOL_NODE_BG = '#1f3d3a', TOOL_NODE_BORDER = '#38d9a9', TOOL_FONT_COLOR = '#7fe3c8';
-// Planos de execução: diamantes roxos, id "p{id}" — nós soltos (sem arestas)
+// Planos de execução: diamantes roxos, id "p{id}" — ligam-se por arestas
+// virtuais ao card de pessoa e às tools do plano
 const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = '#d0bfff';
+// People cards: triângulos rosados, id "u{id}" — a aresta "identidade" liga
+// o card à memória LT que representa a pessoa no grafo Hebbiano
+const PERSON_NODE_BG = '#40232a', PERSON_NODE_BORDER = '#f783ac', PERSON_FONT_COLOR = '#ffdeeb';
 const FONT_COLOR   = '#9aa0b4';
 
 const nodes = new vis.DataSet();
@@ -826,14 +955,16 @@ function baseNodeOptions(meta) {
   const deg = degreeOf(meta.id);
   const isTool = meta.kind === 'tool';
   const isPlan = meta.kind === 'plan';
+  const isPerson = meta.kind === 'person';
   return {
     id: meta.id, label: meta.label, title: nodeTitle(meta),
-    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : 'dot',
-    size: (isTool ? 9 : isPlan ? 8 : 5) + Math.min(deg, 12) * 1.3,
+    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : isPerson ? 'triangle' : 'dot',
+    size: (isTool ? 9 : isPlan ? 8 : isPerson ? 10 : 5) + Math.min(deg, 12) * 1.3,
     color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
                   : isPlan ? { background: PLAN_NODE_BG, border: PLAN_NODE_BORDER }
-                           : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
-    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : FONT_COLOR, size: 11 },
+                  : isPerson ? { background: PERSON_NODE_BG, border: PERSON_NODE_BORDER }
+                             : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
+    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : isPerson ? PERSON_FONT_COLOR : FONT_COLOR, size: 11 },
   };
 }
 
@@ -846,6 +977,16 @@ function nodeTitle(meta) {
     return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PLAN_FONT_COLOR}">v${meta.version ?? '?'}</span><br>` +
            `<i>${meta.title || '(sem descrição)'}</i><br>` +
            `${meta.steps_count ?? '?'} passo(s) · criado: ${fmt(meta.created_at)} · atualizado: ${fmt(meta.updated_at)}`;
+  }
+  if (meta.kind === 'person') {
+    const d = new Date((meta.created_at || 0) * 1000);
+    const fmt = isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    const extras = [meta.likes, meta.religion].filter(Boolean).map(escapeHtml).join(' · ');
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PERSON_FONT_COLOR}">card</span><br>` +
+           `<i>${meta.title || '(sem descrição)'}</i><br>` +
+           ` voz: ${meta.voice_count ?? 0} exemplo(s) · rosto: ${meta.face_count ?? 0} exemplo(s)` +
+           `${extras ? `<br>${extras}` : ''}<br>` +
+           `criado: ${fmt} · acessos: ${meta.access_count ?? '?'}`;
   }
   if (meta.kind === 'tool') {
     const lu = meta.last_used ? new Date(meta.last_used * 1000).toLocaleString('pt-BR') : 'nunca usada';
@@ -1083,13 +1224,14 @@ function updateCounts() {
   const parts = Object.keys(TYPE_STYLE).map(t =>
     `<span class="t" style="background:${TYPE_STYLE[t].color}22;color:${TYPE_STYLE[t].color}">${TYPE_STYLE[t].name}: ${byType[t] || 0}</span>`
   ).join(' ');
-  let tools = 0, plans = 0;
+  let tools = 0, plans = 0, people = 0;
   for (const m of nodeMeta.values()) {
     if (m.kind === 'tool') tools++;
     else if (m.kind === 'plan') plans++;
+    else if (m.kind === 'person') people++;
   }
   document.getElementById('counts').innerHTML =
-    `memórias: ${nodeMeta.size - tools - plans} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · ${parts}`;
+    `memórias: ${nodeMeta.size - tools - plans - people} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · ${parts}`;
 }
 
 function pushLog(msg) {
@@ -1120,9 +1262,28 @@ function showPanel(id) {
   if (!meta) return;
   const isTool = meta.kind === 'tool';
   const isPlan = meta.kind === 'plan';
+  const isPerson = meta.kind === 'person';
   const d = new Date((meta.created_at || 0) * 1000);
   let head = '', body = '';
-  if (isPlan) {
+  if (isPerson) {
+    const fmt = isNaN(d) ? '?' : d.toLocaleString('pt-BR');
+    const la = new Date((meta.last_accessed || 0) * 1000);
+    const pills =
+      `<span class="pill" style="background:#63e6be22;color:#63e6be">voz: ${meta.voice_count ?? 0}</span>` +
+      `<span class="pill" style="background:#63e6be22;color:#63e6be">rosto: ${meta.face_count ?? 0}</span>` +
+      (meta.memory_id != null ? `<span class="pill" style="background:#38d9a922;color:#38d9a9">identidade #${meta.memory_id}</span>` : '');
+    head = `<h3 style="color:${PERSON_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">card de pessoa (▲ ${escapeHtml(String(meta.id))}) · grau: ${degreeOf(id)}</div>
+      <div class="meta">criado: ${fmt} · acessos: ${meta.access_count ?? '?'} · última: ${isNaN(la) ? '?' : la.toLocaleString('pt-BR')}</div>
+      <div class="meta">${pills}</div>`;
+    const extras = [
+      meta.description ? `<b>Quem é:</b> ${escapeHtml(meta.description)}` : '',
+      meta.likes ? `<b>Gosta:</b> ${escapeHtml(meta.likes)}` : '',
+      meta.religion ? `<b>Religião:</b> ${escapeHtml(meta.religion)}` : '',
+      meta.additional_info ? `<b>Mais:</b> ${escapeHtml(meta.additional_info)}` : '',
+    ].filter(Boolean).map(s => `<div class="text">${s}</div>`).join('');
+    body = extras || '<div class="meta">(card sem campos preenchidos)</div>';
+  } else if (isPlan) {
     const cu = new Date((meta.created_at || 0) * 1000);
     const uu = new Date((meta.updated_at || 0) * 1000);
     const fmt = (dd) => isNaN(dd) ? '?' : dd.toLocaleString('pt-BR');
@@ -1240,7 +1401,7 @@ document.getElementById('searchBox').onkeydown = (e) => {
   for (const [id, meta] of nodeMeta.entries()) {
     if ((meta.text || '').toLowerCase().includes(q)) {
       searchHighlight.push(id);
-      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
+      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : meta.kind === 'person' ? PERSON_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
     }
   }
   pushLog(`🔍 busca "${q}": ${searchHighlight.length} nó(s)`);
@@ -1303,12 +1464,15 @@ es.onmessage = (ev) => {
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Visualização em tempo real do grafo Hebbiano (memórias + tools)")
+    ap = argparse.ArgumentParser(description="Visualização em tempo real do grafo Hebbiano (memórias + tools + planos + people cards)")
     ap.add_argument("--db", default="./Modules/memory/db/ava_memory.db")
     ap.add_argument("--tools-db", default="./Modules/memory/db/ava_tools.db",
                     help="grafo de tools (ToolsDB) — omitido com '' ; se o arquivo não existir, só memórias")
     ap.add_argument("--plans-db", default="./Modules/memory/db/ava_plans.db",
                     help="grafo de planos (PlansDB) — omitido com '' ; se o arquivo não existir, ignora")
+    ap.add_argument("--people-db", default="./Modules/memory/db/ava_people.db",
+                    help="grafo de people cards (PeopleDB) — omitido com '' ; se o arquivo não existir, ignora. "
+                         "Correlações virtuais: card ↔ memória de identidade, plano ↔ card, plano ↔ tools")
     ap.add_argument("--mcp-db", default="./Modules/mcp_manager/db/ava_mcp_servers.db",
                     help="registry do mcp_manager (Rust, HOST) — opcional; fusão por "
                          "graph_name: conteúdo/snippet/enabled vêm daqui, arestas da ToolsDB")
@@ -1317,7 +1481,8 @@ def main():
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
     args = ap.parse_args()
 
-    state = GraphState(args.db, args.tools_db, args.plans_db, args.mcp_db)
+    state = GraphState(args.db, args.tools_db, args.plans_db, args.mcp_db,
+                       args.people_db)
 
     # Snapshot inicial ANTES de servir — o cliente já nasce com o grafo atual.
     delta = state.refresh()
@@ -1328,7 +1493,9 @@ def main():
         extra = "nada novo"
     tools_n = sum(1 for n in snap["nodes"] if n.get("kind") == "tool")
     plans_n = sum(1 for n in snap["nodes"] if n.get("kind") == "plan")
-    print(f"Grafo carregado: {len(snap['nodes'])} nós ({tools_n} tools, {plans_n} planos), "
+    people_n = sum(1 for n in snap["nodes"] if n.get("kind") == "person")
+    print(f"Grafo carregado: {len(snap['nodes'])} nós "
+          f"({tools_n} tools, {plans_n} planos, {people_n} people cards), "
           f"{len(snap['edges'])} arestas ({extra})")
 
     broadcaster = Broadcaster()
@@ -1340,8 +1507,8 @@ def main():
     poller.start()
 
     handler = make_handler(state, broadcaster, args.log)
-    server = ThreadingHTTPServer(("localhost", args.port), handler)
-    print(f"Abra http://localhost:{args.port} no navegador.")
+    server = ThreadingHTTPServer(("127.9.12.22", args.port), handler)
+    print(f"Abra http://127.9.12.22:{args.port} no navegador.")
     print(f"Polling de diff: {args.poll}s · ativações: {args.log}")
     try:
         server.serve_forever()

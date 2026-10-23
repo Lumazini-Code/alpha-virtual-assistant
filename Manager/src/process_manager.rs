@@ -694,7 +694,7 @@ fn browser_profile_dir() -> PathBuf {
 /// CDP está no ar? Um TCP connect basta: o Chrome só abre a porta
 /// quando o servidor DevTools está pronto.
 async fn cdp_alive(port: u16) -> bool {
-    tokio::net::TcpStream::connect(("127.0.0.1", port))
+    tokio::net::TcpStream::connect(("127.9.12.22", port))
         .await
         .is_ok()
 }
@@ -713,7 +713,7 @@ pub async fn start_browser(state: &SharedState) -> Result<BrowserStartInfo> {
         }
         browser.status = ProcStatus::Running;
         return Ok(BrowserStartInfo {
-            cdp_url: format!("http://localhost:{port}"),
+            cdp_url: format!("http://127.9.12.22:{port}"),
             pid: browser.pid,
             profile_dir: browser.profile_dir.clone(),
             already_running: true,
@@ -830,7 +830,7 @@ pub async fn start_browser(state: &SharedState) -> Result<BrowserStartInfo> {
     );
 
     Ok(BrowserStartInfo {
-        cdp_url: format!("http://localhost:{port}"),
+        cdp_url: format!("http://127.9.12.22:{port}"),
         pid,
         profile_dir: dst,
         already_running: false,

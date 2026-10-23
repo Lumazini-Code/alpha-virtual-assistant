@@ -37,14 +37,14 @@ services:
       HF_HUB_ETAG_TIMEOUT: "600"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      test: ["CMD", "curl", "-f", "http://127.9.12.22:9000/status"]
       interval: 30s
       timeout: 10s
       start_period: 240s
       retries: 5
 
   # ── Pipeline de busca web (websearch-mcp consome os três abaixo) ──────────
-  # Portas publicadas só em 127.0.0.1: o ava roda com network_mode: host no
+  # Portas publicadas só em 127.9.12.22: o ava roda com network_mode: host no
   # override linux e alcança tudo via localhost; nada fica exposto na rede.
 
   searxng:
@@ -53,15 +53,15 @@ services:
     volumes:
       - ./resource/searxng/settings.yml:/etc/searxng/settings.yml:ro
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.9.12.22:8081:8080"
     environment:
-      SEARXNG_BASE_URL: "http://127.0.0.1:8081/"
+      SEARXNG_BASE_URL: "http://127.9.12.22:8081/"
 
   valkey:
     image: valkey/valkey:8-alpine
     container_name: ava-valkey
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.9.12.22:6379:6379"
     volumes:
       - websearch-cache:/data
     command: ["valkey-server", "--appendonly", "no", "--save", ""]
@@ -71,7 +71,7 @@ services:
     container_name: ava-crawl4ai
     shm_size: 1g
     ports:
-      - "127.0.0.1:11235:11235"
+      - "127.9.12.22:11235:11235"
     environment:
       # Token interno — sem ele o servidor só escuta no loopback do container.
       # Gerado pelo install.sh em Modules/.env (falha de boot se ausente).
@@ -90,7 +90,7 @@ services:
       # através da allowlist do proxy (sem exec/images/volumes/networks).
       # DOCKER_HOST é lido automaticamente pelo docker.from_env().
     ports:
-      - "127.0.0.1:4010:4010"
+      - "127.9.12.22:4010:4010"
     environment:
       WEBSEARCH_CONFIG: "/app/resource/websearch/config.json"
       SEARXNG_URL: "http://searxng:8080"

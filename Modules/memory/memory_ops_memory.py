@@ -18,8 +18,6 @@ import time
 from typing import Literal, Optional
 
 from memory_config import (
-    AUTO_LINK_BACKFILL_BATCH,
-    AUTO_LINK_BACKFILL_MAX_NODES,
     AUTO_LINK_ENABLED,
     AUTO_LINK_INITIAL_WEIGHT,
     AUTO_LINK_MAX_EDGES,
@@ -192,131 +190,7 @@ async def _auto_link_task(new_id: int, embedding, text: str) -> None:
         )
 
 
-async def _auto_link_backfill() -> dict:
-    """Consolidação retroativa do grafo — o "sono" do memory.
 
-    Roda no startup (agendado por memory_state.startup, com delay p/ o ONNX
-    subir) e liga memórias que JÁ estavam gravadas antes do auto-link existir
-    ou sob thresholds antigos — exatamente o caso do grafo atual: só cadeias
-    temporais, zero ligações semânticas transversais.
-
-    Pipeline:
-      1. carrega todos os (id, text) da LT (teto AUTO_LINK_BACKFILL_MAX_NODES);
-      2. embeda TUDO em lote (chunks de AUTO_LINK_BACKFILL_BATCH — 1 chamada
-         por chunk, não N);
-      3. para cada nó: top-K vizinhos por cosine (matmul local — sem buscas
-         no índice), pré-filtro AUTO_LINK_MIN_COSINE;
-      4. gate por cross-encoder (1 score_many por nó com candidatos);
-      5. upsert_edge — IDEMPOTENTE: arestas já existentes são apenas
-         reforçadas (crescimento saturante até 1.0), por isso pode rodar a
-         cada boot sem inflar o grafo.
-
-    Retorna estatísticas p/ o log de boot."""
-    import numpy as np
-
-    loop = asyncio.get_event_loop()
-    rows = await loop.run_in_executor(
-        None,
-        lambda: state.lt_db._conn.execute(
-            "SELECT id, text FROM memories ORDER BY id LIMIT ?",
-            (AUTO_LINK_BACKFILL_MAX_NODES,),
-        ).fetchall(),
-    )
-    nodes = [(r["id"], r["text"]) for r in rows]
-    if len(nodes) < 2:
-        log.info(f"[AUTO-LINK-BACKFILL] grafo pequeno demais p/ consolidar "
-                 f"({len(nodes)} nó(s)) — pulando")
-        return {"nodes": len(nodes), "created": 0, "reinforced": 0, "skipped_gate": 0}
-
-    t0 = time.perf_counter()
-
-    # ── 1+2: embed em lote (chunks) ─────────────────────────────────────────
-    texts = [t for _, t in nodes]
-    vecs = []
-    for i in range(0, len(texts), AUTO_LINK_BACKFILL_BATCH):
-        vecs.append(await state.embed_engine.embed_passages(
-            texts[i:i + AUTO_LINK_BACKFILL_BATCH]
-        ))
-    X = np.concatenate(vecs, axis=0).astype(np.float32)
-    # E5 já sai normalizado — renormaliza defensivamente (custo trivial).
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    X /= norms
-
-    # ── 3: pré-filtro por cosine (por nó, matmul local) ─────────────────────
-    per_node: dict[int, list[tuple[int, float]]] = {}
-    for i in range(len(nodes)):
-        sims = X @ X[i]
-        sims[i] = -1.0  # exclui a si mesmo
-        idx = np.argsort(sims)[::-1][:AUTO_LINK_TOP_K]
-        cand = [(int(j), float(sims[j])) for j in idx if sims[j] >= AUTO_LINK_MIN_COSINE]
-        if cand:
-            per_node[i] = cand
-
-    if not per_node:
-        log.info("[AUTO-LINK-BACKFILL] nenhum par acima do pré-filtro de "
-                 f"cosine ({AUTO_LINK_MIN_COSINE:.2f}) — nada a consolidar")
-        return {"nodes": len(nodes), "created": 0, "reinforced": 0, "skipped_gate": 0}
-
-    # Arestas co_activation já existentes (p/ estatística criada vs reforçada).
-    existing: set[tuple[int, int]] = set()
-    for row in await loop.run_in_executor(
-        None,
-        lambda: state.lt_db._conn.execute(
-            "SELECT memory_id_a, memory_id_b FROM memory_edges WHERE edge_type = ?",
-            (EDGE_CO_ACTIVATION,),
-        ).fetchall(),
-    ):
-        existing.add((row["memory_id_a"], row["memory_id_b"]))
-
-    # ── 4+5: gate cross-encoder + upsert ────────────────────────────────────
-    created = reinforced = skipped_gate = 0
-    now = time.time()
-    for i, cand in per_node.items():
-        nid, ntext = nodes[i]
-        cand_ids = [j for j, _ in cand]
-        try:
-            cross_scores = await state.rerank_engine.score_many(
-                ntext, [texts[j] for j in cand_ids]
-            )
-        except Exception as e:
-            log.warning(f"[AUTO-LINK-BACKFILL] rerank falhou p/ #{nid} "
-                        f"(pulando nó): {type(e).__name__}: {e}")
-            continue
-
-        linked = 0
-        for j, cross in zip(cand_ids, cross_scores):
-            if cross < AUTO_LINK_MIN_CROSS:
-                continue
-            other = nodes[j][0]
-            a, b = min(nid, other), max(nid, other)  # co_activation é simétrica
-            await loop.run_in_executor(
-                None, state.lt_db.upsert_edge,
-                nid, other, EDGE_LEARNING_RATE, now,
-                EDGE_CO_ACTIVATION, AUTO_LINK_INITIAL_WEIGHT,
-            )
-            if (a, b) in existing:
-                reinforced += 1
-            else:
-                created += 1
-                existing.add((a, b))
-            linked += 1
-            if linked >= AUTO_LINK_MAX_EDGES:
-                break
-        if not linked:
-            skipped_gate += 1
-
-    elapsed = time.perf_counter() - t0
-    log.info(
-        f"[AUTO-LINK-BACKFILL] sono concluído: {len(nodes)} memórias, "
-        f"{len(per_node)} com candidatos, {created} aresta(s) nova(s), "
-        f"{reinforced} reforçada(s), {skipped_gate} nó(s) sem nada acima do "
-        f"gate ({AUTO_LINK_MIN_CROSS:.2f}) — {elapsed:.1f}s"
-    )
-    return {
-        "nodes": len(nodes), "created": created, "reinforced": reinforced,
-        "skipped_gate": skipped_gate, "elapsed_s": round(elapsed, 1),
-    }
 
 
 async def _store_long_term_text(
@@ -498,6 +372,45 @@ async def _link_new_memory(new_id: int, target_id: int, link_type: str) -> None:
         log.error(f"Grafo: falha ao criar aresta {link_type} #{new_id}→#{target_id}: {e}")
 
 
+# ── NEW (people cards): vínculo memória LT ↔ card de pessoa ────────────────────
+
+async def _link_memory_to_person(memory_id: int, person_id: int) -> None:
+    """Cria a aresta co_activation entre a memória recém-gravada e o nó de
+    identidade do card de pessoa no grafo Hebbiano — o PPR espalha ativação
+    entre a pessoa e as memórias sobre ela. Se o card ainda não tem memória
+    de identidade (memory_id vazio), cria uma (`"Nome: descrição"`,
+    source="people_card") e grava o id no card. person_id inválido → só
+    warning, nunca bloqueia a gravação da memória."""
+    loop = asyncio.get_event_loop()
+    try:
+        card = await loop.run_in_executor(None, state.pd_db.get_person_by_id, person_id)
+        if card is None:
+            log.warning(f"people: person_id #{person_id} não existe — memória gravada sem vínculo")
+            return
+        identity_id = card["memory_id"]
+        if identity_id is None:
+            stored, reason, identity_id, _ = await _store_long_term_text(
+                f"{card['person_name']}: {card['description'] or 'sem descrição'}",
+                "people_card", 1.0, False,
+            )
+            if not stored or identity_id is None:
+                log.warning(
+                    f"people: falha ao criar memória de identidade do card "
+                    f"#{person_id} ({reason}) — memória gravada sem vínculo"
+                )
+                return
+            await loop.run_in_executor(
+                None, state.pd_db.set_memory_id, person_id, identity_id,
+            )
+        await loop.run_in_executor(
+            None, state.lt_db.upsert_edge, memory_id, identity_id,
+            EDGE_LEARNING_RATE, time.time(), EDGE_CO_ACTIVATION,
+        )
+        log.info(f"people: memória #{memory_id} ↔ card #{person_id} (co_activation)")
+    except Exception as e:
+        log.error(f"people: falha ao vincular memória #{memory_id} à pessoa #{person_id}: {e}")
+
+
 async def _process_write_request(req: WriteRequest) -> WriteResponse:
     """Ponto único usado tanto por /write quanto por /write_batch (solução 1),
     pra garantir que os dois caminhos tenham exatamente a mesma lógica de
@@ -512,6 +425,11 @@ async def _process_write_request(req: WriteRequest) -> WriteResponse:
     )
     if linking and stored and reason == "ok" and memory_id is not None:
         await _link_new_memory(memory_id, req.link_to, req.link_type)
+    # ── NEW (people cards): vincula a memória ao nó de identidade do card
+    # (aresta co_activation). Depois da ligação explícita — person_id inválido
+    # → warning e grava sem vínculo, sem bloquear.
+    if req.person_id is not None and stored and reason == "ok" and memory_id is not None:
+        await _link_memory_to_person(memory_id, req.person_id)
     resp = WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
     if candidate is not None:
         resp.candidate_id    = candidate["id"]
@@ -566,6 +484,16 @@ async def write_short_term(req: WriteSTRequest):
     embed_text = "\n".join(f"{t.role}: {t.content}" for t in req.turns)
     loop = asyncio.get_event_loop()
 
+    # ── NEW (people cards): valida o card antes de gravar — person_id inválido
+    # → warning e grava sem vínculo (FK sem checagem destruiria a leitura por
+    # pessoa com ids órfãos).
+    person_id = req.person_id
+    if person_id is not None:
+        card = await loop.run_in_executor(None, state.pd_db.get_person_by_id, person_id)
+        if card is None:
+            log.warning(f"people: person_id #{person_id} não existe — ST gravado sem vínculo")
+            person_id = None
+
     async with _st_write_lock:
         embedding = await state.embed_engine.embed_passage_one(embed_text)
 
@@ -573,10 +501,13 @@ async def write_short_term(req: WriteSTRequest):
         if max_sim >= DEDUP_THRESHOLD:
             return WriteSTResponse(stored=False, reason=f"duplicate_semantic:{max_sim:.3f}")
 
-        group_id = state.st_db.insert(req.session_id, req.turns, embed_text)
+        group_id = state.st_db.insert(req.session_id, req.turns, embed_text, person_id=person_id)
         await loop.run_in_executor(None, state.st_index.add, embedding, group_id)
 
-    log.info(f"ST #{group_id} gravado — session={req.session_id} turnos={len(req.turns)}: {embed_text[:80]}")
+    log.info(
+        f"ST #{group_id} gravado — session={req.session_id} turnos={len(req.turns)} "
+        f"person_id={person_id}: {embed_text[:80]}"
+    )
     return WriteSTResponse(stored=True, reason="ok", turn_ids=[group_id])
 
 
@@ -592,8 +523,10 @@ async def read_short_term(req: ReadSTRequest):
 
     n_pairs = req.n_pairs if req.n_pairs > 0 else ST_READ_DEFAULT_PAIRS
     loop = asyncio.get_event_loop()
+    # ── NEW (people cards): person_id filtra os grupos de turnos por card de
+    # pessoa — o histórico devolvido só contém conversas com aquela pessoa.
     raw_turns, groups_fetched = await loop.run_in_executor(
-        None, state.st_db.get_recent_turn_groups, session_id, n_pairs
+        None, state.st_db.get_recent_turn_groups, session_id, n_pairs, req.person_id
     )
     turns = [Turn(**t) for t in raw_turns]
 
@@ -679,6 +612,21 @@ async def read_memory(req: ReadRequest):
         lt_raw = _fuse_max(lt_raw, lt_seg)
         st_raw = _fuse_max(st_raw, st_seg)
         log.info(f"/read query segmentada em {len(query_segments)} partes: {query_segments}")
+
+    # ── NEW (people cards): leitura centrada em uma pessoa. O nó de identidade
+    # do card (memory_id) é injetado como semente extra no PPR — memórias
+    # relacionadas à pessoa vêm como "related" mesmo sem match semântico.
+    # Card inexistente ou sem nó de identidade → só warning, leitura segue
+    # normal (sem semente).
+    if req.person_id is not None:
+        card = await loop.run_in_executor(None, state.pd_db.get_person_by_id, req.person_id)
+        if card is None:
+            log.warning(f"people: person_id #{req.person_id} não existe — /read sem semente de pessoa")
+        elif card["memory_id"] is None:
+            log.warning(f"people: card #{req.person_id} sem memória de identidade — /read sem semente")
+        else:
+            lt_raw.append((card["memory_id"], 1.0))
+            log.info(f"people: semente de identidade #{card['memory_id']} (card #{req.person_id}) injetada no PPR")
 
     # ── NEW (Hebbian graph / Step 6): PPR no grafo, com sementes em lt_raw ──
     # lt_raw já está finalizado aqui (todas as estratégias convergem nele) e
@@ -830,7 +778,6 @@ async def clear_session(session_id: str):
 
 
 __all__ = [
-    '_auto_link_backfill',
     '_auto_link_task',
     '_link_new_memory',
     '_lt_write_lock',

@@ -61,10 +61,10 @@ load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
 # ─────────────────────────────────────────────────────────────
 
 BASEFOLDER = Path(__file__).parent.parent
+HOST_BIND = os.getenv("AVA_BIND_HOST", "127.9.12.22")
 
-
-MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:3000")
-TTS_URL    = "http://localhost:3004"
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{HOST_BIND}:3000")
+TTS_URL    = f"http://{HOST_BIND}:3004"
 
 # OpenRouter API
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"

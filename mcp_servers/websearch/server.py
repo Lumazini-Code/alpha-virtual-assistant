@@ -29,7 +29,7 @@ Transporte: streamable-http em /mcp (o mcp_manager do AVA registra via
 Config: resource/websearch/config.json — caminho via env WEBSEARCH_CONFIG;
 no container default é /app/resource/websearch/config.json, em dev cai no
 relativo ../../resource/websearch/config.json. A memory_api é apontada via
-env MEMORY_API_URL (default http://127.0.0.1:3000; no compose, http://ava:3000).
+env MEMORY_API_URL (default http://127.9.12.22:3000; no compose, http://ava:3000).
 """
 
 import asyncio
@@ -62,10 +62,10 @@ log = logging.getLogger("ava.websearch")
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DEFAULTS = {
-    "searxng": {"url": "http://127.0.0.1:8081", "results": 15, "timeout_s": 3.0, "language": "pt-BR"},
-    "crawl4ai": {"url": "http://127.0.0.1:11235", "concurrency": 5, "timeout_s": 15.0},
+    "searxng": {"url": "http://127.9.12.22:8081", "results": 15, "timeout_s": 3.0, "language": "pt-BR"},
+    "crawl4ai": {"url": "http://127.9.12.22:11235", "concurrency": 5, "timeout_s": 15.0},
     "static_fetch": {"timeout_s": 8.0, "min_chars": 400},
-    "valkey": {"url": "redis://127.0.0.1:6379/0", "search_ttl_s": 21600, "page_ttl_s": 86400},
+    "valkey": {"url": "redis://127.9.12.22:6379/0", "search_ttl_s": 21600, "page_ttl_s": 86400},
     "filter": {"top_urls": 5, "max_per_domain": 1, "block_domains": []},
     "chunks": {"max_chunk_chars": 1200, "min_chunk_chars": 80, "max_per_page": 3, "max_tokens_total": 4000},
     "fetch": {"min_pages": 3},
@@ -346,7 +346,7 @@ def _is_private_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
-    # IPv4-mapped IPv6 (ex: ::ffff:127.0.0.1)
+    # IPv4-mapped IPv6 (ex: ::ffff:127.9.12.22)
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
     return (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -662,7 +662,7 @@ async def run_pipeline(query: str, max_results: int) -> str:
 # Memory API — gravação de fatos em memória de longo prazo (LT)
 # ══════════════════════════════════════════════════════════════════════════════
 
-MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:3000")
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.9.12.22:3000")
 
 _memory_client: httpx.AsyncClient | None = None
 
@@ -820,7 +820,7 @@ async def memory_write_batch(facts: list[str]) -> str:
 if __name__ == "__main__":
     mcp.run(
         transport="streamable-http",
-        host=os.getenv("WEBSEARCH_HOST", "0.0.0.0"),
+        host=os.getenv("WEBSEARCH_HOST", "127.9.12.22"),
         port=int(os.getenv("WEBSEARCH_PORT", "4010")),
         streamable_http_path="/mcp",
         stateless_http=True,

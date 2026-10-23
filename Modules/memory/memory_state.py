@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from memory_config import (
-    AUTO_LINK_BACKFILL,
-    AUTO_LINK_BACKFILL_DELAY_S,
     AUTO_LINK_ENABLED,
     DB_PATH,
     DECAY_HALF_LIFE_DAYS,
@@ -26,7 +24,6 @@ from memory_config import (
     EMBED_DIM,
     FAISS_ID_MAP_PATH,
     FAISS_INDEX_PATH,
-    FD_DB_PATH,
     FD_EMBED_DIM,
     FD_FAISS_ID_MAP_PATH,
     FD_FAISS_INDEX_PATH,
@@ -43,6 +40,7 @@ from memory_config import (
     MT_VOICE_DICT,
     MT_VISUAL_DICT,
     ONNX_SERVING_URL,
+    PD_DB_PATH,
     PLANS_DB_PATH,
     ST_CLEANUP_INTERVAL_S,
     ST_DB_PATH,
@@ -54,7 +52,6 @@ from memory_config import (
     VD_EMBED_DIM,
     VD_FAISS_ID_MAP_PATH,
     VD_FAISS_INDEX_PATH,
-    VO_DB_PATH,
     VO_EMBED_DIM,
     VO_FAISS_ID_MAP_PATH,
     VO_FAISS_INDEX_PATH,
@@ -64,14 +61,13 @@ from memory_config import (
     log,
 )
 from memory_db import (
-    FaceDictDB,
     IndexedFilesDB,
     MemoryDB,
+    PeopleDB,
     PlansDB,
     ShortTermDB,
     ToolsDB,
     VisualDictDB,
-    VoiceDictDB,
 )
 from memory_engines import EmbeddingEngine, RerankEngine
 from memory_vector import LanceStore, MemoryIndex
@@ -109,11 +105,9 @@ class AppState:
     # ── NEW: Dicionário Visual ──
     vd_db:        VisualDictDB    = field(default=None)
     vd_index:     MemoryIndex     = field(default=None)
-    # ── NEW: Dicionário de Rostos ──
-    fd_db:        FaceDictDB      = field(default=None)
+    # ── Unificação: Dicionário de Pessoas (Voice + Face) ──
+    pd_db:         PeopleDB      = field(default=None)
     fd_index:     MemoryIndex     = field(default=None)
-    # ── NEW: Dicionário de Voz ──
-    vo_db:        VoiceDictDB     = field(default=None)
     vo_index:     MemoryIndex     = field(default=None)
     # ── NEW: RAG de tools ──
     tl_db:        ToolsDB         = field(default=None)
@@ -123,7 +117,6 @@ class AppState:
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
-    backfill_task: asyncio.Task   = field(default=None)
 
 state = AppState()
 
@@ -250,13 +243,15 @@ async def startup():
     state.vd_index = MemoryIndex(state.lance, MT_VISUAL_DICT, VD_EMBED_DIM,
                                  VD_FAISS_INDEX_PATH, VD_FAISS_ID_MAP_PATH)
 
-    # ── NEW: Dicionário de Rostos ──
-    state.fd_db    = FaceDictDB(FD_DB_PATH)
+    # ── Unificação: Card de Pessoa (PeopleDB) — Voice + Face ──
+    # Um único banco de pessoas: os metadados (nome, descrição, gostos, etc.)
+    # moram na tabela `people`, enquanto os embeddings de voz e rosto ficam
+    # em tabelas separadas (dimensionalidades diferentes), ambos apontando
+    # pro mesmo person_id. Os índices vetoriais (fd_index/vo_index) continuam
+    # separados pelas mesmas razões.
+    state.pd_db    = PeopleDB(PD_DB_PATH)
     state.fd_index = MemoryIndex(state.lance, MT_FACE_DICT, FD_EMBED_DIM,
                                  FD_FAISS_INDEX_PATH, FD_FAISS_ID_MAP_PATH)
-
-    # ── NEW: Dicionário de Voz ──
-    state.vo_db    = VoiceDictDB(VO_DB_PATH)
     state.vo_index = MemoryIndex(state.lance, MT_VOICE_DICT, VO_EMBED_DIM,
                                  VO_FAISS_INDEX_PATH, VO_FAISS_ID_MAP_PATH)
 
@@ -288,31 +283,13 @@ async def startup():
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
     state.flush_task   = asyncio.create_task(index_flush_job())
 
-    # ── Auto-link backfill ("sono" do memory) ────────────────────────────────
-    # Consolida retroativamente o grafo a cada boot: liga memórias gravadas
-    # antes do auto-link existir / sob thresholds antigos. Fire-and-forget com
-    # delay (ONNX serving ainda aquecendo). Idempotente — arestas existentes
-    # só são reforçadas. Import lazy: memory_ops_memory importa este módulo
-    # (state), então o import direto no topo criaria ciclo.
-    if AUTO_LINK_ENABLED and AUTO_LINK_BACKFILL:
-        async def _autolink_sleep():
-            await asyncio.sleep(AUTO_LINK_BACKFILL_DELAY_S)
-            try:
-                import memory_ops_memory  # noqa: PLC0415 — ciclo evitado de propósito
-                await memory_ops_memory._auto_link_backfill()
-            except Exception as e:
-                log.warning(f"[AUTO-LINK-BACKFILL] falhou (não-bloqueante): "
-                            f"{type(e).__name__}: {e}")
-        state.backfill_task = asyncio.ensure_future(_autolink_sleep())
-
     log.info(
         f"Pronto — {state.lt_db.count()} memórias LT | "
         f"{state.st_db.count()} grupos ST | "
         f"{state.vs.total if state.vs else 0} chunks de conhecimento | "
         f"{state.if_db.count_files()} arquivos indexados ({state.if_db.get_total_chunks()} chunks) | "
         f"{state.vd_db.count()} conceitos visuais ({state.vd_index.total} embeddings) | "
-        f"{state.fd_db.count()} pessoas cadastradas ({state.fd_index.total} embeddings de rosto) | "
-        f"{state.vo_db.count()} pessoas com voz cadastrada ({state.vo_index.total} embeddings de voz) | "
+        f"{state.pd_db.count()} pessoas cadastradas ({state.fd_index.total} emb. de rosto, {state.vo_index.total} emb. de voz) | "
         f"{state.tl_db.count()} tools indexadas ({state.tl_index.total} vetores) | "
         f"{state.plans_db.count()} planos"
     )
@@ -330,8 +307,6 @@ async def shutdown():
         state.cleanup_task.cancel()
     if state.flush_task is not None:
         state.flush_task.cancel()
-    if state.backfill_task is not None and not state.backfill_task.done():
-        state.backfill_task.cancel()
 
     # Flush final e síncrono de todos os índices — garante que nada gravado
     # desde o último ciclo do index_flush_job seja perdido ao encerrar.

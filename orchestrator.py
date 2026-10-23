@@ -100,17 +100,17 @@ import regex as re
 # processo/estado (SQLite/LanceDB). Acessado via state.memory_client /
 # _memory_request(...). Mesma env var usada por LLM.py — os dois processos
 # devem apontar para a mesma instância do memory_api.py.
-MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://localhost:3000")
-TTS_URL              = "http://localhost:3004"
-LLM_URL              = "http://localhost:4003"
-VISION_URL           = "http://localhost:4002"
+MEMORY_API_URL       = os.getenv("MEMORY_API_URL", "http://127.9.12.22:3000")
+TTS_URL              = "http://127.9.12.22:3004"
+LLM_URL              = "http://127.9.12.22:4003"
+VISION_URL           = "http://127.9.12.22:4002"
 # ── Embedding on-demand (rota A do plano — cadastro de voz via /settings) ────
 # Módulo transcribe (main.cpp no HOST, microfone local) expõe um mini servidor
 # HTTP com GET /health e POST /speaker/embed (PCM s16le mono → embedding CAM++
 # 192 dims). No Linux o container ava usa network_mode: host, então localhost
 # alcança o processo; no Windows injete http://host.docker.internal:9100 no
 # compose (docker-compose.windows.yml).
-TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://localhost:9100")
+TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://127.9.12.22:9100")
 # ── Fluxo vision_objects (vision.py :4002) ────────────────────────────────────
 # vision.py está desativado por enquanto (start.sh não sobe o serviço — a
 # forma com que ele foi projetado para ser usado, agente totalmente autônomo
@@ -122,13 +122,13 @@ TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://localhost:9100")
 # vision_objects (face recognition + segmentação de objetos → crops →
 # _answer_vision_with_llm) fica disponível e o nudge original é restaurado.
 VISION_OBJECTS_ENABLED = os.getenv("VISION_OBJECTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-DEEP_SEARCH_URL      = "http://localhost:4005"
-ALPHA_CODE_URL       = "http://localhost:4006"
+DEEP_SEARCH_URL      = "http://127.9.12.22:4005"
+ALPHA_CODE_URL       = "http://127.9.12.22:4006"
 # mcp_manager.py — registro REST + executor de servidores MCP (stdio/http).
 # É o ÚNICO processo que spawna servidores MCP e mantém sessões; este
 # orchestrator fala com ele via REST na descoberta em duas etapas (ver
 # MCP via mcp_manager, abaixo, e _select_skills/_load_mcp_tools).
-MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://localhost:4008")
+MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://127.9.12.22:4008")
 # Teto default de execução para tools MCP — o EXECUTOR_TIMEOUTS não tem
 # entradas por tool MCP (nomes dinâmicos `servidor__tool`), então toda tool
 # externa que não tiver override usa este valor (também enviado ao manager,
@@ -147,7 +147,7 @@ ALWAYS_ON_MCP_SERVERS = {
 # Env: no Windows o container precisa alcançar o tray NO HOST —
 # host.docker.internal (docker-compose.windows.yml injeta o valor);
 # no Linux (host network) o default localhost é o próprio host.
-PROCESS_MANAGER_URL  = os.getenv("PROCESS_MANAGER_URL", "http://localhost:9001")
+PROCESS_MANAGER_URL  = os.getenv("PROCESS_MANAGER_URL", "http://127.9.12.22:9001")
 # ── Browser CDP (Chrome do host p/ tools de browser) ─────────────────────────
 # Servidores MCP que precisam de um Chrome do HOST em modo depuração
 # (CDP :9222). O @playwright/mcp é registrado com --cdp-endpoint
@@ -275,7 +275,7 @@ def _assert_public_url(url: str) -> None:
                 ip = ipaddress.ip_address(ip_str)
             except ValueError:
                 continue
-            # IPv4-mapped IPv6 (ex: ::ffff:127.0.0.1)
+            # IPv4-mapped IPv6 (ex: ::ffff:127.9.12.22)
             if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
                 ip = ip.ipv4_mapped
             if (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -287,6 +287,49 @@ def _assert_public_url(url: str) -> None:
         raise HTTPException(400, f"Validação de URL falhou: {e}")
 
 log = logging.getLogger("ava.orchestrator")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Persona (1ª linha do system prompt — editável na TUI via settings)
+# ══════════════════════════════════════════════════════════════════════════════
+# A frase de identidade ("You are Alpha, ...") fica persistida em
+# resource/persona.json e pode ser trocada pela TUI (settings → persona)
+# via GET/PUT /persona. A cláusula de tools é SEMPRE anexada pelo
+# orchestrator — o texto editado é só a parte de identidade.
+PERSONA_DEFAULT = "You are Alpha, a helpful assistant"
+PERSONA_MAX = 2000
+
+PERSONA_FILE = Path(
+    os.getenv("PERSONA_FILE")
+    or Path(__file__).resolve().parent / "resource" / "persona.json"
+)
+
+
+def _load_persona() -> str:
+    """Persona persistida (resource/persona.json) ou o default. Arquivo
+    ausente/corrompido degrada silenciosamente para o default — nunca derruba
+    o boot por causa de uma linha de prompt."""
+    try:
+        data = json.loads(PERSONA_FILE.read_text(encoding="utf-8"))
+        p = str(data.get("persona") or "").strip()
+        if p:
+            return p[:PERSONA_MAX]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Persona: falha ao ler {PERSONA_FILE} — usando default: {e}")
+    return PERSONA_DEFAULT
+
+
+def _save_persona(text: str) -> None:
+    PERSONA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PERSONA_FILE.write_text(
+        json.dumps({"persona": text}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+_PERSONA = _load_persona()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2354,8 +2397,11 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "zh": "Chinese",
     }
     reply_lang = lang_names.get((lang_hint or "").lower(), None)
+    # Persona editável (TUI settings → persona): a identidade vem de
+    # resource/persona.json (GET/PUT /persona); a cláusula de tools é fixa.
+    persona = _PERSONA.strip().rstrip(".") or PERSONA_DEFAULT
     lines = [
-        "You are Alpha, a helpful assistant. You have access to a set of tools/functions.",
+        f"{persona}. You have access to a set of tools/functions.",
         "",
         "Always reply in the same language the user wrote their message in"
         + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
@@ -2901,13 +2947,17 @@ async def _execute_stream_generator(req: ExecuteRequest):
     log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
     # Espelho no Conversation Hub: `meta` inclui a pergunta (o chat do Manager
-    # precisa dela para desenhar a bolha do usuário) e o `source` do turno.
+    # precisa dela para desenhar a bolha do usuário), o `source` do turno e a
+    # flag `tts` — o Manager usa `tts: true` para decidir se abre automaticamente
+    # a tela de chat (só turnos de voz devem roubar o foco; turnos da TUI/chat
+    # chegam com tts=false e NÃO abrem a janela do Manager).
     await _mirror_conversation(CONVERSATION_HUB, "meta", {
         "execution_id": eid, "session_id": sid,
-        "input": req.input, "source": req.source or "tui",
+        "input": req.input, "source": req.source or "tui", "tts": req.tts,
     })
     yield _sse("meta", {"execution_id": eid, "session_id": sid,
-                        "input": req.input, "source": req.source or "tui"})
+                        "input": req.input, "source": req.source or "tui",
+                        "tts": req.tts})
 
     events_queue: asyncio.Queue = asyncio.Queue(
         maxsize=int(os.environ.get("AVA_EVENTS_QUEUE_MAX", "2000"))
@@ -3534,6 +3584,35 @@ async def list_voices():
         return r.json()
     except Exception as e:
         raise HTTPException(502, f"TTS voices falhou: {e}")
+
+
+# ── Persona (system prompt editável pela TUI — settings → persona) ────────────
+
+class PersonaRequest(BaseModel):
+    persona: str = Field(..., min_length=1, max_length=PERSONA_MAX)
+
+
+@app.get("/persona")
+async def get_persona():
+    return {"persona": _PERSONA, "default": PERSONA_DEFAULT}
+
+
+@app.put("/persona")
+async def set_persona(req: PersonaRequest):
+    """Troca a 1ª linha do system prompt e persiste em resource/persona.json
+    (surte efeito IMEDIATO no próximo turno — sem restart). A cláusula de
+    tools continua sempre anexada pelo _tools_system_prompt."""
+    global _PERSONA
+    p = req.persona.strip()
+    if not p:
+        raise HTTPException(400, "persona não pode ser vazia")
+    _PERSONA = p[:PERSONA_MAX]
+    try:
+        _save_persona(_PERSONA)
+    except Exception as e:
+        raise HTTPException(500, f"Falha ao persistir persona: {e}")
+    log.info(f"Persona atualizada ({len(_PERSONA)} chars) — {PERSONA_FILE}")
+    return {"persona": _PERSONA}
 
 
 if __name__ == "__main__":
