@@ -767,6 +767,7 @@ async def _card_identity_memory(
         stored, _, memory_id, _ = await _store_long_term_text(
             text, "people_card", 1.0, False,
             action="update", memory_id=current,
+            internal=True,  # cards guardam id CRUA (o nó pode morar no geral)
         )
         if stored:
             return memory_id

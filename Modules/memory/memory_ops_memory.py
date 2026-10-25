@@ -28,6 +28,7 @@ from memory_config import (
     EDGE_CO_ACTIVATION,
     EDGE_LEARNING_RATE,
     EDGE_TEMPORAL,
+    GENERAL_SCOPE,
     IF_MIN_SCORE_READ,
     READ_MIN_SCORE_STRICT,
     READ_RERANK_COSINE_WEIGHT,
@@ -43,9 +44,13 @@ from memory_config import (
     ST_READ_DEFAULT_PAIRS,
     UPDATE_SIM_THRESHOLD,
     VS_MIN_SCORE,
+    encode_ref,
+    is_general_ref,
     log,
+    ref_real_id,
 )
 from memory_models import (
+    MemoryEntry,
     MemoryToolError,
     ReadRequest,
     ReadResponse,
@@ -71,11 +76,17 @@ from memory_search import (
     _hebbian_link_task,
     _lateral_inhibition_filter,
     _ppr_reinforce_task,
-    _ppr_spread,
-    _search_dual,
-    _search_expanded,
-    _search_segmented,
+    _ppr_spread_on,
+    _search_lt_dual_on,
+    _search_lt_expanded_on,
+    _search_lt_plain,
+    _search_lt_segmented_on,
+    _search_st_dual,
+    _search_st_expanded,
+    _search_st_plain,
+    _search_st_segmented,
     _split_query_segments,
+    lt_views,
 )
 from memory_state import state
 
@@ -94,10 +105,15 @@ _lt_write_lock = asyncio.Lock()
 _st_write_lock = asyncio.Lock()
 
 
-async def _auto_link_task(new_id: int, embedding, text: str) -> None:
+async def _auto_link_task(new_id: int, embedding, text: str,
+                          lt_db=None, lt_index=None) -> None:
     """Auto-link na ESCRITA (grafo Hebbiano) — liga a memória recém-gravada
     aos seus vizinhos semânticos já existentes, sem esperar uma leitura
     futura que co-ative os dois.
+
+    NEW (projetos): `lt_db`/`lt_index` = grafo/índice DO ESCOPO da memória
+    nova (None = escopo ativo). Arestas nunca cruzam escopos — o auto-link
+    só considera vizinhos do MESMO escopo.
 
     Pipeline (fire-and-forget — falhas nunca derrubam a escrita):
       1. top-K vizinhos no FAISS (o embedding da nova memória já estava em
@@ -117,11 +133,15 @@ async def _auto_link_task(new_id: int, embedding, text: str) -> None:
     """
     try:
         loop = asyncio.get_event_loop()
+        if lt_db is None:
+            lt_db = state.lt_db
+        if lt_index is None:
+            lt_index = state.lt_index
 
         # +1 no top_k: a própria memória (recém-adicionada ao índice) pode
         # voltar como hit — filtrada abaixo.
         hits = await loop.run_in_executor(
-            None, state.lt_index.search, embedding, AUTO_LINK_TOP_K + 1
+            None, lt_index.search, embedding, AUTO_LINK_TOP_K + 1
         )
         candidates = [
             (mid, sim) for mid, sim in hits
@@ -136,7 +156,7 @@ async def _auto_link_task(new_id: int, embedding, text: str) -> None:
             return
 
         rows = await loop.run_in_executor(
-            None, state.lt_db.get_by_ids, [mid for mid, _ in candidates]
+            None, lt_db.get_by_ids, [mid for mid, _ in candidates]
         )
         by_id = {r["id"]: r for r in rows}
         cand_ids = [mid for mid, _ in candidates if mid in by_id]
@@ -165,7 +185,7 @@ async def _auto_link_task(new_id: int, embedding, text: str) -> None:
             if cross < AUTO_LINK_MIN_CROSS:
                 continue
             await loop.run_in_executor(
-                None, state.lt_db.upsert_edge,
+                None, lt_db.upsert_edge,
                 new_id, mid, EDGE_LEARNING_RATE, now,
                 EDGE_CO_ACTIVATION, AUTO_LINK_INITIAL_WEIGHT,
             )
@@ -207,6 +227,12 @@ async def _store_long_term_text(
     # link_type) que este texto é um fato DISTINTO relacionado a outro; a faixa
     # "possible_update" não bloqueia o write.
     allow_near: bool = False,
+    # ── NEW (projetos): True = caller INTERNO (dicionários/cards) que trabalha
+    # no espaço de ids CRUAS — a resposta devolve o id real mesmo quando o alvo
+    # está no escopo geral (o id é gravado de volta no card/conceito e depois
+    # sondado cru). False (default) = caller externo (/write) recebe id de API
+    # (composta com offset quando o alvo é do geral em leitura mesclada).
+    internal: bool = False,
 ) -> tuple[bool, str, Optional[int], Optional[dict]]:
     """
     Lógica compartilhada de gravação em memória de longo prazo — usada tanto
@@ -216,6 +242,12 @@ async def _store_long_term_text(
     Retorna (stored, reason, memory_id, candidate) — `candidate` só vem
     preenchido (dict com id/text/score) quando `reason` começa com
     "possible_update:".
+
+    NEW (projetos): a CRIAÇÃO acontece sempre no ESCOPO ATIVO. O UPDATE
+    resolve o dono do alvo: id composta (offset) → escopo geral; id crua
+    inexistente no ativo → sonda o geral (nós de identidade de cards criados
+    no modo geral permanecem estáveis no grafo original — ver
+    _card_identity_memory). Fora isso, escrita só no ativo.
     """
     text = text.strip()
     if len(text) < 10:
@@ -229,6 +261,28 @@ async def _store_long_term_text(
     if action == "update":
         async with _lt_write_lock:
             target_id = memory_id
+            # Escopo dono do alvo (default: escopo ativo)
+            target_db, target_index = state.lt_db, state.lt_index
+            if target_id is not None and is_general_ref(target_id):
+                # Id COMPOSTA (leitura mesclada) → alvo no escopo geral.
+                gen = state.scopes.get(GENERAL_SCOPE)
+                if gen is None:
+                    return False, "update_target_not_found", None, None
+                target_id = ref_real_id(target_id)
+                target_db, target_index = gen.lt_db, gen.lt_index
+            elif target_id is not None:
+                # Id CRUA: se não existe no escopo ativo, sonda o geral — o
+                # update de um nó existente mantém o nó no dono original
+                # (arestas/permanência no grafo certo), sem criar cópia no
+                # escopo ativo.
+                row = await loop.run_in_executor(None, state.lt_db.get_by_id, target_id)
+                if row is None:
+                    gen = state.scopes.get(GENERAL_SCOPE)
+                    grow = await loop.run_in_executor(
+                        None, gen.lt_db.get_by_id, target_id
+                    ) if gen is not None else None
+                    if grow is not None:
+                        target_db, target_index = gen.lt_db, gen.lt_index
             if target_id is None:
                 # Sem memory_id explícito: acha a memória de LT mais
                 # parecida semanticamente e usa ela como alvo, desde que
@@ -240,6 +294,10 @@ async def _store_long_term_text(
                 # checar); quem confirma é o reranker cross-encoder, que
                 # não sofre do mesmo problema de anisotropia (ver
                 # RERANK_UPDATE_SCORE / comentário perto de UPDATE_SIM_THRESHOLD).
+                #
+                # Busca SÓ no escopo ativo (escrita não vira update no geral
+                # por semelhança — isso seria criação disfarçada fora do
+                # escopo ativo).
                 embedding = await state.embed_engine.embed_passage_one(text)
                 hits = state.lt_index.search(embedding, top_k=1)
                 if hits and hits[0][1] >= UPDATE_SIM_THRESHOLD:
@@ -259,11 +317,11 @@ async def _store_long_term_text(
             if target_id is None:
                 return False, "update_target_not_found", None, None
 
-            row = state.lt_db.get_by_id(target_id)
+            row = target_db.get_by_id(target_id)
             if row is None:
                 return False, "update_target_not_found", None, None
 
-            ok = state.lt_db.update(
+            ok = target_db.update(
                 target_id, text,
                 source=source, confidence=confidence,
                 forgettable=forgettable,
@@ -276,17 +334,29 @@ async def _store_long_term_text(
             # de novo com o mesmo id, pra busca semântica continuar
             # refletindo o texto atual em vez do corrigido.
             new_embedding = await state.embed_engine.embed_passage_one(text)
-            await loop.run_in_executor(None, state.lt_index.remove_ids, {target_id})
-            await loop.run_in_executor(None, state.lt_index.add, new_embedding, target_id)
+            await loop.run_in_executor(None, target_index.remove_ids, {target_id})
+            await loop.run_in_executor(None, target_index.add, new_embedding, target_id)
 
             # Auto-link: o texto atualizado deve ligar aos seus vizinhos
             # semânticos ATUAIS (as arestas antigas permanecem; esta task só
-            # acrescenta o que o novo conteúdo trouxer de novo).
+            # acrescenta o que o novo conteúdo trouxe de novo) — no escopo
+            # dono do alvo.
             if AUTO_LINK_ENABLED:
-                asyncio.ensure_future(_auto_link_task(target_id, new_embedding, text))
+                asyncio.ensure_future(
+                    _auto_link_task(target_id, new_embedding, text,
+                                    lt_db=target_db, lt_index=target_index)
+                )
 
-        log.info(f"LT #{target_id} atualizada: {text[:60]}")
-        return True, "updated", target_id, None
+        # Id de RESPOSTA: cru p/ callers internos (cards/conceitos guardam id
+        # crua) ou quando o alvo é do próprio escopo ativo; composta quando o
+        # alvo é do geral e o caller é externo com projeto ativo.
+        out_id = target_id
+        if not internal and target_db is not state.lt_db:
+            out_id = encode_ref(GENERAL_SCOPE, target_id)
+        owner = "ativo" if target_db is state.lt_db else GENERAL_SCOPE
+        log.info(f"LT #{target_id} atualizada [{owner}]: {text[:60]}")
+        return True, "updated", out_id, None
+
 
     # ── Fluxo normal de criação ─────────────────────────────────────────
     async with _lt_write_lock:
@@ -358,9 +428,19 @@ async def _store_long_term_text(
 async def _link_new_memory(new_id: int, target_id: int, link_type: str) -> None:
     """Cria a aresta tipada entre uma memória recém-gravada e `target_id`.
     Direção: updates = nova → antiga; temporal_precedence = `target_id` (veio
-    antes) → nova; contradicts/co_activation são simétricas."""
+    antes) → nova; contradicts/co_activation são simétricas.
+
+    NEW (projetos): arestas nunca cruzam escopos — `target_id` composto
+    (memória do geral referenciada num /write feito com projeto ativo) é
+    recusado com warning (a memória nova está no escopo ativo)."""
     loop = asyncio.get_event_loop()
     try:
+        if is_general_ref(target_id):
+            log.warning(
+                f"link_to #{target_id} é do escopo GERAL (id composta) — arestas "
+                f"nunca cruzam escopos; ligação ignorada"
+            )
+            return
         if await loop.run_in_executor(None, state.lt_db.get_by_id, target_id) is None:
             log.warning(f"link_to #{target_id} não existe — aresta {link_type} não criada")
             return
@@ -380,7 +460,13 @@ async def _link_memory_to_person(memory_id: int, person_id: int) -> None:
     entre a pessoa e as memórias sobre ela. Se o card ainda não tem memória
     de identidade (memory_id vazio), cria uma (`"Nome: descrição"`,
     source="people_card") e grava o id no card. person_id inválido → só
-    warning, nunca bloqueia a gravação da memória."""
+    warning, nunca bloqueia a gravação da memória.
+
+    NEW (projetos): o nó de identidade pode morar no escopo ativo OU no geral
+    (o card foi criado em outro modo) — sonda os dois ANTES de criar a aresta:
+    dono = ativo → aresta no grafo ativo; dono = geral com projeto ativo →
+    recusada (arestas nunca cruzam escopos); nó não existe em nenhum →
+    warning, sem aresta (não recria o nó — preserva o ponteiro do card)."""
     loop = asyncio.get_event_loop()
     try:
         card = await loop.run_in_executor(None, state.pd_db.get_person_by_id, person_id)
@@ -392,6 +478,7 @@ async def _link_memory_to_person(memory_id: int, person_id: int) -> None:
             stored, reason, identity_id, _ = await _store_long_term_text(
                 f"{card['person_name']}: {card['description'] or 'sem descrição'}",
                 "people_card", 1.0, False,
+                internal=True,
             )
             if not stored or identity_id is None:
                 log.warning(
@@ -402,8 +489,33 @@ async def _link_memory_to_person(memory_id: int, person_id: int) -> None:
             await loop.run_in_executor(
                 None, state.pd_db.set_memory_id, person_id, identity_id,
             )
+            edge_db = state.lt_db   # nó criado agora, no escopo ativo
+        else:
+            # Sonda o dono do nó de identidade: escopo ativo primeiro, geral
+            # depois (ids de cards são cruas — vêm do banco de pessoas).
+            if await loop.run_in_executor(None, state.lt_db.get_by_id, identity_id) is not None:
+                edge_db = state.lt_db
+            else:
+                gen = state.scopes.get(GENERAL_SCOPE)
+                if gen is not None and await loop.run_in_executor(
+                    None, gen.lt_db.get_by_id, identity_id
+                ) is not None:
+                    if state.active_scope == GENERAL_SCOPE:
+                        edge_db = gen.lt_db
+                    else:
+                        log.warning(
+                            f"people: nó de identidade #{identity_id} do card #{person_id} está "
+                            f"no escopo GERAL — aresta não criada (arestas nunca cruzam escopos)"
+                        )
+                        return
+                else:
+                    log.warning(
+                        f"people: nó de identidade #{identity_id} do card #{person_id} não "
+                        f"encontrado em nenhum escopo — memória gravada sem vínculo"
+                    )
+                    return
         await loop.run_in_executor(
-            None, state.lt_db.upsert_edge, memory_id, identity_id,
+            None, edge_db.upsert_edge, memory_id, identity_id,
             EDGE_LEARNING_RATE, time.time(), EDGE_CO_ACTIVATION,
         )
         log.info(f"people: memória #{memory_id} ↔ card #{person_id} (co_activation)")
@@ -457,8 +569,14 @@ async def write_memory_batch(req: WriteBatchRequest):
         resp = await _process_write_request(item)
         results.append(resp)
         # ── NEW: batch sequencial → aresta temporal_precedence (anterior → seguinte)
+        # NEW (projetos): aresta só quando AMBAS as ids são do MESMO escopo —
+        # ids compostas (offset) indicam memória do geral (update em modo
+        # projeto); arestas nunca cruzam escopos.
         if req.sequential and resp.stored and resp.memory_id is not None:
-            if prev_id is not None and prev_id != resp.memory_id:
+            if (
+                prev_id is not None and prev_id != resp.memory_id
+                and not is_general_ref(prev_id) and not is_general_ref(resp.memory_id)
+            ):
                 await loop.run_in_executor(
                     None, state.lt_db.upsert_edge, prev_id, resp.memory_id,
                     EDGE_LEARNING_RATE, time.time(), EDGE_TEMPORAL,
@@ -537,6 +655,16 @@ async def read_short_term(req: ReadSTRequest):
 # ── POST /read ─────────────────────────────────────────────────────────────────
 
 async def read_memory(req: ReadRequest):
+    """Leitura mesclada — pipeline completo do /read.
+
+    NEW (projetos): `lt_views()` devolve o escopo ATIVO primeiro e, com um
+    projeto ativo, o GERAL ao final (leitura mesclada). Cada estágio roda
+    POR VIEW com os MESMOS embeddings (calculados uma vez — sem custo extra
+    de ONNX): busca LT estratégica, PPR, VS, IF. ST é global (busca única).
+    Entradas do escopo geral saem com id composta (offset +10^12) e tag
+    `scope` — escrita/update resolve de volta (ref_real_id). Com escopo
+    geral ativo há uma view só e o comportamento é idêntico ao de antes.
+    """
     query = req.query.strip()
     if not query:
         raise MemoryToolError("query vazia")
@@ -544,28 +672,31 @@ async def read_memory(req: ReadRequest):
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
 
+    views = lt_views()
+    merged = len(views) > 1
+    # Escopo ativo é sempre views[0]; state.scopes dá acesso a vs/if_index/if_db.
+    scope_states = [state.scopes[v.name] for v in views]
+
     query_emb = await state.embed_engine.embed_query_one(query)
 
-    # Start VS search in background
-    vs_future = None
-    if state.vs is not None and state.vs.total > 0:
-        vs_min_score = min(req.min_score, VS_MIN_SCORE) if req.min_score < VS_MIN_SCORE else VS_MIN_SCORE
-        vs_future = asyncio.ensure_future(
-            loop.run_in_executor(
-                None,
-                state.vs.search,
-                query_emb,
-                req.top_k,
-                vs_min_score,
+    # ── VS + IF: busca POR ESCOPO em background (cada escopo tem os seus) ──
+    vs_futures: dict[str, object] = {}
+    if_futures: dict[str, object] = {}
+    for v, sc in zip(views, scope_states):
+        if sc.vs is not None and sc.vs.total > 0:
+            vs_min_score = min(req.min_score, VS_MIN_SCORE) if req.min_score < VS_MIN_SCORE else VS_MIN_SCORE
+            vs_futures[v.name] = asyncio.ensure_future(
+                loop.run_in_executor(None, sc.vs.search, query_emb, req.top_k, vs_min_score)
             )
-        )
+        if sc.if_index.total > 0:
+            if_futures[v.name] = asyncio.ensure_future(
+                loop.run_in_executor(None, sc.if_index.search, query_emb, req.top_k * 2)
+            )
 
-    # ── NEW: Start indexed files search in background ──
-    if_future = None
-    if state.if_index.total > 0:
-        if_future = asyncio.ensure_future(
-            loop.run_in_executor(None, state.if_index.search, query_emb, req.top_k * 2)
-        )
+    # Hits LT por view — ids CRUAS do escopo (PPR/vetor usam ids cruas; a
+    # codificação de resposta acontece só no _build_* com encode/scope).
+    lt_raw_by_view: dict[str, list[tuple[int, float]]] = {v.name: [] for v in views}
+    st_raw: list[tuple[int, float]] = []
 
     if req.session_id and req.strategy != "none":
         context_block = await loop.run_in_executor(None, _build_context_block, req.session_id)
@@ -579,10 +710,23 @@ async def read_memory(req: ReadRequest):
                 log.warning(f"Estratégia desconhecida '{req.strategy}', usando 'auto'")
                 effective_strategy = _classify_query(query)
 
+            # ── Embeddings da estratégia: UMA vez (ST global + LT por view) ──
             if effective_strategy == "expanded":
-                lt_raw, st_raw = await _search_expanded(query, context_block, req.top_k)
+                expanded = f"{context_block}\n\nquery atual: {query}" if context_block else query
+                strat_emb = await state.embed_engine.embed_query_one(expanded)
+                lt_coros = [_search_lt_expanded_on(v.index, strat_emb, req.top_k) for v in views]
+                st_task = _search_st_expanded(strat_emb, req.top_k)
             else:
-                lt_raw, st_raw = await _search_dual(query, context_block, req.top_k)
+                emb_query, emb_ctx = await state.embed_engine.embed_query_two(query, context_block)
+                lt_coros = [_search_lt_dual_on(v.index, emb_query, emb_ctx, req.top_k) for v in views]
+                st_task = _search_st_dual(emb_query, emb_ctx, req.top_k)
+
+            # gather devolve uma lista FLAT ([lt_view0, …, lt_viewN, st]) —
+            # fatia por posição (views primeiro, ST por último).
+            gathered = await asyncio.gather(*lt_coros, st_task)
+            lt_results, st_raw = gathered[:len(views)], gathered[len(views)]
+            for v, lt_res in zip(views, lt_results):
+                lt_raw_by_view[v.name] = list(lt_res)
 
             log.info(
                 f"/read session={req.session_id} strategy={effective_strategy} "
@@ -590,26 +734,31 @@ async def read_memory(req: ReadRequest):
             )
         else:
             effective_strategy = "none"
-            lt_raw, st_raw = await asyncio.gather(
-                loop.run_in_executor(None, state.lt_index.search, query_emb, req.top_k * 2),
-                loop.run_in_executor(None, state.st_index.search, query_emb, req.top_k * 2),
-            )
-    else:
-        lt_raw, st_raw = await asyncio.gather(
-            loop.run_in_executor(None, state.lt_index.search, query_emb, req.top_k * 2),
-            loop.run_in_executor(None, state.st_index.search, query_emb, req.top_k * 2),
-        )
+
+    if effective_strategy == "none":
+        lt_coros = [_search_lt_plain(v.index, query_emb, req.top_k) for v in views]
+        # gather devolve lista FLAT (views primeiro, ST por último) — ver acima.
+        gathered = await asyncio.gather(*lt_coros, _search_st_plain(query_emb, req.top_k))
+        lt_results, st_raw = gathered[:len(views)], gathered[len(views)]
+        for v, lt_res in zip(views, lt_results):
+            lt_raw_by_view[v.name] = list(lt_res)
 
     # ── NEW: query composta → busca adicional por segmento, sem LLM ───────────
     # Se a pergunta tem vários sub-pedidos numa frase só (ex.: "quero fazer X
     # usando Y para conseguir Z"), a busca acima (query inteira) tende a
     # trazer só o que é mais "central" na frase. Aqui cada sub-tópico é
     # embedado/buscado à parte e o resultado é fundido por max-score — sem
-    # afogar um sub-tópico no outro nem gerar custo de LLM.
+    # afogar um sub-tópico no outro nem gerar custo de LLM. Os embeddings dos
+    # segmentos são calculados UMA vez e buscados em cada view.
     query_segments = _split_query_segments(query)
     if len(query_segments) > 1:
-        lt_seg, st_seg = await _search_segmented(query_segments, req.top_k)
-        lt_raw = _fuse_max(lt_raw, lt_seg)
+        seg_emb = await state.embed_engine.embed_queries(query_segments)  # shape (N, dim)
+        lt_seg_coros = [_search_lt_segmented_on(v.index, seg_emb, req.top_k) for v in views]
+        # gather devolve lista FLAT (views primeiro, ST por último).
+        gathered = await asyncio.gather(*lt_seg_coros, _search_st_segmented(seg_emb, req.top_k))
+        lt_segs, st_seg = gathered[:len(views)], gathered[len(views)]
+        for v, lt_seg in zip(views, lt_segs):
+            lt_raw_by_view[v.name] = _fuse_max(lt_raw_by_view[v.name], lt_seg)
         st_raw = _fuse_max(st_raw, st_seg)
         log.info(f"/read query segmentada em {len(query_segments)} partes: {query_segments}")
 
@@ -617,7 +766,9 @@ async def read_memory(req: ReadRequest):
     # do card (memory_id) é injetado como semente extra no PPR — memórias
     # relacionadas à pessoa vêm como "related" mesmo sem match semântico.
     # Card inexistente ou sem nó de identidade → só warning, leitura segue
-    # normal (sem semente).
+    # normal (sem semente). NEW (projetos): a semente pode morar no escopo
+    # ativo OU no geral (o card pode ter sido criado em outro modo) — sonda
+    # as views em ordem (ativo primeiro).
     if req.person_id is not None:
         card = await loop.run_in_executor(None, state.pd_db.get_person_by_id, req.person_id)
         if card is None:
@@ -625,39 +776,38 @@ async def read_memory(req: ReadRequest):
         elif card["memory_id"] is None:
             log.warning(f"people: card #{req.person_id} sem memória de identidade — /read sem semente")
         else:
-            lt_raw.append((card["memory_id"], 1.0))
-            log.info(f"people: semente de identidade #{card['memory_id']} (card #{req.person_id}) injetada no PPR")
+            for v in views:
+                row = await loop.run_in_executor(None, v.db.get_by_id, card["memory_id"])
+                if row is not None:
+                    lt_raw_by_view[v.name].append((card["memory_id"], 1.0))
+                    log.info(
+                        f"people: semente de identidade #{card['memory_id']} (card #{req.person_id}, "
+                        f"escopo {v.name}) injetada no PPR"
+                    )
+                    break
+            else:
+                log.warning(
+                    f"people: memória de identidade #{card['memory_id']} do card #{req.person_id} "
+                    f"não encontrada em nenhum escopo — /read sem semente"
+                )
 
-    # ── NEW (Hebbian graph / Step 6): PPR no grafo, com sementes em lt_raw ──
-    # lt_raw já está finalizado aqui (todas as estratégias convergem nele) e
-    # a conversão pra MemoryEntry ainda não aconteceu — posição exata do Step 6.
+    # ── NEW (Hebbian graph / Step 6): PPR POR ESCOPO — cada view propaga no
+    # SEU grafo (sementes com ids cruas do escopo) e guarda o ctx próprio.
     # ctx enriquece o log de ativação (query/strategy/session) consumido pela
-    # visualização em tempo real (graph_activation.py).
-    ppr_ctx = await _ppr_spread(lt_raw, loop, ctx={
+    # visualização em tempo real (graph_activation.py), que segue o escopo
+    # ativo via /status.
+    read_ctx = {
         "query": query,
         "strategy": effective_strategy,
         "session_id": req.session_id,
-    })
-    related_raw: list[tuple[int, float]] = ppr_ctx["related_raw"]
-    related_ids = {mid for mid, _ in related_raw}
-
-    # Await VS results
-    vs_results = []
-    if vs_future is not None:
-        try:
-            vs_results = await vs_future
-        except Exception as e:
-            log.error(f"VectorStore search failed: {e}")
-            vs_results = []
-
-    # ── NEW: Await indexed files results ──
-    if_raw = []
-    if if_future is not None:
-        try:
-            if_raw = await if_future
-        except Exception as e:
-            log.error(f"Indexed files search failed: {e}")
-            if_raw = []
+    }
+    view_names = [v.name for v in views]
+    ctx_list = await asyncio.gather(*(
+        _ppr_spread_on(v.db, lt_raw_by_view[v.name], loop, ctx=read_ctx)
+        for v in views
+    ))
+    per_view_ctx: dict[str, dict] = dict(zip(view_names, ctx_list))
+    ppr_ms = sum(c["elapsed_ms"] for c in per_view_ctx.values())
 
     # ── Otimização de tokens ───────────────────────────────────────────────────
     # 1. Threshold mais seletivo para /read (combinação de 4 fontes gera ruído)
@@ -668,17 +818,49 @@ async def read_memory(req: ReadRequest):
     strict_min_score = max(req.min_score, READ_MIN_SCORE_STRICT)
     if_strict_min_score = max(strict_min_score, IF_MIN_SCORE_READ)
 
-    results: list[MemoryEntry] = (
-        _build_lt_entries(lt_raw, strict_min_score, loop) +
+    # ── Build POR ESCOPO: ids compostas + tag `scope` só na leitura mesclada ──
+    # ST é global — entra uma vez (i == 0, escopo ativo).
+    results: list[MemoryEntry] = []
+    for i, v in enumerate(views):
+        vctx = per_view_ctx[v.name]
+        scope_tag = v.name if merged else None     # None = compatibilidade (modo geral)
+        related_raw = vctx["related_raw"]
+        related_ids = {mid for mid, _ in related_raw}
+        results += _build_lt_entries(
+            lt_raw_by_view[v.name], strict_min_score, loop,
+            lt_db=v.db, encode=v.encode, scope=scope_tag,
+        )
         # "related" tem threshold próprio: score PPR é massa de probabilidade
         # (<= PPR_SPREAD_WEIGHT), jamais passaria no strict_min_score (0.85).
         # O piso real de elegibilidade é PPR_MIN_ACTIVATION_REINFORCE, já
         # aplicado dentro de _ppr_spread no próprio rank.
-        _build_lt_entries(related_raw, 0.0, loop, related_ids=related_ids) +
-        _build_st_entries(st_raw, strict_min_score, loop) +
-        _build_vs_entries(vs_results, strict_min_score) +
-        _build_if_entries(if_raw, if_strict_min_score, loop)  # NEW
-    )
+        results += _build_lt_entries(
+            related_raw, 0.0, loop, related_ids=related_ids,
+            lt_db=v.db, encode=v.encode, scope=scope_tag,
+        )
+        if i == 0:
+            results += _build_st_entries(st_raw, strict_min_score, loop)
+        vs_results = []
+        vs_future = vs_futures.get(v.name)
+        if vs_future is not None:
+            try:
+                vs_results = await vs_future
+            except Exception as e:
+                log.error(f"VectorStore search failed [{v.name}]: {e}")
+                vs_results = []
+        results += _build_vs_entries(vs_results, strict_min_score, encode=v.encode, scope=scope_tag)
+        if_raw = []
+        if_future = if_futures.get(v.name)
+        if if_future is not None:
+            try:
+                if_raw = await if_future
+            except Exception as e:
+                log.error(f"Indexed files search failed [{v.name}]: {e}")
+                if_raw = []
+        results += _build_if_entries(
+            if_raw, if_strict_min_score, loop,
+            if_db=scope_states[i].if_db, encode=v.encode, scope=scope_tag,
+        )  # NEW
     results.sort(key=lambda r: r.score * r.confidence, reverse=True)
 
     # ── NEW: rerank dos candidatos primary com o cross-encoder ───────────────
@@ -717,7 +899,7 @@ async def read_memory(req: ReadRequest):
                 log.warning(f"/read rerank falhou (seguindo com ranking cosine): {e}")
 
     # ── NEW (Step 7): inibição lateral (MMR) SÓ no subconjunto "related",
-    # antes do orçamento de tokens — primary não é penalizado. ──
+    # antes do orçamento de tokens — primary não é penalizado. Por escopo. ──
     results = await loop.run_in_executor(None, _lateral_inhibition_filter, results)
 
     # ── Orçamento global de tokens ─────────────────────────────────────────────
@@ -746,21 +928,26 @@ async def read_memory(req: ReadRequest):
         f"/read query='{query[:50]}' strategy={effective_strategy} "
         f"results={len(results)} total_chars={total_chars} "
         f"budget={total_budget} strict_score={strict_min_score:.2f} "
-        f"ppr_ms={ppr_ctx['elapsed_ms']:.1f} related={len(related_raw)}"
+        f"ppr_ms={ppr_ms:.1f} views={view_names}"
     )
 
     response = ReadResponse(results=results, query=query, strategy=effective_strategy)
 
     # ── NEW (Step 4, background): criação de arestas hebbianas entre as
     # memórias LT FINAIS com score >= EDGE_MIN_SCORE_TO_LINK. Fire-and-forget
-    # — o caller já recebeu a resposta; falhas só logam. ──
+    # — o caller já recebeu a resposta; falhas só logam. A tarefa agrupa por
+    # escopo (entry.scope) — arestas nunca cruzam escopos. ──
     asyncio.ensure_future(_hebbian_link_task(results))
-    # ── NEW (Step 8, background): reforço das arestas EXISTENTES do subgrafo
-    # PPR pela regra de co-ativação (Opção B). Também fire-and-forget. ──
-    asyncio.ensure_future(_ppr_reinforce_task(ppr_ctx))
+    # ── NEW (Step 8, background): reforço das arestas EXISTENTES dos subgrafos
+    # PPR pela regra de co-ativação (Opção B). Também fire-and-forget. Na
+    # leitura mesclada o ctx vem por escopo ({"scopes": {nome: ctx}}); no modo
+    # geral, o formato plano de antes. ──
+    if merged:
+        asyncio.ensure_future(_ppr_reinforce_task({"scopes": per_view_ctx}))
+    else:
+        asyncio.ensure_future(_ppr_reinforce_task(per_view_ctx[views[0].name]))
 
     return response
-
 
 # ── DELETE /session/{session_id} ───────────────────────────────────────────────
 

@@ -39,6 +39,15 @@ class MemoryDB(EdgeGraphMixin):
         self._lock = threading.Lock()
         self._create_tables()
 
+    def close(self):
+        """Fecha a conexão SQLite — usado ao remover/descartar um escopo de
+        projeto (memory_state.close_scope). Silencioso: escopo sendo apagado
+        nunca pode derrubar o processo."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
     def _create_tables(self):
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS memories (
@@ -427,6 +436,14 @@ class IndexedFilesDB:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
+
+    def close(self):
+        """Fecha a conexão SQLite — usado ao remover/descartar um escopo de
+        projeto (memory_state.close_scope). Silencioso."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     def _create_tables(self):
         self._conn.executescript("""
@@ -1459,6 +1476,14 @@ class PlansDB:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()  # ITEM 4 — ver comentário em MemoryDB
         self._create_tables()
+
+    def close(self):
+        """Fecha a conexão SQLite — usado ao remover/descartar um escopo de
+        projeto (memory_state.close_scope). Silencioso."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     def _create_tables(self):
         # ATENÇÃO: o índice idx_plans_person NÃO entra aqui — em bancos criados

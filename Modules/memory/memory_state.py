@@ -10,6 +10,8 @@ LanceDB), startup()/shutdown() e a integração opcional com o VectorStore
 """
 
 import asyncio
+import asyncio
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,6 +29,7 @@ from memory_config import (
     FD_EMBED_DIM,
     FD_FAISS_ID_MAP_PATH,
     FD_FAISS_INDEX_PATH,
+    GENERAL_SCOPE,
     IF_DB_PATH,
     IF_FAISS_ID_MAP_PATH,
     IF_FAISS_INDEX_PATH,
@@ -42,6 +45,7 @@ from memory_config import (
     ONNX_SERVING_URL,
     PD_DB_PATH,
     PLANS_DB_PATH,
+    ScopePaths,
     ST_CLEANUP_INTERVAL_S,
     ST_DB_PATH,
     ST_FAISS_ID_MAP_PATH,
@@ -58,7 +62,11 @@ from memory_config import (
     VS_DB_PATH,
     VS_FAISS_ID_MAP_PATH,
     VS_FAISS_INDEX_PATH,
+    VS_MIN_SCORE,
+    is_valid_scope,
     log,
+    resolve_scope_paths,
+    scope_db_dir,
 )
 from memory_db import (
     IndexedFilesDB,
@@ -90,48 +98,206 @@ else:
 # ── Estado global ──────────────────────────────────────────────────────────────
 
 @dataclass
+class ScopeState:
+    """Artefatos ESCOPADOS de um escopo (modo geral ou projeto): LT + grafo
+    Hebbiano, arquivos indexados, planos, LanceDB próprio, KG-RAG e log de
+    ativação — todos sob db/<slug>/ (o geral usa db/ raiz, sem migração).
+    ST, dicionários, cards de pessoa e RAG de tools são GLOBAIS (AppState)."""
+    name:      str                 # "general" ou slug do projeto
+    paths:     ScopePaths          = field(default=None)
+    lance:     LanceStore          = field(default=None)   # store DO escopo (o geral compartilha state.lance)
+    lt_db:     MemoryDB            = field(default=None)
+    lt_index:  MemoryIndex         = field(default=None)
+    if_db:     IndexedFilesDB      = field(default=None)
+    if_index:  MemoryIndex         = field(default=None)
+    plans_db:  PlansDB             = field(default=None)
+    vs:        Optional[VectorStore] = field(default=None)
+
+    def close(self):
+        """Flush dos índices + fechamento das conexões SQLite. Chamado ao
+        remover um escopo (delete_scope) — silencioso por design."""
+        for idx in (self.lt_index, self.if_index):
+            if idx is not None:
+                try:
+                    idx.flush()
+                except Exception as e:
+                    log.error(f"[{self.name}] falha ao compactar índice no close: {e}")
+        for db in (self.lt_db, self.if_db, self.plans_db):
+            if db is not None:
+                try:
+                    db.close()
+                except Exception as e:
+                    log.error(f"[{self.name}] falha ao fechar DB no close: {e}")
+
+
+@dataclass
 class AppState:
     embed_engine: EmbeddingEngine = field(default=None)
     rerank_engine: RerankEngine   = field(default=None)
-    lance:        LanceStore      = field(default=None)   # NEW: LanceDB (todos os índices vetoriais)
-    lt_db:        MemoryDB        = field(default=None)
-    lt_index:     MemoryIndex     = field(default=None)
+    # ── GLOBAIS (compartilhados entre o geral e todos os projetos) ──────────
+    # `lance` é o store GLOBAL (db/ava_lance) — usado por ST/dicionários/
+    # pessoas/tools. O escopo geral o COMPARTILHA (mesmo diretório); projetos
+    # têm store próprio (db/<slug>/ava_lance).
+    lance:        LanceStore      = field(default=None)
     st_db:        ShortTermDB     = field(default=None)
     st_index:     MemoryIndex     = field(default=None)
-    vs:           Optional[VectorStore] = field(default=None)
-    # ── NEW: Indexed files ──
-    if_db:        IndexedFilesDB  = field(default=None)
-    if_index:     MemoryIndex     = field(default=None)
     # ── NEW: Dicionário Visual ──
     vd_db:        VisualDictDB    = field(default=None)
     vd_index:     MemoryIndex     = field(default=None)
     # ── Unificação: Dicionário de Pessoas (Voice + Face) ──
-    pd_db:         PeopleDB      = field(default=None)
+    pd_db:        PeopleDB        = field(default=None)
     fd_index:     MemoryIndex     = field(default=None)
     vo_index:     MemoryIndex     = field(default=None)
     # ── NEW: RAG de tools ──
     tl_db:        ToolsDB         = field(default=None)
     tl_index:     MemoryIndex     = field(default=None)
-    # ── NEW: Planos de execução híbridos (macro + modelo) ──
-    plans_db:     PlansDB         = field(default=None)
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
+    # ── ESCOPOS (projetos × geral) ──────────────────────────────────────────
+    # `scopes` mantém TODO escopo já aberto em cache (switch = troca de
+    # ponteiro, O(1) — sem reabrir DBs). "general" nasce aberto no startup.
+    scopes:       dict            = field(default_factory=dict)
+    active_scope: str             = GENERAL_SCOPE
+    scope_lock:   asyncio.Lock    = field(default_factory=asyncio.Lock)
+
+    # ── Compatibilidade: os handlers (memory_ops_*) acessam state.lt_db /
+    # state.lt_index / state.if_db / ... — viram propriedades do ESCOPO ATIVO.
+    # Nenhum ponto de call-site precisou mudar para a separação por projeto.
+    @property
+    def scope(self) -> ScopeState:
+        s = self.scopes.get(self.active_scope)
+        if s is None:                      # boot safety — geral sempre aberto
+            s = self.scopes.get(GENERAL_SCOPE)
+        return s
+
+    @property
+    def lt_db(self) -> MemoryDB:
+        return self.scope.lt_db
+
+    @property
+    def lt_index(self) -> MemoryIndex:
+        return self.scope.lt_index
+
+    @property
+    def if_db(self) -> IndexedFilesDB:
+        return self.scope.if_db
+
+    @property
+    def if_index(self) -> MemoryIndex:
+        return self.scope.if_index
+
+    @property
+    def plans_db(self) -> PlansDB:
+        return self.scope.plans_db
+
+    @property
+    def vs(self) -> Optional[VectorStore]:
+        return self.scope.vs
+
+    # Índices globais que usam o store global (st/vd/fd/vo/tl) — sem propriedade
+    # porque os handlers os acessam por state.st_index etc. direto.
 
 state = AppState()
 
 
+# ── Escopos — abertura/troca/remoção ───────────────────────────────────────────
+
+def _open_scope(name: str, shared_lance: Optional[LanceStore] = None) -> ScopeState:
+    """Abre os artefatos de conteúdo de um escopo (bloqueante — chame via
+    run_in_executor). `shared_lance`: quando informado (escopo geral), o
+    escopo COMPARTILHA o store global em vez de abrir uma 2ª conexão no
+    mesmo diretório — preserva o comportamento de processo único de antes."""
+    paths = resolve_scope_paths(name)
+    sc = ScopeState(name=name, paths=paths)
+    sc.lance    = shared_lance if shared_lance is not None else LanceStore(paths.LANCE_DIR)
+    sc.lt_db    = MemoryDB(paths.LT_DB_PATH)
+    sc.lt_index = MemoryIndex(sc.lance, MT_LONG_TERM, EMBED_DIM,
+                              paths.LT_FAISS_INDEX_PATH, paths.LT_FAISS_ID_MAP_PATH)
+    # Log de ativação do grafo por escopo (memory_graph lê via getattr).
+    sc.lt_db._activation_log_path = paths.ACTIVATION_LOG_PATH
+    sc.if_db    = IndexedFilesDB(paths.IF_DB_PATH)
+    sc.if_index = MemoryIndex(sc.lance, MT_INDEXED_FILE, EMBED_DIM,
+                              paths.IF_FAISS_INDEX_PATH, paths.IF_FAISS_ID_MAP_PATH)
+    sc.plans_db = PlansDB(paths.PLANS_DB_PATH)
+    if _VS_AVAILABLE:
+        try:
+            sc.vs = VectorStore(
+                index_path  = paths.VS_FAISS_INDEX_PATH,
+                db_path     = paths.VS_DB_PATH,
+                id_map_path = paths.VS_FAISS_ID_MAP_PATH,
+                embed_dim   = EMBED_DIM,
+            )
+        except Exception as e:
+            log.error(f"[{name}] VectorStore initialization failed: {e} — knowledge search disabled")
+            sc.vs = None
+    log.info(
+        f"Escopo '{name}' aberto — {sc.lt_db.count()} memórias LT | "
+        f"{sc.lt_db.count_edges()} arestas | {sc.if_db.count_files()} arquivos "
+        f"indexados | {sc.plans_db.count()} planos ({paths.db_dir})"
+    )
+    return sc
+
+
+async def switch_scope(name: str) -> dict:
+    """Ativa um escopo (projeto ou geral). Escopo já em cache → troca de
+    ponteiro O(1); novo → abre sob o lock (a troca nunca afeta um handler em
+    voo mais do que a própria atribuição do ponteiro — handlers capturam os
+    objetos via state.* na hora do uso)."""
+    if not is_valid_scope(name):
+        raise RuntimeError(f"Escopo inválido: {name!r}")
+    async with state.scope_lock:
+        sc = state.scopes.get(name)
+        opened = sc is None
+        if sc is None:
+            # Escopo geral compartilha o store global (mesmo diretório).
+            shared = state.lance if name == GENERAL_SCOPE else None
+            sc = await asyncio.get_event_loop().run_in_executor(
+                None, _open_scope, name, shared
+            )
+            state.scopes[name] = sc
+        previous = state.active_scope
+        state.active_scope = name
+    log.info(f"Escopo ativo: '{previous}' → '{name}'" + (" (aberto agora)" if opened else " (cache)"))
+    return {"scope": name, "opened": opened, "previous": previous}
+
+
+async def delete_scope(name: str) -> None:
+    """Fecha (se aberto) e APAGA o diretório do escopo — memórias LT, grafo,
+    planos, arquivos indexados, LanceDB e log, tudo. Recusa o escopo geral e
+    o escopo ativo (o chamador deve desativar antes)."""
+    if name == GENERAL_SCOPE:
+        raise RuntimeError("O escopo 'general' não pode ser removido")
+    if not is_valid_scope(name):
+        raise RuntimeError(f"Escopo inválido: {name!r}")
+    async with state.scope_lock:
+        if state.active_scope == name:
+            raise RuntimeError(f"Escopo '{name}' está ATIVO — desative antes de remover")
+        sc = state.scopes.pop(name, None)
+        if sc is not None:
+            await asyncio.get_event_loop().run_in_executor(None, sc.close)
+        d = scope_db_dir(name)
+        # Guarda de segurança: só remove diretórios DENTRO de db/ (o scope_db_dir
+        # já valida o slug; a checagem explícita é defesa em profundidade).
+        if str(d) != str(scope_db_dir(GENERAL_SCOPE)) and d.is_dir():
+            await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, d)
+    log.info(f"Escopo '{name}' removido ({d})")
+
+
 def _all_indices() -> list["MemoryIndex"]:
-    """Todos os índices vetoriais (LanceDB) do processo — usado pelo job de
-    manutenção periódica e pelo shutdown para compactar tudo de uma vez."""
-    return [
+    """Todos os índices vetoriais (LanceDB) do processo — globais + os de
+    TODOS os escopos abertos. Usado pelo job de manutenção periódica e pelo
+    shutdown para compactar tudo de uma vez."""
+    idxs = [
         idx for idx in (
-            state.lt_index, state.st_index,
-            state.if_index, state.vd_index, state.fd_index, state.vo_index,
+            state.st_index, state.vd_index, state.fd_index, state.vo_index,
             state.tl_index,
         )
         if idx is not None
     ]
+    for sc in state.scopes.values():
+        idxs.extend(idx for idx in (sc.lt_index, sc.if_index) if idx is not None)
+    return idxs
 
 
 # ── Jobs em background ─────────────────────────────────────────────────────────
@@ -191,25 +357,13 @@ async def st_cleanup_job():
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
-def _resolve_vs_paths() -> tuple[str, str, str]:
-    try:
-        from config import FAISS_INDEX_PATH as _cfg_idx, FAISS_META_PATH as _cfg_meta
-        idx_path    = str(_cfg_idx)
-        meta_str    = str(_cfg_meta)
-        db_path     = meta_str.replace(".json", ".db") if meta_str.endswith(".json") else meta_str + ".db"
-        id_map_path = idx_path.replace(".index", "_id_map.npy")
-        log.info(f"VS paths from config: index={idx_path} db={db_path}")
-        return idx_path, db_path, id_map_path
-    except ImportError:
-        log.info(f"VS paths from defaults: index={VS_FAISS_INDEX_PATH} db={VS_DB_PATH}")
-        return VS_FAISS_INDEX_PATH, VS_DB_PATH, VS_FAISS_ID_MAP_PATH
-
-
 async def startup():
-    """Inicializa o estado global da memória (DBs, índices FAISS, engine de
-    embeddings, jobs em background). Chamado pelo MCP server no startup do
-    processo — substitui o antigo `lifespan` do FastAPI."""
-    log.info("Iniciando AVA Memory (MCP)...")
+    """Inicializa o estado global da memória (DBs, índices, engines, jobs em
+    background). Artefatos GLOBAIS (ST, dicionários, pessoas, tools) + o
+    escopo 'general' (LT+grafo, arquivos indexados, planos) — projetos são
+    abertos sob demanda via switch_scope (o orchestrator re-afirma o escopo
+    ativo no boot e a cada turno)."""
+    log.info("Iniciando AVA Memory...")
 
     try:
         from onnx_client import check_health
@@ -222,21 +376,13 @@ async def startup():
     state.embed_engine = EmbeddingEngine(base_url=ONNX_SERVING_URL)
     state.rerank_engine = RerankEngine(base_url=ONNX_SERVING_URL)
 
-    # ── NEW: LanceDB — um diretório só; FAISS_*_PATH viram fontes de migração ──
+    # ── GLOBAIS: um LanceDB só (db/ava_lance) p/ ST/dicionários/pessoas/tools;
+    # FAISS_*_PATH viram fontes de migração ──────────────────────────────────
     state.lance = LanceStore(LANCE_DIR)
-
-    state.lt_db    = MemoryDB(DB_PATH)
-    state.lt_index = MemoryIndex(state.lance, MT_LONG_TERM, EMBED_DIM,
-                                 FAISS_INDEX_PATH, FAISS_ID_MAP_PATH)
 
     state.st_db    = ShortTermDB(ST_DB_PATH)
     state.st_index = MemoryIndex(state.lance, MT_SHORT_TERM, EMBED_DIM,
                                  ST_FAISS_INDEX_PATH, ST_FAISS_ID_MAP_PATH)
-
-    # ── NEW: Indexed files ──
-    state.if_db    = IndexedFilesDB(IF_DB_PATH)
-    state.if_index = MemoryIndex(state.lance, MT_INDEXED_FILE, EMBED_DIM,
-                                 IF_FAISS_INDEX_PATH, IF_FAISS_ID_MAP_PATH)
 
     # ── NEW: Dicionário Visual ──
     state.vd_db    = VisualDictDB(VD_DB_PATH)
@@ -259,25 +405,12 @@ async def startup():
     state.tl_db    = ToolsDB(TOOLS_DB_PATH)
     state.tl_index = MemoryIndex(state.lance, MT_TOOL, EMBED_DIM)
 
-    # ── NEW: Planos de execução híbridos ──
-    state.plans_db = PlansDB(PLANS_DB_PATH)
-
-    if _VS_AVAILABLE:
-        try:
-            vs_idx, vs_db, vs_idmap = _resolve_vs_paths()
-            state.vs = VectorStore(
-                index_path  = vs_idx,
-                db_path     = vs_db,
-                id_map_path = vs_idmap,
-                embed_dim   = EMBED_DIM,
-            )
-            log.info(f"VectorStore integrado — {state.vs.total} chunks de conhecimento")
-        except Exception as e:
-            log.error(f"VectorStore initialization failed: {e} — knowledge search disabled")
-            state.vs = None
-    else:
-        state.vs = None
-        log.warning("VectorStore not available — knowledge search disabled")
+    # ── ESCOPO GERAL (db/ raiz — paths idênticos aos de sempre, zero migração;
+    # compartilha o store Lance global que fica no mesmo diretório) ──
+    state.scopes[GENERAL_SCOPE] = await asyncio.get_event_loop().run_in_executor(
+        None, _open_scope, GENERAL_SCOPE, state.lance,
+    )
+    state.active_scope = GENERAL_SCOPE
 
     state.decay_task   = asyncio.create_task(decay_job())
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
@@ -308,25 +441,29 @@ async def shutdown():
     if state.flush_task is not None:
         state.flush_task.cancel()
 
-    # Flush final e síncrono de todos os índices — garante que nada gravado
-    # desde o último ciclo do index_flush_job seja perdido ao encerrar.
+    # Flush final e síncrono de todos os índices (globais + todos os escopos
+    # abertos) — garante que nada gravado desde o último ciclo do
+    # index_flush_job seja perdido ao encerrar.
     for index in _all_indices():
         try:
             index.flush()
         except Exception as e:
             log.error(f"Erro ao compactar índice LanceDB no shutdown: {e}")
 
-    log.info("AVA Memory (MCP) encerrada")
+    log.info("AVA Memory encerrada")
 
 
 __all__ = [
     'AppState',
+    'ScopeState',
     '_all_indices',
-    '_resolve_vs_paths',
+    '_open_scope',
     'decay_job',
+    'delete_scope',
     'index_flush_job',
     'shutdown',
     'st_cleanup_job',
     'startup',
     'state',
+    'switch_scope',
 ]

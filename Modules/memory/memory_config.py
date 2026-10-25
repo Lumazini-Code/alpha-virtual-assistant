@@ -12,7 +12,9 @@ Extraído do memory.py original sem alteração de valores.
 
 import logging
 import os
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # ── Bootstrap de imports da pasta-mãe ─────────────────────────────────────────
@@ -29,6 +31,102 @@ if _MODULES_DIR not in sys.path:
 
 # Diretório de dados do memory — ancorado no próprio pacote, independe do CWD
 _DB_DIR = _BASE_DIR / "db"
+
+# ── NEW: Escopos de memória (modo geral × projetos) ────────────────────────────
+# Cada projeto tem um conjunto PRÓPRIO de artefatos de conteúdo (LT + grafo
+# Hebbiano, arquivos indexados, planos, LanceDB do escopo, log de ativação e
+# KG-RAG) em Modules/memory/db/<slug>/. O escopo "general" usa o diretório
+# raiz db/ — exatamente os paths das constantes abaixo, então a base existente
+# NÃO precisa de migração. ST, tools RAG, dicionários e cards de pessoa são
+# GLOBAIS (compartilhados entre o geral e todos os projetos).
+#
+# Ids compostos (leitura mesclada): quando um projeto está ativo, o /read
+# funde resultados do projeto E do geral. Como os dois DBs têm sequências de
+# id independentes, toda id do escopo geral sai na resposta com
+# +GENERAL_ID_OFFSET (10^12 — ids reais ficam longe disso). O cliente só ecoa
+# o id de volta; /write (update), /plans/* e /indexed-file/{id} resolvem o
+# offset de volta para o DB do geral (ver ref_real_id/is_general_ref).
+# Com escopo geral ativo, nada é codificado — respostas idênticas às de antes.
+GENERAL_SCOPE     = "general"
+GENERAL_ID_OFFSET = 10_000_000_000_000
+
+_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def is_valid_scope(name: str) -> bool:
+    """Slug de escopo válido: 1-64 chars [a-z0-9_-] (anti path-traversal —
+    o slug vira diretório sob db/)."""
+    return bool(name) and _SCOPE_RE.match(name) is not None
+
+
+def scope_db_dir(scope: str) -> Path:
+    """Diretório de dados do escopo: db/ (geral) ou db/<projeto>/."""
+    if scope == GENERAL_SCOPE:
+        return _DB_DIR
+    if not is_valid_scope(scope):
+        raise ValueError(f"Escopo inválido: {scope!r}")
+    return _DB_DIR / scope
+
+
+@dataclass(frozen=True)
+class ScopePaths:
+    """Paths dos ARTEFATOS ESCOPADOS de um escopo. ST/tools/pessoas/dicionários
+    são globais e ficam fora (usam as constantes de módulo)."""
+    scope:               str
+    db_dir:              str
+    LT_DB_PATH:          str
+    LT_FAISS_INDEX_PATH: str
+    LT_FAISS_ID_MAP_PATH: str
+    IF_DB_PATH:          str
+    IF_FAISS_INDEX_PATH: str
+    IF_FAISS_ID_MAP_PATH: str
+    PLANS_DB_PATH:       str
+    LANCE_DIR:           str
+    ACTIVATION_LOG_PATH: str
+    VS_DB_PATH:          str
+    VS_FAISS_INDEX_PATH: str
+    VS_FAISS_ID_MAP_PATH: str
+
+
+def resolve_scope_paths(scope: str) -> ScopePaths:
+    """Resolve os paths dos artefatos de conteúdo de um escopo. Para o escopo
+    geral, devolve EXATAMENTE os paths das constantes de módulo (mesmos
+    arquivos de sempre — zero migração)."""
+    d = scope_db_dir(scope)
+    return ScopePaths(
+        scope=scope,
+        db_dir=str(d),
+        LT_DB_PATH=str(d / "ava_memory.db"),
+        LT_FAISS_INDEX_PATH=str(d / "ava_memory.index"),
+        LT_FAISS_ID_MAP_PATH=str(d / "ava_id_map.npy"),
+        IF_DB_PATH=str(d / "ava_indexed_files.db"),
+        IF_FAISS_INDEX_PATH=str(d / "ava_indexed_files.index"),
+        IF_FAISS_ID_MAP_PATH=str(d / "ava_indexed_files_id_map.npy"),
+        PLANS_DB_PATH=str(d / "ava_plans.db"),
+        LANCE_DIR=str(d / "ava_lance"),
+        ACTIVATION_LOG_PATH=str(d / "activation_log.jsonl"),
+        VS_DB_PATH=str(d / "ava_kg_chunks.db"),
+        VS_FAISS_INDEX_PATH=str(d / "ava_kg_vectors.index"),
+        VS_FAISS_ID_MAP_PATH=str(d / "ava_kg_vectors_id_map.npy"),
+    )
+
+
+def is_general_ref(ref_id: int) -> bool:
+    """True se `ref_id` é uma id COMPOSTA do escopo geral (offset aplicado)."""
+    return ref_id >= GENERAL_ID_OFFSET
+
+
+def ref_real_id(ref_id: int) -> int:
+    """Id real (dentro do DB dono) a partir de uma id composta ou crua."""
+    return ref_id - GENERAL_ID_OFFSET if ref_id >= GENERAL_ID_OFFSET else ref_id
+
+
+def encode_ref(scope: str, real_id: int) -> int:
+    """Id de referência p/ respostas da API: ids do escopo geral ganham o
+    offset (o escopo ativo sai cru — compatibilidade com todos os callers).
+    O chamador aplica só quando a leitura é mesclada (projeto ativo)."""
+    return real_id + GENERAL_ID_OFFSET if scope == GENERAL_SCOPE else real_id
+
 
 # ── NEW: Planos de execução híbridos (macro + modelo) ──────────────────────────
 PLANS_DB_PATH           = str(_DB_DIR / "ava_plans.db")
@@ -480,6 +578,8 @@ __all__ = [
     'FD_FAISS_INDEX_PATH',
     'FD_MIN_SCORE',
     'FD_TOP_K',
+    'GENERAL_ID_OFFSET',
+    'GENERAL_SCOPE',
     'HEBBIAN_LINK_MAX_IDS',
     'IF_DB_PATH',
     'IF_EMBED_BATCH_SIZE',
@@ -577,6 +677,13 @@ __all__ = [
     'VS_FAISS_ID_MAP_PATH',
     'VS_FAISS_INDEX_PATH',
     'VS_MIN_SCORE',
+    'ScopePaths',
     '_STOP_WORDS',
+    'encode_ref',
+    'is_general_ref',
+    'is_valid_scope',
     'log',
+    'ref_real_id',
+    'resolve_scope_paths',
+    'scope_db_dir',
 ]

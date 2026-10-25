@@ -34,7 +34,7 @@ Regras de ouro:
 
 # Submódulos importados explicitamente: ficam acessíveis como atributos
 # da fachada (ex.: memory.memory_search.state) para depuração/patches.
-import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_plans, memory_status  # noqa: F401
+import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
 
 from memory_config import *  # noqa: F401,F403
 from memory_models import *  # noqa: F401,F403
@@ -49,6 +49,7 @@ from memory_ops_files import *  # noqa: F401,F403
 from memory_ops_dicts import *  # noqa: F401,F403
 from memory_ops_tools import *  # noqa: F401,F403
 from memory_ops_plans import *  # noqa: F401,F403
+from memory_ops_scope import *  # noqa: F401,F403
 from memory_status import *  # noqa: F401,F403
 
 __all__ = [
@@ -94,6 +95,8 @@ __all__ = [
     'FD_FAISS_INDEX_PATH',
     'FD_MIN_SCORE',
     'FD_TOP_K',
+    'GENERAL_ID_OFFSET',
+    'GENERAL_SCOPE',
     'FaceCandidate',
     'FaceDictDB',
     'FaceDictEntry',
@@ -199,14 +202,34 @@ __all__ = [
     'PlanUpdateRequest',
     'PlanUpdateResponse',
     'PlansDB',
+    'LTView',
+    'RelatedMemory',
+    'RerankEngine',
+    'ScopeDeleteResponse',
+    'ScopeInfoResponse',
+    'ScopePaths',
+    'ScopeState',
+    'ScopeSwitchRequest',
     '_plans_write_lock',
     '_row_to_entry',
     '_resolve_row',
+    'delete_scope',
+    'encode_ref',
+    'is_general_ref',
+    'is_valid_scope',
+    'lt_views',
     'plan_create',
     'plan_delete',
     'plan_list',
     'plan_read',
     'plan_update',
+    'project_current',
+    'project_delete',
+    'project_switch',
+    'ref_real_id',
+    'resolve_scope_paths',
+    'scope_db_dir',
+    'switch_scope',
     'ToolMatch',
     'ToolRegisterBatchRequest',
     'ToolRegisterBatchResponse',

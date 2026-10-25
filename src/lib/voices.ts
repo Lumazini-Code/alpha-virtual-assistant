@@ -56,15 +56,21 @@ async function errorDetail(res: Response): Promise<string> {
   }
 }
 
-/** GET /voice-dict/list — todos os cards de pessoa (com contagem de exemplos). */
+/** GET /voice-dict/list — todos os cards de pessoa (com contagem de exemplos).
+ * A memory (PeopleDB unificado) responde {"total", "people"} — lê `people`;
+ * `voices` fica como fallback por compatibilidade com versões antigas da API. */
 export async function listVoices(): Promise<VoiceEntry[]> {
   const res = await fetch(`${MEMORY_API_URL}/voice-dict/list`, {
     method: "GET",
     headers: authHeaders({}),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
-  const data = (await res.json()) as { total?: number; voices?: VoiceEntry[] };
-  return data.voices ?? [];
+  const data = (await res.json()) as {
+    total?: number;
+    people?: VoiceEntry[];
+    voices?: VoiceEntry[];
+  };
+  return data.people ?? data.voices ?? [];
 }
 
 /** PATCH /voice-dict/{id} — edita a descrição do card (campos não enviados são preservados). */

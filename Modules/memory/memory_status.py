@@ -26,6 +26,7 @@ from memory_config import (
     FD_EMBED_DIM,
     FD_MIN_SCORE,
     FD_TOP_K,
+    GENERAL_SCOPE,
     IF_MAX_CHUNKS,
     IF_MAX_CONTENT_SIZE,
     IF_MIN_SCORE,
@@ -207,6 +208,18 @@ def _gather_status_sync() -> dict:
             "chunks_in_db":     0,
             "vectors_in_index": 0,
         }
+    # ── NEW (projetos): escopo ativo + escopos abertos — consumido pelo
+    # orchestrator (re-assert por turno) e pelo graph_activation.py (segue o
+    # log de ativação do escopo ativo). ──
+    sc = state.scope
+    resp["project"] = {
+        "active_scope": state.active_scope,
+        "db_dir":       sc.paths.db_dir if sc is not None else None,
+        "lance_dir":    sc.paths.LANCE_DIR if sc is not None else None,
+        "activation_log": sc.paths.ACTIVATION_LOG_PATH if sc is not None else None,
+        "open_scopes":  sorted(state.scopes.keys()),
+        "merged_read":  state.active_scope != GENERAL_SCOPE,
+    }
     return resp
 
 

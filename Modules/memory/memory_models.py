@@ -175,6 +175,10 @@ class MemoryEntry(BaseModel):
     # deixa o LLM downstream distinguir fato diretamente relevante de
     # contexto associativo ──
     match_type:   Literal["primary", "related"] = "primary"
+    # ── NEW (projetos): escopo dono da entrada na leitura mesclada —
+    # "general" (vem com id composta, offset +10^12) ou o slug do projeto
+    # ativo. None = modo geral puro (compatibilidade) ou entrada global (ST).
+    scope:        Optional[str]        = None
     # ── NEW: Indexed file metadata ──
     file_path:    Optional[str]        = None
     file_name:    Optional[str]        = None
@@ -252,6 +256,10 @@ class IndexedFileEntry(BaseModel):
     created_at:   float
     access_count: int
     source:       str = "local_scraping"
+    # ── NEW (projetos): escopo dono do arquivo na leitura mesclada —
+    # "general" (file_id com offset +10^12) ou o slug do projeto ativo.
+    # None = modo geral puro (compatibilidade).
+    scope:        Optional[str] = None
     chunk_text:   Optional[str] = None  # chunk específico que deu match
     # ── NEW: posição da chunk dentro do arquivo — ajuda o chamador a se
     # orientar sem precisar do arquivo inteiro (útil pra arquivos grandes) ──
@@ -659,6 +667,10 @@ class PlanEntry(BaseModel):
     version:    int
     steps:      list[PlanStep]
     corrections: dict[str, str] = {}
+    # ── NEW (projetos): escopo dono do plano na listagem mesclada —
+    # "general" (plan_id com offset +10^12) ou o slug do projeto ativo.
+    # None = modo geral puro (compatibilidade).
+    scope:      Optional[str] = None
     # ── NEW (people cards): card de pessoa ao qual este plano se relaciona
     # (ex.: "plano que paga a conta da pessoa X"). Opcional — None = sem vínculo.
     person_id:  Optional[int] = None
@@ -698,6 +710,32 @@ class MemoryToolError(Exception):
     def __init__(self, detail: str):
         super().__init__(detail)
         self.detail = detail
+
+
+# ── NEW (projetos): Modelos de request/response — escopos ──────────────────────
+
+class ScopeSwitchRequest(BaseModel):
+    """POST /project/switch — troca o escopo ativo do processo de memória.
+    "general" = modo geral (sem projeto). Slug de projeto = abre (se ainda
+    não estiver) e ativa o conjunto de artefatos do projeto."""
+    scope: str = Field(..., description='Escopo: "general" ou slug do projeto.')
+
+
+class ScopeInfoResponse(BaseModel):
+    """Estado do escopo ativo — consumido pelo orchestrator (re-assert a cada
+    turno, proteção contra restart da memory) e pelo graph_activation.py."""
+    scope:      str            # escopo ativo ("general" ou slug)
+    db_dir:     str            # diretório dos artefatos do escopo ativo
+    previous:   Optional[str]  = None  # escopo anterior (só no switch)
+    opened:     Optional[bool] = None  # True se o escopo acabou de ser aberto
+
+
+class ScopeDeleteResponse(BaseModel):
+    """DELETE /project/{slug} — fecha o escopo (se aberto) e apaga o
+    diretório db/<slug>/ INTEIRO (memórias LT, grafo, planos, arquivos
+    indexados). "general" e o escopo ativo são recusados."""
+    scope:   str
+    deleted: bool
 
 
 class FaceDictUpdateRequest(BaseModel):
@@ -745,6 +783,9 @@ __all__ = [
     'ReadSTRequest',
     'ReadSTResponse',
     'RelatedMemory',
+    'ScopeDeleteResponse',
+    'ScopeInfoResponse',
+    'ScopeSwitchRequest',
     'ToolMatch',
     'ToolRegisterBatchRequest',
     'ToolRegisterBatchResponse',

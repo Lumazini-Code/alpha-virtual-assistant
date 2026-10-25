@@ -15,6 +15,7 @@ import {
 } from "../lib/voices.js";
 import { recordMic } from "../lib/voiceRecorder.js";
 import { getPersona, setPersona } from "../lib/persona.js";
+import { getWatchConfidence, setWatchConfidence } from "../lib/settings.js";
 import {
   listMCPServers,
   installMCPServer,
@@ -144,6 +145,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const [personaStage, setPersonaStage] = useState<"edit" | "saving" | "saved" | "error">("edit");
   const [personaMsg, setPersonaMsg] = useState<string | null>(null);
 
+  // ── Memory Watch (vigia de confiança do LLM.py — toggle via orchestrator) ─
+  // null = ainda não carregado (GET no mount do painel).
+  const [watchEnabled, setWatchEnabled] = useState<boolean | null>(null);
+  const [watchBusy, setWatchBusy] = useState(false);
+  const [watchMsg, setWatchMsg] = useState<string | null>(null);
+
   const backTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { stdin, isRawModeSupported, setRawMode } = useStdin() as {
     stdin?: { pause?: () => void; resume?: () => void };
@@ -155,6 +162,23 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     return () => {
       if (backTimerRef.current) clearTimeout(backTimerRef.current);
       if (recCountdownTimerRef.current) clearInterval(recCountdownTimerRef.current);
+    };
+  }, []);
+
+  // Carrega o estado do Memory Watch quando o painel abre (1 GET leve).
+  useEffect(() => {
+    let cancelled = false;
+    getWatchConfidence()
+      .then((info) => {
+        if (!cancelled) setWatchEnabled(info.enabled);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn("settings: GET /settings/watch-confidence falhou", { message: msg });
+        if (!cancelled) setWatchMsg(`orchestrator offline ou sem resposta: ${msg}`);
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -235,6 +259,31 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     setRecordPhase("result");
     void loadPlans(); // lista por trás já fica atualizada
   }, [recordUrl, onSuspendChange, isRawModeSupported, setRawMode, stdin, loadPlans]);
+
+  /** Liga/desliga o Memory Watch (toggle imediato via PUT no orchestrator).
+   * O flag vale já no próximo turno — o orchestrator injeta watch_confidence
+   * nos requests de chat ao LLM.py. */
+  const toggleWatch = useCallback(async () => {
+    if (watchBusy) return;
+    const next = !(watchEnabled ?? false);
+    setWatchBusy(true);
+    setWatchMsg(null);
+    try {
+      const info = await setWatchConfidence(next);
+      setWatchEnabled(info.enabled);
+      setWatchMsg(
+        info.enabled
+          ? "✓ Memory Watch ativado — o vigia de confiança já vale no próximo turno"
+          : "✓ Memory Watch desativado — já vale no próximo turno",
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: PUT /settings/watch-confidence falhou", { message: msg });
+      setWatchMsg(`✗ ${msg}`);
+    } finally {
+      setWatchBusy(false);
+    }
+  }, [watchBusy, watchEnabled]);
 
   // ── MCP: listar / instalar / remover (via mcp_manager :4008) ────────────
   const loadMCPServers = useCallback(async () => {
@@ -675,6 +724,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     { label: "👤  Cards de Pessoa — cadastro unificado (voz + dados)", value: "voices" },
     { label: "⤓  Servidores MCP — instalar/gerenciar", value: "mcp" },
     { label: "✎  Persona — editar o system prompt", value: "persona" },
+    {
+      label:
+        `👁  Memory Watch (recuperação contínua de memória): ` +
+        (watchEnabled === null ? "…" : watchEnabled ? "ATIVADO" : "DESATIVADO"),
+      value: "watch",
+    },
     { label: "↩  Fechar (Esc)", value: "close" },
   ];
 
@@ -715,11 +770,23 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
                 enterVoices();
               } else if (item.value === "persona") {
                 void enterPersona();
+              } else if (item.value === "watch") {
+                void toggleWatch();
               } else {
                 onClose();
               }
             }}
           />
+          {watchBusy && <Text color={COLORS.amber}>▶ alternando Memory Watch…</Text>}
+          {watchMsg && (
+            <Text
+              color={
+                watchMsg.startsWith("✓") ? COLORS.green : watchMsg.startsWith("✗") ? COLORS.red : COLORS.dim
+              }
+            >
+              {watchMsg}
+            </Text>
+          )}
         </Box>
       )}
 

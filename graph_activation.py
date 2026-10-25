@@ -39,25 +39,59 @@ Arquitetura (v2 — polling de diff):
     - tool que só existe na MCP DB (sync pendente / memory offline): entra
       como nó extra id "m{servidor__tool}" (prefixo m, sem arestas);
     - servidor desabilitado aparece com badge "desabilitado" no tooltip/painel.
+
+  v6 — MULTI-ESCOPO (projetos): o visualizador mostra TODOS os escopos de
+  memória AO MESMO TEMPO, separados visualmente. O db raiz da memory
+  (Modules/memory/db/) tem o escopo "geral" + um subdiretório por projeto
+  (db/<slug>/ = LT + planos + grafo Hebbiano do projeto). A cada poll:
+    - descoberta de escopos (os.scandir do db root — barato);
+    - scan POR ESCOPO (ava_memory.db + ava_plans.db) com ids NAMESPACED:
+      memória "{scope}:{id}" (ex. "geral:12", "meu-proj:3") e plano
+      "{scope}:p{id}" — ids inteiros colidem ENTRE escopos;
+    - tools/MCP/pessoas continuam GLOBAIS (ids t/m/u sem escopo);
+    - cada nó/aresta carrega "scope" (null = global) — o cliente colore a
+      borda pela cor do escopo, posiciona cada escopo num SETOR próprio e
+      oferece liga/desliga por escopo na legenda;
+    - arestas virtuais cruzadas: plan_tool/plan_person (plano do escopo →
+      tool/pessoa global) e person_identity (card global → memória de
+      identidade que pode morar em QUALQUER escopo — resolvido sondando os
+      ids de memória coletados por escopo no próprio scan);
+    - resiliência: erro transitório de SQLite num escopo NÃO zera o delta
+      (nós/arestas do escopo em falha ficam fora da passada de remoção —
+      snapshot do escopo permanece); escopo cujo diretório desaparece tem
+      seus nós removidos normalmente.
+  A ativação PPR também é multi-escopo: UM ActivationTailer POR escopo
+  (db/activation_log.jsonl + db/<slug>/activation_log.jsonl), cada evento
+  publicado ganha "scope" e o /graph/replay funde todos os logs por
+  timestamp. O escopo ATIVO da memory API (POST /project/switch) vira
+  {"type":"scope_switch"} → badge "ativo" na legenda de escopos da UI.
   ══════════════════════════════════════════════════════════════════════════
 
   Eventos SSE (o cliente roteia por "type"):
-    {"type": "activation",  "graph", "ts", "seeds", "rank", "elapsed_ms",
-                            "query", "strategy", "session_id"}   ← PPR numa leitura
+    {"type": "activation",  "graph", "scope", "ts", "seeds", "rank",
+                            "elapsed_ms", "query", "strategy", "session_id"}
+                            ← PPR numa leitura; "scope" = escopo dono do log
+    {"type": "scope_switch", "scope", "ts"}   ← escopo ativo mudou (badge UI)
     {"type": "graph_delta", "ts",
                             "nodes": {"added": [...], "updated": [...], "removed": [id,...]},
                             "edges": {"added": [...], "updated": [...],
                                       "removed": ["a|b|type", ...]}}
-      — nós de tools têm id string "t{id}", kind="tool"; planos "p{id}",
-        kind="plan"; pessoas "u{id}", kind="person"; memórias têm id int.
+      — nós de tools têm id string "t{id}", kind="tool"; planos
+        "{scope}:p{id}", kind="plan"; pessoas "u{id}", kind="person";
+        memórias "{scope}:{id}" (string namespaced), kind="memory";
+        nodes/edges carregam "scope" (null = global: tools/MCP/pessoas).
 
   Endpoints:
     GET /                  → UI (vis-network, overhaul: cores/setas/weights por
                              tipo de aresta, painel de inspeção de nó, filtros,
-                             busca, decay slider, replay, legenda)
-    GET /graph             → snapshot atual enriquecido (boot do cliente)
-    GET /events            → SSE (activation + graph_delta, keepalive 15s)
-    GET /graph/replay?n=N  → últimos N eventos de ativação do JSONL (animação)
+                             busca, decay slider, replay, legenda de ESCOPOS
+                             com contagem/ativo/toggle)
+    GET /graph             → snapshot atual enriquecido (boot do cliente;
+                             + "scopes" e "active_scope")
+    GET /events            → SSE (activation + graph_delta + scope_switch,
+                             keepalive 15s)
+    GET /graph/replay?n=N  → últimos N eventos de ativação FUNDIDOS de todos
+                             os logs de escopo (ordenados por timestamp)
 
 Rodar:
     python graph_activation.py                      (defaults abaixo)
@@ -68,12 +102,30 @@ Rodar:
 import argparse
 import html
 import json
+import os
 import queue
 import sqlite3
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ── NEW (projetos): auth interna p/ consultar a memory API (/status). O
+# pacote vive em Modules/internal_auth.py — o import depende de COMO o script
+# é chamado (repo root × diretório próprio); env AVA_INTERNAL_TOKEN/AVA_BIND_HOST
+# é o fallback (mesma política fail-open dos demais clientes internos).
+try:
+    from Modules.internal_auth import internal_bind_host, internal_token
+except ImportError:  # script fora da raiz do repo
+    try:
+        from internal_auth import internal_bind_host, internal_token  # type: ignore
+    except ImportError:
+        def internal_bind_host() -> str:
+            return os.getenv("AVA_BIND_HOST", "127.9.12.22")
+
+        def internal_token() -> str | None:
+            return os.getenv("AVA_INTERNAL_TOKEN")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,10 +142,12 @@ def _open_ro(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def _node_public(row: sqlite3.Row) -> dict:
+def _node_public(row: sqlite3.Row, scope: str | None = None) -> dict:
     text = (row["text"] or "").strip().replace("\n", " ")
     return {
-        "id":          row["id"],
+        # NEW (multi-escopo): id NAMESPACED "{scope}:{id}" — os inteiros
+        # colidem ENTRE escopos (memória 1 do geral ≠ memória 1 do projeto).
+        "id":          f"{scope}:{row['id']}" if scope else row["id"],
         "kind":        "memory",
         "label":       text[:40] + ("…" if len(text) > 40 else ""),
         "title":       html.escape(text[:400]),
@@ -103,6 +157,9 @@ def _node_public(row: sqlite3.Row) -> dict:
         "created_at":  row["created_at"],
         "access_count": row["access_count"],
         "forgettable": bool(row["forgettable"]),
+        # escopo dono da memória ("geral" | slug do projeto). Tools/MCP/
+        # pessoas são GLOBAIS → scope=None.
+        "scope":       scope,
     }
 
 
@@ -127,6 +184,7 @@ def _tool_node_public(row: sqlite3.Row) -> dict:
         "last_used":   row["last_used"],
         "created_at":  row["created_at"],
         "source":      f"tool:{server}" if server else "tool",
+        "scope":       None,   # tools são GLOBAIS (compartilhadas entre escopos)
     }
 
 
@@ -157,18 +215,24 @@ def _mcp_tool_node_public(graph_name: str, srow: sqlite3.Row | None,
         "transport":   srow["transport"] if srow is not None else None,
         "enabled":     bool(srow["enabled"]) if srow is not None else True,
         "always_on":   bool(srow["always_on"]) if srow is not None else False,
+        "scope":       None,   # registry MCP é GLOBAL (host, fora dos escopos)
     }
 
 
-def _edge_public(row: sqlite3.Row) -> dict:
+def _edge_public(row: sqlite3.Row, scope: str | None = None) -> dict:
+    """Aresta do grafo Hebbiano de memórias. NEW (multi-escopo): os ids
+    inteiros colidem ENTRE escopos — key/from/to ganham o prefixo
+    "{scope}:" (ou ficam crus quando scope=None, formato antigo)."""
+    p = f"{scope}:" if scope else ""
     return {
-        "key":   f"{row['memory_id_a']}|{row['memory_id_b']}|{row['edge_type']}",
-        "from":  row["memory_id_a"],
-        "to":    row["memory_id_b"],
+        "key":   f"{p}{row['memory_id_a']}|{p}{row['memory_id_b']}|{row['edge_type']}",
+        "from":  f"{p}{row['memory_id_a']}",
+        "to":    f"{p}{row['memory_id_b']}",
         "type":  row["edge_type"],
         "weight": round(row["weight"], 4),
         "count": row["coactivation_count"],
         "last":  row["last_coactivated"],
+        "scope": scope,
     }
 
 
@@ -183,13 +247,15 @@ def _tool_edge_public(row: sqlite3.Row) -> dict:
         "weight": round(row["weight"], 4),
         "count": row["coactivation_count"],
         "last":  row["last_coactivated"],
+        "scope": None,   # tools são GLOBAIS
     }
 
 
-def _plan_node_public(row: sqlite3.Row) -> dict:
+def _plan_node_public(row: sqlite3.Row, scope: str | None = None) -> dict:
     """Nó público de um plano de execução (PlansDB: ava_plans.db). Id STRING
     com prefixo "p" — liga-se por arestas virtuais ao card de pessoa
-    (plans.person_id) e às tools do plano (plans.tools_json)."""
+    (plans.person_id) e às tools do plano (plans.tools_json). NEW
+    (multi-escopo): prefixado com o escopo dono ("{scope}:p{id}")."""
     name = (row["name"] or "").strip()
     desc = (row["description"] or "").strip()
     steps_count = len(json.loads(row["steps_json"] or "[]"))
@@ -198,7 +264,7 @@ def _plan_node_public(row: sqlite3.Row) -> dict:
     except (json.JSONDecodeError, TypeError):
         tool_ids = []
     return {
-        "id":          f"p{row['id']}",
+        "id":          f"{scope}:p{row['id']}" if scope else f"p{row['id']}",
         "kind":        "plan",
         "label":       name[:40] + ("…" if len(name) > 40 else ""),
         "title":       html.escape(desc[:400]),
@@ -213,6 +279,7 @@ def _plan_node_public(row: sqlite3.Row) -> dict:
         "created_at":  row["created_at"],
         "updated_at":  row["updated_at"],
         "source":      "plan",
+        "scope":       scope,
     }
 
 
@@ -242,6 +309,7 @@ def _person_node_public(row: sqlite3.Row) -> dict:
         "created_at":  row["created_at"],
         "last_accessed": row["last_accessed"],
         "source":      row["source"],
+        "scope":       None,   # pessoas/cards são GLOBAIS (dicionário compartilhado)
     }
 
 
@@ -249,31 +317,55 @@ class GraphState:
     """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
     completo cobre criação, atualização E remoção (decay job) sem depender
-    de surrogate keys. Cobre CINCO grafos no mesmo espaço visual:
-      - memórias LT (ava_memory.db) — ids inteiros, kind="memory";
-      - tools (ava_tools.db) — ids string "t{id}", kind="tool"; o DB é
+    de surrogate keys.
+
+    NEW (v6 — MULTI-ESCOPO): cobre TODOS os escopos de memória ao mesmo
+    tempo. O db raiz da memory (pai de --db) é o escopo "geral"; cada
+    subdiretório (db/<slug>/ = projeto criado via /projects) tem LT +
+    planos do projeto. Cobre, no mesmo espaço visual:
+      - memórias LT POR ESCOPO (ava_memory.db) — ids "{scope}:{id}"
+        (ex. "geral:12", "meu-proj:3"): os ids inteiros colidem ENTRE
+        escopos, então o namespacing é obrigatório;
+      - planos POR ESCOPO (ava_plans.db) — ids "{scope}:p{id}";
+      - tools (ava_tools.db) — GLOBAIS, ids "t{id}", kind="tool"; o DB é
         opcional (memory process pode não tê-lo criado ainda);
-      - planos (ava_plans.db) — ids string "p{id}", kind="plan"; também
-        opcional;
-      - pessoas/cards (ava_people.db) — ids string "u{id}", kind="person";
+      - pessoas/cards (ava_people.db) — GLOBAIS, ids "u{id}", kind="person";
         opcional; liga-se às memórias pela memória de identidade;
       - MCP registry (mcp_manager Rust no HOST: Modules/mcp_manager/db/
-        ava_mcp_servers.db) — opcional; FUSÃO por graph_name com as tools
-        da ToolsDB: conteúdo (snippet/core/enabled/transporte) vem daqui,
-        ids t{N} e arestas ficam na ToolsDB; tools só-MCP entram como
-        "m{servidor__tool}".
+        ava_mcp_servers.db) — GLOBAIS, opcional; FUSÃO por graph_name com
+        as tools da ToolsDB: conteúdo (snippet/core/enabled/transporte)
+        vem daqui, ids t{N} e arestas ficam na ToolsDB; tools só-MCP
+        entram como "m{servidor__tool}".
 
-    Correlações ENTRE grafos (NEW people cards / tools ↔ planos): arestas
-    virtuais derivadas dos metadados dos nós, recomputadas a cada scan —
-      person_identity: card u{N} → memória de identidade (people.memory_id);
-      plan_person:     plano p{N} ↔ card u{N}          (plans.person_id);
-      plan_tool:       plano p{N} ↔ tool t{N}          (plans.tools_json)."""
+    Cada nó/aresta pública carrega "scope" ("geral" | slug | None p/ os
+    globais) — o cliente separa os escopos por cor de borda, setor espacial
+    e liga/desliga na legenda.
+
+    Correlações ENTRE grafos (arestas virtuais derivadas dos metadados,
+    recomputadas a cada scan):
+      person_identity: card u{N} GLOBAL → memória de identidade — que pode
+        morar em QUALQUER escopo; resolvido sondando os ids de memória
+        coletados por escopo no próprio scan (geral primeiro, depois
+        projetos em ordem alfabética);
+      plan_person:     plano {scope}:p{N} ↔ card u{N} global (plans.person_id);
+      plan_tool:       plano {scope}:p{N} ↔ tool t{N} global (plans.tools_json).
+
+    Resiliência por escopo: erro transitório de SQLite num escopo (lock
+    indisponível, bind mount lento) NÃO zera o delta — o escopo em falha é
+    reportado em _scan() e seus nós/arestas ficam FORA da passada de
+    remoção (snapshot do escopo permanece até a próxima leitura ok). Escopo
+    cujo DIRETÓRIO desaparece (projeto apagado) sai da descoberta e seus
+    nós são removidos normalmente."""
 
     TOOL_ID_PREFIX = "t"
     PLAN_ID_PREFIX = "p"
     MCP_ID_PREFIX = "m"
     PERSON_ID_PREFIX = "u"
     VIRTUAL_EDGE_WEIGHT = 0.5   # peso fixo das arestas virtuais entre grafos
+    GENERAL_SCOPE = "general"   # MESMO valor de memory_config.GENERAL_SCOPE —
+                                # o badge da memory API tem que casar com o
+                                # nome do escopo raiz do scan, senão nasce
+                                # chip fantasma na UI
 
     def __init__(self, db_path: str, tools_db_path: str = "",
                  plans_db_path: str = "", mcp_db_path: str = "",
@@ -283,32 +375,111 @@ class GraphState:
         self.plans_db_path = plans_db_path
         self.mcp_db_path = mcp_db_path
         self.people_db_path = people_db_path
+        # NEW (multi-escopo): raiz dos escopos = diretório do db geral;
+        # subdiretórios são os projetos (db/<slug>/ava_memory.db).
+        self.db_root = Path(db_path).resolve().parent
+        self.active_scope = self.GENERAL_SCOPE   # atualizado pelo ScopeWatcher
         self.lock = threading.Lock()
-        self.nodes: dict = {}                                  # id -> node público (int | "tN" | "pN" | "m...")
+        self.nodes: dict = {}                                  # id -> node público ("{scope}:{id}" | "tN" | "pN" | "m..." | "uN")
         self.nodes_sig: dict = {}                              # id -> sig por tipo
         self.edges: dict[str, dict] = {}                       # key -> edge pública
         self.edges_sig: dict[str, tuple] = {}                  # key -> (weight, count)
 
-    def _scan(self) -> tuple[dict, dict]:
-        """Scan completo (nodes, edges) dos dois grafos — tudo público."""
-        conn = _open_ro(self.db_path)
+    # ── NEW (multi-escopo): descoberta de escopos ────────────────────────
+    def _discover_scopes(self) -> list[tuple[str, str, str]]:
+        """Escopos visíveis agora: (nome, ava_memory.db, ava_plans.db).
+        O db root é o escopo "geral" (usa os paths dos args); cada
+        subdiretório é um projeto (slug = nome do diretório). Ordenado —
+        determinístico p/ o cliente (cores/posições por ordem de aparição).
+        os.scandir é barato (só readdir) — seguro a cada poll.
+        Subdirs TÉCNICOS (convenção da memory: prefixo "ava_" — ex.
+        ava_lance/, LanceDB de vetores do geral) NÃO são escopos."""
+        scopes = [(self.GENERAL_SCOPE, self.db_path, self.plans_db_path)]
         try:
-            nodes = {
-                r["id"]: _node_public(r)
-                for r in conn.execute(
-                    "SELECT id, text, source, confidence, created_at, "
-                    "access_count, forgettable FROM memories"
-                )
-            }
-            edges = {
-                _edge_public(r)["key"]: _edge_public(r)
-                for r in conn.execute(
-                    "SELECT memory_id_a, memory_id_b, edge_type, weight, "
-                    "coactivation_count, last_coactivated FROM memory_edges"
-                )
-            }
-        finally:
-            conn.close()
+            for entry in sorted(os.scandir(self.db_root), key=lambda e: e.name):
+                if entry.name.startswith("ava_"):
+                    continue   # dir técnico (LanceDB etc.) — não é projeto
+                if entry.is_dir(follow_symlinks=False):
+                    d = Path(entry.path)
+                    scopes.append((entry.name, str(d / "ava_memory.db"),
+                                   str(d / "ava_plans.db")))
+        except OSError:
+            pass   # root sumiu (transitório) — só o geral, paths dos args
+        return scopes
+
+    def _resolve_identity_scope(self, mid: int,
+                                mem_ids: dict[str, set]) -> str | None:
+        """Escopo dono da memória de identidade `mid` (people.memory_id pode
+        apontar pra qualquer escopo). Geral primeiro; senão o 1º projeto
+        (ordem alfabética) que tiver a memória. None = memória não existe
+        (ainda) em nenhum escopo → sem aresta."""
+        if mid is None:
+            return None
+        if mid in mem_ids.get(self.GENERAL_SCOPE, ()):
+            return self.GENERAL_SCOPE
+        for scope in sorted(s for s in mem_ids if s != self.GENERAL_SCOPE):
+            if mid in mem_ids[scope]:
+                return scope
+        return None
+
+    def _scan(self) -> tuple[dict, dict, set]:
+        """Scan completo (nodes, edges) — tudo público. NEW (multi-escopo):
+        percorre TODOS os escopos descobertos (db root + subdiretórios),
+        coleta os ids de memória por escopo (p/ resolver person_identity
+        cruzada) e devolve também o conjunto de escopos EM FALHA transitória
+        (o refresh os exclui da passada de remoção — snapshot permanece)."""
+        nodes: dict = {}
+        edges: dict[str, dict] = {}
+        mem_ids: dict[str, set] = {}      # scope -> {id de memória} (identidade)
+        failed_scopes: set[str] = set()
+
+        # ── ESCOPOS: LT + planos de cada um (geral + projetos) ──────────
+        for scope, mem_db, plans_db in self._discover_scopes():
+            # Memórias + arestas hebbianas do escopo. Falha (lock/WAL/IO) →
+            # marca o escopo como falho e segue pros próximos (os outros
+            # escopos continuam atualizando; o falho mantém o snapshot).
+            try:
+                conn = _open_ro(mem_db)
+                try:
+                    snodes = {
+                        f"{scope}:{r['id']}": _node_public(r, scope)
+                        for r in conn.execute(
+                            "SELECT id, text, source, confidence, created_at, "
+                            "access_count, forgettable FROM memories"
+                        )
+                    }
+                    sedges = {
+                        _edge_public(r, scope)["key"]: _edge_public(r, scope)
+                        for r in conn.execute(
+                            "SELECT memory_id_a, memory_id_b, edge_type, weight, "
+                            "coactivation_count, last_coactivated FROM memory_edges"
+                        )
+                    }
+                finally:
+                    conn.close()
+            except (sqlite3.Error, FileNotFoundError, OSError):
+                failed_scopes.add(scope)
+                continue
+            mem_ids[scope] = {int(nid.split(":", 1)[1]) for nid in snodes}
+            nodes.update(snodes)
+            edges.update(sedges)
+
+            # Planos do escopo (opcional — DB pode não existir ainda)
+            try:
+                pconn = _open_ro(plans_db)
+                try:
+                    pnodes = {
+                        f"{scope}:p{r['id']}": _plan_node_public(r, scope)
+                        for r in pconn.execute(
+                            "SELECT id, name, description, version, steps_json, "
+                            "person_id, tools_json, created_at, updated_at FROM plans"
+                        )
+                    }
+                finally:
+                    pconn.close()
+                nodes.update(pnodes)
+            except (sqlite3.Error, FileNotFoundError, OSError):
+                pass   # plans DB ainda não existe / sem tabela — ignora
         # ── Grafo de tools (opcional): mesmo esquema de arestas tipadas ──
         if self.tools_db_path:
             try:
@@ -334,23 +505,6 @@ class GraphState:
                 edges.update(tedges)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # tools DB ainda não existe / sem tabelas — só memórias
-        # ── Grafo de planos (opcional): nós soltos + vínculos persistidos ──
-        if self.plans_db_path:
-            try:
-                pconn = _open_ro(self.plans_db_path)
-                try:
-                    pnodes = {
-                        f"{self.PLAN_ID_PREFIX}{r['id']}": _plan_node_public(r)
-                        for r in pconn.execute(
-                            "SELECT id, name, description, version, steps_json, "
-                            "person_id, tools_json, created_at, updated_at FROM plans"
-                        )
-                    }
-                finally:
-                    pconn.close()
-                nodes.update(pnodes)
-            except (sqlite3.Error, FileNotFoundError):
-                pass   # plans DB ainda não existe / sem tabela — ignora
         # ── NEW (people cards): grafo de pessoas/cards (opcional) ──
         if self.people_db_path:
             try:
@@ -432,25 +586,32 @@ class GraphState:
         # metadados dos nós — não moram em tabela de arestas; são recomputadas
         # a cada scan e o diff detecta criação/remoção naturalmente (sem
         # back-edges fantasmas quando um plano/pessoa é apagado).
-        #   person_identity: card u{N} → memória de identidade (people.memory_id)
-        #   plan_person:     plano p{N} ↔ card u{N}            (plans.person_id)
-        #   plan_tool:       plano p{N} ↔ tool t{N}            (plans.tools_json)
+        #   person_identity: card u{N} GLOBAL → memória de identidade
+        #     (people.memory_id) que pode morar em QUALQUER escopo —
+        #     resolvido sondando mem_ids coletado por escopo acima;
+        #   plan_person:     plano {scope}:p{N} ↔ card u{N} GLOBAL
+        #   plan_tool:       plano {scope}:p{N} ↔ tool t{N} GLOBAL
         # Aresta só nasce se AMBOS os nós existirem (identidade ainda sem
-        # memória, plano sem card, tool não cadastrada → sem aresta).
+        # memória em nenhum escopo, plano sem card, tool não cadastrada →
+        # sem aresta).
         virtual: dict[str, dict] = {}
         w = self.VIRTUAL_EDGE_WEIGHT
         for node in nodes.values():
             kind = node.get("kind")
             if kind == "person":
                 mid = node.get("memory_id")
-                if mid is not None and mid in nodes:
-                    key = f"{node['id']}|{mid}|person_identity"
+                scope_id = self._resolve_identity_scope(mid, mem_ids)
+                if scope_id is not None:
+                    target = f"{scope_id}:{mid}"
+                    key = f"{node['id']}|{target}|person_identity"
                     virtual[key] = {
-                        "key": key, "from": node["id"], "to": mid,
+                        "key": key, "from": node["id"], "to": target,
                         "type": "person_identity", "weight": w,
                         "count": 1, "last": node.get("last_accessed") or time.time(),
+                        "scope": scope_id,   # escopo da memória de identidade
                     }
             elif kind == "plan":
+                pscope = node.get("scope")   # escopo dono do plano
                 pid = node.get("person_id")
                 if pid is not None and f"{self.PERSON_ID_PREFIX}{pid}" in nodes:
                     puid = f"{self.PERSON_ID_PREFIX}{pid}"
@@ -459,6 +620,7 @@ class GraphState:
                         "key": key, "from": node["id"], "to": puid,
                         "type": "plan_person", "weight": w,
                         "count": 1, "last": node.get("updated_at") or time.time(),
+                        "scope": pscope,
                     }
                 for tid in node.get("tool_ids") or []:
                     tuid = f"{self.TOOL_ID_PREFIX}{tid}"
@@ -468,23 +630,43 @@ class GraphState:
                             "key": key, "from": node["id"], "to": tuid,
                             "type": "plan_tool", "weight": w,
                             "count": 1, "last": node.get("updated_at") or time.time(),
+                            "scope": pscope,
                         }
         edges.update(virtual)
-        return nodes, edges
+        return nodes, edges, failed_scopes
+
+    def scope_log_paths(self) -> dict[str, str]:
+        """NEW (multi-escopo): log de ativação POR escopo (geral + projetos) —
+        fonte do /graph/replay (funde todos, ordenando por timestamp) e do
+        ScopeWatcher (um ActivationTailer por escopo). Subdirs técnicos
+        (prefixo "ava_") não são escopos."""
+        logs = {self.GENERAL_SCOPE: str(self.db_root / "activation_log.jsonl")}
+        try:
+            for entry in sorted(os.scandir(self.db_root), key=lambda e: e.name):
+                if entry.name.startswith("ava_"):
+                    continue   # dir técnico (LanceDB etc.)
+                if entry.is_dir(follow_symlinks=False):
+                    logs[entry.name] = str(Path(entry.path) / "activation_log.jsonl")
+        except OSError:
+            pass
+        return logs
 
     def refresh(self) -> dict:
         """Um poll: escaneia, dif contra o snapshot e devolve o delta.
         Retorna {"nodes": {"added","updated","removed"},
                  "edges": {"added","updated","removed"}} — sempre presente,
-        com listas vazias quando nada mudou."""
+        com listas vazias quando nada mudou.
+        NEW (multi-escopo): erro transitório num escopo (failed_scopes) NÃO
+        zera o delta — os demais escopos atualizam normalmente e os nós/
+        arestas do escopo em falha ficam FORA da passada de remoção (o
+        snapshot dele permanece; o escopo volta a difar na leitura ok)."""
         try:
-            db_nodes, db_edges = self._scan()
+            db_nodes, db_edges, failed_scopes = self._scan()
         except sqlite3.Error as e:
-            # Erro de leitura (lock/WAL indisponível — clássico de SQLite
-            # sobre bind mount lento do Docker Desktop/WSL2: "unable to open
-            # database file"). Sem backoff isso spamava o log a cada 1s:
-            # loga a 1ª falha e depois 1 a cada 30 (~30s no interval default).
-            # O snapshot anterior permanece — o grafo segue servindo.
+            # Erro de leitura FORA do escopo (descoberta/abertura geral).
+            # Sem backoff isso spamava o log a cada 1s: loga a 1ª falha e
+            # depois 1 a cada 30 (~30s no interval default). O snapshot
+            # anterior permanece — o grafo segue servindo.
             self._fail_n = getattr(self, "_fail_n", 0) + 1
             if self._fail_n == 1 or self._fail_n % 30 == 0:
                 print(f"[graph] poll falhou ({e}) — mantendo snapshot anterior "
@@ -525,10 +707,15 @@ class GraphState:
                     self.nodes_sig[nid] = sig
                     nodes_updated.append(node)
             for nid in list(self.nodes_sig):
-                if nid not in db_nodes:
-                    self.nodes.pop(nid, None)
-                    self.nodes_sig.pop(nid, None)
-                    nodes_removed.append(nid)
+                if nid in db_nodes:
+                    continue
+                # NEW (multi-escopo): escopo em falha transitória → mantém o
+                # snapshot dele (remoção só quando a leitura confirmar).
+                if (self.nodes.get(nid) or {}).get("scope") in failed_scopes:
+                    continue
+                self.nodes.pop(nid, None)
+                self.nodes_sig.pop(nid, None)
+                nodes_removed.append(nid)
 
             for key, edge in db_edges.items():
                 sig = (edge["weight"], edge["count"])
@@ -542,10 +729,13 @@ class GraphState:
                     self.edges_sig[key] = sig
                     edges_updated.append(edge)
             for key in list(self.edges_sig):
-                if key not in db_edges:
-                    self.edges.pop(key, None)
-                    self.edges_sig.pop(key, None)
-                    edges_removed.append(key)
+                if key in db_edges:
+                    continue
+                if self.edges.get(key, {}).get("scope") in failed_scopes:
+                    continue   # idem: escopo em falha mantém snapshot
+                self.edges.pop(key, None)
+                self.edges_sig.pop(key, None)
+                edges_removed.append(key)
 
         return {
             "nodes": {"added": nodes_added, "updated": nodes_updated, "removed": nodes_removed},
@@ -557,6 +747,10 @@ class GraphState:
             return {
                 "nodes": list(self.nodes.values()),
                 "edges": list(self.edges.values()),
+                # NEW (multi-escopo): lista de escopos p/ o cliente pré-atribuir
+                # cores/setores na ordem do servidor + escopo ativo (badge).
+                "scopes": [s for s, _, _ in self._discover_scopes()],
+                "active_scope": self.active_scope,
                 "ts": time.time(),
             }
 
@@ -597,28 +791,41 @@ class Broadcaster:
 
 
 class ActivationTailer(threading.Thread):
-    """Tail do activation_log.jsonl (eventos de PPR) → broadcaster.
-    Linhas antigas (sem "type", geradas antes do ctx) viram activation."""
+    """Tail do activation_log.jsonl DE UM ESCOPO (eventos de PPR) →
+    broadcaster. NEW (multi-escopo): existe UM TAILER POR ESCOPO (geral +
+    cada db/<slug>/) — todos os escopos são seguidos SIMULTANEAMENTE (antes
+    o tailer era único e fazia retarget quando o escopo ativo mudava). Cada
+    evento publicado ganha "scope" (o cliente mapeia os ids p/ o espaço
+    "{scope}:{id}"). Linhas antigas (sem "type", geradas antes do ctx) viram
+    activation. Criado/removido pelo ScopeWatcher conforme o diretório do
+    escopo aparece/desaparece (stop() encerra o thread)."""
 
     daemon = True
 
-    def __init__(self, log_path: str, broadcaster: Broadcaster):
+    def __init__(self, scope: str, log_path: str, broadcaster: Broadcaster):
         super().__init__()
+        self.scope = scope
         self.log_path = log_path
         self.broadcaster = broadcaster
+        self._stop_evt = threading.Event()
+
+    def stop(self):
+        """Para o tail (chamado pelo ScopeWatcher quando o escopo some)."""
+        self._stop_evt.set()
 
     def run(self):
+        # Espera o arquivo nascer (escopo novo ainda sem ativações) — até stop.
         pos = 0
-        while True:
+        while not self._stop_evt.is_set():
             try:
                 with open(self.log_path, "r", encoding="utf-8") as f:
                     f.seek(0, 2)
                     pos = f.tell()
                 break
             except FileNotFoundError:
-                time.sleep(1.0)
+                self._stop_evt.wait(1.0)
 
-        while True:
+        while not self._stop_evt.is_set():
             try:
                 with open(self.log_path, "r", encoding="utf-8") as f:
                     f.seek(pos)
@@ -631,11 +838,87 @@ class ActivationTailer(threading.Thread):
                         except json.JSONDecodeError:
                             continue
                         evt.setdefault("type", "activation")
+                        evt["scope"] = self.scope   # multi-escopo: dono do log
                         self.broadcaster.publish(evt)
                     pos = f.tell()
             except FileNotFoundError:
-                pass
-            time.sleep(0.25)
+                pass   # log removido/recriado — reabre no próximo tick
+            self._stop_evt.wait(0.25)
+
+
+class ScopeWatcher(threading.Thread):
+    """V2 (multi-escopo): dois serviços leves.
+      1. TAILERS — mantém um ActivationTailer POR escopo: db root (geral) +
+         cada db/<slug>/ (projeto). Escopo novo → tailer nasce (e passa a
+         publicar ativações com "scope"); diretório removido → tailer é
+         parado e sai da lista.
+      2. BADGE — consulta a memory API (GET /status → project.active_scope)
+         e publica {"type":"scope_switch","scope"} quando muda, pra UI
+         destacar o escopo ativo na legenda de escopos. NÃO retargeta paths:
+         o grafo agora cobre TODOS os escopos ao mesmo tempo.
+    Best-effort: memory offline → mantém o badge atual e tenta de novo."""
+
+    daemon = True
+
+    def __init__(self, state: GraphState, broadcaster: Broadcaster,
+                 memory_api: str | None = None, interval: float = 2.0):
+        super().__init__()
+        self.state = state
+        self.broadcaster = broadcaster
+        self.memory_api = memory_api.rstrip("/") if memory_api else None
+        self.interval = interval
+        self.tailers: dict[str, ActivationTailer] = {}   # scope -> tailer
+        self._last_badge: str | None = None
+
+    def _fetch_active_scope(self) -> str | None:
+        """GET /status na memory API → escopo ativo (best-effort). None =
+        falha/offline (mantém o badge atual)."""
+        req = urllib.request.Request(f"{self.memory_api}/status")
+        tok = internal_token()
+        if tok:
+            req.add_header("Authorization", f"Bearer {tok}")
+        try:
+            with urllib.request.urlopen(req, timeout=3.0) as r:
+                proj = json.loads(r.read().decode("utf-8")).get("project") or {}
+                return proj.get("active_scope")
+        except Exception:
+            return None
+
+    def _sync_tailers(self):
+        """Cria tailer p/ escopo novo, para o de escopo removido."""
+        logs = self.state.scope_log_paths()
+        for scope, path in logs.items():
+            if scope not in self.tailers:
+                t = ActivationTailer(scope, path, self.broadcaster)
+                self.tailers[scope] = t
+                t.start()
+                print(f"[graph] tailer de ativações: '{scope}' → {path}")
+        for scope in list(self.tailers):
+            if scope not in logs:
+                self.tailers.pop(scope).stop()
+                print(f"[graph] tailer removido: escopo '{scope}' desapareceu")
+
+    def run(self):
+        self._sync_tailers()   # tailers do boot (idempotente no loop)
+        if self.memory_api:
+            print(f"[graph] escopo ativo: seguindo {self.memory_api}/status")
+            first = self._fetch_active_scope()
+            if first:
+                self.state.active_scope = first
+                self._last_badge = first   # 1º fetch só registra — sem "troca"
+        while True:
+            time.sleep(self.interval)
+            self._sync_tailers()
+            if not self.memory_api:
+                continue   # standalone: só tailers, sem badge
+            scope = self._fetch_active_scope()
+            if scope and scope != self._last_badge:
+                self.state.active_scope = scope
+                self._last_badge = scope
+                self.broadcaster.publish({
+                    "type": "scope_switch", "scope": scope, "ts": time.time(),
+                })
+                print(f"[graph] escopo ativo → '{scope}'")
 
 
 class GraphPoller(threading.Thread):
@@ -666,7 +949,7 @@ class GraphPoller(threading.Thread):
 #                                HTTP HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_handler(state: GraphState, broadcaster: Broadcaster, activation_log: str):
+def make_handler(state: GraphState, broadcaster: Broadcaster):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass  # silencia log padrão
@@ -697,20 +980,27 @@ def make_handler(state: GraphState, broadcaster: Broadcaster, activation_log: st
                     n = 50
                 n = max(1, min(n, 500))
                 events: list[dict] = []
-                try:
-                    with open(activation_log, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                evt = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            evt.setdefault("type", "activation")
-                            events.append(evt)
-                except FileNotFoundError:
-                    pass
+                # NEW (multi-escopo): funde TODOS os logs de escopo (geral +
+                # projetos), taggeia cada evento com "scope" e ordena por
+                # timestamp — o replay mostra ativações de qualquer projeto
+                # em ordem cronológica real.
+                for scope, log_path in state.scope_log_paths().items():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    evt = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                evt.setdefault("type", "activation")
+                                evt.setdefault("scope", scope)
+                                events.append(evt)
+                    except FileNotFoundError:
+                        pass
+                events.sort(key=lambda e: e.get("ts") or 0)
                 self._json({"events": events[-n:], "ts": time.time()})
             elif path == "/events":
                 self.send_response(200)
@@ -770,6 +1060,26 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   /* ── Status (topo-direita) ── */
   #status { position:absolute; top:14px; right:16px; z-index:10; font-size:12px; color:#8ecae6; }
+
+  /* ── NEW (multi-escopo): legenda de escopos (topo-centro) — um chip por
+     escopo de memória (geral + projetos), contagem, badge "ativo" e toggle */
+  #scopeBar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%); z-index:10;
+    background:rgba(16,18,26,0.92); border:1px solid #232738; border-radius:12px;
+    padding:7px 14px; font-size:11.5px; display:flex; gap:10px; align-items:center;
+    flex-wrap:wrap; max-width:56vw;
+  }
+  #scopeBar .sbTitle { text-transform:uppercase; letter-spacing:.08em; color:#7a819a; font-size:10px; }
+  #scopeChips { display:inline-flex; gap:6px; flex-wrap:wrap; }
+  .scopeChip { display:inline-flex; align-items:center; gap:5px; cursor:pointer;
+    padding:3px 10px; border-radius:10px; border:1px solid #33384a; background:#141724;
+    color:#cdd3e0; user-select:none; white-space:nowrap; }
+  .scopeChip:hover { background:#1c2032; }
+  .scopeChip .dot { width:9px; height:9px; border-radius:50%; display:inline-block; }
+  .scopeChip .cnt { color:#8a90a5; }
+  .scopeChip.off { opacity:.35; text-decoration:line-through; }
+  .scopeChip .act { font-size:9px; padding:0 6px; border-radius:6px;
+    background:#51cf6622; color:#51cf66; text-transform:uppercase; letter-spacing:.05em; }
 
   /* ── Legenda (rodapé) ── */
   #legend {
@@ -857,6 +1167,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="row"><button id="resetBtn">reset view</button></div>
 </div>
 
+<div id="scopeBar"><span class="sbTitle">escopos</span><span id="scopeChips"></span></div>
+
 <div id="status">conectando…</div>
 <div id="network"></div>
 
@@ -869,7 +1181,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <span><i class="chip node" style="background:#ffd166"></i>PPR</span>
   <span><i class="chip node" style="background:#51cf66"></i>novo</span>
   <span><i class="chip node" style="background:#38d9a9"></i>tool (⬡ MCP/nativa)</span>
-  <span><i class="chip node" style="background:#b197fc"></i>plano (⬥ p{id})</span>
+  <span><i class="chip node" style="background:#b197fc"></i>plano (⬥ {escopo}:p{id})</span>
+  <span><i class="chip node" style="background:#4dabf7"></i>borda do nó = escopo (geral/projeto)</span>
   <span style="opacity:.65">espessura = peso da aresta · tamanho = grau + ativação</span>
 </div>
 
@@ -901,6 +1214,47 @@ const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = 
 // o card à memória LT que representa a pessoa no grafo Hebbiano
 const PERSON_NODE_BG = '#40232a', PERSON_NODE_BORDER = '#f783ac', PERSON_FONT_COLOR = '#ffdeeb';
 const FONT_COLOR   = '#9aa0b4';
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NEW (multi-escopo): paleta + SETORES por escopo — cada escopo de memória
+//  ("geral" + db/<slug>/ do projeto) ganha COR de borda própria e um SETOR
+//  espacial próprio; tools/MCP/pessoas são GLOBAIS (scope null → núcleo
+//  central compartilhado, pois se ligam a todos os escopos).
+// ═══════════════════════════════════════════════════════════════════════════
+const SCOPE_PALETTE = ['#4dabf7', '#ffd166', '#ff922b', '#63e6be', '#f783ac',
+                       '#b197fc', '#38d9a9', '#e599f7', '#a9e34b', '#74c0fc'];
+const GOLDEN_ANGLE = 2.39996323;   // rad — distribui setores sem saber n total
+const scopeOrder = [];             // escopos em ordem de aparição (geral primeiro)
+const scopeColorMap = new Map();   // scope -> cor (atribuída por ordem de aparição)
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+function scopeIndex(scope) {
+  if (!scopeOrder.includes(scope)) scopeOrder.push(scope);
+  return scopeOrder.indexOf(scope);
+}
+function scopeColor(scope) {
+  if (!scope) return BASE_NODE_BORDER;   // global: borda neutra original
+  scopeIndex(scope);                     // garante registro na ordem
+  if (!scopeColorMap.has(scope))
+    scopeColorMap.set(scope, SCOPE_PALETTE[scopeColorMap.size % SCOPE_PALETTE.length]);
+  return scopeColorMap.get(scope);
+}
+// Posição inicial (seed da física): setor do escopo, raio por tipo, jitter
+// estável por id (mesmo nó sempre nasce no mesmo lugar do setor).
+function scopePos(meta) {
+  const j = (hashStr(String(meta.id)) % 160) - 80;
+  if (!meta.scope) {   // global (tools/pessoas/MCP): núcleo central
+    return { x: (hashStr('g' + String(meta.id)) % 200) - 100,
+             y: (hashStr('h' + String(meta.id)) % 200) - 100 };
+  }
+  const ang = scopeIndex(meta.scope) * GOLDEN_ANGLE;
+  const r = meta.kind === 'plan' ? 330 : 250;   // planos um anel além das memórias
+  return { x: Math.cos(ang) * r + j, y: Math.sin(ang) * r + j };
+}
 
 const nodes = new vis.DataSet();
 const edges = new vis.DataSet();
@@ -960,10 +1314,13 @@ function baseNodeOptions(meta) {
     id: meta.id, label: meta.label, title: nodeTitle(meta),
     shape: isTool ? 'hexagon' : isPlan ? 'diamond' : isPerson ? 'triangle' : 'dot',
     size: (isTool ? 9 : isPlan ? 8 : isPerson ? 10 : 5) + Math.min(deg, 12) * 1.3,
+    // NEW (multi-escopo): borda na COR DO ESCOPO (memórias e planos);
+    // tools/pessoas globais mantêm as cores próprias dos kinds.
     color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
-                  : isPlan ? { background: PLAN_NODE_BG, border: PLAN_NODE_BORDER }
+                  : isPlan ? { background: PLAN_NODE_BG, border: scopeColor(meta.scope) }
                   : isPerson ? { background: PERSON_NODE_BG, border: PERSON_NODE_BORDER }
-                             : { background: BASE_NODE_BG, border: BASE_NODE_BORDER },
+                             : { background: BASE_NODE_BG, border: scopeColor(meta.scope) },
+    borderWidth: (isTool || isPerson) ? 1 : 2,   // escopo precisa ficar legível
     font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : isPerson ? PERSON_FONT_COLOR : FONT_COLOR, size: 11 },
   };
 }
@@ -974,7 +1331,8 @@ function nodeTitle(meta) {
       const d = new Date((t || 0) * 1000);
       return isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
     };
-    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PLAN_FONT_COLOR}">v${meta.version ?? '?'}</span><br>` +
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${PLAN_FONT_COLOR}">v${meta.version ?? '?'}</span>` +
+           ` <span style="color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span><br>` +
            `<i>${meta.title || '(sem descrição)'}</i><br>` +
            `${meta.steps_count ?? '?'} passo(s) · criado: ${fmt(meta.created_at)} · atualizado: ${fmt(meta.updated_at)}`;
   }
@@ -999,7 +1357,7 @@ function nodeTitle(meta) {
   }
   const d = new Date((meta.created_at || 0) * 1000);
   const dateStr = isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
-  return `<b>#${meta.id}</b> (${TYPE_STYLE ? '' : ''}${(meta.source || '?')})<br>` +
+  return `<b>#${meta.id}</b> <span style="color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span> (${(meta.source || '?')})<br>` +
          `<i>${meta.title || ''}</i><br>` +
          `confiança: ${Math.round((meta.confidence || 0) * 100)}% · ` +
          `acessos: ${meta.access_count ?? '?'} · criada: ${dateStr}`;
@@ -1022,6 +1380,63 @@ function edgeOptions(meta, isBirth) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  NEW (multi-escopo): legenda de escopos — contagem, badge "ativo" e toggle
+// ═══════════════════════════════════════════════════════════════════════════
+let activeScope = 'general';      // escopo em uso na TUI (badge verde) —
+                                  // memory_config.GENERAL_SCOPE = "general"
+let serverScopes = [];            // lista de escopos do servidor (boot: /graph)
+const hiddenScopes = new Set();   // escopos desligados (toggle do chip)
+
+function renderScopeBar() {
+  const counts = {};
+  for (const m of nodeMeta.values()) {
+    const s = m.scope || '';
+    counts[s] = (counts[s] || 0) + 1;
+  }
+  // escopos nomeados: TODOS os do servidor (mesmo com 0 nós — projeto recém-
+  // criado) + vistos em deltas/switches; globais (tools/pessoas/MCP) no fim.
+  const named = [...serverScopes];
+  for (const s of scopeOrder) if (!named.includes(s)) named.push(s);
+  const extra = counts[''] ? [''] : [];
+  document.getElementById('scopeChips').innerHTML =
+    [...named, ...extra].map(s => {
+      const c = scopeColor(s);
+      const label = s || '🌐 global';
+      const off = hiddenScopes.has(s) ? ' off' : '';
+      const act = (s && s === activeScope) ? '<span class="act">ativo</span>' : '';
+      const safe = escapeHtml(s);
+      return `<span class="scopeChip${off}" data-scope="${safe}" ` +
+             `title="clique: mostrar/esconder '${escapeHtml(label)}'">` +
+             `<i class="dot" style="background:${c}"></i>${escapeHtml(label)} ` +
+             `<span class="cnt">${counts[s] || 0}</span>${act}</span>`;
+    }).join('');
+}
+
+document.getElementById('scopeChips').onclick = (e) => {
+  const chip = e.target.closest('.scopeChip');
+  if (!chip) return;
+  const s = chip.dataset.scope;
+  if (hiddenScopes.has(s)) hiddenScopes.delete(s); else hiddenScopes.add(s);
+  applyScopeVisibility();
+  renderScopeBar();
+};
+
+function applyScopeVisibility() {
+  const nops = [];
+  for (const [id, meta] of nodeMeta) {
+    nops.push({ id, hidden: hiddenScopes.has(meta.scope || '') });
+  }
+  nodes.update(nops);
+  const eops = [];
+  for (const [key, meta] of edgeMeta) {
+    const vid = edgeKeyToId.get(key);
+    if (vid === undefined) continue;
+    eops.push({ id: vid, hidden: hiddenScopes.has(meta.scope || '') });
+  }
+  edges.update(eops);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Aplicação de snapshot / delta
 // ═══════════════════════════════════════════════════════════════════════════
 function applyNodes(list, birth) {
@@ -1033,6 +1448,8 @@ function applyNodes(list, birth) {
     if (nodes.get(meta.id)) updates.push(baseNodeOptions(meta));
     else {
       const opt = baseNodeOptions(meta);
+      const pos = scopePos(meta);   // NEW (multi-escopo): nasce no setor do escopo
+      opt.x = pos.x; opt.y = pos.y;
       if (birth) opt.color = { background: BASE_NODE_BG, border: '#51cf66' };
       nodes.add(opt);
     }
@@ -1103,26 +1520,29 @@ function applyDelta(delta) {
 }
 
 function applyActivation(evt) {
-  // Eventos PPR trazem "graph" ("memory" | "tools") — ids de tool são
-  // prefixados com "t" (os inteiros colidem entre os dois grafos). Linhas
-  // antigas do JSONL sem "graph" eram só de memórias.
-  const prefix = evt.graph === 'tools' ? 't' : '';
+  // Eventos PPR trazem "graph" ("memory" | "tools") e, NEW (multi-escopo),
+  // "scope" (escopo dono do log). Ids de memória viram "{scope}:{id}" (os
+  // inteiros colidem ENTRE escopos); ids de tool são globais → prefixo "t"
+  // sem escopo. Linhas antigas do JSONL sem "graph"/"scope" eram do escopo
+  // raiz ("general" — mesmo valor de memory_config.GENERAL_SCOPE).
+  const scope = evt.scope || 'general';
+  const mapId = (sid) => evt.graph === 'tools' ? 't' + sid : scope + ':' + sid;
   const now = Date.now();
-  const seeds = (evt.seeds || []).map(sid => prefix + sid);
+  const seeds = (evt.seeds || []).map(mapId);
   for (const sid of seeds) {
     if (!nodeMeta.has(sid)) continue;   // semente de nó ainda não visto — será quando o delta chegar
     activation.set(sid, Math.max(activation.get(sid) || 0, 1.0));
     isSeed.set(sid, now);
   }
   for (const [k, v] of Object.entries(evt.rank || {})) {
-    const nid = prefix + parseInt(k, 10);
+    const nid = mapId(parseInt(k, 10));
     if (!nodeMeta.has(nid) || seeds.includes(nid)) continue;
     // rank PPR vem <= PPR_SPREAD_WEIGHT (0.4) — escala p/ brilho visível
     activation.set(nid, Math.max(activation.get(nid) || 0, Math.min(1, v * 2.5)));
   }
   const q = evt.query ? `"${String(evt.query).slice(0, 48)}"` : '(leitura)';
   const st = evt.strategy ? ` [${evt.strategy}]` : '';
-  const g = evt.graph === 'tools' ? ' 🔧tools' : '';
+  const g = evt.graph === 'tools' ? ' 🔧tools' : (scope !== 'general' ? ` @${scope}` : '');
   pushLog(`⚡${g} ${q}${st} → ${Object.keys(evt.rank || {}).length} nós em ${evt.elapsed_ms ?? '?'}ms`);
 }
 
@@ -1232,6 +1652,7 @@ function updateCounts() {
   }
   document.getElementById('counts').innerHTML =
     `memórias: ${nodeMeta.size - tools - plans - people} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · ${parts}`;
+  renderScopeBar();   // NEW (multi-escopo): chips com contagem por escopo
 }
 
 function pushLog(msg) {
@@ -1289,6 +1710,7 @@ function showPanel(id) {
     const fmt = (dd) => isNaN(dd) ? '?' : dd.toLocaleString('pt-BR');
     head = `<h3 style="color:${PLAN_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
       <div class="meta">plano de execução (⬥ ${escapeHtml(String(meta.id))}) · versão: <b>${meta.version ?? '?'}</b> · grau: ${degreeOf(id)}</div>
+      <div class="meta">escopo: <span class="pill" style="background:${scopeColor(meta.scope)}22;color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span></div>
       <div class="meta">passos: ${meta.steps_count ?? '?'} · criado: ${fmt(cu)} · atualizado: ${fmt(uu)}</div>`;
     body = `<div class="text">${escapeHtml(meta.description || '(sem descrição — edite na TUI via Ctrl+S → planos)')}</div>`;
   } else if (isTool) {
@@ -1306,7 +1728,8 @@ function showPanel(id) {
   } else {
     const conf = Math.round((meta.confidence || 0) * 100);
     const confColor = conf >= 80 ? '#51cf66' : conf >= 55 ? '#ffd166' : '#ff6b6b';
-    head = `<h3>#${meta.id} — memória LT</h3>
+    head = `<h3>#${escapeHtml(String(meta.id))} — memória LT</h3>
+      <div class="meta">escopo: <span class="pill" style="background:${scopeColor(meta.scope)}22;color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span></div>
       <div class="meta">fonte: ${meta.source || '?'} · grau: ${degreeOf(id)}</div>
       <div class="meta">criada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')} · acessos: ${meta.access_count ?? '?'}</div>
       <div class="meta">confiança: <span style="color:${confColor}"><b>${conf}%</b></span>
@@ -1442,15 +1865,26 @@ es.onmessage = (ev) => {
   let evt;
   try { evt = JSON.parse(ev.data); } catch { return; }
   if (evt.type === 'graph_delta') applyDelta(evt);
+  else if (evt.type === 'scope_switch') {
+    // NEW (multi-escopo): badge "ativo" anda de escopo (POST /project/switch
+    // na TUI) — o grafo continua mostrando TODOS os escopos.
+    activeScope = evt.scope || 'general';
+    if (evt.scope && !serverScopes.includes(evt.scope)) serverScopes.push(evt.scope);
+    renderScopeBar();
+    pushLog(`◆ escopo ativo → '<b>${escapeHtml(evt.scope ?? '?')}</b>' (projeto em uso na TUI)`);
+  }
   else applyActivation(evt);          // "activation" ou linhas antigas sem type
 };
 
 (async () => {
   try {
     const g = await (await fetch('/graph')).json();
+    (g.scopes || []).forEach(s => scopeColor(s));   // cores/setores na ordem do servidor
+    serverScopes = g.scopes || [];
+    activeScope = g.active_scope || 'general';
     applyNodes(g.nodes || [], false);
     applyEdges(g.edges || [], false);
-    pushLog(`snapshot: ${nodeMeta.size} nós, ${edgeMeta.size} arestas`);
+    pushLog(`snapshot: ${nodeMeta.size} nós, ${edgeMeta.size} arestas · ${scopeOrder.length} escopo(s)`);
     tick();
   } catch (err) {
     pushLog(`falha no snapshot inicial: ${err}`);
@@ -1476,10 +1910,19 @@ def main():
     ap.add_argument("--mcp-db", default="./Modules/mcp_manager/db/ava_mcp_servers.db",
                     help="registry do mcp_manager (Rust, HOST) — opcional; fusão por "
                          "graph_name: conteúdo/snippet/enabled vêm daqui, arestas da ToolsDB")
-    ap.add_argument("--log", default="./Modules/memory/db/activation_log.jsonl")
+    ap.add_argument("--memory-api", nargs="?", const="__default__", default=None,
+                    help="NEW (multi-escopo): URL da memory API — lê o ESCOPO ATIVO "
+                         "(GET /status → project.active_scope) e publica o badge "
+                         "scope_switch; o grafo cobre TODOS os escopos ao mesmo tempo. "
+                         "Flag sem valor → http://<bind>:3000; flag ausente → "
+                         "standalone (tailers por escopo, sem badge)")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
     args = ap.parse_args()
+
+    memory_api_url = args.memory_api
+    if memory_api_url == "__default__":
+        memory_api_url = f"http://{internal_bind_host()}:3000"
 
     state = GraphState(args.db, args.tools_db, args.plans_db, args.mcp_db,
                        args.people_db)
@@ -1491,25 +1934,31 @@ def main():
         extra = f"+{len(delta['edges']['added'])} arestas desde o último poll"
     else:
         extra = "nada novo"
-    tools_n = sum(1 for n in snap["nodes"] if n.get("kind") == "tool")
-    plans_n = sum(1 for n in snap["nodes"] if n.get("kind") == "plan")
-    people_n = sum(1 for n in snap["nodes"] if n.get("kind") == "person")
-    print(f"Grafo carregado: {len(snap['nodes'])} nós "
-          f"({tools_n} tools, {plans_n} planos, {people_n} people cards), "
+    # NEW (multi-escopo): contagens POR ESCOPO no boot (geral + projetos).
+    by_scope: dict[str, int] = {}
+    for n in snap["nodes"]:
+        s = n.get("scope") or "(global)"
+        by_scope[s] = by_scope.get(s, 0) + 1
+    parts = [f"{s}: {c}" for s, c in by_scope.items()]
+    print(f"Grafo carregado: {len(snap['nodes'])} nós ({', '.join(parts) or 'vazio'}), "
           f"{len(snap['edges'])} arestas ({extra})")
 
     broadcaster = Broadcaster()
 
-    tailer = ActivationTailer(args.log, broadcaster)
-    tailer.start()
+    # NEW (multi-escopo): o ScopeWatcher mantém UM tailer POR escopo (geral +
+    # projetos — todos simultâneos) e publica o badge do escopo ativo lido da
+    # memory API. Standalone (sem --memory-api): só tailers, sem badge.
+    watcher = ScopeWatcher(state, broadcaster, memory_api=memory_api_url)
+    watcher.start()
 
     poller = GraphPoller(state, broadcaster, interval=args.poll)
     poller.start()
 
-    handler = make_handler(state, broadcaster, args.log)
+    handler = make_handler(state, broadcaster)
     server = ThreadingHTTPServer(("127.9.12.22", args.port), handler)
     print(f"Abra http://127.9.12.22:{args.port} no navegador.")
-    print(f"Polling de diff: {args.poll}s · ativações: {args.log}")
+    print(f"Polling de diff: {args.poll}s · escopos: {', '.join(s for s, _, _ in state._discover_scopes())}"
+          + (f" · badge do escopo ativo: {memory_api_url}" if memory_api_url else " · standalone"))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -337,6 +337,24 @@ async def plans_delete(req: mem.PlanDeleteRequest):
     return await mem.plan_delete(req)
 
 
+# ── NEW: Escopos (modo geral × projetos) ─────────────────────────────────────────
+# Rota estática /project/current e /project/switch ANTES de /project/{slug}.
+
+@app.get("/project/current", response_model=mem.ScopeInfoResponse)
+async def project_current():
+    return await mem.project_current()
+
+
+@app.post("/project/switch", response_model=mem.ScopeInfoResponse)
+async def project_switch(req: mem.ScopeSwitchRequest):
+    return await mem.project_switch(req)
+
+
+@app.delete("/project/{slug}", response_model=mem.ScopeDeleteResponse)
+async def project_delete(slug: str):
+    return await mem.project_delete(slug)
+
+
 # ── Status ───────────────────────────────────────────────────────────────────────
 
 @app.get("/status")

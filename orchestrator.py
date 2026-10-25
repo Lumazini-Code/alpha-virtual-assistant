@@ -71,6 +71,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -334,6 +335,120 @@ def _save_persona(text: str) -> None:
 _PERSONA = _load_persona()
 
 
+# ── Preferências da TUI (resource/settings.json) ─────────────────────────────
+# Hoje só o Memory Watch (vigia de confiança do LLM.py), mas o arquivo é
+# genérico para as próximas chaves. O vigia é opt-in por request
+# (`watch_confidence` no ChatRequest do LLM.py): aqui persistimos a escolha
+# do usuário (feita na aba /settings da TUI) e o orchestrator injeta o flag
+# nos requests de chat — no proxy /chat (modo CHAT) e no _llm_chat_stream
+# (modo TOOLS do /execute; o LLM.py protege tool_calls em montagem).
+SETTINGS_DEFAULT = {"watch_confidence": False}
+
+SETTINGS_FILE = Path(
+    os.getenv("SETTINGS_FILE")
+    or Path(__file__).resolve().parent / "resource" / "settings.json"
+)
+
+
+def _load_settings() -> dict:
+    """Settings persistidos (resource/settings.json) ou os defaults. Arquivo
+    ausente/corrompido degrada silenciosamente para o default — nunca derruba
+    o boot por causa de uma preferência."""
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {**SETTINGS_DEFAULT, **data}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Settings: falha ao ler {SETTINGS_FILE} — usando defaults: {e}")
+    return dict(SETTINGS_DEFAULT)
+
+
+def _save_settings(settings: dict) -> None:
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+_SETTINGS = _load_settings()
+_WATCH_CONFIDENCE = bool(_SETTINGS.get("watch_confidence", False))
+
+
+# ── NEW: Registro de projetos (resource/projects.json) ────────────────────────
+# Metadados dos projetos = escopos de memória (memory: LT + grafo Hebbiano +
+# planos + arquivos indexados + KG-RAG em Modules/memory/db/<slug>/; ST,
+# dicionários, pessoas e RAG de tools são globais). O slug vira o NOME DO
+# DIRETÓRIO do escopo — validado contra ^[a-z0-9][a-z0-9_-]{0,63}$ (mesma
+# regra da memory; "general" é reservado). O arquivo só guarda metadados:
+# o estado de verdade do escopo ativo vive no PROCESSO da memory — que é
+# reiniciado pelo start.sh (restart_on_fail), então o orchestrator RE-AFIRMA
+# o escopo a cada turno (_ensure_memory_scope: /project/current vs registry,
+# /project/switch se divergir).
+PROJECTS_DEFAULT = {"active": "general", "projects": []}
+
+PROJECTS_FILE = Path(
+    os.getenv("PROJECTS_FILE")
+    or Path(__file__).resolve().parent / "resource" / "projects.json"
+)
+
+_PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _slugify(name: str) -> str:
+    """Nome do projeto → slug de diretório: minúsculas, espaços/hífens → '_',
+    resto de [^a-z0-9_-] removido, colapsa '_' e tira bordas. Vazio/invalido
+    após a limpeza → vazio (caller recusa)."""
+    slug = re.sub(r"[^a-z0-9_-]+", "_", name.strip().lower().replace(" ", "_"))
+    slug = re.sub(r"_+", "_", slug).strip("_-")
+    return slug if _PROJECT_SLUG_RE.match(slug or "") else ""
+
+
+def _load_projects() -> dict:
+    """Registro persistido (resource/projects.json) ou o default. Mesma
+    política do settings: arquivo ausente/corrompido degrada silenciosamente."""
+    try:
+        data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            merged = {**PROJECTS_DEFAULT, **data}
+            merged["projects"] = [
+                p for p in merged.get("projects", [])
+                if isinstance(p, dict) and _PROJECT_SLUG_RE.match(str(p.get("slug", "")))
+                and p.get("slug") != "general"
+            ]
+            if merged.get("active") != "general" and not any(
+                p["slug"] == merged["active"] for p in merged["projects"]
+            ):
+                merged["active"] = "general"
+            return merged
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Projetos: falha ao ler {PROJECTS_FILE} — usando defaults: {e}")
+    return {**PROJECTS_DEFAULT, "projects": []}
+
+
+def _save_projects() -> None:
+    PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROJECTS_FILE.write_text(
+        json.dumps(_PROJECTS, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+_PROJECTS = _load_projects()
+
+
+def _project_active() -> str:
+    return _PROJECTS.get("active") or "general"
+
+
+def _project_by_slug(slug: str) -> Optional[dict]:
+    return next((p for p in _PROJECTS.get("projects", []) if p.get("slug") == slug), None)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Data Models
 # ══════════════════════════════════════════════════════════════════════════════
@@ -552,6 +667,29 @@ async def _memory_request(method: str, path: str, json_body: Optional[dict] = No
         return None
     return r.json()
 
+
+async def _ensure_memory_scope() -> str:
+    """NEW (projetos): re-afirma o escopo ativo DESEJADO (registry) no
+    processo da memory. A memory é reiniciada pelo start.sh (restart_on_fail)
+    e volta sempre no escopo 'general' — sem o re-assert, um projeto ativo
+    "sumiria" no meio de uma conversa depois de qualquer restart. Compara
+    GET /project/current com o registry; divergente → POST /project/switch.
+    Best-effort: memory offline → só loga e segue (o recall degrada como
+    sempre). Retorna o slug desejado (p/ hint no system prompt)."""
+    desired = _project_active()
+    try:
+        cur = await _memory_request("GET", "/project/current")
+        current = (cur or {}).get("scope")
+        if current == desired:
+            return desired
+        await _memory_request("POST", "/project/switch", {"scope": desired})
+        log.warning(
+            f"Projetos: escopo da memory divergiu ('{current}' ≠ registry '{desired}') — re-afirmado"
+        )
+    except Exception as e:
+        log.warning(f"Projetos: falha ao re-afirmar escopo '{desired}' na memory: {e}")
+    return desired
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Iniciando AVA Orchestrator (tool-calling engine, sem router/CoT)...")
@@ -598,6 +736,10 @@ async def lifespan(app: FastAPI):
     # transcribe (host): /speaker/embed roda fbank + CAM++ (~200ms por
     # gravação de 5s) — timeout finito e generoso.
     state.transcribe_client = _make_client(TRANSCRIBE_HTTP_URL, 30.0)
+
+    # NEW (projetos): re-afirma o escopo ativo do registry na memory recém
+    # (re)iniciada — boot é o ponto crítico do restart_on_fail do start.sh.
+    await _ensure_memory_scope()
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
@@ -2281,7 +2423,7 @@ class _LLMNoRetryError(RuntimeError):
 
 async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = None,
                            temperature: float = 0.0, max_tokens: Optional[int] = None,
-                           on_delta=None) -> dict:
+                           on_delta=None, session_id: Optional[str] = None) -> dict:
     """
     Variante STREAMING de _llm_chat: fala com o /chat/stream do LLM.py no modo
     TOOLS (messages + tools) e consome o SSE devolvido. Cada fragmento de
@@ -2289,6 +2431,10 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     streaming de verdade no /execute (o /chat/tools síncrono só devolve a
     mensagem completa no FIM da geração, e era por isso que a resposta chegava
     na UI de uma vez).
+
+    `session_id`: sessão da TUI repassada ao LLM.py — usada pelo Memory Watch
+    (watch_confidence) na leitura de memória da correção; sem o flag ligado
+    não tem efeito prático, mas custa nada.
 
     As tool_calls do backend só ficam completas no fim da geração — o LLM.py
     as acumula e emite UMA vez no evento {"tool_calls": [...]}, logo antes do
@@ -2302,7 +2448,10 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     stream se esgotarem, cai EM UM fallback para o /chat/tools síncrono.
     """
     payload: dict = {"messages": messages, "temperature": temperature,
-                     "stream_reasoning": False}
+                     "stream_reasoning": False,
+                     "watch_confidence": _WATCH_CONFIDENCE}
+    if session_id:
+        payload["session_id"] = session_id
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -2389,12 +2538,15 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
 
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
                           mcp_tool_names: Optional[dict[str, str]] = None,
-                          plans_hint: Optional[str] = None) -> str:
+                          plans_hint: Optional[str] = None,
+                          active_project: Optional[str] = None) -> str:
     """`mcp_tool_names`: nome da tool MCP -> descrição, já carregadas pela
     etapa 2 da descoberta (_load_mcp_tools) para ESTA rodada específica —
     somadas às tools nativas (TOOLS) na listagem final do prompt.
     `plans_hint`: bloco opcional com planos salvos relevantes ao pedido
-    (gerado por _recall_plans) — orienta o modelo a preferir run_plan."""
+    (gerado por _recall_plans) — orienta o modelo a preferir run_plan.
+    `active_project`: slug do projeto ativo (escopo de memória) — injeta o
+    hint de escopo (NEW projetos)."""
     lang_names = {
         "pt": "Portuguese (Brazil)", "en": "English", "es": "Spanish",
         "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
@@ -2410,6 +2562,15 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "Always reply in the same language the user wrote their message in"
         + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
         + " Never switch languages mid-conversation unless the user does.",
+        # ── NEW (projetos): hint de escopo — o modelo precisa saber que as
+        # memórias recuperadas podem vir do escopo do projeto E do geral, e
+        # que fatos NOVOS devem ser gravados no contexto do projeto ativo.
+        *([
+            f"Active project: {active_project}. Your long-term memory currently "
+            f"merges this project's dedicated memory scope with your general memory; "
+            f"when you save new facts with the memory write tool, they belong to this "
+            f"project's context."
+        ] if active_project else []),
         "",
         "You have live tool access (web search, memory, etc.) — you are NOT "
         "limited to a static training cutoff and you DO have a way to get current "
@@ -2554,6 +2715,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     """
     depth, think_instruction = await _think_instruction(req.input)
 
+    # ── NEW (projetos): re-afirma o escopo ativo (registry → memory) ANTES do
+    # recall — a memory pode ter reiniciado e voltado ao 'general'. O slug
+    # também vira hint no system prompt.
+    active_project = await _ensure_memory_scope()
+
     # ── A: Recall de memória em background ──────────────────────────────────
     # Dispara JÁ, em paralelo com a descoberta de tools — o custo do recall
     # (2 round-trips HTTP para a memory_api) fica escondido atrás do handshake
@@ -2581,7 +2747,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang,
                                          mcp_tool_names=mcp_descriptions,
-                                         plans_hint=plans_hint)
+                                         plans_hint=plans_hint,
+                                         active_project=(
+                                             active_project
+                                             if active_project != "general" else None
+                                         ))
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
     if recall_block:
@@ -2714,7 +2884,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
         if on_delta is not None:
             message = await _llm_chat_stream(history, tools=tools_schema,
-                                             temperature=0.3, on_delta=on_delta)
+                                             temperature=0.3, on_delta=on_delta,
+                                             session_id=sid)
         else:
             message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
         tool_calls = message.get("tool_calls") or []
@@ -3512,7 +3683,10 @@ async def read_url(req: ReadUrlRequest):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
-        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts})
+        # NEW (projetos): re-afirma o escopo ativo antes do turno (LLM.py lê
+        # memória por conta própria no modo CHAT) e repassa o slug.
+        await _ensure_memory_scope()
+        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts, "watch_confidence": _WATCH_CONFIDENCE, "active_project": _project_active() if _project_active() != "general" else None})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -3617,6 +3791,132 @@ async def set_persona(req: PersonaRequest):
         raise HTTPException(500, f"Falha ao persistir persona: {e}")
     log.info(f"Persona atualizada ({len(_PERSONA)} chars) — {PERSONA_FILE}")
     return {"persona": _PERSONA}
+
+
+# ── Memory Watch (vigia de confiança do LLM.py) ──────────────────────────────
+# Toggle da aba /settings da TUI. O flag é injetado como `watch_confidence`
+# nos requests de chat ao LLM.py (proxy /chat e _llm_chat_stream) — vale no
+# próximo turno, sem restart (mesmo contrato da persona).
+
+class WatchConfidenceRequest(BaseModel):
+    enabled: bool = Field(..., description="True = vigia ligado; False = desligado.")
+
+
+@app.get("/settings/watch-confidence")
+async def get_watch_confidence():
+    return {"enabled": _WATCH_CONFIDENCE, "default": SETTINGS_DEFAULT["watch_confidence"]}
+
+
+@app.put("/settings/watch-confidence")
+async def set_watch_confidence(req: WatchConfidenceRequest):
+    """Liga/desliga o Memory Watch. Persistido em resource/settings.json —
+    surte efeito IMEDIATO no próximo turno (sem restart)."""
+    global _WATCH_CONFIDENCE
+    _WATCH_CONFIDENCE = bool(req.enabled)
+    _SETTINGS["watch_confidence"] = _WATCH_CONFIDENCE
+    try:
+        _save_settings(_SETTINGS)
+    except Exception as e:
+        raise HTTPException(500, f"Falha ao persistir settings: {e}")
+    log.info(f"Memory Watch {'ATIVADO' if _WATCH_CONFIDENCE else 'DESATIVADO'} — {SETTINGS_FILE}")
+    return {"enabled": _WATCH_CONFIDENCE}
+
+
+# ── NEW: Projetos (escopos de memória) — aba /projects da TUI ─────────────────
+# Registry em resource/projects.json; o estado real do escopo vive no processo
+# da memory — criar/ativar/desativar/apagar refletem o registry e chamam a
+# memory via /project/* (switch abre o diretório db/<slug>/ sob demanda).
+
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+
+
+@app.get("/projects")
+async def list_projects():
+    return {"active": _project_active(), "projects": _PROJECTS.get("projects", [])}
+
+
+@app.post("/projects")
+async def create_project(req: ProjectCreateRequest):
+    """Cria um projeto e ATIVA na hora (fluxo natural da TUI: criou → entrou).
+    Slug dedup por similaridade é recusado com 409 (nome → slug determinístico)."""
+    slug = _slugify(req.name)
+    if not slug:
+        raise HTTPException(400, "nome não produz um slug válido ([a-z0-9][a-z0-9_-], 1-64)")
+    if _project_by_slug(slug) is not None:
+        raise HTTPException(409, f"Projeto '{slug}' já existe")
+    project = {
+        "slug": slug,
+        "name": req.name.strip(),
+        "created_at": time.time(),
+    }
+    _PROJECTS["projects"].append(project)
+    try:
+        # Abre/ativa o escopo na memory ANTES de persistir o registry — se a
+        # memory estiver fora, o projeto fica no registry mas não ativa
+        # (o re-assert por turno tenta de novo).
+        await _memory_request("POST", "/project/switch", {"scope": slug})
+        _PROJECTS["active"] = slug
+        _save_projects()
+    except Exception as e:
+        _PROJECTS["projects"].pop()
+        raise HTTPException(502, f"Memory não ativou o escopo '{slug}': {e}")
+    log.info(f"Projeto criado e ativado: '{slug}' ({req.name.strip()!r})")
+    return {"active": slug, "project": project}
+
+
+@app.post("/projects/{slug}/activate")
+async def activate_project(slug: str):
+    """Ativa um projeto existente (switch na memory + registry)."""
+    if slug == "general":
+        raise HTTPException(400, "use POST /projects/deactivate para voltar ao modo geral")
+    project = _project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Projeto '{slug}' não existe")
+    try:
+        await _memory_request("POST", "/project/switch", {"scope": slug})
+    except Exception as e:
+        raise HTTPException(502, f"Memory não ativou o escopo '{slug}': {e}")
+    project["last_activated_at"] = time.time()
+    _PROJECTS["active"] = slug
+    _save_projects()
+    log.info(f"Projeto ativado: '{slug}'")
+    return {"active": slug}
+
+
+@app.post("/projects/deactivate")
+async def deactivate_project():
+    """Volta ao modo geral (sem projeto) — o escopo do projeto continua no
+    registry, apenas desativado."""
+    try:
+        await _memory_request("POST", "/project/switch", {"scope": "general"})
+    except Exception as e:
+        raise HTTPException(502, f"Memory não desativou o escopo: {e}")
+    _PROJECTS["active"] = "general"
+    _save_projects()
+    log.info("Projeto desativado — modo geral")
+    return {"active": "general"}
+
+
+@app.delete("/projects/{slug}")
+async def delete_project(slug: str):
+    """Apaga um projeto: desativa (se ativo) e remove o diretório do escopo
+    INTEIRO na memory (LT, grafo, planos, arquivos indexados). O registro
+    some do registry — ação destrutiva e irreversível."""
+    project = _project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Projeto '{slug}' não existe")
+    try:
+        if _project_active() == slug:
+            await _memory_request("POST", "/project/switch", {"scope": "general"})
+            _PROJECTS["active"] = "general"
+        await _memory_request("DELETE", f"/project/{slug}")
+    except Exception as e:
+        raise HTTPException(502, f"Memory não removeu o escopo '{slug}': {e}")
+    _PROJECTS["projects"] = [p for p in _PROJECTS["projects"] if p.get("slug") != slug]
+    _save_projects()
+    log.info(f"Projeto apagado: '{slug}'")
+    return {"deleted": True, "slug": slug, "active": _project_active()}
 
 
 if __name__ == "__main__":

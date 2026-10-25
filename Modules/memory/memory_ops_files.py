@@ -19,9 +19,13 @@ from memory_config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     EMBED_DIM,
+    GENERAL_SCOPE,
     IF_EMBED_BATCH_SIZE,
     IF_MAX_CONTENT_SIZE,
+    encode_ref,
+    is_general_ref,
     log,
+    ref_real_id,
 )
 from memory_models import (
     IndexedFileCheckResponse,
@@ -38,6 +42,55 @@ from memory_vector import _chunk_text
 # ══════════════════════════════════════════════════════════════════════════════
 # NEW: Arquivos Indexados — /indexed-file/*
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _if_backend_for_file_id(file_id: int):
+    """Resolve (if_db, if_index, real_id, out_id) a partir de uma id de
+    arquivo — offset-aware (projetos). Id composta (offset +10^12) → escopo
+    geral. Id crua → escopo ativo primeiro; não achou → sonda o geral (o
+    arquivo foi indexado em outro modo). `out_id`: id de resposta (crua para
+    o escopo ativo; composta quando o dono é o geral com projeto ativo)."""
+    gen = state.scopes.get(GENERAL_SCOPE)
+    if is_general_ref(file_id):
+        real = ref_real_id(file_id)
+        if gen is None:
+            return None
+        row = gen.if_db.get_by_id(real)
+        if row is None:
+            return None
+        return gen.if_db, gen.if_index, row, file_id
+    row = state.if_db.get_by_id(file_id)
+    if row is not None:
+        return state.if_db, state.if_index, row, file_id
+    if gen is not None:
+        row = gen.if_db.get_by_id(file_id)
+        if row is not None:
+            return gen.if_db, gen.if_index, row, encode_ref(GENERAL_SCOPE, file_id)
+    return None
+
+
+def _if_backend_for_chunk_id(chunk_id: int):
+    """Mesma resolução de _if_backend_for_file_id para ids de CHUNK (sequência
+    própria de cada escopo). Retorna (if_db, real_chunk_id)."""
+    gen = state.scopes.get(GENERAL_SCOPE)
+    if is_general_ref(chunk_id):
+        if gen is None:
+            return None
+        return gen.if_db, ref_real_id(chunk_id)
+    return state.if_db, chunk_id
+
+
+def _if_backend_for_path(file_path: str):
+    """Resolve (if_db, if_index, row) por caminho — escopo ativo primeiro,
+    geral depois (mesmo arquivo indexado em outro modo permanece no dono)."""
+    row = state.if_db.get_by_path(file_path)
+    if row is not None:
+        return state.if_db, state.if_index, row
+    gen = state.scopes.get(GENERAL_SCOPE)
+    if gen is not None:
+        row = gen.if_db.get_by_path(file_path)
+        if row is not None:
+            return gen.if_db, gen.if_index, row
+    return None
 
 async def indexed_file_write(req: IndexedFileWriteRequest):
     """
@@ -66,8 +119,20 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     loop = asyncio.get_event_loop()
 
-    # ── Check existing ──
-    existing = state.if_db.get_by_path(req.file_path)
+    # ── Check existing (NEW projetos: dono por path — ativo primeiro, geral
+    # depois. Arquivo já indexado em outro modo é ATUALIZADO no dono (mesma
+    # identidade de path; evita duplicar o arquivo nos dois escopos). Arquivo
+    # novo → cria no ESCOPO ATIVO. ──
+    resolved = _if_backend_for_path(req.file_path)
+    if resolved is not None:
+        if_db, if_index, existing = resolved
+    else:
+        if_db, if_index, existing = state.if_db, state.if_index, None
+    owner_is_general = if_db is not state.if_db
+
+    def _out_fid(real_id: int) -> int:
+        # Id de resposta: composta quando o dono é o geral com projeto ativo
+        return encode_ref(GENERAL_SCOPE, real_id) if owner_is_general else real_id
 
     if existing and not req.force_reindex:
         if existing["file_hash"] == req.file_hash and existing["content_hash"] == content_hash:
@@ -76,7 +141,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
             return IndexedFileWriteResponse(
                 stored=False,
                 reason="unchanged",
-                file_id=existing["id"],
+                file_id=_out_fid(existing["id"]),
                 chunks_created=0,
                 was_reindexed=False,
                 hash_match=True,
@@ -84,11 +149,14 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
 
     # ── Remove old chunks if re-indexing ──
     if existing:
-        old_chunk_ids = state.if_db.get_chunk_ids_by_file(existing["id"])
+        old_chunk_ids = if_db.get_chunk_ids_by_file(existing["id"])
         if old_chunk_ids:
-            await loop.run_in_executor(None, state.if_index.remove_ids, set(old_chunk_ids))
-            state.if_db.delete_chunks_by_file(existing["id"])
-            log.info(f"Removed {len(old_chunk_ids)} old chunks for: {req.file_path}")
+            await loop.run_in_executor(None, if_index.remove_ids, set(old_chunk_ids))
+            if_db.delete_chunks_by_file(existing["id"])
+            log.info(
+                f"Removed {len(old_chunk_ids)} old chunks for: {req.file_path} "
+                f"[{'geral' if owner_is_general else 'ativo'}]"
+            )
 
     # ── Chunk the content ──
     chunks = _chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
@@ -117,7 +185,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     was_reindexed = existing is not None
     if existing:
         file_id = existing["id"]
-        state.if_db.update_file(
+        if_db.update_file(
             file_id=file_id,
             content=content,
             content_hash=content_hash,
@@ -126,7 +194,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
             modified=req.modified,
         )
     else:
-        file_id = state.if_db.insert_file(
+        file_id = if_db.insert_file(
             file_path=req.file_path,
             file_name=req.file_name,
             extension=req.extension,
@@ -140,10 +208,10 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
         )
 
     # ── Insert chunks into DB ──
-    state.if_db.insert_chunks(file_id, chunks)
+    if_db.insert_chunks(file_id, chunks)
 
     # ── Get chunk IDs (just inserted) ──
-    chunk_rows = state.if_db.get_chunks_by_file(file_id)
+    chunk_rows = if_db.get_chunks_by_file(file_id)
     chunk_ids = [row["id"] for row in chunk_rows]
 
     if len(chunk_ids) != len(chunks):
@@ -156,7 +224,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     if len(chunk_ids) == embeddings.shape[0]:
         await loop.run_in_executor(
             None,
-            state.if_index.add_batch,
+            if_index.add_batch,
             embeddings,
             chunk_ids,
         )
@@ -164,7 +232,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
         # Fallback: add one by one if sizes don't match
         log.warning("Chunk/embedding size mismatch — adding individually")
         for emb, cid in zip(embeddings, chunk_ids):
-            await loop.run_in_executor(None, state.if_index.add, emb, cid)
+            await loop.run_in_executor(None, if_index.add, emb, cid)
 
     hash_match = (
         existing is not None
@@ -173,7 +241,8 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     )
 
     log.info(
-        f"Indexed file: {req.file_path} → file_id={file_id} "
+        f"Indexed file: {req.file_path} → file_id={_out_fid(file_id)} "
+        f"[{'geral' if owner_is_general else 'ativo'}] "
         f"chunks={len(chunks)} reindexed={was_reindexed} "
         f"hash_match={hash_match} content_size={len(content)}"
     )
@@ -181,7 +250,7 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
     return IndexedFileWriteResponse(
         stored=True,
         reason="ok" if not was_reindexed else "reindexed",
-        file_id=file_id,
+        file_id=_out_fid(file_id),
         chunks_created=len(chunks),
         was_reindexed=was_reindexed,
         hash_match=hash_match,
@@ -213,17 +282,21 @@ async def indexed_file_read(req: IndexedFileReadRequest):
 
     # ── Modo 1/2: caminho absoluto informado ──
     if file_path:
-        row = state.if_db.get_by_path(file_path)
-        if row is None:
+        # NEW (projetos): dono por path — ativo primeiro, geral depois
+        resolved = _if_backend_for_path(file_path)
+        if resolved is None:
             return IndexedFileReadResponse(results=[], file_path=file_path, query=query or None)
+        if_db, if_index, row = resolved
+        scope_tag = GENERAL_SCOPE if if_db is not state.if_db else None
+        encode = scope_tag is not None
 
         loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, state.if_db.update_access, row["id"])
+        loop.run_in_executor(None, if_db.update_access, row["id"])
 
         # ── Modo 2: sem query → devolve o arquivo inteiro (comportamento original) ──
         if not query:
             entry = IndexedFileEntry(
-                file_id      = row["id"],
+                file_id      = encode_ref(scope_tag, row["id"]) if encode else row["id"],
                 file_path    = row["file_path"],
                 file_name    = row["file_name"],
                 extension    = row["extension"],
@@ -239,18 +312,19 @@ async def indexed_file_read(req: IndexedFileReadRequest):
                 source       = row["source"],
                 chunk_text   = None,
                 match_type   = "exact_path",
+                scope        = scope_tag,
             )
             return IndexedFileReadResponse(results=[entry], file_path=file_path)
 
         # ── Modo 2b: com query → top_k chunks ranqueadas, restritas a este arquivo ──
-        chunk_rows = state.if_db.get_chunks_by_file(row["id"])
+        chunk_rows = if_db.get_chunks_by_file(row["id"])
         chunk_ids  = [c["id"] for c in chunk_rows]
         if not chunk_ids:
             return IndexedFileReadResponse(results=[], file_path=file_path, query=query)
 
         query_emb = await state.embed_engine.embed_query_one(query)
         ranked = await loop.run_in_executor(
-            None, state.if_index.search_subset, query_emb, chunk_ids, req.top_k
+            None, if_index.search_subset, query_emb, chunk_ids, req.top_k
         )
         ranked = [(cid, score) for cid, score in ranked if score >= req.min_score]
         if not ranked:
@@ -264,7 +338,7 @@ async def indexed_file_read(req: IndexedFileReadRequest):
             if chunk_row is None:
                 continue
             results.append(IndexedFileEntry(
-                file_id      = row["id"],
+                file_id      = encode_ref(scope_tag, row["id"]) if encode else row["id"],
                 file_path    = row["file_path"],
                 file_name    = row["file_name"],
                 extension    = row["extension"],
@@ -282,64 +356,85 @@ async def indexed_file_read(req: IndexedFileReadRequest):
                 chunk_index  = chunk_row["chunk_index"],
                 char_start   = chunk_row["char_start"],
                 char_end     = chunk_row["char_end"],
-                chunk_id = chunk_row["id"],
+                chunk_id     = encode_ref(scope_tag, chunk_row["id"]) if encode else chunk_row["id"],
                 match_type   = "exact_path_chunks",
+                scope        = scope_tag,
             ))
         return IndexedFileReadResponse(results=results, file_path=file_path, query=query)
 
-    # ── Modo 3: busca semântica entre todos os arquivos ──
+    # ── Modo 3: busca semântica entre todos os arquivos (NEW projetos:
+    # MESCLADA — busca no escopo ativo E no geral com os mesmos embeddings,
+    # fundida por score, com tag de escopo e ids compostas p/ o geral) ──
     if not query:
         raise MemoryToolError("informe 'file_path' (leitura exata) ou 'query' (busca semântica)")
-
-    if state.if_index.total == 0:
-        return IndexedFileReadResponse(results=[], query=query)
 
     loop = asyncio.get_event_loop()
     query_emb = await state.embed_engine.embed_query_one(query)
 
-    if_raw = await loop.run_in_executor(
-        None, state.if_index.search, query_emb, req.top_k * 2
-    )
+    gen = state.scopes.get(GENERAL_SCOPE)
+    backends: list[tuple] = [(state.if_db, state.if_index, None)]
+    if state.active_scope != GENERAL_SCOPE and gen is not None:
+        backends.append((gen.if_db, gen.if_index, GENERAL_SCOPE))
 
-    # Filtra por score
-    filtered = [(cid, score) for cid, score in if_raw if score >= req.min_score]
-    if not filtered:
+    active_scopes = [(db, idx, tag) for db, idx, tag in backends if idx.total > 0]
+    if not active_scopes:
         return IndexedFileReadResponse(results=[], query=query)
 
-    # Busca chunk records
-    chunk_ids = [cid for cid, _ in filtered]
-    chunk_rows = state.if_db.get_chunks_by_ids(chunk_ids)
-    chunk_map = {row["id"]: row for row in chunk_rows}
+    # Busca em cada escopo (mesmos embeddings, batch nativo por escopo)
+    per_scope_raw = await asyncio.gather(*(
+        loop.run_in_executor(None, idx.search, query_emb, req.top_k * 2)
+        for _, idx, _ in active_scopes
+    ))
 
-    # Agrupa por file_id — melhor score por arquivo
-    file_best: dict[int, tuple[float, sqlite3.Row]] = {}
-    for cid, score in filtered:
-        chunk_row = chunk_map.get(cid)
-        if chunk_row is None:
+    # Filtra por score, agrupa por file_id (por escopo — sequências de id
+    # não colidem entre escopos) e funde por score
+    candidates: list[tuple] = []   # (score, fid, chunk_row, file_row, scope_tag)
+    for (if_db, _, scope_tag), if_raw in zip(active_scopes, per_scope_raw):
+        filtered = [(cid, score) for cid, score in if_raw if score >= req.min_score]
+        if not filtered:
             continue
-        fid = chunk_row["file_id"]
-        if fid not in file_best or score > file_best[fid][0]:
-            file_best[fid] = (score, chunk_row)
+        # Busca chunk records
+        chunk_rows = if_db.get_chunks_by_ids([cid for cid, _ in filtered])
+        chunk_map = {row["id"]: row for row in chunk_rows}
 
-    if not file_best:
+        # Agrupa por file_id — melhor score por arquivo
+        file_best: dict[int, tuple[float, sqlite3.Row]] = {}
+        for cid, score in filtered:
+            chunk_row = chunk_map.get(cid)
+            if chunk_row is None:
+                continue
+            fid = chunk_row["file_id"]
+            if fid not in file_best or score > file_best[fid][0]:
+                file_best[fid] = (score, chunk_row)
+
+        if not file_best:
+            continue
+
+        # Busca file records
+        file_ids = list(file_best.keys())
+        file_rows = if_db._conn.execute(
+            f"SELECT * FROM indexed_files WHERE id IN ({','.join('?' * len(file_ids))})",
+            file_ids,
+        ).fetchall()
+        file_map = {row["id"]: row for row in file_rows}
+
+        for fid, (score, chunk_row) in file_best.items():
+            file_row = file_map.get(fid)
+            if file_row is None:
+                continue
+            candidates.append((score, fid, chunk_row, file_row, scope_tag))
+
+    if not candidates:
         return IndexedFileReadResponse(results=[], query=query)
 
-    # Busca file records
-    file_ids = list(file_best.keys())
-    file_rows = state.if_db._conn.execute(
-        f"SELECT * FROM indexed_files WHERE id IN ({','.join('?' * len(file_ids))})",
-        file_ids,
-    ).fetchall()
-    file_map = {row["id"]: row for row in file_rows}
+    candidates.sort(key=lambda x: x[0], reverse=True)
 
     results = []
-    for fid, (score, chunk_row) in sorted(file_best.items(), key=lambda x: x[1][0], reverse=True):
-        file_row = file_map.get(fid)
-        if file_row is None:
-            continue
-
+    for score, fid, chunk_row, file_row, scope_tag in candidates:
+        if_db = state.if_db if scope_tag is None else state.scopes[scope_tag].if_db
+        encode = scope_tag is not None
         results.append(IndexedFileEntry(
-            file_id      = fid,
+            file_id      = encode_ref(scope_tag, fid) if encode else fid,
             file_path    = file_row["file_path"],
             file_name    = file_row["file_name"],
             extension    = file_row["extension"],
@@ -357,8 +452,9 @@ async def indexed_file_read(req: IndexedFileReadRequest):
             chunk_index  = chunk_row["chunk_index"],
             char_start   = chunk_row["char_start"],
             char_end     = chunk_row["char_end"],
+            scope        = scope_tag,
         ))
-        loop.run_in_executor(None, state.if_db.update_access, fid)
+        loop.run_in_executor(None, if_db.update_access, fid)
 
     return IndexedFileReadResponse(results=results[:req.top_k], query=query)
 
@@ -371,19 +467,23 @@ async def indexed_file_check(file_path: str):
       - indexed=False  → arquivo nunca foi indexado
       - hash_match=True → já indexado e inalterado
       - hash_match=False → indexado mas arquivo mudou → reindexar
+
+    NEW (projetos): dono por path — ativo primeiro, geral depois.
     """
     if not file_path:
         raise MemoryToolError("file_path vazio")
 
-    row = state.if_db.get_by_path(file_path)
-    if row is None:
+    resolved = _if_backend_for_path(file_path)
+    if resolved is None:
         return IndexedFileCheckResponse(indexed=False)
+    if_db, _, row = resolved
 
-    chunks_count = state.if_db.count_chunks(row["id"])
+    chunks_count = if_db.count_chunks(row["id"])
 
     return IndexedFileCheckResponse(
         indexed            = True,
-        file_id            = row["id"],
+        file_id            = encode_ref(GENERAL_SCOPE, row["id"])
+                             if if_db is not state.if_db else row["id"],
         stored_file_hash   = row["file_hash"],
         stored_content_hash = row["content_hash"],
         stored_modified    = row["modified"],
@@ -395,15 +495,17 @@ async def indexed_file_check(file_path: str):
 async def indexed_file_get(file_id: int):
     """
     Retorna o conteúdo completo de um arquivo indexado pelo seu ID.
+    NEW (projetos): aceita id composta (offset = escopo geral).
     """
-    row = state.if_db.get_by_id(file_id)
-    if row is None:
+    resolved = _if_backend_for_file_id(file_id)
+    if resolved is None:
         raise MemoryToolError(f"Arquivo indexado #{file_id} não encontrado")
+    if_db, _, row, out_id = resolved
 
-    chunks = state.if_db.get_chunks_by_file(file_id)
+    chunks = if_db.get_chunks_by_file(row["id"])
 
     return {
-        "file_id":      row["id"],
+        "file_id":      out_id,
         "file_path":    row["file_path"],
         "file_name":    row["file_name"],
         "extension":    row["extension"],
@@ -422,16 +524,21 @@ async def indexed_file_get(file_id: int):
 
 
 async def get_chunk_by_id(chunk_id: int):
-    row = state.if_db._conn.execute(
+    """NEW (projetos): aceita id composta de chunk (offset = escopo geral)."""
+    resolved = _if_backend_for_chunk_id(chunk_id)
+    if resolved is None:
+        raise MemoryToolError(f"Chunk #{chunk_id} não encontrado")
+    if_db, real_id = resolved
+    row = if_db._conn.execute(
         "SELECT c.*, f.file_path, f.file_hash, f.content "
         "FROM indexed_file_chunks c "
         "JOIN indexed_files f ON c.file_id = f.id "
-        "WHERE c.id = ?", (chunk_id,)
+        "WHERE c.id = ?", (real_id,)
     ).fetchone()
     if row is None:
         raise MemoryToolError(f"Chunk #{chunk_id} não encontrado")
     return {
-        "chunk_id": row["id"],
+        "chunk_id": chunk_id,  # ecoa a id pedida (crua ou composta)
         "file_path": row["file_path"],
         "file_hash": row["file_hash"],
         "char_start": row["char_start"],
@@ -443,62 +550,82 @@ async def get_chunk_by_id(chunk_id: int):
 
 async def indexed_file_delete(file_id: int):
     """
-    Remove um arquivo indexado e todos os seus chunks (DB + FAISS).
+    Remove um arquivo indexado e todos os seus chunks (DB + vetor).
+    NEW (projetos): aceita id composta (offset = escopo geral).
     """
-    row = state.if_db.get_by_id(file_id)
-    if row is None:
+    resolved = _if_backend_for_file_id(file_id)
+    if resolved is None:
         raise MemoryToolError(f"Arquivo indexado #{file_id} não encontrado")
+    if_db, if_index, row, out_id = resolved
+    real_id = row["id"]
 
-    # Remove FAISS vectors first
-    chunk_ids = state.if_db.get_chunk_ids_by_file(file_id)
+    # Remove vectors first
+    chunk_ids = if_db.get_chunk_ids_by_file(real_id)
     if chunk_ids:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, state.if_index.remove_ids, set(chunk_ids))
+        await loop.run_in_executor(None, if_index.remove_ids, set(chunk_ids))
 
     # Delete from DB (cascades to chunks)
-    deleted = state.if_db.delete_file(file_id)
+    deleted = if_db.delete_file(real_id)
 
-    log.info(f"Indexed file deleted: #{file_id} ({len(chunk_ids)} chunks removed)")
-    return {"deleted": deleted, "file_id": file_id, "chunks_removed": len(chunk_ids)}
+    log.info(f"Indexed file deleted: #{real_id} ({len(chunk_ids)} chunks removed)")
+    return {"deleted": deleted, "file_id": out_id, "chunks_removed": len(chunk_ids)}
 
 
 async def indexed_file_delete_by_path(file_path: str):
     """
     Remove um arquivo indexado pelo caminho.
+    NEW (projetos): dono por path — ativo primeiro, geral depois.
     """
     if not file_path:
         raise MemoryToolError("file_path vazio")
 
-    row = state.if_db.get_by_path(file_path)
-    if row is None:
+    resolved = _if_backend_for_path(file_path)
+    if resolved is None:
         return {"deleted": 0, "file_path": file_path, "message": "not indexed"}
 
-    return await indexed_file_delete(row["id"])
+    if_db, _, row = resolved
+    out_id = encode_ref(GENERAL_SCOPE, row["id"]) if if_db is not state.if_db else row["id"]
+
+    # Reaproveita indexed_file_delete resolvendo pelo id REAL do dono
+    return await indexed_file_delete(out_id)
 
 
 async def indexed_file_list():
     """
     Lista todos os arquivos indexados com metadados.
+    NEW (projetos): MESCLADA — arquivos do escopo ativo (ids cruas) + os do
+    geral (ids compostas + scope="general") quando um projeto está ativo.
     """
-    rows = state.if_db.list_files()
+    merged = state.active_scope != GENERAL_SCOPE
+    gen = state.scopes.get(GENERAL_SCOPE)
     files = []
-    for row in rows:
-        files.append({
-            "file_id":      row["id"],
-            "file_path":    row["file_path"],
-            "file_name":    row["file_name"],
-            "extension":    row["extension"],
-            "content_hash": row["content_hash"],
-            "file_hash":    row["file_hash"],
-            "size":         row["size"],
-            "modified":     row["modified"],
-            "created_at":   row["created_at"],
-            "access_count": row["access_count"],
-        })
+    for if_db, tag in (
+        [(state.if_db, None)]
+        + ([(gen.if_db, GENERAL_SCOPE)] if merged and gen is not None else [])
+    ):
+        encode = tag is not None
+        for row in if_db.list_files():
+            files.append({
+                "file_id":      encode_ref(tag, row["id"]) if encode else row["id"],
+                "file_path":    row["file_path"],
+                "file_name":    row["file_name"],
+                "extension":    row["extension"],
+                "content_hash": row["content_hash"],
+                "file_hash":    row["file_hash"],
+                "size":         row["size"],
+                "modified":     row["modified"],
+                "created_at":   row["created_at"],
+                "access_count": row["access_count"],
+                "scope":        tag,
+            })
     return {"total": len(files), "files": files}
 
 
 __all__ = [
+    '_if_backend_for_chunk_id',
+    '_if_backend_for_file_id',
+    '_if_backend_for_path',
     'get_chunk_by_id',
     'indexed_file_check',
     'indexed_file_delete',

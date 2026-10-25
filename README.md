@@ -80,12 +80,15 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - **Memory-watch**: monitor de correção de memória — se a nova resposta contradiz uma memória usada, classifica (confirmação/complementação/correção) e reescreve o prefill da retomada.
 - **Extração pós-resposta** de memórias de longo prazo, forçada por JSON schema.
 - **Conversation Hub**: SSE com todos os eventos dos turnos (`/conversation/stream`) + catch-up por id (`/conversation/recent`) — reconexão do chat widget do Manager sem perder eventos.
+- **Persona editável em runtime**: `GET/PUT /persona` no orchestrator — a 1ª linha do system prompt vive em `resource/persona.json` e é trocada pela TUI (Settings → Persona) sem restart (a cláusula de tools é sempre anexada pelo orchestrator).
 
 ### Memória — grafo hebbiano (o "hipocampo" sintético)
 - Curto prazo (SQLite) + longo prazo (LanceDB vetorial) + **grafo de memórias e tools** com arestas que se **reforçam por co-uso e co-ativação** (regra hebbiana), com auto-link na escrita e decay podando o que esquece.
 - Busca semântica com **E5 multilingual** (ONNX, onnxManager :2002) + **rerank cross-encoder** (ms-marco MiniLM) + **Personalized PageRank** com spread de ativação + MMR (inibição lateral).
-- **Grafo de tools (ToolsDB)**: cada tool MCP tem um snippet (o "skill.md" dela); o selector de servidores usa kNN + PPR no grafo de co-uso para escolher **quais** servidores carregar por rodada (economia de contexto com servidores de 20+ tools).
+- **Grafo de tools (ToolsDB)**: cada tool MCP tem um snippet (o "skill.md" dela); o selector de servidores usa kNN + PPR no grafo de co-uso para escolher **quais** servidores carregar por rodada (economia de contexto com servidores de 20+ tools), com **cota de 4 tools por servidor** (um servidor grande não monopoliza o kNN), **exemplos de uso aprendidos** pós-turno (a query vira vetor "learned") e **self-heal** de vetores perdidos (re-embeda pelo doc_hash).
 - **Dicionários sensoriais** integrados: `visual_dict` (significado de objetos), `face_dict` (rostos) e `voice_dict` (vozes cadastradas pela TUI) — embeddings consultados por kNN, texto pesquisável pela leitura normal de memória.
+- **Cards de pessoa (`people-card`)**: unificam rostos + vozes em um card textual (descrição, likes, religião, infos extras) com **memória de identidade** no grafo (nó estável que ancora as arestas) — criados/editados pelo websearch-mcp (`memory_people_card_*`) e lidos como memória normal.
+- **RAG de arquivos locais (`indexed-file`)**: cadastro com hash SHA-256 (reindexa só o que mudou), chunking 500/100 com posição (`char_start/end`) e leitura em 3 modos — arquivo inteiro por path, chunks daquele arquivo ranqueados pela query, ou busca semântica global.
 - **Planos persistidos** (`/plans/*`) com CRUD pela TUI e pelo `plan_recorder`.
 - Visualização **em tempo real** do grafo em `graph_activation.py` (:8777): polling de diff do SQLite (~1 s) com nós de memória, **tools como hexágonos** (`t{id}`) e **planos como diamantes** (`p{id}`); arestas nascendo, sendo reforçadas e podadas por decay ao vivo.
 
@@ -99,7 +102,7 @@ O pipeline completo (**Depth Anything V2** → clusterização por camadas → *
 - **Cadastro de vozes pela TUI** (Settings → Vozes): gravação local de microfone, edição de descrição, listagem — tudo via `voice_dict` na memory API.
 
 ### Busca web (websearch-mcp)
-O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/websearch`, :4010): uma única tool exposta ao modelo (`web_search`) esconde o pipeline: **cache Valkey → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. O servidor também tem tool de gravação de memórias (`memory_write_batch`) falando direto com a memory API.
+O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/websearch`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — todos falando direto com a memory API.
 
 ### Tools MCP (extensibilidade)
 - **mcp_manager reescrito em Rust** (`Modules/mcp_manager`, :4008) e rodando **NO HOST** — fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome do usuário). O tray o supervisiona: descobre o binário no boot, faz spawn, espera o `/health`, e re-espawna em caso de crash (restart-on-fail).
@@ -111,14 +114,14 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 ### Manager Rust (ava-tray)
 - Ícone na **bandeja do sistema** (GTK/Linux, tray nativo no Windows) + janela de status (egui) com start/stop do docker, status do mcp_manager e do transcript.
 - **Chat widget**: abre com a wake word "Alpha" (detectada pelo pipeline de voz) ou manualmente; envia turnos escritos ao orchestrator (`source="chat"`, sem TTS — a fala é papel da TUI/voz) e consome o Conversation Hub (SSE) para renderizar a resposta em tempo real.
-- API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager).
+- API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager), `/transcript/*` (start/stop/status do pipeline de voz) e `POST /ui/chat-open` (wake word do transcribe → abre o chat widget).
 - **Supervisão de processos do host**: mcp_manager (:4008) e transcript (:9100) — discover → spawn → health check periódico → restart-on-fail. Variáveis de auth/config lidas do `Modules/.env` e injetadas nos filhos.
 - **Timer de inatividade**: `docker down` após 45 min sem perguntas (configurável via `AVA_DOCKER_IDLE_MINUTES`).
 - **Chrome do usuário** sob demanda: aberto em **modo normal** (perfil padrão, sem `--remote-debugging-port`) apenas **se o Chrome não estiver aberto** — spawn detached, sem cópia de perfil e sem cache `chrome-profile-cdp`.
 
 ### TUI (terminal, Ink/React)
 - Chat com streaming SSE, planos de execução (CoT) renderizados, timeline de tool calls e linha de status dos processos.
-- Painel de **status** (CPU/RAM/GPU via systeminformation), painel de **logs do Docker** ao vivo, painel de **settings** com gestão de **servidores MCP** e de **vozes** (cadastro/edição via microfone), links para o grafo.
+- Painel de **status** (CPU/RAM/GPU via systeminformation), painel de **logs do Docker** ao vivo (`Ctrl+D`), painel de **settings** (`Ctrl+S` ou `/settings`) com gestão de **servidores MCP** (instalação assistida npm/http/stdio e remoção), **vozes** (cadastro por microfone, edição de descrição e remoção), **planos** (lista/edição versionada) e **persona** editável, links para o grafo.
 - Comando `/image <caminho>` para anexar imagens à conversa (vão direto ao modelo multimodal).
 - **Autenticação interna**: toda requisição leva `Authorization: Bearer <AVA_INTERNAL_TOKEN>` (token do `Modules/.env` gerado pelo install.sh; nunca logado).
 - **Binário standalone** (~80 MB, cross-compile Bun) — não exige Node no usuário.
@@ -131,6 +134,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - **Sem portas expostas à LAN**: no Windows, todas as portas do container são publicadas apenas em `127.9.12.22`; no Linux, `network_mode: host` mantém os serviços em localhost. O tray (:9001) nunca é publicado.
 - **docker-socket-proxy**: o websearch-mcp não tem acesso direto ao socket do Docker — apenas allowlist mínima (listar/inspecionar containers e start/stop do crawl4ai). Sem exec, images, volumes, networks ou build.
 - **crawl4ai com token** (`CRAWL4AI_API_TOKEN`): sem ele o servidor só escuta no loopback do container.
+- **SSRF guard**: `POST /search` e `POST /read-url` (orchestrator) e o fetch do websearch-mcp resolvem o DNS e bloqueiam IP privado/loopback/link-local/metadata — a validação acompanha redirects.
 
 ---
 
@@ -144,11 +148,13 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   ├── TTS.py               # Supertonic streaming (:3004)
 │   ├── vision.py            # Depth/SAM/DINOv3/YuNet/EdgeFace (:4002) — desligado por padrão
 │   ├── onnxManager.py       # E5 embed + ms-marco rerank, API única (:2002)
+│   ├── onnx_client.py       # Cliente httpx do onnxManager (embed/rerank/score)
 │   ├── internal_auth.py     # Bearer token interno compartilhado (middleware)
 │   ├── mcp_manager/         # MCP manager reescrito em RUST, standalone no host (:4008)
 │   ├── memory/              # Memória: grafo, vetores, dicionários, planos
+│   │   ├── memory.py        #   fachada que reexporta os submódulos (API plana)
 │   │   ├── memory_api.py    #   FastAPI (:3000)
-│   │   └── memory_*.py      #   config/db/graph/vector/search/ops…
+│   │   └── memory_*.py      #   config/db/graph/vector/search/ops/status…
 │   ├── transcribe/          # Pipeline de voz em C++ (integrado!) — NO HOST
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
 │   │   └── linux/ windows/  #   builds por plataforma
@@ -162,7 +168,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 ├── docker-compose.yml       # stack base (+ overrides .linux/.windows)
 ├── start.sh                 # supervisor do container (restart-on-fail por serviço)
 ├── install.sh / install.bat # instaladores (baixam o release, geram tokens, models)
-└── scripts/                 # patch-cfonts (build TUI), plan_recorder, rebuild_indices
+└── scripts/                 # patch-cfonts (build TUI), plan_recorder (gravação de planos)
 ```
 
 ## Serviços e portas
@@ -243,6 +249,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `MCP_CALL_TIMEOUT` | orchestrator | 180 s | Teto de execução de tools MCP sem override |
 | `AVA_LOCALHOST_REWRITE` | compose (Windows) | `host.docker.internal` | Reescrita de URLs localhost de servidores MCP http |
 | `AVA_API_BASE` / `AVA_ORCHESTRATOR_URL` | TUI / Manager | :9001 / :9000 | Endpoints dos componentes |
+| `AVA_TTS_OUTPUT` | TUI | `client` | Onde a fala toca: `client` (a TUI toca no host via pacat/aplay/ffplay) ou `device` (container, via PulseAudio) |
 | `ONNX_PROVIDERS` | compose | `CPUExecutionProvider` | Provedores do ONNX Runtime |
 
 ## Roadmap

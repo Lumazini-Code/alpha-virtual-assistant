@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -26,6 +27,8 @@ from memory_config import (
     EDGE_LEARNING_RATE,
     EDGE_MIN_SCORE_TO_LINK,
     EDGE_MMR_FACTORS,
+    GENERAL_ID_OFFSET,
+    GENERAL_SCOPE,
     HEBBIAN_LINK_MAX_IDS,
     MMR_COSINE_FLOOR,
     MMR_LAMBDA,
@@ -47,6 +50,7 @@ from memory_config import (
     SEGMENT_MIN_WORDS,
     SEGMENT_TRIGGER_WORDS,
     _STOP_WORDS,
+    encode_ref,
     log,
 )
 from memory_graph import (
@@ -59,6 +63,54 @@ from memory_graph import (
 )
 from memory_models import MemoryEntry, RelatedMemory, Turn
 from memory_state import state
+
+
+# ── NEW (projetos): Views de LT p/ leitura mesclada ────────────────────────────
+
+@dataclass
+class LTView:
+    """Um escopo de LT visto pelo pipeline de leitura. `encode` = True quando
+    as ids DE RESPOSTA deste escopo saem com GENERAL_ID_OFFSET (escopo geral
+    visível com um projeto ativo — ids compostas, porque os dois DBs têm
+    sequências independentes). Ids de busca no grafo/vetores continuam CRUAS
+    (use _entry_real_id p/ decodificar)."""
+    name:   str   # "general" ou slug do projeto
+    db:     object  # MemoryDB do escopo
+    index:  object  # MemoryIndex do escopo
+    encode: bool
+
+
+def lt_views() -> list[LTView]:
+    """Views de LT para leitura: escopo ATIVO primeiro; quando um projeto
+    está ativo, o escopo geral entra ao final (leitura mesclada — /read funde
+    os dois). Escopo geral ativo → uma view só, comportamento idêntico ao de
+    antes (ids cruas, sem campo scope nas entradas)."""
+    active = state.scopes.get(state.active_scope) or state.scopes[GENERAL_SCOPE]
+    views = [LTView(name=active.name, db=active.lt_db, index=active.lt_index, encode=False)]
+    if state.active_scope != GENERAL_SCOPE:
+        gen = state.scopes.get(GENERAL_SCOPE)
+        if gen is not None:
+            views.append(LTView(name=GENERAL_SCOPE, db=gen.lt_db, index=gen.lt_index, encode=True))
+    return views
+
+
+def _entry_real_id(entry: MemoryEntry) -> int:
+    """Id REAL (dentro do DB dono) a partir de uma MemoryEntry — decodifica o
+    offset das entradas do escopo geral em leitura mesclada."""
+    if entry.scope == GENERAL_SCOPE and entry.id >= GENERAL_ID_OFFSET:
+        return entry.id - GENERAL_ID_OFFSET
+    return entry.id
+
+
+def _scope_backend(scope_name: Optional[str]) -> tuple[object, object]:
+    """(lt_db, lt_index) do escopo dono de uma entrada. None = modo geral puro
+    (state.*) — usado pelo MMR e pelas tasks hebbianas p/ achar o grafo/índice
+    certo sem saber do escopo no call-site."""
+    if scope_name:
+        sc = state.scopes.get(scope_name)
+        if sc is not None:
+            return sc.lt_db, sc.lt_index
+    return state.lt_db, state.lt_index
 
 # ── Helpers de busca contextual ────────────────────────────────────────────────
 
@@ -185,28 +237,83 @@ def _fuse_max(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+# ── NEW (projetos): helpers de busca LT por view / ST globais ──────────────────
+# As estratégias (expanded/dual/segmented) foram fatiadas: a parte de EMBED
+# acontece UMA vez no read_memory e a parte de BUSCA roda por view de escopo
+# (leitura mesclada busca no índice do projeto E no do geral com os MESMOS
+# embeddings — sem chamada de embedding duplicada).
+
+async def _search_lt_plain(index, query_emb, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, index.search, query_emb, top_k * 2)
+
+
+async def _search_lt_expanded_on(index, emb, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, index.search, emb, top_k * 2)
+
+
+async def _search_lt_dual_on(index, emb_query, emb_ctx, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    lt_q, lt_c = await asyncio.gather(
+        loop.run_in_executor(None, index.search, emb_query, top_k * 2),
+        loop.run_in_executor(None, index.search, emb_ctx,   top_k * 2),
+    )
+    return _fuse_scores(lt_q, lt_c, DUAL_CONTEXT_WEIGHT)
+
+
+async def _search_lt_segmented_on(index, seg_embeddings, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    lt_batches = await loop.run_in_executor(None, index.search_batch, seg_embeddings, top_k)
+    lt_fused: list[tuple[int, float]] = []
+    for seg_results in lt_batches:
+        lt_fused = _fuse_max(lt_fused, seg_results)
+    return lt_fused
+
+
+async def _search_st_plain(query_emb, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, state.st_index.search, query_emb, top_k * 2)
+
+
+async def _search_st_expanded(emb, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, state.st_index.search, emb, top_k * 2)
+
+
+async def _search_st_dual(emb_query, emb_ctx, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    st_q, st_c = await asyncio.gather(
+        loop.run_in_executor(None, state.st_index.search, emb_query, top_k * 2),
+        loop.run_in_executor(None, state.st_index.search, emb_ctx,   top_k * 2),
+    )
+    return _fuse_scores(st_q, st_c, DUAL_CONTEXT_WEIGHT)
+
+
+async def _search_st_segmented(seg_embeddings, top_k: int) -> list[tuple[int, float]]:
+    loop = asyncio.get_event_loop()
+    st_batches = await loop.run_in_executor(None, state.st_index.search_batch, seg_embeddings, top_k)
+    st_fused: list[tuple[int, float]] = []
+    for seg_results in st_batches:
+        st_fused = _fuse_max(st_fused, seg_results)
+    return st_fused
+
+
 async def _search_segmented(
     segments: list[str],
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     """
     Embeda TODOS os segmentos em uma única chamada em lote à API de
-    embeddings, busca todos de uma vez no FAISS (batch nativo) e funde por
+    embeddings, busca todos de uma vez (batch nativo) e funde por
     max-score. Determinístico, sem LLM — apenas cosine similarity aplicado
     a cada pedaço da pergunta em vez da pergunta inteira.
     """
     embeddings = await state.embed_engine.embed_queries(segments)  # shape (N, dim)
-    loop = asyncio.get_event_loop()
-    lt_batches, st_batches = await asyncio.gather(
-        loop.run_in_executor(None, state.lt_index.search_batch, embeddings, top_k),
-        loop.run_in_executor(None, state.st_index.search_batch, embeddings, top_k),
+    lt_fused, st_fused = await asyncio.gather(
+        _search_lt_segmented_on(state.lt_index, embeddings, top_k),
+        _search_st_segmented(embeddings, top_k),
     )
-    lt_fused: list[tuple[int, float]] = []
-    st_fused: list[tuple[int, float]] = []
-    for seg_results in lt_batches:
-        lt_fused = _fuse_max(lt_fused, seg_results)
-    for seg_results in st_batches:
-        st_fused = _fuse_max(st_fused, seg_results)
     return lt_fused, st_fused
 
 
@@ -257,10 +364,9 @@ async def _search_expanded(
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     expanded = f"{context_block}\n\nquery atual: {query}" if context_block else query
     emb = await state.embed_engine.embed_query_one(expanded)
-    loop = asyncio.get_event_loop()
     lt_raw, st_raw = await asyncio.gather(
-        loop.run_in_executor(None, state.lt_index.search, emb, top_k * 2),
-        loop.run_in_executor(None, state.st_index.search, emb, top_k * 2),
+        _search_lt_expanded_on(state.lt_index, emb, top_k),
+        _search_st_expanded(emb, top_k),
     )
     return lt_raw, st_raw
 
@@ -271,15 +377,10 @@ async def _search_dual(
     top_k: int,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     emb_query, emb_ctx = await state.embed_engine.embed_query_two(query, context_block)
-    loop = asyncio.get_event_loop()
-    lt_q, st_q, lt_c, st_c = await asyncio.gather(
-        loop.run_in_executor(None, state.lt_index.search, emb_query, top_k * 2),
-        loop.run_in_executor(None, state.st_index.search, emb_query, top_k * 2),
-        loop.run_in_executor(None, state.lt_index.search, emb_ctx,   top_k * 2),
-        loop.run_in_executor(None, state.st_index.search, emb_ctx,   top_k * 2),
+    lt_fused, st_fused = await asyncio.gather(
+        _search_lt_dual_on(state.lt_index, emb_query, emb_ctx, top_k),
+        _search_st_dual(emb_query, emb_ctx, top_k),
     )
-    lt_fused = _fuse_scores(lt_q, lt_c, DUAL_CONTEXT_WEIGHT)
-    st_fused = _fuse_scores(st_q, st_c, DUAL_CONTEXT_WEIGHT)
     return lt_fused, st_fused
 
 
@@ -331,11 +432,15 @@ async def _ppr_spread_on(
         adjacency, personalization, PPR_DAMPING, PPR_MAX_ITER, PPR_CONVERGENCE_EPS,
     )
     # ── NEW: dispara log de ativação p/ visualização em tempo real, sem bloquear ──
+    # O log é POR ESCOPO (projetos têm o próprio em db/<slug>/) — o caminho
+    # vem do MemoryDB dono (_activation_log_path, setado em _open_scope);
+    # ToolsDB (grafo global de tools) não tem o atributo → cai no geral.
     asyncio.ensure_future(
         loop.run_in_executor(
             None, _log_activation_sync, seed_ids, rank,
             (time.perf_counter() - t0) * 1000.0, ctx,
             getattr(db, "GRAPH_LABEL", "memory"),
+            getattr(db, "_activation_log_path", None),
         )
     )
     seed_set = set(seed_ids)
@@ -373,25 +478,51 @@ async def _dict_graph_related(
     e devolve as memórias LT alcançadas SÓ pelas arestas. Só leitura — não
     cria nem reforça arestas (leituras de dicionário são frequentes/por-frame
     e não devem fortalecer o grafo sozinhas). Candidatos sem memory_id não
-    têm nó no grafo e são ignorados."""
+    têm nó no grafo e são ignorados.
+
+    NEW (projetos): o nó de identidade pode morar no escopo ativo OU no geral
+    (o card foi criado em outro momento) — a semente é resolvida sondando os
+    DBs (ativo primeiro) e o PPR roda no grafo do dono. Related do geral sai
+    com id composta (offset)."""
     real = [(mid, s) for mid, s in seeds if mid is not None]
     if not real:
         return []
-    ctx = await _ppr_spread(real, loop)
-    related_raw = ctx["related_raw"][:DICT_GRAPH_MAX_RELATED]
-    if not related_raw:
-        return []
-    rows = await loop.run_in_executor(
-        None, state.lt_db.get_by_ids, [mid for mid, _ in related_raw]
-    )
-    by_id = {r["id"]: r for r in rows}
-    return [
-        RelatedMemory(
-            memory_id=mid,
-            text=_truncate_text(by_id[mid]["text"], READ_LT_MAX_CHARS),
-            score=round(score, 4),
+    views = lt_views()
+    # Resolve o escopo dono de cada semente (probe barato em SQLite)
+    per_view: dict[int, list[tuple[int, float]]] = {}   # índice da view → sementes
+    unmatched: list[tuple[int, float]] = []
+    for mid, score in real:
+        for vi, v in enumerate(views):
+            if await loop.run_in_executor(None, v.db.get_by_id, mid) is not None:
+                per_view.setdefault(vi, []).append((mid, score))
+                break
+        else:
+            unmatched.append((mid, score))
+    if unmatched:
+        log.warning(
+            f"dict graph: {len(unmatched)} semente(s) sem nó em nenhum escopo — ignoradas"
         )
-        for mid, score in related_raw if mid in by_id
+    if not per_view:
+        return []
+    related: list[tuple[int, str, float]] = []   # (id de resposta, texto, score)
+    for vi, view_seeds in per_view.items():
+        v = views[vi]
+        ctx = await _ppr_spread_on(v.db, view_seeds, loop)
+        related_raw = ctx["related_raw"][:DICT_GRAPH_MAX_RELATED]
+        if not related_raw:
+            continue
+        rows = await loop.run_in_executor(None, v.db.get_by_ids, [mid for mid, _ in related_raw])
+        by_id = {r["id"]: r for r in rows}
+        for mid, score in related_raw:
+            row = by_id.get(mid)
+            if row is None:
+                continue
+            out_id = encode_ref(v.name, mid) if v.encode else mid
+            related.append((out_id, _truncate_text(row["text"], READ_LT_MAX_CHARS), score))
+    related.sort(key=lambda x: x[2], reverse=True)
+    return [
+        RelatedMemory(memory_id=mid, text=text, score=round(score, 4))
+        for mid, text, score in related[:DICT_GRAPH_MAX_RELATED]
     ]
 
 
@@ -406,21 +537,56 @@ def _lateral_inhibition_filter(results: list[MemoryEntry]) -> list[MemoryEntry]:
       * se NÃO existe aresta → cosine direta entre os embeddings (antes: 0.0,
         "totalmente diverso" mesmo p/ candidatos quase idênticos que nunca
         co-ativaram), descontada por MMR_COSINE_FLOOR.
-    Entradas "primary" passam intactas."""
+    Entradas "primary" passam intactas.
+
+    NEW (projetos): o MMR roda POR ESCOPO (entry.scope) — arestas e vetores
+    não cruzam escopos, então cada grupo consulta o grafo/índice do seu dono
+    (ids decodificadas). Um hit "related" do geral e outro do projeto NÃO se
+    inibem (seriam redundâncias em DBs diferentes)."""
     primary = [r for r in results if r.match_type != "related"]
     related = [r for r in results if r.match_type == "related"]
     if len(related) <= 1:
         return results
-    ids = [r.id for r in related]
+
+    # Agrupa os related por escopo dono — a ordem de results (ativo → geral)
+    # é preservada na concatenação final.
+    groups: dict[Optional[str], list[MemoryEntry]] = {}
+    for r in related:
+        groups.setdefault(getattr(r, "scope", None), []).append(r)
+
+    selected_all: list[MemoryEntry] = []
+    for scope_name, group in groups.items():
+        if len(group) == 1:
+            selected_all.extend(group)
+            continue
+        lt_db, lt_index = _scope_backend(scope_name)
+        selected_all.extend(_mmr_select(group, lt_db, lt_index))
+
+    # ATENÇÃO: NÃO reordenar por score aqui. O laço acima seleciona TODOS os
+    # "related" (até esvaziar o pool), então um sort por relevância depois
+    # descartava exatamente a ordem que o MMR acabou de calcular — o filtro
+    # virava no-op e o corte do orçamento de tokens (entries[:top_k]) pegava os
+    # mais relevantes, não os mais diversos. Os "related" sempre têm score PPR
+    # (<= PPR_SPREAD_WEIGHT) abaixo dos "primary" (>= READ_MIN_SCORE_STRICT), então
+    # primary (já ordenado por score) + related (ordem MMR) preserva a ordem
+    # global e deixa o MMR decidir QUEM sobrevive ao corte.
+    return primary + selected_all
+
+
+def _mmr_select(related: list[MemoryEntry], lt_db, lt_index) -> list[MemoryEntry]:
+    """MMR (inibição lateral) DENTRO de um escopo. `related`: entradas
+    "related" do MESMO escopo (ids de resposta; decodificadas p/ grafo/vetor)."""
+    ids = [_entry_real_id(r) for r in related]
+    real_to_entry = {_entry_real_id(r): r for r in related}
 
     edge_sim: dict[tuple[int, int], float] = {}
-    for row in state.lt_db.get_edges_for_ids(ids):
+    for row in lt_db.get_edges_for_ids(ids):
         sim = row["weight"] * EDGE_MMR_FACTORS.get(row["edge_type"], 1.0)
         key = _edge_key(row["memory_id_a"], row["memory_id_b"])
         edge_sim[key] = max(edge_sim.get(key, 0.0), sim)
 
     try:
-        vecs = state.lt_index.get_vectors(ids)
+        vecs = lt_index.get_vectors(ids)
     except Exception as e:
         log.warning(f"MMR: não foi possível buscar vetores p/ o fallback de cosine: {e}")
         vecs = {}
@@ -455,28 +621,26 @@ def _lateral_inhibition_filter(results: list[MemoryEntry]) -> list[MemoryEntry]:
             relevance = c.score * c.confidence
             if not selected:
                 return relevance
-            max_sim = max(pair_sim(c.id, s.id) for s in selected)
+            max_sim = max(
+                pair_sim(_entry_real_id(c), _entry_real_id(s)) for s in selected
+            )
             return MMR_LAMBDA * relevance - (1.0 - MMR_LAMBDA) * max_sim
 
         best = max(pool, key=mmr_score)
         selected.append(best)
         pool.remove(best)
 
-    # ATENÇÃO: NÃO reordenar por score aqui. O laço acima seleciona TODOS os
-    # "related" (até esvaziar o pool), então um sort por relevância depois
-    # descartava exatamente a ordem que o MMR acabou de calcular — o filtro
-    # virava no-op e o corte do orçamento de tokens (entries[:top_k]) pegava os
-    # mais relevantes, não os mais diversos. Os "related" sempre têm score PPR
-    # (<= PPR_SPREAD_WEIGHT) abaixo dos "primary" (>= READ_MIN_SCORE_STRICT), então
-    # primary (já ordenado por score) + related (ordem MMR) preserva a ordem
-    # global e deixa o MMR decidir QUEM sobrevive ao corte.
-    return primary + selected
+    return selected
 
 
-def _upsert_edges_sync(pairs: list[tuple[int, int]], now: float) -> int:
-    """Helper síncrono p/ executor: cria/reforça arestas em lote (Step 4)."""
+def _upsert_edges_sync(pairs: list[tuple[int, int]], now: float, db=None) -> int:
+    """Helper síncrono p/ executor: cria/reforça arestas em lote (Step 4).
+    `db` (opcional): MemoryDB do escopo dono — leitura mesclada cria arestas
+    SÓ dentro do escopo de cada par (arestas nunca cruzam escopos)."""
+    if db is None:
+        db = state.lt_db
     for id_a, id_b in pairs:
-        state.lt_db.upsert_edge(id_a, id_b, EDGE_LEARNING_RATE, now)
+        db.upsert_edge(id_a, id_b, EDGE_LEARNING_RATE, now)
     return len(pairs)
 
 
@@ -484,35 +648,48 @@ async def _hebbian_link_task(results: list[MemoryEntry]) -> None:
     """Step 4 (background) — regra hebbiana NO CONJUNTO FINAL do /read: todo
     par de memórias LT com score >= EDGE_MIN_SCORE_TO_LINK co-ativou, então
     cria/reforça a aresta. Fire-and-forget: loga falhas, nunca levanta —
-    o cliente já recebeu a resposta antes disso começar."""
+    o cliente já recebeu a resposta antes disso começar.
+
+    NEW (projetos): os pares são agrupados POR ESCOPO (entry.scope) — arestas
+    nunca cruzam escopos; cada grupo usa o grafo do seu dono (ids decodificadas)."""
     try:
         scored = [
-            (r.id, r.score)
-            for r in results
+            r for r in results
             if r.memory_type == "long_term" and r.score >= EDGE_MIN_SCORE_TO_LINK
         ]
         if len(scored) < 2:
             return
         now = time.time()
-        if len(scored) > HEBBIAN_LINK_MAX_IDS:
-            # Safeguard: leitura multi-tópico não pode virar O(n²) de arestas
-            # — liga cada id apenas ao de maior score e avisa.
-            scored.sort(key=lambda x: x[1], reverse=True)
-            hub_id = scored[0][0]
-            pairs = [(hub_id, other) for other, _ in scored[1:]]
-            log.warning(
-                f"Grafo Hebbiano: {len(scored)} ids acima de {EDGE_MIN_SCORE_TO_LINK} "
-                f"no /read — ligando cada um apenas ao top-score (anti-O(n²))"
-            )
-        else:
-            ids = [mid for mid, _ in scored]
-            pairs = [
-                (ids[i], ids[j])
-                for i in range(len(ids))
-                for j in range(i + 1, len(ids))
-            ]
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _upsert_edges_sync, pairs, now)
+        # Agrupa por escopo (a ordem de results já preserva ativo → geral)
+        groups: dict[Optional[str], list[MemoryEntry]] = {}
+        for r in scored:
+            groups.setdefault(getattr(r, "scope", None), []).append(r)
+        for scope_name, group in groups.items():
+            if len(group) < 2:
+                continue
+            lt_db, _ = _scope_backend(scope_name)
+            # ids REAIS do escopo (decodifica offset do geral em leitura mesclada)
+            scored_v = [(_entry_real_id(r), r.score) for r in group]
+            if len(scored_v) > HEBBIAN_LINK_MAX_IDS:
+                # Safeguard: leitura multi-tópico não pode virar O(n²) de arestas
+                # — liga cada id apenas ao de maior score e avisa.
+                scored_v.sort(key=lambda x: x[1], reverse=True)
+                hub_id = scored_v[0][0]
+                pairs = [(hub_id, other) for other, _ in scored_v[1:]]
+                log.warning(
+                    f"Grafo Hebbiano [{scope_name or 'geral'}]: {len(scored_v)} ids acima de "
+                    f"{EDGE_MIN_SCORE_TO_LINK} no /read — ligando cada um apenas ao top-score "
+                    f"(anti-O(n²))"
+                )
+            else:
+                ids = [mid for mid, _ in scored_v]
+                pairs = [
+                    (ids[i], ids[j])
+                    for i in range(len(ids))
+                    for j in range(i + 1, len(ids))
+                ]
+            await loop.run_in_executor(None, _upsert_edges_sync, pairs, now, lt_db)
     except Exception as e:
         log.error(f"Grafo Hebbiano: falha ao criar arestas pós-/read: {e}")
 
@@ -525,35 +702,42 @@ async def _ppr_reinforce_task(ppr_ctx: dict) -> None:
     NÃO cria aresta nova (isso é exclusivamente do Step 4). Elegibilidade:
     rank_i e rank_j ambos > PPR_MIN_ACTIVATION_REINFORCE. Mais barato que
     rastrear caminhos exatos de propagação — e mais hebbiano de qualquer
-    forma (co-ativação, não causalidade de caminho)."""
+    forma (co-ativação, não causalidade de caminho).
+
+    NEW (projetos): `ppr_ctx` pode vir como {"scopes": {nome: ctx}} (leitura
+    mesclada — um ctx POR escopo, cada um reforçado no grafo do seu dono) ou
+    no formato plano antigo (reforço no escopo ativo)."""
     try:
-        rank = ppr_ctx.get("ppr_rank") or {}
-        adjacency = ppr_ctx.get("adjacency") or {}
-        if not rank or not adjacency:
-            return
-        updates: list[tuple[int, int, float]] = []
-        seen: set[tuple[int, int]] = set()
-        for a, neighbors in adjacency.items():
-            rank_a = rank.get(a, 0.0)
-            if rank_a <= PPR_MIN_ACTIVATION_REINFORCE:
+        per_scope: dict = ppr_ctx.get("scopes") if "scopes" in (ppr_ctx or {}) else {None: ppr_ctx}
+        for scope_name, ctx in per_scope.items():
+            rank = ctx.get("ppr_rank") or {}
+            adjacency = ctx.get("adjacency") or {}
+            if not rank or not adjacency:
                 continue
-            for b in neighbors:
-                rank_b = rank.get(b, 0.0)
-                if rank_b <= PPR_MIN_ACTIVATION_REINFORCE:
+            updates: list[tuple[int, int, float]] = []
+            seen: set[tuple[int, int]] = set()
+            for a, neighbors in adjacency.items():
+                rank_a = rank.get(a, 0.0)
+                if rank_a <= PPR_MIN_ACTIVATION_REINFORCE:
                     continue
-                key = _edge_key(a, b)
-                if key in seen:
-                    continue  # adjacência é simétrica — não reforça 2x a mesma aresta
-                seen.add(key)
-                updates.append((key[0], key[1], rank_a * rank_b))
-        if not updates:
-            return
-        now = time.time()
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, state.lt_db.reinforce_edges_batch,
-            updates, EDGE_LEARNING_RATE, PPR_MIN_ACTIVATION_REINFORCE, now,
-        )
+                for b in neighbors:
+                    rank_b = rank.get(b, 0.0)
+                    if rank_b <= PPR_MIN_ACTIVATION_REINFORCE:
+                        continue
+                    key = _edge_key(a, b)
+                    if key in seen:
+                        continue  # adjacência é simétrica — não reforça 2x a mesma aresta
+                    seen.add(key)
+                    updates.append((key[0], key[1], rank_a * rank_b))
+            if not updates:
+                continue
+            now = time.time()
+            loop = asyncio.get_event_loop()
+            lt_db, _ = _scope_backend(scope_name)
+            await loop.run_in_executor(
+                None, lt_db.reinforce_edges_batch,
+                updates, EDGE_LEARNING_RATE, PPR_MIN_ACTIVATION_REINFORCE, now,
+            )
     except Exception as e:
         log.error(f"Grafo Hebbiano: falha no reforço por ativação PPR: {e}")
 
@@ -564,7 +748,16 @@ def _build_lt_entries(
     loop: asyncio.AbstractEventLoop,
     max_chars: int = READ_LT_MAX_CHARS,
     related_ids: Optional[set[int]] = None,
+    lt_db=None,
+    encode: bool = False,
+    scope: Optional[str] = None,
 ) -> list[MemoryEntry]:
+    """Converte hits LT (id cru do escopo, score) em MemoryEntry.
+    `lt_db`: MemoryDB do escopo dono (None = ativo). `encode`+`scope`: ids de
+    resposta compostas (offset) + tag de escopo — usados na leitura mesclada
+    p/ entradas do escopo geral."""
+    if lt_db is None:
+        lt_db = state.lt_db
     ids_filtered = [mid for mid, score in lt_raw if score >= min_score]
     score_map    = {mid: score for mid, score in lt_raw}
     if not ids_filtered:
@@ -572,9 +765,9 @@ def _build_lt_entries(
     related_ids = related_ids or set()
     entries = []
     touched_ids: list[int] = []          # NEW (Plano 3 / T4): batch update_access
-    for row in state.lt_db.get_by_ids(ids_filtered):
+    for row in lt_db.get_by_ids(ids_filtered):
         entries.append(MemoryEntry(
-            id           = row["id"],
+            id           = encode_ref(scope, row["id"]) if encode else row["id"],
             text         = _truncate_text(row["text"], max_chars),
             score        = round(score_map[row["id"]], 4),
             confidence   = round(row["confidence"], 4),
@@ -586,11 +779,13 @@ def _build_lt_entries(
             ttl_days     = row["ttl_days"],
             # ── NEW (Hebbian graph): id alcançado só via PPR vira "related" ──
             match_type   = "related" if row["id"] in related_ids else "primary",
+            # ── NEW (projetos): escopo dono (só populado na leitura mesclada) ──
+            scope        = scope,
         ))
         touched_ids.append(row["id"])
     # NEW (Plano 3 / T4): N executor round-trips → 1 batch (1 executemany)
     if touched_ids:
-        loop.run_in_executor(None, state.lt_db.batch_update_access, touched_ids)
+        loop.run_in_executor(None, lt_db.batch_update_access, touched_ids)
     return entries
 
 
@@ -645,6 +840,8 @@ def _build_vs_entries(
     vs_results: list,
     min_score: float,
     max_chars: int = READ_VS_MAX_CHARS,
+    encode: bool = False,
+    scope: Optional[str] = None,
 ) -> list[MemoryEntry]:
     if not vs_results:
         return []
@@ -653,7 +850,7 @@ def _build_vs_entries(
         if score < min_score:
             continue
         entries.append(MemoryEntry(
-            id           = ventry.id,
+            id           = encode_ref(scope, ventry.id) if encode else ventry.id,
             text         = _truncate_text(ventry.text, max_chars),
             score        = round(score, 4),
             confidence   = 1.0,
@@ -661,6 +858,7 @@ def _build_vs_entries(
             access_count = 0,
             memory_type  = "knowledge",
             source       = ventry.source,
+            scope        = scope,
         ))
     return entries
 
@@ -673,14 +871,21 @@ def _build_if_entries(
     loop: asyncio.AbstractEventLoop,
     return_full_content: bool = False,
     max_chars: int = READ_IF_MAX_CHARS,
+    if_db=None,
+    encode: bool = False,
+    scope: Optional[str] = None,
 ) -> list[MemoryEntry]:
     """
-    Converte resultados de busca FAISS de chunks em MemoryEntry.
+    Converte resultados de busca de chunks em MemoryEntry.
 
     Se return_full_content=True, text contém o conteúdo completo do arquivo.
     Se False, text contém apenas o chunk que deu match (mais conciso para /read).
     Deduplica por file_id — mantém apenas o melhor score por arquivo.
+    NEW (projetos): `if_db` = IndexedFilesDB do escopo dono (None = ativo);
+    `encode`+`scope` = ids compostas + tag na leitura mesclada.
     """
+    if if_db is None:
+        if_db = state.if_db
     if not if_raw:
         return []
 
@@ -691,7 +896,7 @@ def _build_if_entries(
 
     # Busca chunk records
     chunk_ids = [cid for cid, _ in filtered]
-    chunk_rows = state.if_db.get_chunks_by_ids(chunk_ids)
+    chunk_rows = if_db.get_chunks_by_ids(chunk_ids)
     chunk_map = {row["id"]: row for row in chunk_rows}
 
     # Agrupa por file_id — mantém melhor score por arquivo
@@ -709,7 +914,7 @@ def _build_if_entries(
 
     # Busca file records
     file_ids = list(file_best.keys())
-    file_rows = state.if_db._conn.execute(
+    file_rows = if_db._conn.execute(
         f"SELECT * FROM indexed_files WHERE id IN ({','.join('?' * len(file_ids))})",
         file_ids,
     ).fetchall()
@@ -730,7 +935,7 @@ def _build_if_entries(
             text = _truncate_text(chunk_row["chunk_text"], max_chars)
 
         entries.append(MemoryEntry(
-            id           = fid,
+            id           = encode_ref(scope, fid) if encode else fid,
             text         = text,
             score        = round(score, 4),
             confidence   = round(file_row["confidence"], 4),
@@ -743,15 +948,17 @@ def _build_if_entries(
             extension    = file_row["extension"],
             content_hash = file_row["content_hash"],
             file_hash    = file_row["file_hash"],
+            scope        = scope,
         ))
         touched_ids.append(fid)
     # NEW (Plano 3 / T4): N executor round-trips → 1 batch (1 executemany)
     if touched_ids:
-        loop.run_in_executor(None, state.if_db.batch_update_access, touched_ids)
+        loop.run_in_executor(None, if_db.batch_update_access, touched_ids)
     return entries
 
 
 __all__ = [
+    'LTView',
     '_GERUND_BOUNDARY_RE',
     '_PURPOSE_BOUNDARY_RE',
     '_apply_token_budget',
@@ -762,17 +969,29 @@ __all__ = [
     '_build_vs_entries',
     '_classify_query',
     '_dict_graph_related',
+    '_entry_real_id',
     '_fuse_max',
     '_fuse_scores',
     '_hebbian_link_task',
     '_lateral_inhibition_filter',
+    '_mmr_select',
     '_ppr_reinforce_task',
     '_ppr_spread',
     '_ppr_spread_on',
+    '_scope_backend',
     '_search_dual',
     '_search_expanded',
+    '_search_lt_dual_on',
+    '_search_lt_expanded_on',
+    '_search_lt_plain',
+    '_search_lt_segmented_on',
     '_search_segmented',
+    '_search_st_dual',
+    '_search_st_expanded',
+    '_search_st_plain',
+    '_search_st_segmented',
     '_split_query_segments',
     '_truncate_text',
     '_upsert_edges_sync',
+    'lt_views',
 ]

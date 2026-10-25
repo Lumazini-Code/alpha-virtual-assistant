@@ -73,7 +73,10 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
-restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py" &
+# NEW (multi-escopo): --memory-api lê o escopo ativo (GET /status) e publica o
+# badge scope_switch — SEM a flag o watcher não sobe e os tailers por projeto
+# (db/<slug>/activation_log.jsonl) nunca publicam ativação (bug runtime).
+restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py --memory-api" &
 sleep 1
 
 

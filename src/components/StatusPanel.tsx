@@ -14,6 +14,10 @@ function colorForPct(pct: number): string {
   return COLORS.green;
 }
 
+function truncateProject(slug: string, n = 18): string {
+  return slug.length > n ? `Projeto: ${slug.slice(0, n - 1)}…` : `Projeto: ${slug}`;
+}
+
 function Metric({ label, pct, detail }: { label: string; pct: number; detail: string }) {
   return (
     <Box marginRight={3}>
@@ -26,10 +30,15 @@ function Metric({ label, pct, detail }: { label: string; pct: number; detail: st
   );
 }
 
-export function StatusPanel({ stats }: { stats: SystemStats }) {
+export function StatusPanel({ stats, activeProject }: { stats: SystemStats; activeProject?: string | null }) {
   const { gpu } = stats;
   return (
     <Box borderStyle="round" borderColor={COLORS.dim} paddingX={1}>
+      {activeProject && activeProject !== "general" && (
+        // NEW (projetos): badge do escopo ativo — leitura mescla o escopo do
+        // projeto com o geral; escritas vão para o projeto. some no modo geral.
+        <Text bold color={COLORS.amber}>◆ {truncateProject(activeProject)} </Text>
+      )}
       <Metric label="CPU" pct={stats.totalCpuPct} detail="" />
       <Metric
         label="RAM"

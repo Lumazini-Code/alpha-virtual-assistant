@@ -130,9 +130,11 @@ MEMORY_EXTRACTOR_CANDIDATES_MAX = min(
 # texto gerado depois dele são).
 #
 # Ativado por request via `watch_confidence=true` no ChatRequest — é opt-in
-# porque adiciona latência (round-trips extras de memory_read/classificação)
-# e só funciona no modo CHAT (precisa de session_id e de uma query semântica
-# com sentido; no modo TOOLS o caller já gerencia seu próprio histórico).
+# porque adiciona latência (round-trips extras de memory_read/classificação).
+# Funciona nos dois modos: no CHAT (session_id do request) e no TOOLS — o
+# orchestrator manda o session_id da TUI para a leitura de correção, e o vigia
+# NUNCA interrompe com tool_calls em montagem (uma interrupção nesse ponto
+# perderia os fragmentos acumulados — ver o guard no loop de streaming).
 
 CONFIDENCE_THRESHOLD        = float(os.getenv("CONFIDENCE_THRESHOLD", "0.55"))
 CONFIDENCE_MIN_TOKENS       = int(os.getenv("CONFIDENCE_MIN_TOKENS", "6"))
@@ -1854,6 +1856,7 @@ def _build_messages(
     lang: str,
     memories: list[dict],
     recent_turns: Optional[list[dict]] = None,
+    active_project: Optional[str] = None,
 ) -> list[dict]:
     """
     Monta a lista de mensagens para o OpenRouter.
@@ -1872,8 +1875,25 @@ def _build_messages(
     Estrutura (sem memórias/turnos):
       [0] system:     prompt ESTÁVEL
       [1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
+
+    NEW (projetos): `active_project` (slug ≠ None) injeta o hint de escopo
+    como mensagem system — o /read mescla o escopo do projeto com o geral e
+    fatos novos pertencem ao projeto. None = modo geral, sem system extra
+    (prefixo de cache inalterado).
     """
     messages = []
+
+    # NEW (projetos): hint de escopo — vira o [0] do array (system), mantendo
+    # o recall de memória como assistant logo depois.
+    if active_project and active_project != "general":
+        messages.append({
+            "role": "system",
+            "content": (
+                f"Active project: {active_project}. Your long-term memory currently "
+                f"merges this project's dedicated memory scope with your general memory; "
+                f"new facts you save (memory write) belong to this project's context."
+            ),
+        })
 
     # DINÂMICO: recall de memória em voz do próprio assistant.
     # role=assistant para o modelo tratar como autoconhecimento.
@@ -1964,6 +1984,16 @@ class ChatRequest(BaseModel):
         ),
     )
     model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
+
+    # ── NEW (projetos): escopo ativo de memória (slug ou None/"general").
+    # Repassado pelo orchestrator (re-afirmado a cada turno — a memory pode
+    # ter reiniciado). Só muda o prompt quando um projeto está ativo: injeta
+    # o hint de escopo (o /read mescla projeto+geral; fatos novos pertencem
+    # ao projeto). None/"general" = modo geral, prefixo inalterado (cache).
+    active_project: Optional[str] = Field(
+        default=None,
+        description="Slug do projeto ativo (escopo de memória). None = modo geral.",
+    )
 
     # ── Tool calling nativo (unificação com o antigo /chat/tools) ──────────
     messages: Optional[list[ToolCallMessage]] = Field(
@@ -2148,7 +2178,8 @@ async def chat(req: ChatRequest):
         lang = "pt"
 
     # Monta prompt
-    messages = _build_messages(user_input, lang, memories, recent_turns)
+    messages = _build_messages(user_input, lang, memories, recent_turns,
+                               active_project=req.active_project)
     log.info(f"tamanho do contexto do assistente: {str(messages).count(chr(0))} caracteres.")
 
     # Inferência (OpenRouter, com retry para falhas transitórias)
@@ -2306,9 +2337,10 @@ async def chat_stream(req: ChatRequest):
         reasoning_extra = {"reasoning": {"effort": req.reasoning_effort}}
 
     # ── Confidence-watch: pede logprobs por token ao OpenRouter ────────────
-    # Só faz sentido no modo CHAT (precisa de session_id + query semântica
-    # com sentido de conversa; no modo TOOLS o caller já gerencia o histórico).
-    watch_confidence = req.watch_confidence and not tool_mode
+    # Vale nos dois modos (CHAT e TOOLS). No TOOLS o guard no loop de
+    # streaming impede a interrupção com tool_calls em montagem; a leitura de
+    # correção usa req.session_id (o orchestrator manda o sid do /execute).
+    watch_confidence = req.watch_confidence
 
     # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
     
@@ -2368,7 +2400,8 @@ async def chat_stream(req: ChatRequest):
                     lang = "pt"
                 state["lang"] = lang
 
-                messages = _build_messages(user_input, lang, memories, recent_turns)
+                messages = _build_messages(user_input, lang, memories, recent_turns,
+                               active_project=req.active_project)
             except Exception as e:
                 yield f"data: {json.dumps({'error': f'prep do prompt falhou: {e}'})}\n\n"
                 return
@@ -2551,35 +2584,49 @@ async def chat_stream(req: ChatRequest):
                                 # com aviso explícito — sem isso, ele falhava
                                 # silenciosamente para sempre (window nunca
                                 # acumula, sentence_ready nunca dispara).
-                                if watch_confidence and window is not None \
-                                   and watch_events_used < CONFIDENCE_MAX_CORRECTIONS:
-                                    lp_obj = choices[0].get("logprobs") \
-                                             or delta_obj.get("logprobs") or {}
-                                    lp_content = lp_obj.get("content") or []
-                                    if lp_content:
-                                        watch_lp_seen += len(lp_content)
-                                        for lp_item in lp_content:
-                                            window.add(lp_item.get("token", ""), lp_item.get("logprob"))
-                                    else:
-                                        watch_chunks_no_lp += 1
-                                        if watch_chunks_no_lp == WATCH_LP_PROBE_CHUNKS and not watch_lp_seen:
-                                            log.warning(
-                                                "[MEMORY-WATCH] "
-                                                f"{WATCH_LP_PROBE_CHUNKS} chunks de conteúdo e nenhum "
-                                                "logprob recebido — o provedor/modelo não devolve "
-                                                "logprobs. Vigia de confiança desativado nesta "
-                                                "resposta (memory_read de correção não vai disparar)."
-                                            )
-                                    if window.sentence_ready():
-                                        conf = window.avg_confidence()
-                                        if conf < CONFIDENCE_THRESHOLD:
-                                            log.info(
-                                                f"[MEMORY-WATCH] Confiança baixa ({conf:.2f} < "
-                                                f"{CONFIDENCE_THRESHOLD}) na janela: {window.text!r}"
-                                            )
-                                            interrupted_for_correction = True
-                                            break
-                                        window.reset()
+                                #
+                                # Modo TOOLS: com tool_calls em montagem o vigia
+                                # NÃO age — interromper aqui perderia os
+                                # fragmentos já acumulados, e os logprobs desse
+                                # trecho são de JSON de argumento, não de prosa.
+                                # (a montagem das fragments acontece no bloco
+                                # `for tc in delta_obj.get("tool_calls")` logo
+                                # acima, então tool_calls_acc cobre o caso de
+                                # chunk misto content+tool_calls também.)
+                                if watch_confidence and window is not None:
+                                    if tool_calls_acc or delta_obj.get("tool_calls"):
+                                        # reseta a janela — a confiança daqui
+                                        # por diante não é de prosa conversável
+                                        if window.text:
+                                            window.reset()
+                                    elif watch_events_used < CONFIDENCE_MAX_CORRECTIONS:
+                                        lp_obj = choices[0].get("logprobs") \
+                                                 or delta_obj.get("logprobs") or {}
+                                        lp_content = lp_obj.get("content") or []
+                                        if lp_content:
+                                            watch_lp_seen += len(lp_content)
+                                            for lp_item in lp_content:
+                                                window.add(lp_item.get("token", ""), lp_item.get("logprob"))
+                                        else:
+                                            watch_chunks_no_lp += 1
+                                            if watch_chunks_no_lp == WATCH_LP_PROBE_CHUNKS and not watch_lp_seen:
+                                                log.warning(
+                                                    "[MEMORY-WATCH] "
+                                                    f"{WATCH_LP_PROBE_CHUNKS} chunks de conteúdo e nenhum "
+                                                    "logprob recebido — o provedor/modelo não devolve "
+                                                    "logprobs. Vigia de confiança desativado nesta "
+                                                    "resposta (memory_read de correção não vai disparar)."
+                                                )
+                                        if window.sentence_ready():
+                                            conf = window.avg_confidence()
+                                            if conf < CONFIDENCE_THRESHOLD:
+                                                log.info(
+                                                    f"[MEMORY-WATCH] Confiança baixa ({conf:.2f} < "
+                                                    f"{CONFIDENCE_THRESHOLD}) na janela: {window.text!r}"
+                                                )
+                                                interrupted_for_correction = True
+                                                break
+                                            window.reset()
                             except (json.JSONDecodeError, KeyError, IndexError):
                                 continue
 

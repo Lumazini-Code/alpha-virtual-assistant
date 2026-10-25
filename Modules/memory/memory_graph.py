@@ -450,6 +450,7 @@ def _expand_graph_sync(
 def _log_activation_sync(
     seed_ids: list[int], rank: dict[int, float], elapsed_ms: float,
     ctx: Optional[dict] = None, graph: str = "memory",
+    log_path: Optional[str] = None,
 ):
     """Grava um evento de ativação PPR no log JSONL, consumido por
     graph_activation.py p/ visualização em tempo real. Best-effort:
@@ -459,7 +460,9 @@ def _log_activation_sync(
     provocou (query, strategy, session_id) — a UI mostra POR QUÊ o grafo
     ativou, não só que ativou. `graph` identifica o grafo de origem
     ("memory" | "tools") — ids inteiros colidem entre os dois, e a UI
-    prefixa os de tools com "t"."""
+    prefixa os de tools com "t". `log_path` (opcional): arquivo do escopo
+    dono do grafo (projetos têm log próprio em db/<slug>/); None = o geral."""
+    target = log_path or ACTIVATION_LOG_PATH
     try:
         top = sorted(rank.items(), key=lambda kv: kv[1], reverse=True)[:ACTIVATION_LOG_MAX_IDS]
         line = json.dumps({
@@ -473,8 +476,8 @@ def _log_activation_sync(
             "strategy": (ctx or {}).get("strategy"),
             "session_id": (ctx or {}).get("session_id"),
         }, ensure_ascii=False)
-        Path(ACTIVATION_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with open(ACTIVATION_LOG_PATH, "a", encoding="utf-8") as f:
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         log.debug("activation log: falha ao gravar (ignorado)", exc_info=True)
