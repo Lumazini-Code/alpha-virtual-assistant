@@ -1122,6 +1122,23 @@ class PeopleDB:
             );
             CREATE INDEX IF NOT EXISTS idx_p_key ON people(person_key);
 
+            -- NEW: card de identidade da própria assistente (Alpha) —
+            -- SINGLETON (id=1 check): uma linha por instância. Mesmo desenho
+            -- do card de pessoa (nome/descrição/extras + memory_id p/ a
+            -- memória de identidade LT) — é essa memória que dá à Alpha o nó
+            -- no grafo Hebbiano (aresta identity_memory no viewer).
+            CREATE TABLE IF NOT EXISTS identity (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                name            TEXT    NOT NULL DEFAULT 'Alpha',
+                description     TEXT    NOT NULL DEFAULT '',  -- quem é a Alpha
+                roles           TEXT    NOT NULL DEFAULT '',  -- papéis/valores
+                additional_info TEXT    NOT NULL DEFAULT '',  -- informações extras
+                memory_id       INTEGER,                    -- FK lógica p/ memories.id
+                source          TEXT    NOT NULL DEFAULT 'identity',
+                created_at      REAL    NOT NULL,
+                updated_at      REAL    NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS voice_embeddings (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 person_id  INTEGER NOT NULL,
@@ -1240,6 +1257,68 @@ class PeopleDB:
             "AS face_examples_count "
             "FROM people p ORDER BY p.last_accessed DESC"
         ).fetchall()
+
+    # ── NEW: Identity (card singleton da própria assistente — Alpha) ──
+    #
+    # Mesma idéia do card de pessoa, mas com UMA linha só (id=1, CHECK na
+    # tabela): quem é a própria assistente. memory_id aponta pra memória LT
+    # de identidade (source="identity") que ancora o nó no grafo.
+
+    def get_identity(self) -> Optional[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM identity WHERE id = 1").fetchone()
+
+    def insert_identity(
+        self, name: str = "Alpha", description: str = "", roles: str = "",
+        additional_info: str = "", source: str = "identity",
+        memory_id: Optional[int] = None,
+    ) -> None:
+        """Cria o card singleton. `OR IGNORE` + id=1 explícito: corrida com
+        outro writer (seed × edit) não sobrescreve o card existente."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO identity "
+                "(id, name, description, roles, additional_info, memory_id, "
+                " source, created_at, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, description, roles, additional_info, memory_id,
+                 source, now, now),
+            )
+
+    def update_identity(
+        self, name: Optional[str] = None, description: Optional[str] = None,
+        roles: Optional[str] = None, additional_info: Optional[str] = None,
+    ) -> None:
+        """Atualiza campos do card singleton. Apenas campos não-nulos são
+        alterados (mesmo contrato do update_card — string vazia limpa)."""
+        with self._lock:
+            updates, params = [], []
+            if name is not None and name.strip():
+                updates.append("name = ?")
+                params.append(name.strip())
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if roles is not None:
+                updates.append("roles = ?")
+                params.append(roles)
+            if additional_info is not None:
+                updates.append("additional_info = ?")
+                params.append(additional_info)
+            if not updates:
+                return
+            updates.append("updated_at = ?")
+            params.append(time.time())
+            self._conn.execute(
+                f"UPDATE identity SET {', '.join(updates)} WHERE id = 1", params
+            )
+
+    def set_identity_memory_id(self, memory_id: Optional[int]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE identity SET memory_id = ?, updated_at = ? WHERE id = 1",
+                (memory_id, time.time()),
+            )
 
     # ── Embedding-row operations (mapeamento embedding_id → person_id) ──
 

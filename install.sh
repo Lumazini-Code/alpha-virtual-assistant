@@ -396,7 +396,7 @@ AVA_TOKEN="$(get_env_var AVA_INTERNAL_TOKEN)"
 ok "AVA_INTERNAL_TOKEN configurado em $ENV_FILE (chmod 600)."
 
 # ── 5b. Token do crawl4ai (CRAWL4AI_API_TOKEN) ───────────────────────────────
-# O compose exige esta variável (falha de boot se ausente). O websearch-mcp
+# O compose exige esta variável (falha de boot se ausente). O alpha-mcp
 # e o crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
 
 if ! grep -qE '^CRAWL4AI_API_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
@@ -626,14 +626,14 @@ register_playwright_mcp() {
   ok "Playwright MCP registrado e sincronizado."
 }
 
-register_websearch_mcp() {
-  # URL do MCP do websearch (server.py). Se o manager rodar dentro do Docker,
-  # use o nome do serviço (http://websearch:4010/mcp) ou host.docker.internal.
-  local ws_url="${WEBSEARCH_MCP_URL:-http://localhost:4010/mcp}"
+register_alpha_mcp() {
+  # URL do MCP do alpha-mcp (server.py). Se o manager rodar dentro do Docker,
+  # use o nome do serviço (http://alpha-mcp:4010/mcp) ou host.docker.internal.
+  local ws_url="${ALPHA_MCP_URL:-http://localhost:4010/mcp}"
   local payload
   payload=$(cat <<EOF
 {
-  "name": "websearch",
+  "name": "alpha-mcp",
   "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.",
   "transport": "http",
   "url": "$ws_url",
@@ -659,7 +659,7 @@ register_websearch_mcp() {
 EOF
 )
 
-  info "Registrando websearch MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  info "Registrando alpha-mcp no mcp_manager ($MCP_MANAGER_URL)..."
   local registered=0 i
   for i in $(seq 1 24); do
     if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
@@ -671,18 +671,18 @@ EOF
     sleep 5
   done
   if [ "$registered" -ne 1 ]; then
-    warn "Não consegui cadastrar o websearch MCP — manager não respondeu em 2 min."
+    warn "Não consegui cadastrar o alpha-mcp — manager não respondeu em 2 min."
     warn "Cadastre manualmente depois (dois comandos):"
     printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -H "Authorization: Bearer $AVA_INTERNAL_TOKEN" -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
-    printf '  curl -X POST %s/servers/websearch/sync -H "Authorization: Bearer $AVA_INTERNAL_TOKEN"\n' "$MCP_MANAGER_URL"
+    printf '  curl -X POST %s/servers/alpha-mcp/sync -H "Authorization: Bearer $AVA_INTERNAL_TOKEN"\n' "$MCP_MANAGER_URL"
     return 1
   fi
 
-  # /sync: exige a memory_api (:3000) de pé E o server.py do websearch
+  # /sync: exige a memory_api (:3000) de pé E o server.py do alpha-mcp
   # respondendo em $ws_url (o cadastro é lazy; só o sync conecta de fato).
   local synced=0
   for i in $(seq 1 12); do
-    if curl -fsS --max-time 120 -X POST "$MCP_MANAGER_URL/servers/websearch/sync" \
+    if curl -fsS --max-time 120 -X POST "$MCP_MANAGER_URL/servers/alpha-mcp/sync" \
          -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
       synced=1
       break
@@ -690,11 +690,11 @@ EOF
     sleep 10
   done
   if [ "$synced" -ne 1 ]; then
-    warn "websearch MCP cadastrado, mas o sync falhou (memory_api ou websearch ainda bootando?)."
-    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/websearch/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
+    warn "alpha-mcp cadastrado, mas o sync falhou (memory_api ou alpha-mcp ainda bootando?)."
+    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/alpha-mcp/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
     return 1
   fi
-  ok "websearch MCP registrado e sincronizado."
+  ok "alpha-mcp registrado e sincronizado."
 }
 
 register_desktop_commander_mcp() {
@@ -840,7 +840,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
   # Registro dos MCPs — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
-  register_websearch_mcp || true
+  register_alpha_mcp || true
   register_desktop_commander_mcp || true
 
 

@@ -51,7 +51,7 @@ services:
         max-size: "20m"
         max-file: "5"
 
-  # ── Pipeline de busca web (websearch-mcp consome os três abaixo) ──────────
+  # ── Pipeline de busca web (alpha-mcp consome os três abaixo) ─────────────
   # Portas publicadas só em 127.9.12.22: o ava roda com network_mode: host no
   # override linux e alcança tudo via localhost; nada fica exposto na rede.
 
@@ -71,7 +71,7 @@ services:
     ports:
       - "127.9.12.22:6379:6379"
     # Sem persistência (appendonly no + save "") — o cache vive só em RAM;
-    # não há mais volume websearch-cache montado (era sempre vazio no disco).
+    # não há mais volume de cache do alpha-mcp montado (era sempre vazio no disco).
     command: ["valkey-server", "--appendonly", "no", "--save", ""]
 
   crawl4ai:
@@ -85,22 +85,22 @@ services:
       # Gerado pelo install.sh em Modules/.env (falha de boot se ausente).
       CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
 
-  websearch-mcp:
+  alpha-mcp:
     build:
-      context: ./mcp_servers/websearch
+      context: ./mcp_servers/alpha-mcp
       dockerfile: Dockerfile
-    image: ava-websearch-mcp:latest
-    container_name: ava-websearch-mcp
+    image: ava-alpha-mcp:latest
+    container_name: ava-alpha-mcp
     volumes:
       - ./resource:/app/resource:ro
       # crawl4ai on-demand via docker-socket-proxy (abaixo): o socket do host
-      # NÃO é mais montado aqui — o websearch só pode subir/parar o crawl4ai
+      # NÃO é mais montado aqui — o alpha-mcp só pode subir/parar o crawl4ai
       # através da allowlist do proxy (sem exec/images/volumes/networks).
       # DOCKER_HOST é lido automaticamente pelo docker.from_env().
     ports:
       - "127.9.12.22:4010:4010"
     environment:
-      WEBSEARCH_CONFIG: "/app/resource/websearch/config.json"
+      ALPHA_MCP_CONFIG: "/app/resource/alpha-mcp/config.json"
       SEARXNG_URL: "http://searxng:8080"
       CRAWL4AI_URL: "http://crawl4ai:11235"
       VALKEY_URL: "redis://valkey:6379/0"
@@ -116,7 +116,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Proxy do socket Docker — o websearch não tem acesso direto ao socket ──
+  # ── Proxy do socket Docker — o alpha-mcp não tem acesso direto ao socket ──
   # Allowlist mínima: apenas listar/inspecionar containers e start/stop do
   # crawl4ai (on-demand, economia de ~490MB RAM). Tudo mais (exec, images,
   # volumes, networks, build) fica bloqueado pelo HAProxy interno do proxy.
@@ -139,5 +139,5 @@ volumes:
     driver: local
   ava-logs:
     driver: local
-  # websearch-cache removido — o valkey roda sem persistência
+  # volume de cache do alpha-mcp removido — o valkey roda sem persistência
   # (--appendonly no, --save ""), o volume nunca recebia dado algum.

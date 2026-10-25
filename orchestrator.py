@@ -142,7 +142,7 @@ MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # Ainda filtered pelo /skills do manager, então um servidor desabilitado ou
 # offline não é injetado. Env para override sem tocar em código.
 ALWAYS_ON_MCP_SERVERS = {
-    s.strip() for s in os.getenv("AVA_ALWAYS_ON_MCP_SERVERS", "websearch").split(",") if s.strip()
+    s.strip() for s in os.getenv("AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp").split(",") if s.strip()
 }
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 # Env: no Windows o container precisa alcançar o tray NO HOST —
@@ -2256,7 +2256,7 @@ async def _select_skills(user_input: str) -> list[str]:
         log.warning(f"[_select_skills] seleção via grafo falhou ({type(e).__name__}: {e}) — "
                     f"liberando todos os servidores habilitados: {chosen}")
     # Always-on: servidores self-hosted cujas tools (ex.: gravação de
-    # memórias via websearch__memory_write_batch) devem estar disponíveis
+    # memórias via alpha-mcp__memory_write_batch) devem estar disponíveis
     # em TODO turno — bypass do seletor. Filtrados pela lista de habilitados
     # acima (servidor desabilitado nunca é injetado).
     always_on = [s["name"] for s in enabled if s["name"] in ALWAYS_ON_MCP_SERVERS]

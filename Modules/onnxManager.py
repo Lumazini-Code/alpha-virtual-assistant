@@ -56,6 +56,12 @@ EMBED_TOKENIZER    = os.getenv("ONNX_EMBED_TOKENIZER", "./Models/multilingual-e5
 EMBED_MAX_LENGTH   = max(32, int(os.getenv("ONNX_EMBED_MAX_LENGTH", "128")))
 EMBED_DIM          = int(os.getenv("ONNX_EMBED_DIM", "384"))
 EMBED_THREADS      = max(1, int(os.getenv("ONNX_EMBED_THREADS", "2")))
+# Padding dinâmico: cada batch é paddado só até o texto mais longo dele,
+# arredondado para múltiplo de PAD_MULTIPLE (shapes alinhados rendem melhor
+# nos kernels SIMD e limitam a variedade de shapes). Antes era fixo em
+# max_length (128 no embed / 512 no rerank) — ~10x de cálculo em texto curto.
+# 0 ou 1 = sem arredondamento.
+PAD_MULTIPLE       = max(1, int(os.getenv("ONNX_PAD_MULTIPLE", "8")))
 # Teto de textos por chamada de inferência. A arena do ORT cresce com o batch
 # e com workers concorrentes (medido: 3 batches de 128 → +850MB que não voltam).
 # Chunkar aqui bounda o pico sem mudar a API.
@@ -131,7 +137,10 @@ class TokenizerWrapper:
         self._max_length = max_length
         if HAS_TOKENIZERS:
             self._tok = Tokenizer.from_file(path)
-            self._tok.enable_padding(length=max_length)
+            # Padding dinâmico (BatchLongest): sem `length`, paddar até o mais
+            # longo do batch. Máscara de atenção zera o padding, então o
+            # resultado do pooling não muda.
+            self._tok.enable_padding(pad_to_multiple_of=PAD_MULTIPLE if PAD_MULTIPLE > 1 else None)
             self._tok.enable_truncation(max_length=max_length)
             self._backend = "tokenizers"
         else:
@@ -141,6 +150,13 @@ class TokenizerWrapper:
     @property
     def backend(self) -> str:
         return self._backend
+
+    def use_fixed_padding(self) -> None:
+        """Volta ao padding fixo em max_length. Usado se o .onnx foi exportado
+        com comprimento de sequência estático (dynamic padding quebraria)."""
+        if self._backend == "tokenizers":
+            self._tok.enable_padding(length=self._max_length)
+            log.warning("Modelo ONNX com seq_len estático — usando padding fixo em %d.", self._max_length)
 
     def encode_batch(self, texts: list[str]) -> dict[str, np.ndarray]:
         if self._backend == "tokenizers":
@@ -153,14 +169,19 @@ class TokenizerWrapper:
 
     def encode_pairs(self, pairs: list[tuple[str, str]]) -> dict[str, np.ndarray]:
         if self._backend == "tokenizers":
-            texts   = [f"{q} [SEP] {p}" for q, p in pairs]
-            encoded = self._tok.encode_batch(texts)
+            # Par nativo (query, passage): o post-processor do tokenizer insere
+            # [CLS]/[SEP] corretamente e gera type_ids (0 = query, 1 = passage),
+            # como o cross-encoder foi treinado. Truncamento longest_first.
+            encoded = self._tok.encode_batch([(q, p) for q, p in pairs])
             return {
                 "input_ids":      np.array([e.ids            for e in encoded], dtype=np.int64),
                 "attention_mask": np.array([e.attention_mask for e in encoded], dtype=np.int64),
+                "token_type_ids": np.array([e.type_ids       for e in encoded], dtype=np.int64),
             }
         texts = [f"{q} [SEP] {p}" for q, p in pairs]
-        return self._simple_encode(texts)
+        out = self._simple_encode(texts)
+        out["token_type_ids"] = np.zeros_like(out["input_ids"])
+        return out
 
     def _simple_encode(self, texts: list[str]) -> dict[str, np.ndarray]:
         ml = self._max_length
@@ -259,6 +280,11 @@ class EmbeddingModel:
         self._tokenizer = TokenizerWrapper(tokenizer_path, EMBED_MAX_LENGTH)
         self._provider  = self._session.get_providers()[0]
 
+        # Se o eixo de sequência for estático (int), padding dinâmico não é possível.
+        _seq_dim = self._session.get_inputs()[0].shape[1]
+        if isinstance(_seq_dim, int):
+            self._tokenizer.use_fixed_padding()
+
         # Pre-compute token_type_ids shape for models that need it
         self._needs_token_type_ids = "token_type_ids" in {
             i.name for i in self._session.get_inputs()
@@ -286,11 +312,18 @@ class EmbeddingModel:
 
         # Chunking: bounda o tamanho de cada run do ORT (arena/alocador não
         # explode com requests grandes) preservando a ordem dos resultados.
-        chunks = [texts[i:i + EMBED_MAX_BATCH] for i in range(0, len(texts), EMBED_MAX_BATCH)]
+        # Ordena por tamanho (textos parecidos no mesmo chunk → menos padding)
+        # e restaura a ordem original no final.
+        order   = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        sorted_texts = [texts[i] for i in order]
+        chunks = [sorted_texts[i:i + EMBED_MAX_BATCH] for i in range(0, len(sorted_texts), EMBED_MAX_BATCH)]
         out: list[np.ndarray] = []
         for chunk in chunks:
             out.append(self._embed_batch(chunk))
-        return np.concatenate(out, axis=0)
+        sorted_emb = np.concatenate(out, axis=0)
+        result = np.empty_like(sorted_emb)
+        result[np.asarray(order)] = sorted_emb
+        return result
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
         inputs = self._tokenizer.encode_batch(texts)
@@ -329,6 +362,11 @@ class RerankerModel:
         self._tokenizer = TokenizerWrapper(tokenizer_path, RERANK_MAX_LENGTH)
         self._provider  = self._session.get_providers()[0]
 
+        # Se o eixo de sequência for estático (int), padding dinâmico não é possível.
+        _seq_dim = self._session.get_inputs()[0].shape[1]
+        if isinstance(_seq_dim, int):
+            self._tokenizer.use_fixed_padding()
+
         self._needs_token_type_ids = "token_type_ids" in {
             i.name for i in self._session.get_inputs()
         }
@@ -351,8 +389,14 @@ class RerankerModel:
 
         # Chunking igual ao embed: bounda cada run do ORT (passages de 256 ×
         # 512 tokens alocavam centenas de MB por request).
-        chunks = [passages[i:i + RERANK_MAX_BATCH] for i in range(0, len(passages), RERANK_MAX_BATCH)]
-        return np.concatenate([self._score_batch(query, c) for c in chunks]).astype(np.float32)
+        # Ordena por tamanho para reduzir padding; restaura a ordem original.
+        order   = sorted(range(len(passages)), key=lambda i: len(passages[i]))
+        sorted_p = [passages[i] for i in order]
+        chunks = [sorted_p[i:i + RERANK_MAX_BATCH] for i in range(0, len(sorted_p), RERANK_MAX_BATCH)]
+        sorted_scores = np.concatenate([self._score_batch(query, c) for c in chunks]).astype(np.float32)
+        result = np.empty_like(sorted_scores)
+        result[np.asarray(order)] = sorted_scores
+        return result
 
     def _score_batch(self, query: str, passages: list[str]) -> np.ndarray:
         pairs  = [(query, p) for p in passages]
@@ -363,7 +407,9 @@ class RerankerModel:
             "attention_mask": inputs["attention_mask"],
         }
         if self._needs_token_type_ids:
-            ort_inputs["token_type_ids"] = np.zeros_like(inputs["input_ids"])
+            ort_inputs["token_type_ids"] = inputs.get(
+                "token_type_ids", np.zeros_like(inputs["input_ids"])
+            )
 
         # Run inference — logits shape: (batch, 1) or (batch, 2)
         logits = self._session.run(None, ort_inputs)[0].astype(np.float32)

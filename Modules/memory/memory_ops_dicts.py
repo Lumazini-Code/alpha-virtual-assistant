@@ -14,6 +14,7 @@ comentário em memory_ops_memory.
 """
 
 import asyncio
+import json
 import sqlite3
 from typing import Optional
 
@@ -22,6 +23,8 @@ import numpy as np
 from memory_config import (
     FD_AMBIGUOUS_MARGIN,
     FD_EMBED_DIM,
+    PERSONA_FILE,
+    PERSONA_MAX,
     VD_AMBIGUOUS_MARGIN,
     VD_EMBED_DIM,
     VO_AMBIGUOUS_MARGIN,
@@ -35,6 +38,8 @@ from memory_models import (
     FaceDictReadResponse,
     FaceDictWriteRequest,
     FaceDictWriteResponse,
+    IdentityEntry,
+    IdentityUpdateRequest,
     MemoryToolError,
     PeopleCardEntry,
     PeopleCardUpdateRequest,
@@ -722,7 +727,7 @@ async def voice_dict_delete(person_id: int):
 # O card unificado (PeopleDB) já centraliza os metadados ricos das pessoas
 # (nome, descrição, gostos, religião, informações adicionais) — é a mesma
 # tabela `people` que face-dict e voice-dict usam. Estes handlers expõem o
-# card como recurso TEXTUAL puro: o MCP websearch (LLM, sem câmera/microfone)
+# card como recurso TEXTUAL puro: o MCP alpha-mcp (LLM, sem câmera/microfone)
 # cria e edita pessoas pela conversa. O mesmo person_id continua recebendo
 # embeddings dos pipelines de visão/áudio normalmente.
 #
@@ -916,6 +921,162 @@ async def people_card_list():
     return {"total": len(people), "people": people}
 
 
+# ── NEW: Identity Card — card singleton da própria assistente (Alpha) ─────────
+#
+# Mesmo desenho dos people cards, aplicado à ALPHa: card textual em ava_people.db
+# (tabela `identity`, UMA linha — id=1) + memória de identidade LT
+# (source="identity", id guardado em identity.memory_id). É essa memória que
+# dá à Alpha o nó no grafo Hebbiano e a aresta `identity_memory` no viewer
+# (graph_activation.py) — por ela ela se liga a outras memórias LT e,
+# transitivamente, às pessoas (cada uma com a sua).
+#
+# Seed no boot (identity_seed): se a tabela estiver vazia, o card nasce a
+# partir de resource/persona.json — a frase de identidade que também é a 1ª
+# linha do system prompt no orchestrator. Depois do seed os dois evoluem
+# INDEPENDENTES (persona.json continua fonte do prompt; o card é o que vive
+# no grafo). O seed é auto-curativo: card existe sem memória (ONNX fora do
+# ar no boot anterior) → tenta criar o vínculo no boot seguinte.
+
+_identity_lock = asyncio.Lock()   # guarda check-then-insert/update do singleton
+
+
+def _identity_entry(row: sqlite3.Row) -> IdentityEntry:
+    return IdentityEntry(
+        name=row["name"],
+        description=row["description"],
+        roles=row["roles"],
+        additional_info=row["additional_info"],
+        memory_id=row["memory_id"],
+        source=row["source"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _load_persona_identity() -> str:
+    """Frase de identidade persistida em resource/persona.json (MESMO arquivo
+    que o orchestrator usa como 1ª linha do system prompt). Ausente/corrompido
+    → default — o seed nunca derruba o boot por causa de uma linha de prompt."""
+    try:
+        data = json.loads(PERSONA_FILE.read_text(encoding="utf-8"))
+        p = str(data.get("persona") or "").strip()
+        if p:
+            return p[:PERSONA_MAX]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Identity: falha ao ler {PERSONA_FILE} — usando default: {e}")
+    return "You are Alpha, a helpful assistant"
+
+
+async def _identity_memory(
+    name: str, description: str, current: Optional[int],
+) -> Optional[int]:
+    """Cria/atualiza a memória de identidade LT do card ("Nome: descrição",
+    source="identity") e garante o memory_id atualizado no card — espelha
+    _card_identity_memory: update in-place (action="update", mesmo memory_id)
+    mantém o nó estável no grafo; falha no update mantém o vínculo atual."""
+    text = f"{name}: {description.strip() or 'sem descrição'}"
+    if current is not None:
+        stored, _, memory_id, _ = await _store_long_term_text(
+            text, "identity", 1.0, False,
+            action="update", memory_id=current,
+            internal=True,  # card guarda id CRUA (a memória pode morar no geral)
+        )
+        if stored:
+            return memory_id
+        log.warning(
+            f"identity: update da memória de identidade recusado — vínculo "
+            f"atual mantido (#{current})"
+        )
+        return current
+    stored, reason, memory_id, _ = await _store_long_term_text(
+        text, "identity", 1.0, False,
+    )
+    if not stored or memory_id is None:
+        log.warning(
+            f"identity: falha ao criar memória de identidade ({reason}) — "
+            f"card segue sem nó"
+        )
+        return None
+    state.pd_db.set_identity_memory_id(memory_id)
+    return memory_id
+
+
+async def identity_seed() -> None:
+    """Seed do card de identidade no BOOT (chamado por memory_state.startup).
+
+    Tabela vazia → cria o card a partir de resource/persona.json e, na
+    sequência, a memória de identidade LT. Card já existe SEM memória →
+    só tenta criar o vínculo (auto-heal do boot em que o ONNX estava fora).
+    Qualquer falha vira warning — o boot da memory NUNCA quebra por aqui."""
+    try:
+        row = state.pd_db.get_identity()
+        if row is None:
+            persona = _load_persona_identity()
+            # memória PRIMEIRO (insert já grava o memory_id — mesmo fluxo do
+            # people_card create; se falhar, o card nasce sem nó e o auto-heal
+            # do próximo boot tenta de novo)
+            memory_id = await _identity_memory("Alpha", persona, None)
+            state.pd_db.insert_identity(
+                name="Alpha", description=persona, memory_id=memory_id,
+            )
+            log.info(
+                f"Identity: card semeado da persona (memory_id={memory_id})"
+            )
+            return
+        if row["memory_id"] is None:
+            memory_id = await _identity_memory(
+                row["name"], row["description"], None,
+            )
+            log.info(
+                f"Identity: vínculo de memória criado no boot "
+                f"(memory_id={memory_id})"
+            )
+    except Exception as e:
+        log.warning(f"Identity: seed pulado ({type(e).__name__}: {e})")
+
+
+async def identity_get() -> IdentityEntry:
+    """Card de identidade da Alpha (singleton). Cria o card MINIMO na hora
+    se o seed do boot ainda não rodou (ONNX fora do ar) — o vínculo de
+    memória nasce no boot seguinte ou em identity_update."""
+    row = state.pd_db.get_identity()
+    if row is None:
+        async with _identity_lock:
+            row = state.pd_db.get_identity()
+            if row is None:
+                state.pd_db.insert_identity(name="Alpha")
+                row = state.pd_db.get_identity()
+    return _identity_entry(row)
+
+
+async def identity_update(req: IdentityUpdateRequest) -> IdentityEntry:
+    """Edita o card de identidade (singleton). Campos não enviados (None)
+    NÃO são alterados. Mudar name/description regenera a memória de identidade
+    LT in-place (relink_memory=True) — o nó permanece estável no grafo."""
+    async with _identity_lock:
+        row = state.pd_db.get_identity()
+        if row is None:
+            state.pd_db.insert_identity(name="Alpha")   # seed ausente → card mínimo
+        sent = set(req.model_fields_set)
+        state.pd_db.update_identity(
+            name=req.name if "name" in sent else None,
+            description=req.description if "description" in sent else None,
+            roles=req.roles if "roles" in sent else None,
+            additional_info=req.additional_info if "additional_info" in sent else None,
+        )
+        row = state.pd_db.get_identity()
+        if req.relink_memory and (("name" in sent) or ("description" in sent)):
+            await _identity_memory(row["name"], row["description"], row["memory_id"])
+            row = state.pd_db.get_identity()
+        log.info(
+            f"Identity: card atualizado (memory_id={row['memory_id']}, "
+            f"campos: {', '.join(sorted(sent - {'relink_memory'}))})"
+        )
+        return _identity_entry(row)
+
+
 __all__ = [
     '_fd_write_lock',
     '_vd_write_lock',
@@ -926,6 +1087,9 @@ __all__ = [
     'face_dict_read',
     'face_dict_update',
     'face_dict_write',
+    'identity_get',
+    'identity_seed',
+    'identity_update',
     'people_card_get',
     'people_card_list',
     'people_card_update',

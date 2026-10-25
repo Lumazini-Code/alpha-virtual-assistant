@@ -87,7 +87,7 @@ echo "  • onnx Manager..."
 restart_on_fail "onnx Manager" "python3 onnxManager.py" &
 
 # Deep Search removido — busca web agora é um servidor MCP próprio
-# (mcp_servers/websearch, serviço websearch-mcp no docker-compose).
+# (mcp_servers/alpha-mcp, serviço alpha-mcp no docker-compose).
 
 echo "  • LLM..."
 restart_on_fail "LLM" "python3 LLM.py" &

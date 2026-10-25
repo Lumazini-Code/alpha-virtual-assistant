@@ -48,14 +48,16 @@ Arquitetura (v2 — polling de diff):
     - scan POR ESCOPO (ava_memory.db + ava_plans.db) com ids NAMESPACED:
       memória "{scope}:{id}" (ex. "geral:12", "meu-proj:3") e plano
       "{scope}:p{id}" — ids inteiros colidem ENTRE escopos;
-    - tools/MCP/pessoas continuam GLOBAIS (ids t/m/u sem escopo);
+    - tools/MCP/pessoas/identidade continuam GLOBAIS (ids t/m/u/a sem escopo);
     - cada nó/aresta carrega "scope" (null = global) — o cliente colore a
       borda pela cor do escopo, posiciona cada escopo num SETOR próprio e
       oferece liga/desliga por escopo na legenda;
     - arestas virtuais cruzadas: plan_tool/plan_person (plano do escopo →
-      tool/pessoa global) e person_identity (card global → memória de
+      tool/pessoa global), person_identity (card global → memória de
       identidade que pode morar em QUALQUER escopo — resolvido sondando os
-      ids de memória coletados por escopo no próprio scan);
+      ids de memória coletados por escopo no próprio scan) e
+      identity_memory (card de identidade da Alpha "a1" → memória LT que
+      representa a própria assistente no grafo Hebbiano);
     - resiliência: erro transitório de SQLite num escopo NÃO zera o delta
       (nós/arestas do escopo em falha ficam fora da passada de remoção —
       snapshot do escopo permanece); escopo cujo diretório desaparece tem
@@ -78,6 +80,7 @@ Arquitetura (v2 — polling de diff):
                                       "removed": ["a|b|type", ...]}}
       — nós de tools têm id string "t{id}", kind="tool"; planos
         "{scope}:p{id}", kind="plan"; pessoas "u{id}", kind="person";
+        identidade da Alpha "a{id}", kind="identity" (singleton "a1");
         memórias "{scope}:{id}" (string namespaced), kind="memory";
         nodes/edges carregam "scope" (null = global: tools/MCP/pessoas).
 
@@ -313,6 +316,31 @@ def _person_node_public(row: sqlite3.Row) -> dict:
     }
 
 
+def _identity_node_public(row: sqlite3.Row) -> dict:
+    """Nó público do card de IDENTIDADE da Alpha (PeopleDB: tabela `identity`,
+    singleton id=1). Id STRING com prefixo "a" — t/p/m/u já estão ocupados.
+    Liga-se por aresta virtual à memória de identidade LT (identity.memory_id),
+    que pode morar em qualquer escopo (mesma sondagem do person_identity)."""
+    name = (row["name"] or "").strip()
+    desc = (row["description"] or "").strip()
+    return {
+        "id":          f"a{row['id']}",   # prefixo "a" (t/p/m/u já ocupados)
+        "kind":        "identity",
+        "label":       name[:40] + ("…" if len(name) > 40 else ""),
+        "title":       html.escape(desc[:400]),
+        "text":        f"{name}. {desc} {row['roles']}".strip(),  # p/ busca
+        "name":        name,
+        "description": desc,
+        "roles":       row["roles"],
+        "additional_info": row["additional_info"],
+        "memory_id":   row["memory_id"],   # nó de identidade no grafo de memórias
+        "source":      row["source"],
+        "created_at":  row["created_at"],
+        "updated_at":  row["updated_at"],
+        "scope":       None,   # a identidade é GLOBAL (existe uma só, sem escopo)
+    }
+
+
 class GraphState:
     """Snapshot do grafo + diff por poll. Scan completo das tabelas a
     cada tick — com centenas/milhares de linhas custa poucos ms, e diff
@@ -331,6 +359,9 @@ class GraphState:
         opcional (memory process pode não tê-lo criado ainda);
       - pessoas/cards (ava_people.db) — GLOBAIS, ids "u{id}", kind="person";
         opcional; liga-se às memórias pela memória de identidade;
+      - identidade da Alpha (ava_people.db, tabela `identity` singleton) —
+        GLOBAL, id "a{id}" (prefixo "a": t/p/m/u já ocupados),
+        kind="identity"; liga-se à memória LT que a representa no grafo;
       - MCP registry (mcp_manager Rust no HOST: Modules/mcp_manager/db/
         ava_mcp_servers.db) — GLOBAIS, opcional; FUSÃO por graph_name com
         as tools da ToolsDB: conteúdo (snippet/core/enabled/transporte)
@@ -347,6 +378,9 @@ class GraphState:
         morar em QUALQUER escopo; resolvido sondando os ids de memória
         coletados por escopo no próprio scan (geral primeiro, depois
         projetos em ordem alfabética);
+      identity_memory: card de identidade a{N} GLOBAL → memória LT da
+        própria Alpha (identity.memory_id) — mesma sondagem por escopo do
+        person_identity;
       plan_person:     plano {scope}:p{N} ↔ card u{N} global (plans.person_id);
       plan_tool:       plano {scope}:p{N} ↔ tool t{N} global (plans.tools_json).
 
@@ -361,6 +395,7 @@ class GraphState:
     PLAN_ID_PREFIX = "p"
     MCP_ID_PREFIX = "m"
     PERSON_ID_PREFIX = "u"
+    IDENTITY_ID_PREFIX = "a"   # card singleton da Alpha (tabela `identity`)
     VIRTUAL_EDGE_WEIGHT = 0.5   # peso fixo das arestas virtuais entre grafos
     GENERAL_SCOPE = "general"   # MESMO valor de memory_config.GENERAL_SCOPE —
                                 # o badge da memory API tem que casar com o
@@ -528,6 +563,24 @@ class GraphState:
                 nodes.update(unodes)
             except (sqlite3.Error, FileNotFoundError):
                 pass   # people DB ainda não existe / sem tabela — ignora
+            # NEW: card de IDENTIDADE da Alpha (tabela singleton `identity`).
+            # Bloco SEPARADO de propósito: a tabela é nova (DBs antigos não a
+            # têm) — erro aqui não pode derrubar os people cards de cima.
+            try:
+                iconn = _open_ro(self.people_db_path)
+                try:
+                    irow = iconn.execute(
+                        "SELECT id, name, description, roles, additional_info, "
+                        "memory_id, source, created_at, updated_at "
+                        "FROM identity WHERE id = 1"
+                    ).fetchone()
+                finally:
+                    iconn.close()
+                if irow is not None:
+                    nodes[f"{self.IDENTITY_ID_PREFIX}{irow['id']}"] = \
+                        _identity_node_public(irow)
+            except (sqlite3.Error, FileNotFoundError):
+                pass   # tabela identity ainda não existe — ignora
         # ── MCP registry (opcional): fusão por graph_name ─────────────────
         # 1. Enriquece t-nodes da ToolsDB cujo name existe na MCP DB — o
         #    id t{N} MANTÉM (arestas de co-uso intactas) e o CONTEÚDO passa
@@ -589,6 +642,8 @@ class GraphState:
         #   person_identity: card u{N} GLOBAL → memória de identidade
         #     (people.memory_id) que pode morar em QUALQUER escopo —
         #     resolvido sondando mem_ids coletado por escopo acima;
+        #   identity_memory: card de identidade a{N} GLOBAL → memória LT da
+        #     própria Alpha (identity.memory_id) — mesma sondagem;
         #   plan_person:     plano {scope}:p{N} ↔ card u{N} GLOBAL
         #   plan_tool:       plano {scope}:p{N} ↔ tool t{N} GLOBAL
         # Aresta só nasce se AMBOS os nós existirem (identidade ainda sem
@@ -608,6 +663,19 @@ class GraphState:
                         "key": key, "from": node["id"], "to": target,
                         "type": "person_identity", "weight": w,
                         "count": 1, "last": node.get("last_accessed") or time.time(),
+                        "scope": scope_id,   # escopo da memória de identidade
+                    }
+            elif kind == "identity":
+                # card único da Alpha → a memória LT que a representa
+                mid = node.get("memory_id")
+                scope_id = self._resolve_identity_scope(mid, mem_ids)
+                if scope_id is not None:
+                    target = f"{scope_id}:{mid}"
+                    key = f"{node['id']}|{target}|identity_memory"
+                    virtual[key] = {
+                        "key": key, "from": node["id"], "to": target,
+                        "type": "identity_memory", "weight": w,
+                        "count": 1, "last": node.get("updated_at") or time.time(),
                         "scope": scope_id,   # escopo da memória de identidade
                     }
             elif kind == "plan":
@@ -1201,6 +1269,7 @@ const TYPE_STYLE = {
   // derivadas dos metadados — tracejadas pra diferenciar das arestas
   // "reais" do banco Hebbiano/ToolsDB.
   person_identity:     { color: '#63e6be', directed: true,  dashes: [2, 3], name: 'identidade' },
+  identity_memory:     { color: '#ffd43b', directed: true,  dashes: [2, 3], name: 'identidade Alpha' },
   plan_person:         { color: '#f783ac', directed: false, dashes: [2, 3], name: 'plano↔pessoa' },
   plan_tool:           { color: '#74c0fc', directed: false, dashes: [2, 3], name: 'plano→tool' },
 };
@@ -1213,6 +1282,10 @@ const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = 
 // People cards: triângulos rosados, id "u{id}" — a aresta "identidade" liga
 // o card à memória LT que representa a pessoa no grafo Hebbiano
 const PERSON_NODE_BG = '#40232a', PERSON_NODE_BORDER = '#f783ac', PERSON_FONT_COLOR = '#ffdeeb';
+// Identidade da Alpha: estrela dourada, id "a{id}" (singleton) — o ÚNICO nó
+// que representa a própria assistente; a aresta "identidade Alpha" liga o
+// card à memória LT que a representa no grafo Hebbiano
+const IDENTITY_NODE_BG = '#3a3013', IDENTITY_NODE_BORDER = '#ffd43b', IDENTITY_FONT_COLOR = '#ffe8a3';
 const FONT_COLOR   = '#9aa0b4';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1310,18 +1383,22 @@ function baseNodeOptions(meta) {
   const isTool = meta.kind === 'tool';
   const isPlan = meta.kind === 'plan';
   const isPerson = meta.kind === 'person';
+  const isIdentity = meta.kind === 'identity';
   return {
     id: meta.id, label: meta.label, title: nodeTitle(meta),
-    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : isPerson ? 'triangle' : 'dot',
-    size: (isTool ? 9 : isPlan ? 8 : isPerson ? 10 : 5) + Math.min(deg, 12) * 1.3,
+    shape: isTool ? 'hexagon' : isPlan ? 'diamond' : isPerson ? 'triangle'
+                 : isIdentity ? 'star' : 'dot',
+    size: (isTool ? 9 : isPlan ? 8 : isPerson ? 10 : isIdentity ? 12 : 5) + Math.min(deg, 12) * 1.3,
     // NEW (multi-escopo): borda na COR DO ESCOPO (memórias e planos);
-    // tools/pessoas globais mantêm as cores próprias dos kinds.
+    // tools/pessoas/identidade globais mantêm as cores próprias dos kinds.
     color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
                   : isPlan ? { background: PLAN_NODE_BG, border: scopeColor(meta.scope) }
                   : isPerson ? { background: PERSON_NODE_BG, border: PERSON_NODE_BORDER }
+                  : isIdentity ? { background: IDENTITY_NODE_BG, border: IDENTITY_NODE_BORDER }
                              : { background: BASE_NODE_BG, border: scopeColor(meta.scope) },
     borderWidth: (isTool || isPerson) ? 1 : 2,   // escopo precisa ficar legível
-    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : isPerson ? PERSON_FONT_COLOR : FONT_COLOR, size: 11 },
+    font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : isPerson ? PERSON_FONT_COLOR
+                  : isIdentity ? IDENTITY_FONT_COLOR : FONT_COLOR, size: 11 },
   };
 }
 
@@ -1335,6 +1412,14 @@ function nodeTitle(meta) {
            ` <span style="color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span><br>` +
            `<i>${meta.title || '(sem descrição)'}</i><br>` +
            `${meta.steps_count ?? '?'} passo(s) · criado: ${fmt(meta.created_at)} · atualizado: ${fmt(meta.updated_at)}`;
+  }
+  if (meta.kind === 'identity') {
+    const d = new Date((meta.created_at || 0) * 1000);
+    const fmt = isNaN(d) ? '?' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> <span style="color:${IDENTITY_FONT_COLOR}">identidade</span><br>` +
+           `<i>${meta.title || '(sem descrição)'}</i><br>` +
+           `${meta.roles ? `papéis: ${escapeHtml(meta.roles)}<br>` : ''}` +
+           `criado: ${fmt} · fonte: ${escapeHtml(meta.source || '?')}`;
   }
   if (meta.kind === 'person') {
     const d = new Date((meta.created_at || 0) * 1000);
@@ -1554,9 +1639,11 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function nodeColor(act, seedRecent, born, meta) {
   const isTool = meta && meta.kind === 'tool';
   const isPlan = meta && meta.kind === 'plan';
+  const isIdentity = meta && meta.kind === 'identity';
   if (born) return isTool ? { background: TOOL_NODE_BG, border: '#51cf66' }
                           : isPlan ? { background: PLAN_NODE_BG, border: '#51cf66' }
-                                   : { background: BASE_NODE_BG, border: '#51cf66' };
+                          : isIdentity ? { background: IDENTITY_NODE_BG, border: '#51cf66' }
+                                       : { background: BASE_NODE_BG, border: '#51cf66' };
   if (seedRecent) {
     return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 107, act))}, ${Math.round(lerp(74, 107, act))})`,
              border: '#ff3b3b' };
@@ -1570,6 +1657,11 @@ function nodeColor(act, seedRecent, born, meta) {
     // ativação de plano (defensiva — PPR não semeia planos): lilás escuro → lilás claro
     return { background: `rgb(${Math.round(lerp(42, 224, act))}, ${Math.round(lerp(35, 219, act))}, ${Math.round(lerp(64, 255, act))})`,
              border: act > 0.05 ? '#e5dbff' : PLAN_NODE_BORDER };
+  }
+  if (isIdentity) {
+    // ativação da identidade: dourado escuro → dourado aceso (a estrela da Alpha)
+    return { background: `rgb(${Math.round(lerp(58, 255, act))}, ${Math.round(lerp(48, 212, act))}, ${Math.round(lerp(19, 59, act))})`,
+             border: act > 0.05 ? '#ffd43b' : IDENTITY_NODE_BORDER };
   }
   return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 209, act))}, ${Math.round(lerp(74, 102, act))})`,
            border: act > 0.05 ? '#ffd166' : BASE_NODE_BORDER };
@@ -1644,14 +1736,15 @@ function updateCounts() {
   const parts = Object.keys(TYPE_STYLE).map(t =>
     `<span class="t" style="background:${TYPE_STYLE[t].color}22;color:${TYPE_STYLE[t].color}">${TYPE_STYLE[t].name}: ${byType[t] || 0}</span>`
   ).join(' ');
-  let tools = 0, plans = 0, people = 0;
+  let tools = 0, plans = 0, people = 0, identity = 0;
   for (const m of nodeMeta.values()) {
     if (m.kind === 'tool') tools++;
     else if (m.kind === 'plan') plans++;
     else if (m.kind === 'person') people++;
+    else if (m.kind === 'identity') identity++;
   }
   document.getElementById('counts').innerHTML =
-    `memórias: ${nodeMeta.size - tools - plans - people} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · ${parts}`;
+    `memórias: ${nodeMeta.size - tools - plans - people - identity} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · <span style="color:${IDENTITY_FONT_COLOR}">identidade: ${identity}</span> · ${parts}`;
   renderScopeBar();   // NEW (multi-escopo): chips com contagem por escopo
 }
 
@@ -1684,9 +1777,25 @@ function showPanel(id) {
   const isTool = meta.kind === 'tool';
   const isPlan = meta.kind === 'plan';
   const isPerson = meta.kind === 'person';
+  const isIdentity = meta.kind === 'identity';
   const d = new Date((meta.created_at || 0) * 1000);
   let head = '', body = '';
-  if (isPerson) {
+  if (isIdentity) {
+    const fmt = isNaN(d) ? '?' : d.toLocaleString('pt-BR');
+    const pills = meta.memory_id != null
+      ? `<span class="pill" style="background:#ffd43b22;color:#ffd43b">memória #${meta.memory_id}</span>`
+      : '<span class="pill" style="background:#e0503c22;color:#e0503c">sem memória de identidade</span>';
+    head = `<h3 style="color:${IDENTITY_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">identidade da Alpha (★ ${escapeHtml(String(meta.id))}) · grau: ${degreeOf(id)}</div>
+      <div class="meta">criado: ${fmt} · fonte: ${escapeHtml(meta.source || '?')}</div>
+      <div class="meta">${pills}</div>`;
+    const extras = [
+      meta.description ? `<b>Quem é:</b> ${escapeHtml(meta.description)}` : '',
+      meta.roles ? `<b>Papéis/valores:</b> ${escapeHtml(meta.roles)}` : '',
+      meta.additional_info ? `<b>Mais:</b> ${escapeHtml(meta.additional_info)}` : '',
+    ].filter(Boolean).map(s => `<div class="text">${s}</div>`).join('');
+    body = extras || '<div class="meta">(card sem campos preenchidos)</div>';
+  } else if (isPerson) {
     const fmt = isNaN(d) ? '?' : d.toLocaleString('pt-BR');
     const la = new Date((meta.last_accessed || 0) * 1000);
     const pills =
@@ -1824,7 +1933,7 @@ document.getElementById('searchBox').onkeydown = (e) => {
   for (const [id, meta] of nodeMeta.entries()) {
     if ((meta.text || '').toLowerCase().includes(q)) {
       searchHighlight.push(id);
-      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : meta.kind === 'person' ? PERSON_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
+      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : meta.kind === 'person' ? PERSON_NODE_BG : meta.kind === 'identity' ? IDENTITY_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
     }
   }
   pushLog(`🔍 busca "${q}": ${searchHighlight.length} nó(s)`);

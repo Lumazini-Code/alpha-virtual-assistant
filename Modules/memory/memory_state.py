@@ -412,6 +412,18 @@ async def startup():
     )
     state.active_scope = GENERAL_SCOPE
 
+    # ── NEW: seed do card de identidade da Alpha (PeopleDB `identity`) ──
+    # Só popula se a tabela estiver vazia (ou existir sem vínculo de memória).
+    # Import local de propósito: memory_ops_dicts importa memory_state — um
+    # import de topo aqui criaria ciclo. Falha (ex.: ONNX ainda fora do ar)
+    # vira warning — o boot da memory nunca quebra por causa disso; o seed
+    # tenta de novo no boot seguinte.
+    try:
+        from memory_ops_dicts import identity_seed
+        await identity_seed()
+    except Exception as e:
+        log.warning(f"Identity: seed do card de identidade pulado: {e}")
+
     state.decay_task   = asyncio.create_task(decay_job())
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
     state.flush_task   = asyncio.create_task(index_flush_job())

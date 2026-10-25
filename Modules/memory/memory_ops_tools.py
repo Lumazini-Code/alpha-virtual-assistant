@@ -192,7 +192,7 @@ def _ranked_with_quota(ranked: list[tuple[int, float]], names: dict[int, str],
                        limit: int, min_score: float | None) -> list[tuple[int, float]]:
     """Corta `ranked` em `limit` slots com cota TOOLS_MAX_PER_SERVER por
     servidor MCP. Sem a cota, um servidor de 24 tools (playwright) ocupa os
-    8 slots do kNN e um servidor de 1 tool (websearch) nunca entra — e como
+    8 slots do kNN e um servidor de 1 tool (alpha-mcp) nunca entra — e como
     a seleção final é por SERVIDOR (1 hit libera as 24), a competição por
     tool é injusta por construção. Com a cota, servidores diversos dividem
     os slots; slots não usados (servidor com poucas tools) caem pro próximo

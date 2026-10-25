@@ -41,7 +41,7 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 │  Chrome normal do usuário (perfil padrão) p/ Playwright MCP (--extension)   │
 │                                                                             │
 │  Stack de busca web: searxng :8081 · valkey :6379 · crawl4ai :11235         │
-│    websearch-mcp :4010 · docker-socket-proxy (allowlist p/ crawl4ai)        │
+│    alpha-mcp :4010 · docker-socket-proxy (allowlist p/ crawl4ai)            │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -87,7 +87,8 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - Busca semântica com **E5 multilingual** (ONNX, onnxManager :2002) + **rerank cross-encoder** (ms-marco MiniLM) + **Personalized PageRank** com spread de ativação + MMR (inibição lateral).
 - **Grafo de tools (ToolsDB)**: cada tool MCP tem um snippet (o "skill.md" dela); o selector de servidores usa kNN + PPR no grafo de co-uso para escolher **quais** servidores carregar por rodada (economia de contexto com servidores de 20+ tools), com **cota de 4 tools por servidor** (um servidor grande não monopoliza o kNN), **exemplos de uso aprendidos** pós-turno (a query vira vetor "learned") e **self-heal** de vetores perdidos (re-embeda pelo doc_hash).
 - **Dicionários sensoriais** integrados: `visual_dict` (significado de objetos), `face_dict` (rostos) e `voice_dict` (vozes cadastradas pela TUI) — embeddings consultados por kNN, texto pesquisável pela leitura normal de memória.
-- **Cards de pessoa (`people-card`)**: unificam rostos + vozes em um card textual (descrição, likes, religião, infos extras) com **memória de identidade** no grafo (nó estável que ancora as arestas) — criados/editados pelo websearch-mcp (`memory_people_card_*`) e lidos como memória normal.
+- **Cards de pessoa (`people-card`)**: unificam rostos + vozes em um card textual (descrição, likes, religião, infos extras) com **memória de identidade** no grafo (nó estável que ancora as arestas) — criados/editados pelo alpha-mcp (`memory_people_card_*`) e lidos como memória normal.
+- **Card de identidade da Alpha (`GET/PATCH /identity`)**: card singleton com quem a própria assistente é (nome, descrição, papéis/valores, infos extras), **semeado no boot** a partir de `resource/persona.json` e ligado à sua **memória de identidade LT** — no viewer vira o nó ★ dourado `a{id}` com aresta `identity_memory`; editado pelo alpha-mcp (`memory_identity_*`).
 - **RAG de arquivos locais (`indexed-file`)**: cadastro com hash SHA-256 (reindexa só o que mudou), chunking 500/100 com posição (`char_start/end`) e leitura em 3 modos — arquivo inteiro por path, chunks daquele arquivo ranqueados pela query, ou busca semântica global.
 - **Planos persistidos** (`/plans/*`) com CRUD pela TUI e pelo `plan_recorder`.
 - Visualização **em tempo real** do grafo em `graph_activation.py` (:8777): polling de diff do SQLite (~1 s) com nós de memória, **tools como hexágonos** (`t{id}`) e **planos como diamantes** (`p{id}`); arestas nascendo, sendo reforçadas e podadas por decay ao vivo.
@@ -101,8 +102,8 @@ O pipeline completo (**Depth Anything V2** → clusterização por camadas → *
 - **TTS** (Supertonic, :3004): pipeline estilo Piper (worker pool, fila de texto, heap de áudio ordenado, miniaudio 40 ms): `/speak`, `/stream` (síntese paralela por sentença em ordem), `/cancel`. Disparado automaticamente sobre a resposta final; o modelo nunca decide chamar TTS.
 - **Cadastro de vozes pela TUI** (Settings → Vozes): gravação local de microfone, edição de descrição, listagem — tudo via `voice_dict` na memory API.
 
-### Busca web (websearch-mcp)
-O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/websearch`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — todos falando direto com a memory API.
+### Busca web (alpha-mcp)
+O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/alpha-mcp`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — todos falando direto com a memory API.
 
 ### Tools MCP (extensibilidade)
 - **mcp_manager reescrito em Rust** (`Modules/mcp_manager`, :4008) e rodando **NO HOST** — fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome do usuário). O tray o supervisiona: descobre o binário no boot, faz spawn, espera o `/health`, e re-espawna em caso de crash (restart-on-fail).
@@ -132,9 +133,9 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 
 - **Token interno compartilhado** (`AVA_INTERNAL_TOKEN`, gerado pelo install.sh em `Modules/.env` com chmod 600): memory (:3000), orchestrator (:9000) e mcp_manager (:4008) exigem `Bearer` — middleware dedicado em todos os serviços internos.
 - **Sem portas expostas à LAN**: no Windows, todas as portas do container são publicadas apenas em `127.9.12.22`; no Linux, `network_mode: host` mantém os serviços em localhost. O tray (:9001) nunca é publicado.
-- **docker-socket-proxy**: o websearch-mcp não tem acesso direto ao socket do Docker — apenas allowlist mínima (listar/inspecionar containers e start/stop do crawl4ai). Sem exec, images, volumes, networks ou build.
+- **docker-socket-proxy**: o alpha-mcp não tem acesso direto ao socket do Docker — apenas allowlist mínima (listar/inspecionar containers e start/stop do crawl4ai). Sem exec, images, volumes, networks ou build.
 - **crawl4ai com token** (`CRAWL4AI_API_TOKEN`): sem ele o servidor só escuta no loopback do container.
-- **SSRF guard**: `POST /search` e `POST /read-url` (orchestrator) e o fetch do websearch-mcp resolvem o DNS e bloqueiam IP privado/loopback/link-local/metadata — a validação acompanha redirects.
+- **SSRF guard**: `POST /search` e `POST /read-url` (orchestrator) e o fetch do alpha-mcp resolvem o DNS e bloqueiam IP privado/loopback/link-local/metadata — a validação acompanha redirects.
 
 ---
 
@@ -159,12 +160,12 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
 │   │   └── linux/ windows/  #   builds por plataforma
 │   └── Models/              # Pesos ONNX/GGUF (gitignored; via Models.zip)
-├── mcp_servers/websearch/   # websearch-mcp (SearXNG→BM25→Crawl4AI, :4010)
+├── mcp_servers/alpha-mcp/   # alpha-mcp (SearXNG→BM25→Crawl4AI, :4010)
 ├── Manager/                 # ava-tray (Rust: axum + eframe + tray-icon, :9001)
 │   └── src/                 #   api, chat (widget), transcript, mcp_manager, idle_watcher…
 ├── src/                     # TUI (TypeScript/Ink; build Bun)
 │   └── lib/                 #   auth (Bearer), voiceRecorder, voices, mcpServers, plans…
-├── resource/                # ícones, settings do SearXNG, config websearch
+├── resource/                # ícones, settings do SearXNG, config alpha-mcp
 ├── docker-compose.yml       # stack base (+ overrides .linux/.windows)
 ├── start.sh                 # supervisor do container (restart-on-fail por serviço)
 ├── install.sh / install.bat # instaladores (baixam o release, geram tokens, models)
@@ -187,8 +188,8 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 | searxng | container | 8081 | Meta-busca (loopback) |
 | valkey | container | 6379 | Cache da busca web (loopback) |
 | crawl4ai | container | 11235 | Crawl com navegador (loopback, on-demand) |
-| websearch-mcp | container | 4010 | Tool `web_search` (loopback) |
-| docker-socket-proxy | container | — (rede interna) | Allowlist do socket Docker p/ websearch |
+| alpha-mcp | container | 4010 | Tool `web_search` (loopback) |
+| docker-socket-proxy | container | — (rede interna) | Allowlist do socket Docker p/ alpha-mcp |
 | Chrome do usuário | host | — | Aberto pelo tray em modo normal (só se já não estiver aberto) |
 
 ---

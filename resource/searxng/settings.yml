@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# SearXNG — instância privada da pipeline websearch (AVA)
+# SearXNG — instância privada da pipeline do alpha-mcp (AVA)
 # Uso interno: só a tool web_search consome a API JSON. Sem UI pública,
 # sem proxy de imagem, limiter desligado (consumidor único é o orchestrator;
 # o controle de ritmo fica na pipeline, não aqui).
@@ -9,7 +9,7 @@ use_default_settings: true
 
 server:
   # Instância privada em rede interna — chave fixa só pra assinar cookies.
-  secret_key: "ava-websearch-local"
+  secret_key: "ava-alpha-mcp-local"
   limiter: false
   image_proxy: false
   base_url: ""

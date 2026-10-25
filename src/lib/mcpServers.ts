@@ -11,7 +11,7 @@ import { authHeaders } from "./auth.js";
  * (instalado/removido) pela TUI.
  */
 
-export const NATIVE_SERVERS = new Set(["playwright", "playwright-mcp", "websearch"]);
+export const NATIVE_SERVERS = new Set(["playwright", "playwright-mcp", "alpha-mcp"]);
 
 export interface MCPServerEntry {
   name: string;
@@ -91,7 +91,7 @@ export async function installMCPServer(req: {
 /**
  * Registro manual de servidores que não vêm de pacote npm:
  *  - transport "http": streamable-http em URL externa OU local
- *    (http://localhost:4010 — ex.: websearch) — nada é spawnado.
+ *    (http://localhost:4010 — ex.: alpha-mcp) — nada é spawnado.
  *  - transport "stdio": comando custom (python/uvx/node…) com args e env.
  *  - transporte "stdio" com comando `npx -y <pacote>` NÃO use aqui —
  *    prefira installMCPServer, que valida o pacote no registry npm.

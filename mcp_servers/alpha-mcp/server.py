@@ -1,4 +1,4 @@
-"""websearch-mcp — tools self-hosted do AVA (busca web + memória).
+"""alpha-mcp — tools self-hosted do AVA (busca web + memória).
 
 Tools MCP expostas:
   - `web_search(query, max_results)` → trechos relevantes com fontes.
@@ -17,6 +17,11 @@ Tools MCP expostas:
     existente (só os campos enviados; None mantém o valor atual).
   - `memory_people_card_list()` → lista os cards para o modelo descobrir
     person_ids e evitar duplicados antes de criar.
+  - `memory_identity_get()` → lê o card de IDENTIDADE da própria Alpha
+    (quem É a assistente — nome, descrição, papéis/valores, infos extras).
+    Card singleton semeado no boot da memory a partir da persona.
+  - `memory_identity_edit(description?, roles?, ...)` → edita campos do
+    card de identidade (só os campos enviados; None mantém o atual).
     Mesma autenticação do write LT: client persistente com Bearer token
     interno (Modules.internal_auth / AVA_INTERNAL_TOKEN).
 
@@ -36,9 +41,9 @@ Fluxo da busca web:
 Transporte: streamable-http em /mcp (o mcp_manager do AVA registra via
 `POST /servers {"transport":"http","url":...}`).
 
-Config: resource/websearch/config.json — caminho via env WEBSEARCH_CONFIG;
-no container default é /app/resource/websearch/config.json, em dev cai no
-relativo ../../resource/websearch/config.json. A memory_api é apontada via
+Config: resource/alpha-mcp/config.json — caminho via env ALPHA_MCP_CONFIG;
+no container default é /app/resource/alpha-mcp/config.json, em dev cai no
+relativo ../../resource/alpha-mcp/config.json. A memory_api é apontada via
 env MEMORY_API_URL (default http://127.9.12.22:3000; no compose, http://ava:3000).
 """
 
@@ -65,7 +70,7 @@ logging.basicConfig(
     level=logging.DEBUG if os.environ.get("AVA_DEBUG") else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("ava.websearch")
+log = logging.getLogger("ava.alpha_mcp")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
@@ -85,11 +90,11 @@ _DEFAULTS = {
 def _load_config() -> dict:
     import copy
     cfg = copy.deepcopy(_DEFAULTS)
-    path = os.getenv("WEBSEARCH_CONFIG")
+    path = os.getenv("ALPHA_MCP_CONFIG")
     if not path:
         candidates = [
-            Path("/app/resource/websearch/config.json"),
-            Path(__file__).resolve().parent.parent.parent / "resource" / "websearch" / "config.json",
+            Path("/app/resource/alpha-mcp/config.json"),
+            Path(__file__).resolve().parent.parent.parent / "resource" / "alpha-mcp" / "config.json",
         ]
         path = next((str(p) for p in candidates if p.is_file()), None)
     if path and Path(path).is_file():
@@ -773,7 +778,7 @@ async def _memory_write_facts(texts: list[str]) -> list[dict]:
 # Servidor MCP
 # ══════════════════════════════════════════════════════════════════════════════
 
-mcp = MCPServer("websearch")
+mcp = MCPServer("alpha-mcp")
 
 
 @mcp.tool()
@@ -974,11 +979,74 @@ async def memory_people_card_list() -> str:
     return f"{len(people)} pessoa(s) cadastrada(s):\n" + "\n".join(lines)
 
 
+def _format_identity(c: dict) -> str:
+    """Card de identidade em linha compacta: 'Nome — descrição (papéis/info)'."""
+    extra = " / ".join(
+        f"{label}: {c[label]}" for label in ("roles", "additional_info")
+        if c.get(label)
+    )
+    desc = c.get("description") or "sem descrição"
+    return f"{c.get('name', '?')} — {desc}" + (f" ({extra})" if extra else "")
+
+
+@mcp.tool()
+async def memory_identity_get() -> str:
+    """Lê o card de IDENTIDADE da Alpha — quem VOCÊ é (nome, descrição,
+    papéis/valores e informações extras persistentes). Use para responder
+    perguntas sobre si mesma e antes de memory_identity_edit. O card é
+    único (singleton) e nasce no boot da memória a partir da persona."""
+    try:
+        c = await _memory_api_request("GET", "/identity")
+    except MemoryToolError as e:
+        return f"Erro ao ler card de identidade: {e.detail}"
+    except Exception as e:
+        log.exception("memory_identity_get falhou")
+        return f"Erro ao ler card de identidade: {e}"
+    return (
+        f"memory_id={c.get('memory_id')} — {_format_identity(c)}"
+    )
+
+
+@mcp.tool()
+async def memory_identity_edit(
+    name: str | None = None,
+    description: str | None = None,
+    roles: str | None = None,
+    additional_info: str | None = None,
+) -> str:
+    """Edita o card de identidade da Alpha (card único/singleton — quem a
+    própria assistente É). Campos enviados SOBRESCREVEM o valor atual
+    (string vazia limpa o campo); campos deixados em None NÃO são alterados.
+    Mudar name ou description também atualiza a memória de identidade LT
+    dela na memória de longo prazo (o nó no grafo permanece estável). Use ao
+    aprender algo duradouro sobre si mesma (papéis, valores, relações,
+    preferências próprias) — para fatos soltos use memory_write_batch."""
+    payload = {
+        k: v for k, v in {
+            "name":            name,
+            "description":     description,
+            "roles":           roles,
+            "additional_info": additional_info,
+        }.items() if v is not None
+    }
+    if not payload:
+        return "Erro: nenhum campo para editar (todos em None)."
+    try:
+        c = await _memory_api_request("PATCH", "/identity", payload)
+    except MemoryToolError as e:
+        return f"Erro ao editar card de identidade: {e.detail}"
+    except Exception as e:
+        log.exception("memory_identity_edit falhou")
+        return f"Erro ao editar card de identidade: {e}"
+    log.info(f"[identity] card editado: campos={sorted(payload)}")
+    return f"Card de identidade atualizado: {_format_identity(c)}"
+
+
 if __name__ == "__main__":
     mcp.run(
         transport="streamable-http",
-        host=os.getenv("WEBSEARCH_HOST", "127.9.12.22"),
-        port=int(os.getenv("WEBSEARCH_PORT", "4010")),
+        host=os.getenv("ALPHA_MCP_HOST", "127.9.12.22"),
+        port=int(os.getenv("ALPHA_MCP_PORT", "4010")),
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,

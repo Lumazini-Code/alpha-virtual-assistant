@@ -482,7 +482,7 @@ class VoiceDictUpdateRequest(BaseModel):
 # O card unificado (PeopleDB) já é o modelo de dados das pessoas do sistema
 # (face-dict e voice-dict usam a mesma tabela `people`). Esses modelos expõem
 # o card PELA PRIMEIRA VEZ como endpoint textual puro — sem exigir embedding
-# biométrico — para o MCP websearch criar/editar pessoas pela conversa.
+# biométrico — para o MCP alpha-mcp criar/editar pessoas pela conversa.
 # Metadados idênticos aos de FaceDict/VoiceDict: o mesmo person_id continua
 # recebendo embeddings dos pipelines de visão/áudio normalmente.
 
@@ -536,6 +536,36 @@ class PeopleCardUpdateRequest(BaseModel):
     additional_info: Optional[str] = None
     # renomear/atualizar a descrição também regenera a memória de identidade
     # LT quando o card já tem uma (textos LT antigos ficam como histórico).
+    relink_memory:   bool = True
+
+
+# ── NEW: Modelos — Identity Card (card singleton da própria assistente) ───────
+#
+# Mesmo desenho textual dos People Cards, aplicado à ALPHa: uma linha só
+# (tabela `identity`, id=1) com quem é a assistente + memory_id apontando
+# pra memória LT de identidade (source="identity") que ancora o nó no grafo
+# Hebbiano. Semeado no boot a partir de resource/persona.json.
+
+class IdentityEntry(BaseModel):
+    name:            str
+    description:     str
+    roles:           str
+    additional_info: str
+    memory_id:       Optional[int] = None   # nó de identidade em `memories`
+    source:          str
+    created_at:      float
+    updated_at:      float
+
+class IdentityUpdateRequest(BaseModel):
+    """Edita o card de identidade (singleton). Campos não enviados (None)
+    NÃO são alterados; string vazia limpa o campo — mesmo contrato do
+    PeopleCardUpdateRequest."""
+    name:            Optional[str] = None
+    description:     Optional[str] = None
+    roles:           Optional[str] = None
+    additional_info: Optional[str] = None
+    # mudar name/description também regenera a memória de identidade LT
+    # in-place (nó estável no grafo).
     relink_memory:   bool = True
 
 
@@ -755,6 +785,8 @@ __all__ = [
     'FaceDictUpdateRequest',
     'FaceDictWriteRequest',
     'FaceDictWriteResponse',
+    'IdentityEntry',
+    'IdentityUpdateRequest',
     'IndexedFileCheckResponse',
     'IndexedFileEntry',
     'IndexedFileReadRequest',

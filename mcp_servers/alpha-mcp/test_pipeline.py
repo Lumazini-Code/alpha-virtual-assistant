@@ -1,4 +1,4 @@
-"""Testes unitários da pipeline websearch — sem rede, só as partes puras.
+"""Testes unitários da pipeline do alpha-mcp — sem rede, só as partes puras.
 
 Rodar: python test_pipeline.py   (precisa de rank-bm25/trafilatura instalados)
 O servidor em si precisa dos serviços de rede (SearXNG etc.) — para teste

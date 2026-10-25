@@ -482,7 +482,7 @@ if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
 }
 
 # -- 5b'. Token do crawl4ai (CRAWL4AI_API_TOKEN) ------------------------------
-# O compose exige esta variavel (falha de boot se ausente). O websearch-mcp e o
+# O compose exige esta variavel (falha de boot se ausente). O alpha-mcp e o
 # crawl4ai precisam do MESMO valor para o pipeline de busca funcionar.
 if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
   Set-EnvVar 'CRAWL4AI_API_TOKEN' (New-RandomToken)
@@ -594,7 +594,7 @@ function Register-PlaywrightMcp {
   return $true
 }
 
-# -- 5c. Registro dos demais MCPs (websearch e Desktop Commander) -------------
+# -- 5c. Registro dos demais MCPs (alpha-mcp e Desktop Commander) -------------
 # Mesmo fluxo do Playwright: POST /servers (upsert idempotente) + POST /sync.
 # Helper generico para nao triplicar o loop de retry. O body vai em bytes UTF-8
 # (Invoke-RestMethod com string usa ISO-8859-1 no Windows PowerShell 5.1 e
@@ -647,14 +647,14 @@ function Register-McpServer {
   return $true
 }
 
-function Register-WebsearchMcp {
-  # URL do MCP do websearch (server.py, streamable-http em :4010/mcp). O manager
+function Register-AlphaMcp {
+  # URL do MCP do alpha-mcp (server.py, streamable-http em :4010/mcp). O manager
   # roda DENTRO do container: localhost seria ele mesmo, entao o default usa
-  # host.docker.internal (porta 4010 publicada no host). Se o websearch for um
-  # servico do mesmo compose, sobrescreva: $env:WEBSEARCH_MCP_URL = 'http://websearch:4010/mcp'
-  $wsUrl = if ($env:WEBSEARCH_MCP_URL) { $env:WEBSEARCH_MCP_URL } else { 'http://host.docker.internal:4010/mcp' }
-  return (Register-McpServer -Label 'websearch' -Name 'websearch' -SyncTimeoutSec 120 -Spec @{
-    name          = 'websearch'
+  # host.docker.internal (porta 4010 publicada no host). Se o alpha-mcp for um
+  # servico do mesmo compose, sobrescreva: $env:ALPHA_MCP_URL = 'http://alpha-mcp:4010/mcp'
+  $wsUrl = if ($env:ALPHA_MCP_URL) { $env:ALPHA_MCP_URL } else { 'http://host.docker.internal:4010/mcp' }
+  return (Register-McpServer -Label 'Alpha' -Name 'alpha-mcp' -SyncTimeoutSec 120 -Spec @{
+    name          = 'alpha-mcp'
     skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.'
     transport     = 'http'
     url           = $wsUrl
@@ -922,7 +922,7 @@ if (-not $SkipBuild) {
 
   # Registro dos MCPs - logo apos o up, quando o stack ja esta carregado.
   Register-PlaywrightMcp | Out-Null
-  Register-WebsearchMcp | Out-Null
+  Register-AlphaMcp | Out-Null
   Register-DesktopCommanderMcp | Out-Null
 
   $StatusUrl = 'http://127.9.12.22:9000/status'

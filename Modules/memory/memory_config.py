@@ -235,6 +235,18 @@ VO_AMBIGUOUS_MARGIN  = 0.05
 # embeddings de rosto (EdgeFace) e de voz (CAM++) são diferentes.
 PD_DB_PATH           = str(_DB_DIR / "ava_people.db")
 
+# ── NEW: Identidade da própria assistente (card singleton `identity`) ─────────
+# O card da Alpha mora na MESMA PeopleDB (tabela `identity`, linha única) e é
+# semeado no boot a partir da frase de identidade que o orchestrator usa como
+# 1ª linha do system prompt (resource/persona.json) — os dois passam a evoluir
+# independentes depois do seed (a persona continua fonte do prompt; o card é o
+# que vive no grafo). Caminho e limite IDÊNTICOS aos do orchestrator.
+PERSONA_FILE = Path(
+    os.getenv("PERSONA_FILE")
+    or _BASE_DIR.parent.parent / "resource" / "persona.json"
+)
+PERSONA_MAX = 2000
+
 # ── NEW: LanceDB (substitui FAISS + .npy de id-map) ───────────────────────────
 # Um único diretório LanceDB guarda os vetores de TODOS os stores (longo prazo,
 # curto prazo, arquivos indexados, dicionários visual/rosto/voz, tools). Vetores

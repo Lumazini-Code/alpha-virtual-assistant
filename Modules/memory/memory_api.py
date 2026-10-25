@@ -252,10 +252,10 @@ async def voice_dict_delete(person_id: int):
     return await mem.voice_dict_delete(person_id)
 
 
-# ── NEW: People Card — card textual de pessoa (MCP websearch) ───────────────────
+# ── NEW: People Card — card textual de pessoa (MCP alpha-mcp) ────────────────
 #
 # Card textual puro (sem embedding biométrico) sobre a mesma tabela `people`
-# unificada (PeopleDB). Usado pelo MCP websearch para criar/editar pessoas
+# unificada (PeopleDB). Usado pelo MCP alpha-mcp para criar/editar pessoas
 # pela conversa; face-dict e voice-dict continuam cuidando dos embeddings.
 
 @app.post("/people-card/write", response_model=mem.PeopleCardWriteResponse)
@@ -276,6 +276,23 @@ async def people_card_get(person_id: int):
 @app.patch("/people-card/{person_id}")
 async def people_card_update(person_id: int, req: mem.PeopleCardUpdateRequest):
     return await mem.people_card_update(person_id, req)
+
+
+# ── NEW: Identity Card — card singleton da própria assistente (Alpha) ────────
+#
+# Mesmo padrão do people card, aplicado à ALPHa: UMA linha (tabela `identity`
+# em ava_people.db) com quem é a assistente + memória de identidade LT no
+# grafo. Sem POST de create — o card nasce no seed do boot (identity_seed a
+# partir de resource/persona.json); aqui só leitura e edição.
+
+@app.get("/identity", response_model=mem.IdentityEntry)
+async def identity_get():
+    return await mem.identity_get()
+
+
+@app.patch("/identity", response_model=mem.IdentityEntry)
+async def identity_update(req: mem.IdentityUpdateRequest):
+    return await mem.identity_update(req)
 
 
 # ── RAG de seleção de tools ──────────────────────────────────────────────────────
