@@ -148,11 +148,13 @@ ALWAYS_ON_MCP_SERVERS = {
 # host.docker.internal (docker-compose.windows.yml injeta o valor);
 # no Linux (host network) o default localhost é o próprio host.
 PROCESS_MANAGER_URL  = os.getenv("PROCESS_MANAGER_URL", "http://127.9.12.22:9001")
-# ── Browser CDP (Chrome do host p/ tools de browser) ─────────────────────────
-# Servidores MCP que precisam de um Chrome do HOST em modo depuração
-# (CDP :9222). O @playwright/mcp é registrado com --cdp-endpoint
-# (mcp_manager.py) — quem garante o Chrome é o Manager Rust via
-# POST /browser/start no tray (copia o perfil e spawn detached).
+# ── Browser (Chrome do host p/ tools de browser) ─────────────────────────────
+# Servidores MCP que precisam do Chrome do HOST aberto. O @playwright/mcp
+# roda com --extension — conecta ao Chrome REAL do usuário via extensão
+# "Playwright MCP Bridge" (autenticada pelo token PLAYWRIGHT_MCP_EXTENSION_TOKEN
+# do Modules/.env, injetado no servidor pelo tray). Quem garante o Chrome
+# aberto é o Manager Rust via POST /browser/start: abre o Chrome NORMAL
+# (perfil padrão) SÓ se ele não estiver aberto — nunca em modo depuração.
 CDP_BROWSERS         = {s.strip() for s in os.getenv("AVA_CDP_SERVERS", "playwright").split(",") if s.strip()}
 
 # ── Planos de execução híbridos (macro + modelo) ─────────────────────────────
@@ -2163,13 +2165,15 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
     return schema, dispatch
 
 
-async def _ensure_cdp_browser() -> None:
-    """Garante o Chrome do host em modo depuração (CDP :9222) antes de
-    executar uma tool de um servidor em CDP_BROWSERS.
+async def _ensure_browser() -> None:
+    """Garante o Chrome do host aberto antes de executar uma tool de um
+    servidor em CDP_BROWSERS.
 
-    Chama POST /browser/start no tray (Manager Rust): ele copia o perfil
-    padrão do usuário e abre o Chrome com --remote-debugging-port. É
-    idempotente — com o CDP vivo responde rápido (probe TCP).
+    Chama POST /browser/start no tray (Manager Rust): abre o Chrome NORMAL
+    (perfil padrão, SEM modo depuração) apenas se ele não estiver aberto —
+    o @playwright/mcp conecta via extensão "Playwright MCP Bridge",
+    autenticada pelo token do Modules/.env. É idempotente e rápido
+    (detecção de processo, sem cópia de perfil nem espera de CDP).
 
     Best-effort e fail-open de propósito: se o tray estiver fora do ar ou
     sem Chrome instalado, a tool MESMO ASSIM é executada — o Playwright
@@ -2179,18 +2183,18 @@ async def _ensure_cdp_browser() -> None:
     try:
         r = await asyncio.wait_for(
             state.process_manager_client.post("/browser/start"),
-            timeout=60.0,  # 1ª chamada paga a cópia do perfil + espera do CDP
+            timeout=30.0,  # spawn do Chrome é rápido; folga p/ primeiro boot
         )
         r.raise_for_status()
         data = r.json()
         if data.get("ok"):
-            log.info(f"[BROWSER] {data.get('message')} cdp={data.get('cdp_url')}")
+            log.info(f"[BROWSER] {data.get('message')}")
         else:
             log.warning(f"[BROWSER] tray não conseguiu abrir o Chrome: {data.get('message')}")
     except Exception as e:
         log.warning(
             f"[BROWSER] /browser/start indisponível ({type(e).__name__}: {e}) "
-            "— seguindo sem Chrome CDP."
+            "— seguindo sem Chrome."
         )
 
 
@@ -2793,11 +2797,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     server, mcp_tool_name = mcp_dispatch[tool_name]
                     mcp_timeout = EXECUTOR_TIMEOUTS.get(tool_name, MCP_CALL_TIMEOUT)
                     # Tools de browser (CDP_BROWSERS) precisam do Chrome do
-                    # host em modo depuração — o tray garante (best-effort,
-                    # FORA do teto de timeout da tool, para não comer o
-                    # orçamento do round-trip com infraestrutura).
+                    # host aberto — o tray garante (best-effort, FORA do
+                    # teto de timeout da tool, para não comer o orçamento
+                    # do round-trip com infraestrutura).
                     if server in CDP_BROWSERS:
-                        await _ensure_cdp_browser()
+                        await _ensure_browser()
                     r = await asyncio.wait_for(
                         state.mcp_client.post(
                             f"/servers/{server}/call",

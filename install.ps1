@@ -392,16 +392,22 @@ $PlaywrightExtensionStatusUrl = 'chrome-extension://mmlmfjhmonkocbjadbfplnigmagl
 # A pagina status.html renderiza o token via React - o valor confiavel esta no
 # localStorage persistido, nao no HTML estatico.
 function Get-PlaywrightExtensionToken {
+  # Extracao ANCORADA na origem da extensao. Um regex solto de 43 chars gera
+  # FALSO POSITIVO: outros sites gravam valores de 43 chars no Local Storage
+  # (caso real: token extraido errado vindo de mega.nz). A chave completa no
+  # LevelDB e '_chrome-extension://<id>\x00\x01auth-token' e o token (43
+  # chars base64url) aparece na janela de 64B logo apos a chave.
+  $extId = 'mmlmfjhmonkocbjadbfplnigmagldckm'
+  $keyNeedle = [System.Text.Encoding]::UTF8.GetBytes("chrome-extension://$extId`0`1auth-token")
+  $tokenRegex = [regex]'[A-Za-z0-9_-]{43}'
+  $window = 64 + 43
+
   $leveldbRoots = @(
     (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'),
     (Join-Path $env:LOCALAPPDATA 'Chromium\User Data'),
     (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'),
     (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data')
   )
-  # Token: 32 bytes em base64url sem padding = 43 chars de [A-Za-z0-9_-]
-  $tokenRegex = [regex]'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])'
-  $needleUtf8 = [System.Text.Encoding]::UTF8.GetBytes('auth-token')
-  $needleUtf16 = [System.Text.Encoding]::Unicode.GetBytes('auth-token')
 
   $files = @()
   foreach ($root in $leveldbRoots) {
@@ -412,36 +418,41 @@ function Get-PlaywrightExtensionToken {
       ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } |
       Where-Object { $_.Extension -in @('.ldb', '.log') }
   }
-  # Arquivo mais recente primeiro: se o usuario regenerou o token, o valor
-  # atual costuma estar no WAL (.log) ou no .ldb mais novo.
-  $files = $files | Sort-Object LastWriteTime -Descending
+  # Ordem de geracao do LevelDB: numero do arquivo maior = write mais recente.
+  $files = $files | Sort-Object { [int]($_.BaseName -replace '\D', '') } -Descending
 
   foreach ($file in $files) {
     try { $raw = [System.IO.File]::ReadAllBytes($file.FullName) } catch { continue }
-    if (-not (Contains-Bytes $raw $needleUtf8) -and -not (Contains-Bytes $raw $needleUtf16)) { continue }
-    # O valor pode estar gravado em UTF-8 ou UTF-16LE no LevelDB -
-    # decodifica o arquivo nas duas visoes e procura o padrao.
-    $utf8View = [System.Text.Encoding]::UTF8.GetString($raw)
-    $utf16View = [System.Text.Encoding]::Unicode.GetString($raw)
-    foreach ($view in @($utf8View, $utf16View)) {
-      $m = $tokenRegex.Match($view)
+    # Varre todas as ocorrencias da chave exata; a primeira neste arquivo
+    # (mais novo) ja e o write mais recente do token.
+    $pos = 0
+    while ($true) {
+      $i = Find-Bytes $raw $keyNeedle $pos
+      if ($i -lt 0) { break }
+      $start = $i + $keyNeedle.Length
+      $end = [Math]::Min($start + $window, $raw.Length)
+      $seg = New-Object byte[] ($end - $start)
+      [Array]::Copy($raw, $start, $seg, 0, $end - $start)
+      $m = $tokenRegex.Match([System.Text.Encoding]::UTF8.GetString($seg))
       if ($m.Success) { return $m.Value }
+      $pos = $i + 1
     }
   }
   return $null
 }
 
-# Busca sequencial de bytes (Array.IndexOf nao aceita padrao multi-byte)
-function Contains-Bytes {
-  param([byte[]]$Haystack, [byte[]]$Needle)
-  for ($i = 0; $i -le $Haystack.Length - $Needle.Length; $i++) {
+# Posicao da primeira ocorrencia de $Needle em $Haystack a partir de $Start
+function Find-Bytes {
+  param([byte[]]$Haystack, [byte[]]$Needle, [int]$Start = 0)
+  if ($Needle.Length -eq 0 -or $Haystack.Length -lt $Needle.Length) { return -1 }
+  for ($i = $Start; $i -le $Haystack.Length - $Needle.Length; $i++) {
     $match = $true
     for ($j = 0; $j -lt $Needle.Length; $j++) {
       if ($Haystack[$i + $j] -ne $Needle[$j]) { $match = $false; break }
     }
-    if ($match) { return $true }
+    if ($match) { return $i }
   }
-  return $false
+  return -1
 }
 
 if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
@@ -456,6 +467,18 @@ if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
   }
 } else {
   Write-Ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN ja existe em $EnvFile"
+  # Verificacao de drift — o mecanismo de autenticacao da extensao: a
+  # connect.html compara o 'token' da URL com o 'auth-token' do localStorage;
+  # divergencia = "Invalid token provided" em TODA conexao (o servidor manda o
+  # token velho do env). Se o token do .env nao e o valor atual da extensao
+  # (regenerado na status.html), atualiza o .env; o re-registro adiante derruba
+  # a sessao do @playwright/mcp no mcp_manager, que respawna com o token novo.
+  $fresh = Get-PlaywrightExtensionToken
+  if ($fresh -and $fresh -ne (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
+    Write-Warn2 'PLAYWRIGHT_MCP_EXTENSION_TOKEN divergente: a extensao esta usando outro token (regenerado?).'
+    Set-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN' $fresh
+    Write-Ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN atualizado -> $EnvFile (o re-registro adiante respawna o servidor)."
+  }
 }
 
 # -- 5b'. Token do crawl4ai (CRAWL4AI_API_TOKEN) ------------------------------
@@ -476,23 +499,39 @@ if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
 $McpManagerUrl = 'http://127.9.12.22:4008'
 
 function Register-PlaywrightMcp {
-  # No Windows nao ha X server (DISPLAY) e o Chrome CDP roda no host
-  # via host.docker.internal (mesmo endereco do AVA_CDP_ENDPOINT).
+  # O env do registro e autocontido (o mcp_manager mescla server.env sobre o
+  # ambiente herdado — a linha vale mesmo sem o tray injetando o env):
+  #   - PLAYWRIGHT_MCP_EXTENSION_TOKEN: a connect.html da extensao compara o
+  #     'token' da URL com o 'auth-token' do localStorage; igual -> a conexao e
+  #     aprovada sozinha (sem dialogo manual por chamada).
+  #   - PLAYWRIGHT_EXTENSION_PROTOCOL=2: a extensao exige exatamente a
+  #     protocolVersion 2 (v<2 -> "unsupported protocol version", v>2 ->
+  #     versionMismatch); forcar 2 mantem o par testado com a extensao 0.4.x
+  #     da loja mesmo se o @playwright/mcp@latest subir o default do relay
+  #     (o env e lido pelo relay no spawn: process.env.PLAYWRIGHT_EXTENSION_PROTOCOL).
+  $token = Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN'
+  $envMap = @{ PLAYWRIGHT_EXTENSION_PROTOCOL = '2' }
+  if ($token) { $envMap['PLAYWRIGHT_MCP_EXTENSION_TOKEN'] = $token }
   $payload = @{
     name           = 'playwright'
     skill_summary  = 'Automação de navegador (navegar, clicar, extrair conteúdo)'
     transport      = 'stdio'
     command        = 'npx'
     args           = @('-y', '@playwright/mcp@latest', '--extension')
+    env            = $envMap
   } | ConvertTo-Json -Depth 3
 
   # A extensao precisa ser instalada manualmente na Chrome Web Store -
-  # o Playwright MCP no modo --extension conecta a ela via bridge.
-  Write-Info 'Abrindo a Chrome Web Store para instalar a extensao do Playwright...'
-  Write-Info $PlaywrightExtensionUrl
-  try { Start-Process $PlaywrightExtensionUrl } catch {
-    Write-Warn2 'Nao consegui abrir o navegador - instale a extensao manualmente:'
-    Write-Warn2 $PlaywrightExtensionUrl
+  # o Playwright MCP no modo --extension conecta a ela via bridge. Com o
+  # token ja no .env (extensao instalada em execucao anterior) a abertura e
+  # pulada: re-executar o instalador nao deve reabrir a loja.
+  if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
+    Write-Info 'Abrindo a Chrome Web Store para instalar a extensao do Playwright...'
+    Write-Info $PlaywrightExtensionUrl
+    try { Start-Process $PlaywrightExtensionUrl } catch {
+      Write-Warn2 'Nao consegui abrir o navegador - instale a extensao manualmente:'
+      Write-Warn2 $PlaywrightExtensionUrl
+    }
   }
 
   # Se o token ainda nao foi extraido (extensao instalada agora), abre a

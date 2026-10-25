@@ -4,13 +4,15 @@
 //!   GET  /status          -> status atual do docker
 //!   POST /docker/start    -> inicia o ambiente docker
 //!   POST /docker/stop     -> encerra o ambiente docker
-//!   POST /browser/start   -> copia o perfil do Chrome e abre o Chrome em
-//!                            modo depuração (CDP :9222) — usado pelo
-//!                            orchestrator antes de tools do Playwright.
-//!                            O Chrome fica ABERTO depois (processo do host,
-//!                            detached) — só /browser/stop fecha.
-//!   POST /browser/stop    -> encerra o Chrome de depuração (controle manual)
-//!   GET  /browser/status  -> estado do Chrome + liveness do CDP
+//!   POST /browser/start   -> abre o Chrome NORMAL do usuário (perfil
+//!                            padrão, SEM modo depuração) apenas se ele
+//!                            não estiver aberto — o @playwright/mcp
+//!                            conecta via extensão. Processo do host,
+//!                            detached: sobrevive ao tray; só
+//!                            /browser/stop encerra a instância do tray.
+//!   POST /browser/stop    -> encerra o Chrome aberto pelo tray (controle
+//!                            manual; o Chrome do usuário não é tocado)
+//!   GET  /browser/status  -> Chrome aberto no host? + pid rastreado
 //!   POST /transcript/start -> inicia o transcript de voz no host (mic +
 //!                            ASR + ingest no orchestrator). Também é
 //!                            AUTO-iniciado quando o container carrega.
@@ -91,19 +93,15 @@ struct SimpleResponse {
 struct BrowserStartResponse {
     ok: bool,
     message: String,
-    /// URL do CDP para o --cdp-endpoint do Playwright MCP.
-    cdp_url: Option<String>,
     pid: Option<u32>,
-    profile_dir: String,
 }
 
 #[derive(Serialize)]
 struct BrowserStatusResponse {
+    /// Chrome aberto no host (QUALQUER instância, a do usuário incluída)?
     running: bool,
+    /// PID rastreado — Some só se o Chrome foi aberto pelo próprio tray.
     pid: Option<u32>,
-    cdp_alive: bool,
-    cdp_url: String,
-    profile_dir: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -165,34 +163,29 @@ async fn post_browser_start(State(state): State<SharedState>) -> impl IntoRespon
         Ok(info) => Json(BrowserStartResponse {
             ok: true,
             message: if info.already_running {
-                "Chrome CDP já estava ativo — reaproveitado.".into()
+                "Chrome já estava aberto — reaproveitado.".into()
             } else {
-                // Nota sobre a cópia do perfil (pode ser inconsistente se o
-                // Chrome real estava aberto durante a cópia).
-                "Chrome aberto em modo depuração (cópia do perfil). Se o Chrome \
-                 real estava aberto, alguns dados da cópia podem estar \
-                 inconsistentes — feche-o antes de novas sessões."
-                    .into()
+                "Chrome aberto (modo normal — o Playwright MCP conecta via extensão).".into()
             },
-            cdp_url: Some(info.cdp_url),
             pid: info.pid,
-            profile_dir: info.profile_dir.display().to_string(),
         }),
         Err(e) => Json(BrowserStartResponse {
             ok: false,
             message: e.to_string(),
-            cdp_url: None,
             pid: None,
-            profile_dir: String::new(),
         }),
     }
 }
 
 async fn post_browser_stop(State(state): State<SharedState>) -> impl IntoResponse {
     match process_manager::stop_browser(&state).await {
-        Ok(()) => Json(SimpleResponse {
+        Ok(killed) => Json(SimpleResponse {
             ok: true,
-            message: "Chrome de depuração encerrado.".into(),
+            message: if killed {
+                "Chrome aberto pelo tray encerrado.".into()
+            } else {
+                "Nada a encerrar — o tray não abriu nenhum Chrome.".into()
+            },
         }),
         Err(e) => Json(SimpleResponse {
             ok: false,
@@ -202,17 +195,9 @@ async fn post_browser_stop(State(state): State<SharedState>) -> impl IntoRespons
 }
 
 async fn get_browser_status(State(state): State<SharedState>) -> impl IntoResponse {
-    let (running, pid, cdp_alive, profile_dir) = process_manager::browser_status(&state).await;
+    let (running, pid) = process_manager::browser_status(&state).await;
 
-    let port = { state.browser.lock().await.cdp_port };
-
-    Json(BrowserStatusResponse {
-        running,
-        pid,
-        cdp_alive,
-        cdp_url: format!("http://localhost:{port}"),
-        profile_dir: profile_dir.display().to_string(),
-    })
+    Json(BrowserStatusResponse { running, pid })
 }
 
 // ════════════════════════════════════════════════════════════════════════

@@ -38,7 +38,7 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 │    miniaudio → TEN VAD → wake word (sherpa-onnx KWS) → ASR streaming       │
 │    (nemotron 0.6B GGUF) → speaker embedding CAM++ → POST /voice/ingest     │
 │                                                                             │
-│  Chrome de depuração (perfil copiado, CDP :9222) p/ Playwright MCP          │
+│  Chrome normal do usuário (perfil padrão) p/ Playwright MCP (--extension)   │
 │                                                                             │
 │  Stack de busca web: searxng :8081 · valkey :6379 · crawl4ai :11235         │
 │    websearch-mcp :4010 · docker-socket-proxy (allowlist p/ crawl4ai)        │
@@ -52,7 +52,7 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 3. **Inferência**: o histórico + tools vão ao **LLM.py** (:4003), que chama o OpenRouter com function-calling nativo.
 4. **Tools**: o loop resolve as chamadas em duas frentes:
    - **Nativas** (`list_plans`, `run_plan`, `memory_search`, `vision_objects` quando habilitada) — registradas direto no orchestrator;
-   - **MCP** — descoberta em duas etapas via mcp_manager :4008 (grafo de co-uso escolhe os servidores → carrega as tools reais → executa via REST). Antes de tools de browser, o orchestrator pede o Chrome de depuração ao tray.
+   - **MCP** — descoberta em duas etapas via mcp_manager :4008 (grafo de co-uso escolhe os servidores → carrega as tools reais → executa via REST). Antes de tools de browser, o orchestrator pede o Chrome ao tray (que o abre apenas se não estiver aberto).
 5. **Memória**: leituras/escritas no **grafo hebbiano** (memory_api :3000) durante o loop — recall, correção e extração de novas memórias.
 6. **Resposta final**: o texto encerra o turno (não existe tool "finish") e dispara **TTS automático** quando o cliente pediu áudio. Todos os eventos (delta, tool_call, done) são espelhados no **Conversation Hub** (`GET /conversation/stream`, SSE), que alimenta o chat widget do Manager em tempo real.
 
@@ -102,10 +102,10 @@ O pipeline completo (**Depth Anything V2** → clusterização por camadas → *
 O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/websearch`, :4010): uma única tool exposta ao modelo (`web_search`) esconde o pipeline: **cache Valkey → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. O servidor também tem tool de gravação de memórias (`memory_write_batch`) falando direto com a memory API.
 
 ### Tools MCP (extensibilidade)
-- **mcp_manager reescrito em Rust** (`Modules/mcp_manager`, :4008) e rodando **NO HOST** — fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome de depuração :9222). O tray o supervisiona: descobre o binário no boot, faz spawn, espera o `/health`, e re-espawna em caso de crash (restart-on-fail).
+- **mcp_manager reescrito em Rust** (`Modules/mcp_manager`, :4008) e rodando **NO HOST** — fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome do usuário). O tray o supervisiona: descobre o binário no boot, faz spawn, espera o `/health`, e re-espawna em caso de crash (restart-on-fail).
 - O orchestrator é **cliente REST** dele: registro, sync, listagem de tools e **execução** (`/servers/{name}/call`) ficam todos lá; este processo nunca spawna servidores MCP nem segura sessões.
 - Servidores são registrados/sincronizados/removidos **em runtime** — inclusive pela **TUI** (instalação assistida de servidores remotos, comandos locais pip/uv e endpoints localhost), sem reiniciar nada.
-- **Playwright MCP** pré-configurado com `--cdp-endpoint`: o orchestrator pede o Chrome ao tray, que **copia o perfil padrão do usuário** (sem caches) e abre o Chrome do host em modo depuração — **o Chrome fica aberto** após as ações (processo detached do host, sobrevive ao docker). Suas sessões/logins do Chrome valendo.
+- **Playwright MCP** pré-configurado com `--extension`: conecta ao **Chrome real do usuário** via extensão "Playwright MCP Bridge" (instalada no perfil padrão). O orchestrator pede o Chrome ao tray, que o abre **apenas se ele não estiver aberto** — em modo normal, sem CDP nem cópia de perfil — e **o Chrome fica aberto** após as ações (processo detached do host, sobrevive ao docker). Suas sessões/logins do Chrome valendo. A autenticação da extensão é automática: o token `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (`Modules/.env`) é injetado pelo tray no mcp_manager e herdado pelo servidor MCP — sem diálogo de aprovação por conexão.
 - **Windows**: URLs de servidores http cadastradas como `localhost:PORTA` são reescritas para `host.docker.internal` no momento da conexão (porta e path preservados).
 
 ### Manager Rust (ava-tray)
@@ -114,7 +114,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager).
 - **Supervisão de processos do host**: mcp_manager (:4008) e transcript (:9100) — discover → spawn → health check periódico → restart-on-fail. Variáveis de auth/config lidas do `Modules/.env` e injetadas nos filhos.
 - **Timer de inatividade**: `docker down` após 45 min sem perguntas (configurável via `AVA_DOCKER_IDLE_MINUTES`).
-- **Chrome de depuração** sob demanda: cópia do perfil (cookies/sessões preservados, caches excluídos — 3,9 GB viram centenas de MB) em `<install>/cache/chrome-profile-cdp`, spawn detached com `--remote-debugging-port=9222`.
+- **Chrome do usuário** sob demanda: aberto em **modo normal** (perfil padrão, sem `--remote-debugging-port`) apenas **se o Chrome não estiver aberto** — spawn detached, sem cópia de perfil e sem cache `chrome-profile-cdp`.
 
 ### TUI (terminal, Ink/React)
 - Chat com streaming SSE, planos de execução (CoT) renderizados, timeline de tool calls e linha de status dos processos.
@@ -128,7 +128,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 ## Segurança
 
 - **Token interno compartilhado** (`AVA_INTERNAL_TOKEN`, gerado pelo install.sh em `Modules/.env` com chmod 600): memory (:3000), orchestrator (:9000) e mcp_manager (:4008) exigem `Bearer` — middleware dedicado em todos os serviços internos.
-- **Sem portas expostas à LAN**: no Windows, todas as portas do container são publicadas apenas em `127.9.12.22`; no Linux, `network_mode: host` mantém os serviços em localhost. O tray (:9001) e o Chrome CDP (:9222) nunca são publicados.
+- **Sem portas expostas à LAN**: no Windows, todas as portas do container são publicadas apenas em `127.9.12.22`; no Linux, `network_mode: host` mantém os serviços em localhost. O tray (:9001) nunca é publicado.
 - **docker-socket-proxy**: o websearch-mcp não tem acesso direto ao socket do Docker — apenas allowlist mínima (listar/inspecionar containers e start/stop do crawl4ai). Sem exec, images, volumes, networks ou build.
 - **crawl4ai com token** (`CRAWL4AI_API_TOKEN`): sem ele o servidor só escuta no loopback do container.
 
@@ -183,7 +183,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 | crawl4ai | container | 11235 | Crawl com navegador (loopback, on-demand) |
 | websearch-mcp | container | 4010 | Tool `web_search` (loopback) |
 | docker-socket-proxy | container | — (rede interna) | Allowlist do socket Docker p/ websearch |
-| Chrome CDP | host | 9222 | Browser de depuração (perfil copiado) |
+| Chrome do usuário | host | — | Aberto pelo tray em modo normal (só se já não estiver aberto) |
 
 ---
 
@@ -223,7 +223,7 @@ cd ~/.local/opt/alpha-ai
 ./docker-start.sh logs -f ava    # logs do backend
 ./docker-start.sh down           # derruba o stack manualmente
 curl -s localhost:9001/status    # tray: docker + mcp_manager + transcript
-curl -s localhost:9001/browser/status   # Chrome de depuração
+curl -s localhost:9001/browser/status   # Chrome do host
 ```
 
 ## Configuração (principais)
@@ -234,8 +234,9 @@ curl -s localhost:9001/browser/status   # Chrome de depuração
 | `AVA_INTERNAL_TOKEN` | `Modules/.env` | — | Bearer token interno (memory/orchestrator/mcp_manager/TUI) |
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
 | `AVA_DOCKER_IDLE_MINUTES` | tray | 45 | Minutos de inatividade antes do `docker down` |
-| `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome p/ modo depuração |
-| `AVA_CDP_SERVERS` | orchestrator | `playwright` | Servidores MCP que usam o Chrome CDP |
+| `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
+| `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
+| `AVA_CDP_SERVERS` | orchestrator | `playwright` | Servidores MCP que usam o Chrome do host |
 | `MCP_MANAGER_URL` | orchestrator | `localhost:4008` | Onde o mcp_manager está |
 | `TRANSCRIBE_HTTP_URL` | orchestrator | `localhost:9100` | Mini HTTP do transcript (host) p/ `/speaker/embed` |
 | `VISION_OBJECTS_ENABLED` | orchestrator | `0` | Liga o fluxo vision_objects (sobe vision.py à parte) |
@@ -259,7 +260,7 @@ curl -s localhost:9001/browser/status   # Chrome de depuração
 | Orquestração | Python 3.11, FastAPI, httpx, SSE |
 | IA/ML | OpenRouter (LLM), ONNX Runtime (E5, ms-marco, DINOv3, EdgeSAM, Depth Anything V2, YuNet, EdgeFace, nemotron-ASR, sherpa-onnx KWS, CAM++), Supertonic (TTS), LanceDB, SQLite |
 | Voz | C++ (miniaudio, ten-vad, sherpa-onnx, GGUF streaming) — host |
-| Tools | MCP (mcp_manager próprio em Rust, standalone no host), Playwright MCP (CDP), SearXNG + Valkey + Crawl4AI + docker-socket-proxy |
+| Tools | MCP (mcp_manager próprio em Rust, standalone no host), Playwright MCP (extensão), SearXNG + Valkey + Crawl4AI + docker-socket-proxy |
 | Manager | Rust, axum, tokio, eframe/egui, tray-icon |
 | TUI | TypeScript, Ink/React, Bun (single-binary cross-compile) |
 | Infra | Docker Compose (base + overrides Linux/Windows) |

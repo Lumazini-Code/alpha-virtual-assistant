@@ -93,6 +93,23 @@ ST_CONTEXT_PAIRS = 5
 CHAT_RECALL_TOP_K_FINAL     = int(os.getenv("CHAT_RECALL_TOP_K_FINAL", "6"))
 CHAT_RECALL_TOTAL_MAX_CHARS = int(os.getenv("CHAT_RECALL_TOTAL_MAX_CHARS", "3200"))
 
+# ── Extractor de memórias (protocolo de fatos — ver _extract_and_save_memories) ──
+# Parâmetros de geração: temperatura 0–0,2 (saída determinística) + saída
+# restrita por JSON schema (response_format json_schema no OpenRouter).
+MEMORY_EXTRACTOR_TEMPERATURE = min(
+    max(float(os.getenv("MEMORY_EXTRACTOR_TEMPERATURE", "0.1")), 0.0), 0.2
+)
+# Roteamento de provider OpenRouter (bloco `provider` do payload — ver curl de
+# referência: provider.only + allow_fallbacks). "" = omite o bloco. Só é
+# aplicado às tentativas com o MODELO EXTRATOR; o fallback roda sem bloqueio.
+MEMORY_EXTRACTOR_PROVIDERS = os.getenv("MEMORY_EXTRACTOR_PROVIDERS", "coreweave/bf16")
+# Candidatos a memórias existentes enviados ao extractor (faixa 15–30).
+# O modelo só enxerga as memórias que enviamos — o corte define o que ele
+# consegue comparar. Default 24.
+MEMORY_EXTRACTOR_CANDIDATES_MAX = min(
+    max(int(os.getenv("MEMORY_EXTRACTOR_CANDIDATES_MAX", "24")), 15), 30
+)
+
 # ─────────────────────────────────────────────────────────────
 #   RECUPERAÇÃO CONTÍNUA DE MEMÓRIA (confidence-watch + prefill)
 # ─────────────────────────────────────────────────────────────
@@ -655,6 +672,7 @@ async def memory_read(
     top_k: int = 10,
     top_k_final: Optional[int] = None,
     total_max_chars: Optional[int] = None,
+    min_score: float = 0.3,
 ) -> list[dict]:
     """
     Busca memórias relevantes (LT semântico + ST + knowledge + arquivos
@@ -668,7 +686,7 @@ async def memory_read(
         payload = {
             "query": query,
             "top_k": top_k,
-            "min_score": 0.3,
+            "min_score": min_score,
             "session_id": session_id,
             "strategy": "auto",
         }
@@ -875,98 +893,450 @@ async def memory_write_facts_batch(items: list[dict]) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-#              EXTRAÇÃO AUTOMÁTICA DE MEMÓRIAS (LT + ST)
+#              EXTRAÇÃO AUTOMÁTICA DE MEMÓRIAS (fatos → LT)
 # ─────────────────────────────────────────────────────────────
-# Para cada dupla pergunta-resposta (considerando o assistant prefill e
-# múltiplas requisições na mesma resposta — ou seja, usamos o user_input
-# ORIGINAL e a resposta FINAL agregada, não importa quantas chamadas
-# internas tenham ocorrido), um modelo extractor dedicado recebe o par
-# e decide:
-#   1. Quais informações (pergunta + resposta) valem gravar.
-#   2. Se cada uma é "esquecível" ou não (aplica-se apenas às semânticas).
-#   3. Se cada uma é "episódica" ou "semântica" — este campo define
-#      o ROTEAMENTO da memória:
-#        - semantic  → LT (memória de longo prazo, via /write)
-#        - episodic  → ST (memória de curto prazo, via /write_st)
-# A resposta é forçada via JSON schema estruturado para garantir parsing
-# confiável.
+# Para cada dupla pergunta-resposta (usamos o user_input ORIGINAL e a resposta
+# FINAL agregada — não importa quantas chamadas internas tenham ocorrido), um
+# modelo extractor dedicado compara a troca com as memórias EXISTENTES e
+# decide, para cada fato, uma ação:
+#   ADD | NOOP | UPDATE | CONFLICT | MERGE | DISCARD
+# O modelo só enxerga as memórias que enviamos — os candidatos são coletados
+# por embedding das SENTENÇAS da pergunta e da resposta + expansão pelo grafo
+# (match_type "related" que o /read já devolve), com as usadas_na_resposta
+# primeiro, limitados a 15–30, e mapeados para IDs sintéticos M1..Mn que são
+# revertidos para os IDs reais no código (IDs fora do mapa são descartados).
+# Saída restrita por JSON schema (response_format json_schema) e temperatura
+# 0–0,2. A resposta é forçada via JSON schema estruturado para garantir
+# parsing confiável.
 
 _MEMORY_EXTRACTION_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "memories": {
+        "facts": {
             "type": "array",
             "description": (
-                "Lista de memórias úteis extraídas da dupla pergunta-resposta. "
-                "Pode ser vazia se nenhuma informação merecer ser gravada."
+                "Até 8 fatos úteis extraídos da troca atual, cada um com a ação "
+                "decidida por comparação com as memórias existentes. Lista vazia "
+                "se nada merecer ser gravado."
             ),
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
-                    "content": {
+                    "evidence": {
                         "type": "string",
                         "description": (
-                            "Texto autocontido da memória, redigido em terceira "
-                            "pessoa. Ex.: 'O usuário chama-se João' ou "
-                            "'Usuário preferiu Python para o novo projeto'."
+                            "Trecho curto e LITERAL copiado da conversa que "
+                            "suporta o fato."
                         ),
                     },
-                    "forgettable": {
-                        "type": "boolean",
+                    "text": {
+                        "type": "string",
                         "description": (
-                            "true  → memória transitória, pode decair com o tempo "
-                            "(ex.: projeto atual, tarefa em andamento). "
-                            "false → memória permanente (ex.: nome, alergia, "
-                            "preferência gastronômica estável). Aplicável apenas "
-                            "a memórias semânticas (LT); para episódicas (ST) "
-                            "ignore este campo, pois ST já é efêmera por natureza."
+                            "Fato autocontido, em 3ª pessoa, no idioma da "
+                            "conversa. Em UPDATE/MERGE deve conter TODA a "
+                            "informação relevante das fontes."
                         ),
                     },
                     "type": {
                         "type": "string",
-                        "enum": ["episodic", "semantic"],
+                        "enum": ["fact", "preference", "decision", "instruction"],
+                    },
+                    "related": {
+                        "type": "array",
                         "description": (
-                            "Define o ROTEAMENTO da memória: "
-                            "semantic  → gravada na memória de longo prazo (LT) "
-                            "como fato/conhecimento geral (ex.: 'usuário é "
-                            "alérgico a amendoim'). "
-                            "episodic  → gravada na memória de curto prazo (ST) "
-                            "como evento específico do momento (ex.: 'em 2024 o "
-                            "usuário viajou para Paris')."
+                            "IDs M<n> das memórias existentes comparadas, mesmo "
+                            "quando a ação é ADD ou DISCARD ([] se nenhuma)."
                         ),
+                        "items": {"type": "string", "pattern": "^M\\d+$"},
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Uma frase curta explicando a comparação.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["ADD", "NOOP", "UPDATE", "CONFLICT", "MERGE", "DISCARD"],
+                    },
+                    "target": {
+                        "type": "array",
+                        "description": (
+                            "[] para ADD e DISCARD; 1 ID para NOOP, UPDATE e "
+                            "CONFLICT; 1 ou mais IDs para MERGE."
+                        ),
+                        "items": {"type": "string", "pattern": "^M\\d+$"},
+                    },
+                    "validity": {
+                        "type": "string",
+                        "enum": ["permanent", "temporal"],
                     },
                 },
-                "required": ["content", "forgettable", "type"],
+                "required": [
+                    "evidence", "text", "type", "related", "rationale",
+                    "action", "target", "validity",
+                ],
+                "additionalProperties": False,
             },
-        }
+        },
     },
-    "required": ["memories"],
+    "required": ["facts"],
+    "additionalProperties": False,
 }
 
 
-_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
-    "Você é um extrator de memórias para um assistente conversacional chamado alfa. "
-    "Com base na dupla PERGUNTA-RESPOSTA fornecida, identifique TODAS as informações "
-    "presentes (tanto na pergunta do usuário quanto na resposta do assistente) que "
-    "seriam úteis de serem gravadas sobre o usuário, o contexto da conversa, ou o "
-    "mundo.\n\n"
-    "Para cada memória identificada, classifique:\n"
-    "  - type: 'semantic' se é um fato ou conhecimento geral (ex.: 'usuário sabe "
-    "    programar em Python', 'usuário é alérgico a amendoim'). Essas memórias "
-    "    vão para a memória de LONGO prazo (LT). 'episodic' se descreve um evento "
-    "    específico (algo que aconteceu em um momento — ex.: 'em 2024 o usuário "
-    "    viajou para Paris', 'hoje o usuário perguntou sobre X'). Essas memórias "
-    "    vão para a memória de CURTO prazo (ST).\n"
-    "  - forgettable: aplicável apenas a memórias semânticas (LT). true se é uma "
-    "    informação transitória que pode perder relevância com o tempo (ex.: "
-    "    tarefa atual, projeto do momento, humor atual); false se é permanente "
-    "    (ex.: nome do usuário, alergias, profissão, preferências estáveis). Para "
-    "    memórias episódicas (ST), preencha com true — ST é efêmera por natureza.\n\n"
-    "Redija cada memória em terceira pessoa e de forma autocontida (sem referenciar "
-    "esta instrução nem a conversa). Evite duplicar informações que já estão "
-    "implícitas em outra memória da mesma resposta.\n\n"
-    "Se nenhuma informação merecer ser gravada, retorne uma lista vazia."
-)
+_MEMORY_EXTRACTOR_SYSTEM_PROMPT = """You are the long-term memory writing module of a personal assistant.
+Your task: given an exchange (USER / ASSISTANT) and a list of EXISTING MEMORIES, extract useful facts and decide, for each one, what to do with the memory. You do NOT talk to the user. You respond only with valid JSON in the format defined below.
+
+# 1. WHAT TO EXTRACT
+Extract only information that will remain useful in future conversations:
+- stable facts about the user, their belongings, projects and close people
+- preferences and standing instructions
+- decisions made
+- technical facts about the user's environment (tools, files, configurations) when they are lasting
+
+Do not extract:
+- momentary state ("I'm in a hurry", "now I'm going to test it")
+- user questions that reveal no fact
+- content generated by the ASSISTANT that the user did not confirm, adopt or use (suggestions, general explanations, example code)
+- general knowledge anyone can look up
+- passages that only make sense inside this conversation
+
+Source and confidence: facts stated by the USER take priority. Information from the ASSISTANT becomes memory only if the user confirmed, chose or applied it. In that case record it as a decision or fact about the user, not as a statement by the assistant.
+
+# 2. HOW TO WRITE EACH FACT
+- Self-contained: readable on its own, without the conversation. Resolve pronouns and references ("he", "it", "the file") using explicit names.
+- Atomic: one idea per fact. If two ideas only make sense together, keep them in the same fact.
+- Third person ("The user...") and in the language of the conversation.
+- Preserve numbers, names, versions, file paths and dates exactly as they appear. Convert relative dates ("yesterday") to absolute ones using the CURRENT DATE provided.
+- Do not invent, do not generalize, do not infer beyond what was said.
+- Every fact needs an "evidence" field: a SHORT, LITERAL excerpt copied from the conversation that supports it.
+
+# 3. HOW TO DECIDE THE ACTION
+For each fact, compare it with the EXISTING MEMORIES and follow this order:
+
+1. Is it useless, ephemeral or outside what should be extracted? → DISCARD
+2. Does any memory already say the same thing, or something equally or more complete? → NOOP (target = that memory's ID)
+3. Does it contradict a memory?
+   - The new fact is clearly more recent or the user signals a change ("now", "I moved", "I switched", "I no longer use") → UPDATE (target = old ID; the new text replaces it)
+   - Nothing indicates which one holds → CONFLICT (target = ID; the new text is stored and both are flagged)
+4. Does it complement a memory (more detail on the same subject, without contradicting)? → UPDATE (target = ID; text = complete combined version)
+5. Are two or more new facts, or a new fact and existing memories, only useful together (separated they lose meaning)? → MERGE (target = list of IDs of the existing memories involved, or [] if only new facts are involved; "text" = unified version)
+6. Otherwise → ADD
+
+Decision rules:
+- When in doubt between NOOP and ADD, prefer NOOP if the essential content already exists.
+- When in doubt between DISCARD and ADD, prefer DISCARD if the fact would not help in a future conversation.
+- Memories with state "superseded" cannot be the target of any action; use them only as historical context.
+- Only use IDs that appear in EXISTING MEMORIES. Never invent IDs.
+- In UPDATE and MERGE, "text" must contain ALL the relevant information from the sources (nothing is lost) and nothing that is not in them.
+- A memory with source "assistant" can be corrected by a user fact without generating a CONFLICT.
+
+# 4. VALIDITY
+Set "validity":
+- "permanent": preference, identity, structural decision, a fact that does not change by itself
+- "temporal": a fact likely to change (current version, location, project status, what is in progress)
+
+# 5. OUTPUT FORMAT
+Respond ONLY with a JSON object, with no markdown and no text outside it:
+
+{
+  "facts": [
+    {
+      "evidence": "short literal excerpt from the conversation",
+      "text": "self-contained fact",
+      "type": "fact | preference | decision | instruction",
+      "related": ["M3"],
+      "rationale": "one short sentence explaining the comparison",
+      "action": "ADD | NOOP | UPDATE | CONFLICT | MERGE | DISCARD",
+      "target": ["M3"],
+      "validity": "permanent | temporal"
+    }
+  ]
+}
+
+Format rules:
+- Keep exactly this field order: evidence, text, type, related, rationale, action, target, validity.
+- "related": IDs of the existing memories you compared against, even if the action is ADD or DISCARD ([] if none).
+- "target": [] for ADD and DISCARD; one ID for NOOP, UPDATE and CONFLICT; one or more IDs for MERGE.
+- If there is nothing to extract, respond {"facts": []}.
+- Maximum of 8 facts per response. Prioritize the most useful ones.
+
+# 6. EXAMPLES
+
+## Example A: ADD with resolved coreference
+CURRENT DATE: 2026-10-24
+EXISTING MEMORIES: (none)
+USER: I'm porting orchestrator.py to Rust. It runs on port 4008.
+ASSISTANT: Sure, I can suggest a crate structure.
+Output:
+{"facts":[{"evidence":"porting orchestrator.py to Rust","text":"The user is porting orchestrator.py to Rust.","type":"decision","related":[],"rationale":"No memory about this port.","action":"ADD","target":[],"validity":"temporal"},{"evidence":"It runs on port 4008","text":"The user's orchestrator.py runs on port 4008.","type":"fact","related":[],"rationale":"New technical configuration.","action":"ADD","target":[],"validity":"permanent"}]}
+
+## Example B: NOOP and UPDATE due to change
+CURRENT DATE: 2026-10-24
+EXISTING MEMORIES:
+[M1] (created 2026-08-02, source user) The user uses the Qwen3-8B model as the main LLM.
+[M2] (created 2026-09-10, source user) The user runs the embeddings server on port 2002.
+USER: I switched the main LLM to LFM2.5-8B-A1B. The embeddings server is still on 2002.
+Output:
+{"facts":[{"evidence":"I switched the main LLM to LFM2.5-8B-A1B","text":"The user uses the LFM2.5-8B-A1B model as the main LLM (previously used Qwen3-8B).","type":"decision","related":["M1"],"rationale":"The user explicitly states a switch; the new fact replaces M1.","action":"UPDATE","target":["M1"],"validity":"temporal"},{"evidence":"The embeddings server is still on 2002","text":"The user runs the embeddings server on port 2002.","type":"fact","related":["M2"],"rationale":"Already recorded in M2.","action":"NOOP","target":["M2"],"validity":"permanent"}]}
+
+## Example C: MERGE
+CURRENT DATE: 2026-10-24
+EXISTING MEMORIES:
+[M4] (created 2026-09-01, source user) The user has a 1TB hard drive with errors.
+USER: That 1TB drive only shows up as /dev/sdd. I'll try to fix it from the terminal before throwing it away.
+Output:
+{"facts":[{"evidence":"only shows up as /dev/sdd. I'll try to fix it from the terminal before throwing it away","text":"The user's faulty 1TB hard drive shows up as /dev/sdd; they will try to fix it from the terminal before discarding it.","type":"decision","related":["M4"],"rationale":"Complements M4 and only makes sense together with it.","action":"MERGE","target":["M4"],"validity":"temporal"}]}
+
+## Example D: DISCARD
+CURRENT DATE: 2026-10-24
+EXISTING MEMORIES:
+[M7] (created 2026-07-15, source user) The user prefers short answers.
+USER: Explain in more detail how PPR works. I'm tired today.
+ASSISTANT: PPR (Personalized PageRank) is...
+Output:
+{"facts":[{"evidence":"Explain in more detail how PPR works","text":"The user asked for a detailed explanation of PPR.","type":"preference","related":["M7"],"rationale":"One-off request; it does not indicate a change to the preference for short answers (M7).","action":"DISCARD","target":[],"validity":"temporal"},{"evidence":"I'm tired today","text":"The user is tired today.","type":"fact","related":[],"rationale":"Momentary state.","action":"DISCARD","target":[],"validity":"temporal"}]}
+"""
+
+
+# ── Helpers do protocolo de extração ─────────────────────────────────────────
+
+_EXTRACTION_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])["\')\]]?\s+')
+_EXTRACTION_MAX_SENTENCES_PER_SIDE = 6
+_EXTRACTION_MIN_SENTENCE_CHARS = 20
+_EXTRACTION_MAX_QUERIES = 14
+_EXTRACTION_TOP_K_PER_QUERY = 8
+_EXTRACTION_READ_TOP_K_FINAL = 12      # teto server-side do /read
+_EXTRACTION_READ_TOTAL_MAX_CHARS = 12000
+_EXTRACTION_READ_MIN_SCORE = 0.2       # mais permissivo que o recall de chat
+_EXTRACTION_ST_PAIRS = 3
+
+
+def _split_extraction_queries(text: str) -> list[str]:
+    """
+    Divide um texto (pergunta ou resposta) em sentenças para ampliar a
+    cobertura da busca por candidatos. O texto INTEIRO vem sempre primeiro;
+    as sentenças entram como queries adicionais.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= _EXTRACTION_MIN_SENTENCE_CHARS:
+        return [text]
+    sentences = [
+        s.strip()
+        for s in _EXTRACTION_SENTENCE_SPLIT_RE.split(text)
+        if s.strip() and len(s.strip()) >= _EXTRACTION_MIN_SENTENCE_CHARS
+    ][:_EXTRACTION_MAX_SENTENCES_PER_SIDE]
+    return [text] + sentences if sentences else [text]
+
+
+async def _collect_extraction_candidates(
+    user_input: str,
+    assistant_response: str,
+    recall_memories: Optional[list[dict]],
+    session_id: Optional[str],
+) -> list[dict]:
+    """
+    Coleta os candidatos a memórias EXISTENTES que o extractor vai comparar.
+
+    O modelo só enxerga as memórias que enviamos — o que não entra aqui é
+    invisível para ele. A lista é construída por:
+      1. recall do chat (memórias usadas para produzir a resposta) —
+         flag used_in_answer=True, prioridade MÁXIMA na ordenação;
+      2. embedding das SENTENÇAS da pergunta e da resposta, além das
+         perguntas/respostas inteiras (buscas em paralelo);
+      3. expansão pelo grafo — match_type="related" (PPR) que o /read
+         já devolve junto com os hits primários.
+
+    Dedup por id, filtro só long_term, ordenação used_in_answer →
+    primary → related → score, cap em MEMORY_EXTRACTOR_CANDIDATES_MAX
+    (clampado a 15–30).
+    """
+    best: dict[int, dict] = {}
+    used_ids: set[int] = set()
+
+    # 1) Marca as memórias que o assistente de fato usou na resposta.
+    if recall_memories:
+        for m in recall_memories:
+            if not isinstance(m, dict):
+                continue
+            try:
+                mid = int(m.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if (m.get("memory_type") or "") == "long_term":
+                used_ids.add(mid)
+
+    def _merge(m: dict) -> None:
+        try:
+            mid = int(m.get("id"))
+        except (TypeError, ValueError):
+            return
+        text = (m.get("text") or "").strip()
+        if not text:
+            return
+        cur = best.get(mid)
+        if cur is None:
+            best[mid] = {**m, "id": mid, "used_in_answer": mid in used_ids}
+            return
+        if (m.get("score") or 0.0) > (cur.get("score") or 0.0):
+            cur["score"] = m.get("score")
+        # Um hit primário (embedding) "promove" um hit que só chegou pelo grafo.
+        if (m.get("match_type") or "primary") == "primary" and cur.get("match_type") != "primary":
+            cur["match_type"] = "primary"
+        if len(text) > len((cur.get("text") or "")):
+            cur["text"] = text
+
+    if recall_memories:
+        for m in recall_memories:
+            if isinstance(m, dict) and (m.get("memory_type") or "") == "long_term":
+                _merge(m)
+
+    # 2+3) Embedding por sentença + grafo, em paralelo.
+    queries: list[str] = []
+    for text in (user_input, assistant_response):
+        queries.extend(_split_extraction_queries(text))
+    queries = queries[:_EXTRACTION_MAX_QUERIES]
+
+    async def _search(q: str) -> list[dict]:
+        return await memory_read(
+            q,
+            session_id=session_id,
+            top_k=_EXTRACTION_TOP_K_PER_QUERY,
+            top_k_final=_EXTRACTION_READ_TOP_K_FINAL,
+            total_max_chars=_EXTRACTION_READ_TOTAL_MAX_CHARS,
+            min_score=_EXTRACTION_READ_MIN_SCORE,
+        )
+
+    results_lists = await asyncio.gather(*[_search(q) for q in queries]) if queries else []
+    for results in results_lists:
+        for m in results:
+            if isinstance(m, dict) and (m.get("memory_type") or "") == "long_term":
+                _merge(m)
+
+    def _rank_key(m: dict):
+        return (
+            0 if m.get("used_in_answer") else 1,
+            0 if (m.get("match_type") or "primary") == "primary" else 1,
+            -(m.get("score") or 0.0),
+        )
+
+    candidates = sorted(best.values(), key=_rank_key)[:MEMORY_EXTRACTOR_CANDIDATES_MAX]
+    log.info(
+        f"[MEMORY-EXTRACT] candidatos: {len(candidates)} "
+        f"(queries={len(queries)}, session={session_id})."
+    )
+    return candidates
+
+
+def _fmt_extraction_date(ts) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def _source_label(source) -> str:
+    """
+    Mapeia o source técnico do DB para o vocabulário do prompt
+    (user | assistant | imported). Fatos extraídos do chat são atribuídos ao
+    usuário; material ingerido (imports, scraping, pipelines de visão/voz) é
+    'imported'; o resto é tratado como 'assistant'.
+    """
+    s = (source or "").lower()
+    if not s or s.startswith(("chat", "user")):
+        return "user"
+    if s.startswith(("import", "scraping", "vision", "face", "voice")):
+        return "imported"
+    return "assistant"
+
+
+def _format_existing_memories(candidates: list[dict]) -> tuple[str, dict[int, int]]:
+    """
+    Formata EXISTING MEMORIES no formato do protocolo:
+      [M{n}] (created X, updated X, source …, type fact, state active,
+      used_in_answer yes|no) {text}
+    e devolve o mapa M{n} → id real (usado para reverter os IDs do modelo).
+    """
+    lines: list[str] = []
+    m_map: dict[int, int] = {}
+    for i, m in enumerate(candidates, start=1):
+        m_map[i] = m.get("id")
+        created = _fmt_extraction_date(m.get("created_at") or 0.0)
+        lines.append(
+            f"[M{i}] (created {created}, updated {created}, "
+            f"source {_source_label(m.get('source'))}, type fact, state active, "
+            f"used_in_answer {'yes' if m.get('used_in_answer') else 'no'}) "
+            f"{(m.get('text') or '').strip()}"
+        )
+    return ("\n".join(lines) if lines else "(none)"), m_map
+
+
+def _build_extraction_user_prompt(
+    user_input: str,
+    assistant_response: str,
+    candidates: list[dict],
+    previous_context: Optional[list[dict]],
+) -> tuple[str, dict[int, int]]:
+    """
+    Renderiza o prompt do extractor (template do protocolo): CURRENT DATE,
+    CANONICAL ENTITIES, EXISTING MEMORIES, PREVIOUS CONTEXT, CURRENT EXCHANGE.
+    Retorna (prompt, mapa M{n} → id real).
+    """
+    iso_date = datetime.date.today().isoformat()
+    memories_block, m_map = _format_existing_memories(candidates)
+
+    prev_lines: list[str] = []
+    if previous_context:
+        for t in previous_context:
+            content = (t.get("content") or "").strip()
+            if content:
+                role = (t.get("role") or "user").upper()
+                prev_lines.append(f"{role}: {content[:300]}")
+    prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
+
+    prompt = (
+        f"CURRENT DATE: {iso_date}\n\n"
+        "CANONICAL ENTITIES (use these names when writing facts):\n"
+        "(none)\n\n"
+        'EXISTING MEMORIES (sorted by relevance; "used_in_answer" indicates it '
+        "was sent to the assistant to produce its answer):\n"
+        f"{memories_block}\n\n"
+        "PREVIOUS CONTEXT (only to resolve references; do NOT extract facts from "
+        "here):\n"
+        f"{prev_block}\n\n"
+        "CURRENT EXCHANGE (extract from here):\n"
+        f"USER: {user_input}\n"
+        f"ASSISTANT: {assistant_response}\n\n"
+        "Task: extract the useful facts from the CURRENT EXCHANGE and decide the "
+        "action for each one by comparing it with the EXISTING MEMORIES. Respond "
+        "only with the JSON in the defined format."
+    )
+    return prompt, m_map
+
+
+async def _memory_write_update(payload: dict, memory_id: int):
+    """
+    Reenvia uma escrita como action="update" numa memória específica —
+    usado pelo extractor para UPDATE/MERGE/CONFLICT (roteamento por ID real).
+    """
+    try:
+        data = await _call_memory_tool(
+            "memory_write",
+            {**payload, "action": "update", "memory_id": memory_id},
+        )
+        if not data.get("stored"):
+            log.info(
+                f"[MEMORY-EXTRACT] update LT não efetivado (memory_id={memory_id}): "
+                f"{data.get('reason')}"
+            )
+        else:
+            log.info(
+                f"[MEMORY-EXTRACT] update LT efetivado (memory_id={memory_id})."
+            )
+    except Exception as e:
+        log.info(f"[MEMORY-EXTRACT] falha no update LT (memory_id={memory_id}): {e}")
 
 
 async def _extract_and_save_memories(
@@ -974,13 +1344,16 @@ async def _extract_and_save_memories(
     assistant_response: str,
     *,
     session_id: Optional[str] = None,
+    recall_memories: Optional[list[dict]] = None,
 ) -> list[dict]:
     """
     Roda o modelo extractor (MEMORY_EXTRACTOR_MODEL) sobre a dupla
-    pergunta-resposta, força a saída em JSON schema estruturado, e roteia
-    cada memória identificada:
-      - semantic  → LT (memória de longo prazo, via /write)
-      - episodic  → ST (memória de curto prazo, via /write_st)
+    pergunta-resposta e roteia cada fato extraído para a LT:
+      - ADD        → cria (via write_batch, junto dos demais ADDs)
+      - UPDATE     → sobrescreve a memória-alvo (action="update", id real)
+      - MERGE      → atualiza o 1º alvo com o texto unificado do fato
+      - CONFLICT   → cria o fato novo E marca a antiga com prefixo de conflito
+      - NOOP/DISCARD → nada é gravado
 
     `user_input`        — texto ORIGINAL que o usuário enviou (não o prefill
                           nem um turno intermediário de tool use).
@@ -989,8 +1362,14 @@ async def _extract_and_save_memories(
                           internas: streaming, reasoning, múltiplos turnos
                           de tool use). Só chamamos o extractor UMA vez por
                           turno de conversa, sobre o produto final.
+    `recall_memories`   — resultados do /read usados para CONSTRUIR a resposta
+                          deste turno (quando disponível, /chat e /chat/stream
+                          passam o recall). Essas memórias ganham
+                          used_in_answer=yes na lista de candidatos —
+                          prioridade máxima, pois o turno foi produzido
+                          a partir delas.
 
-    Retorna a lista de memórias extraídas (para fins de logging/inspeção).
+    Retorna a lista de fatos processados (logging/inspeção).
     """
     if not user_input or not assistant_response:
         return []
@@ -998,21 +1377,35 @@ async def _extract_and_save_memories(
         log.info("[MEMORY-EXTRACT] OPENROUTER_API_KEY ausente — extração pulada.")
         return []
 
+    # ── Contexto anterior + candidatos ──────────────────────────────────────
+    # O modelo só enxerga as memórias que enviamos: coletamos os melhores
+    # candidatos (recall usado na resposta → embedding por sentença → grafo),
+    # o contexto anterior cru (só p/ resolver referências) e montamos o prompt
+    # no template definido (CURRENT DATE / CANONICAL ENTITIES / EXISTING
+    # MEMORIES / PREVIOUS CONTEXT / CURRENT EXCHANGE).
+    try:
+        previous_turns = await memory_read_st(session_id, n_pairs=_EXTRACTION_ST_PAIRS)
+    except Exception as e:
+        log.info(f"[MEMORY-EXTRACT] falha na leitura do contexto anterior: {e}")
+        previous_turns = []
+    cur_user = user_input.strip().lower()
+    cur_assist = assistant_response.strip().lower()
+    previous_context = [
+        t for t in previous_turns
+        if (t.get("content") or "").strip().lower() not in (cur_user, cur_assist)
+    ]
+
+    candidates = await _collect_extraction_candidates(
+        user_input, assistant_response, recall_memories, session_id,
+    )
+
+    prompt_user, m_map = _build_extraction_user_prompt(
+        user_input, assistant_response, candidates, previous_context,
+    )
+
     messages_base = [
         {"role": "system", "content": _MEMORY_EXTRACTOR_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"=== PERGUNTA DO USUÁRIO ===\n{user_input}\n\n"
-                f"=== RESPOSTA DO ASSISTENTE ===\n{assistant_response}\n\n"
-                "=== TAREFA ===\n"
-                "Com base nessa dupla pergunta-resposta, identifique se alguma "
-                "informação presente (tanto na pergunta quanto na resposta) seria "
-                "útil de ser gravada. Para cada uma, indique se é esquecível ou "
-                "não, e se é episódica (→ ST) ou semântica (→ LT). "
-                "Responda SOMENTE no formato JSON definido."
-            ),
-        },
+        {"role": "user", "content": prompt_user},
     ]
 
     # ── Cadeia de tentativas ────────────────────────────────────────────────
@@ -1037,31 +1430,49 @@ async def _extract_and_save_memories(
     _plain_json_instruction = (
         "\n\nFORMATO OBRIGATÓRIO — responda APENAS com um objeto JSON válido, "
         "sem texto antes ou depois e sem markdown:\n"
-        '{"memories": [{"content": "<fato em 3ª pessoa>", '
-        '"forgettable": true|false, "type": "semantic"|"episodic"}]}\n'
-        "Se nada merecer ser gravado, responda exatamente: {\"memories\": []}"
+        '{"facts": [{"evidence": "<trecho literal curto>", '
+        '"text": "<fato autocontido em 3ª pessoa>", '
+        '"type": "fact"|"preference"|"decision"|"instruction", '
+        '"related": [], "rationale": "<uma frase curta>", '
+        '"action": "ADD"|"NOOP"|"UPDATE"|"CONFLICT"|"MERGE"|"DISCARD", '
+        '"target": [], "validity": "permanent"|"temporal"}]}\n'
+        "Regras: target=[] para ADD e DISCARD; 1 ID (M<n>) para NOOP, UPDATE e "
+        "CONFLICT; 1 ou mais para MERGE. Máximo de 8 fatos. "
+        "Se nada merecer ser gravado, responda exatamente: "
+        '{"facts": []}'
     )
     fallback_model = MEMORY_EXTRACTOR_FALLBACK_MODEL or MAIN_MODEL
-    attempts: list[tuple[str, Optional[dict], str]] = [
-        (MEMORY_EXTRACTOR_MODEL, json_schema_fmt, ""),
-        (MEMORY_EXTRACTOR_MODEL, None, _plain_json_instruction),
-        (fallback_model, json_schema_fmt, ""),
+    # Bloco de roteamento de provider (curl `provider.only`) — só acompanha as
+    # tentativas com o MODELO EXTRATOR: o fallback pode rodar em outro modelo
+    # que não esteja no provider configurado.
+    provider_block: Optional[dict] = None
+    if MEMORY_EXTRACTOR_PROVIDERS.strip():
+        provider_block = {
+            "only": [p.strip() for p in MEMORY_EXTRACTOR_PROVIDERS.split(",") if p.strip()],
+            "allow_fallbacks": True,
+        }
+    attempts: list[tuple[str, Optional[dict], str, bool]] = [
+        (MEMORY_EXTRACTOR_MODEL, json_schema_fmt, "", True),
+        (MEMORY_EXTRACTOR_MODEL, None, _plain_json_instruction, True),
+        (fallback_model, json_schema_fmt, "", False),
     ]
 
     client = await _get_openrouter_client()
     content = ""
     last_err = ""
-    for attempt_i, (model, fmt, suffix) in enumerate(attempts, start=1):
+    for attempt_i, (model, fmt, suffix, use_provider) in enumerate(attempts, start=1):
         fmt_label = fmt.get("type") if fmt else "sem response_format"
         msg_user = messages_base[-1]["content"] + suffix if suffix else messages_base[-1]["content"]
         payload: dict = {
             "model":       model,
             "messages":    messages_base[:-1] + [{"role": "user", "content": msg_user}],
-            "temperature": 0.2,
-            "max_tokens":  1024,
+            "temperature": MEMORY_EXTRACTOR_TEMPERATURE,
+            "max_tokens":  1500,
         }
         if fmt:
             payload["response_format"] = fmt
+        if use_provider and provider_block:
+            payload["provider"] = provider_block
         try:
             r = await client.post("/chat/completions", json=payload)
         except Exception as e:
@@ -1128,60 +1539,151 @@ async def _extract_and_save_memories(
             log.info(f"[MEMORY-EXTRACT] Recovery falhou. Raw: {content[:200]}")
             return []
 
-    memories_raw = parsed.get("memories", []) if isinstance(parsed, dict) else []
+    facts_raw = parsed.get("facts", []) if isinstance(parsed, dict) else []
 
-    # Roteia cada memória identificada:
-    #   semantic  → LT (memória de longo prazo) — TODAS de uma vez via
-    #               memory_write_batch (1 round-trip MCP em vez de N).
-    #   episodic  → ST (memória de curto prazo, via /write_st) —
-    #               continua individual (não existe write_st em lote).
+    # ── Pós-validação + roteamento ──────────────────────────────────────────
+    # Qualquer ID fora do padrão ^M\d+$ ou fora do mapa M→id real é
+    # DESCARTADO — modelos pequenos alucinam IDs; um id que não corresponde a
+    # nenhuma memória enviada não tem destino válido.
+    today_iso = datetime.date.today().isoformat()
+
+    def _resolve_ids(m_ids) -> list[int]:
+        resolved: list[int] = []
+        for mid in (m_ids or []):
+            match = re.match(r"^M(\d+)$", str(mid).strip())
+            if not match:
+                log.warning(f"[MEMORY-EXTRACT] id inválido {mid!r} — descartado.")
+                continue
+            real_id = m_map.get(int(match.group(1)))
+            if real_id is None:
+                log.warning(
+                    f"[MEMORY-EXTRACT] id {mid!r} fora do mapa (M1..M{len(m_map)}) "
+                    "— descartado."
+                )
+                continue
+            resolved.append(real_id)
+        return resolved
+
+    def _lt_payload(text: str, validity: str) -> dict:
+        # permanent → fato estável (preferência, identidade, decisão estrutural):
+        #             não decai, confidence alta.
+        # temporal  → fato que pode mudar sozinho (versão, local, projeto): decai.
+        return {
+            "text":        text,
+            "source":      "chat:extractor",
+            "confidence":  0.9 if validity == "permanent" else 0.65,
+            "forgettable": validity != "permanent",
+            "ttl_days":    None,
+        }
+
     saved: list[dict] = []
-    semantic_payloads: list[dict] = []
-    for mem in memories_raw:
-        if not isinstance(mem, dict):
+    add_payloads: list[dict] = []
+    update_ops: list[tuple[dict, int]] = []
+
+    for fact in facts_raw:
+        if not isinstance(fact, dict):
             continue
-        text = (mem.get("content") or "").strip()
+        text = (fact.get("text") or "").strip()
         if not text:
             continue
-        mem_type = mem.get("type") or "semantic"
-        if mem_type not in ("episodic", "semantic"):
-            mem_type = "semantic"
-        forgettable = bool(mem.get("forgettable", True))
-
-        if mem_type == "semantic":
-            # LT: confidence mais alta para memórias não-esquecíveis —
-            # elas tendem a ser fatos estáveis sobre o usuário e
-            # merecem prioridade na busca.
-            confidence = 0.9 if not forgettable else 0.6
-            semantic_payloads.append({
-                "text":        text,
-                "source":      "chat:semantic",
-                "confidence":  confidence,
-                "forgettable": forgettable,
-                "ttl_days":    None,
-            })
-        else:
-            # episodic → ST (curto prazo). ST é efêmera por natureza,
-            # então o forgetable do extractor é ignorado neste caso.
-            asyncio.create_task(
-                memory_write_st_episodic(session_id=session_id, text=text)
+        action = str(fact.get("action") or "").strip().upper()
+        if action not in ("ADD", "NOOP", "UPDATE", "CONFLICT", "MERGE", "DISCARD"):
+            log.warning(
+                f"[MEMORY-EXTRACT] action desconhecida {action!r} — fato pulado: "
+                f"{text[:80]!r}"
             )
+            continue
+        validity = fact.get("validity")
+        if validity not in ("permanent", "temporal"):
+            validity = "temporal"
+        targets = _resolve_ids(fact.get("target"))
+        related_ids = _resolve_ids(fact.get("related"))
+        evidence = (fact.get("evidence") or "").strip()[:200]
+        rationale = (fact.get("rationale") or "").strip()[:200]
 
-        saved.append({
-            "content":    text,
-            "type":       mem_type,
-            "target":     "LT" if mem_type == "semantic" else "ST",
-            "forgettable": forgettable,
-        })
+        entry: dict = {
+            "content":      text,
+            "type":         fact.get("type") or "fact",
+            "action":       action,
+            "target_ids":   targets,
+            "related_ids":  related_ids,
+            "validity":     validity,
+            "target":       "LT",
+            "forgettable":  validity != "permanent",
+        }
+        if evidence:
+            entry["evidence"] = evidence
+        if rationale:
+            entry["rationale"] = rationale
 
-    if semantic_payloads:
+        if action == "ADD":
+            add_payloads.append(_lt_payload(text, validity))
+        elif action in ("UPDATE", "MERGE"):
+            if not targets:
+                # UPDATE/MERGE alegado mas alvo inválido → downgrade para ADD
+                # para não perder o fato.
+                log.warning(
+                    f"[MEMORY-EXTRACT] {action} sem alvo válido — downgrade para ADD. "
+                    f"rationale={rationale!r}"
+                )
+                add_payloads.append(_lt_payload(text, validity))
+                entry["action"] = "ADD"
+                entry["target_ids"] = []
+            else:
+                target_id = targets[0]
+                if action == "MERGE" and len(targets) > 1:
+                    # Sem estado "superseded" no DB: só o 1º alvo é atualizado
+                    # com o texto unificado; os demais ficam intocados (ficam
+                    # redundantes, mas nada é perdido).
+                    log.info(
+                        f"[MEMORY-EXTRACT] MERGE com {len(targets)} alvos — só o "
+                        f"primeiro ({target_id}) é atualizado; demais ignorados: "
+                        f"{targets[1:]}"
+                    )
+                # O "text" do fato já deve conter TODA a informação relevante
+                # das fontes (regra do prompt) — o update sobrescreve com ele.
+                update_ops.append((_lt_payload(text, validity), target_id))
+                entry["target_ids"] = [target_id]
+        elif action == "CONFLICT":
+            # Cria o fato novo E marca a memória antiga preservando o texto
+            # original com um prefixo de conflito (não há flag de conflito no
+            # DB — assim nada é destruído).
+            add_payloads.append(_lt_payload(text, validity))
+            if targets:
+                old = next((c for c in candidates if c.get("id") == targets[0]), None)
+                old_text = (old.get("text") or "").strip() if old else ""
+                if old_text:
+                    update_ops.append((
+                        {
+                            "text":        f"[CONFLITO {today_iso}] {old_text}",
+                            "source":      old.get("source") or "chat",
+                            "confidence":  old.get("confidence") or 0.65,
+                            "forgettable": bool(old.get("forgettable", True)),
+                            "ttl_days":    None,
+                        },
+                        targets[0],
+                    ))
+        elif action == "NOOP" and not targets:
+            # NOOP sem alvo: sem destino, o fato viraria órfão — trata como
+            # DISCARD para o registro refletir o que de fato aconteceu.
+            log.info("[MEMORY-EXTRACT] NOOP sem alvo — tratado como DISCARD.")
+            entry["action"] = "DISCARD"
+        # DISCARD → apenas registrado em `saved`; nada é gravado.
+
+        saved.append(entry)
+
+    if add_payloads:
         # fire-and-forget: o /chat não espera a gravação terminar para
-        # responder, mas as N memórias semânticas viram 1 chamada MCP.
-        asyncio.create_task(memory_write_facts_batch(semantic_payloads))
+        # responder; os N fatos ADD viram 1 chamada MCP de batch.
+        asyncio.create_task(memory_write_facts_batch(add_payloads))
+    for upd_payload, upd_target in update_ops:
+        asyncio.create_task(_memory_write_update(upd_payload, upd_target))
 
     log.info(
-        f"[MEMORY-EXTRACT] {len(saved)} memória(s) extraída(s) "
-        f"(session={session_id}, modelo={model})."
+        f"[MEMORY-EXTRACT] {len(saved)} fato(s) processado(s) "
+        f"(adds={len(add_payloads)}, updates={len(update_ops)}, "
+        f"discards={sum(1 for s in saved if s['action'] == 'DISCARD')}, "
+        f"session={session_id}, modelo={model})."
     )
     return saved
 
@@ -1707,7 +2209,11 @@ async def chat(req: ChatRequest):
     # requisições: aqui só interessa o produto final visto pelo usuário.
     if req.extract_memories:
         asyncio.create_task(
-            _extract_and_save_memories(user_input, response_text, session_id=req.session_id)
+            _extract_and_save_memories(
+                user_input, response_text,
+                session_id=req.session_id,
+                recall_memories=memories,
+            )
         )
 
     # Disparar TTS em background
@@ -2200,7 +2706,11 @@ async def chat_stream(req: ChatRequest):
             # só disparem o extractor UMA vez, sobre o produto final.
             if req.extract_memories:
                 asyncio.create_task(
-                    _extract_and_save_memories(user_input, full_response, session_id=req.session_id)
+                    _extract_and_save_memories(
+                        user_input, full_response,
+                        session_id=req.session_id,
+                        recall_memories=memories,
+                    )
                 )
 
     return StreamingResponse(

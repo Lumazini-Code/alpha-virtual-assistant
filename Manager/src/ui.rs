@@ -173,10 +173,12 @@ impl TrayApp {
             "meta" => {
                 // Novo turno: registra a pergunta no histórico. A troca
                 // automática de tela + foco da janela acontece SÓ para turnos
-                // com tts=true (pipeline de voz / wake word). Turnos digitados
-                // na TUI ou no próprio chat do Manager chegam com tts=false e
-                // não devem roubar o foco da janela do Manager.
-                let should_open = ev.tts_flag();
+                // do transcribe (source="voice" — o /ui/chat-open já abre na
+                // wake word; isso aqui é o fallback caso esse POST falhe).
+                // Turnos digitados na TUI (source=tui) ou no próprio chat do
+                // Manager (source=chat) chegam NUNCA abrem a tela — só
+                // atualizam o histórico em segundo plano.
+                let should_open = ev.source_name() == Some("voice");
                 let changed_screen = self.screen != Screen::Chat;
                 if let Some(input) = ev.input_text() {
                     self.chat_history.push(ChatMessage {
@@ -194,11 +196,11 @@ impl TrayApp {
                     });
                     self.chat_running = true;
                 }
-                // Traz a janela para frente SÓ quando um novo turno de voz
-                // começa (tts=true). Para turnos de texto a tela do chat é
-                // atualizada silenciosamente em segundo plano.
+                // Traz a janela para frente SÓ quando um novo turno do
+                // transcribe começa (source=voice). Para turnos de texto a
+                // tela do chat é atualizada silenciosamente em segundo plano.
                 if should_open && changed_screen {
-                    tracing::info!("ui: novo turno de voz (tts=true) — abrindo tela de chat");
+                    tracing::info!("ui: novo turno do transcribe (source=voice) — abrindo tela de chat");
                     self.screen = Screen::Chat;
                     self.window_visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));

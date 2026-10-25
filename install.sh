@@ -428,6 +428,19 @@ extract_playwright_token() {
 import glob, os, re, sys
 
 home = os.path.expanduser('~')
+EXT_ID = b'mmlmfjhmonkocbjadbfplnigmagldckm'
+# Chave completa do localStorage da extensão no LevelDB (Meta key:
+# _<origem>\x00\x01<chave>). Ancorar a busca na origem evita FALSO POSITIVO:
+# outros sites gravam valores de 43 chars [A-Za-z0-9_-] no Local Storage
+# (caso real: token extraído errado vindo de mega.nz).
+KEY_NEEDLE = EXT_ID + b'\x00\x01auth-token'
+# Após a chave vem a parte interna do registro LevelDB (seq~type, 8 bytes
+# nos .ldb; varints nos .log) e então o valor. O token (43 chars base64url)
+# aparece na janela logo à frente — sem parse estrutural do SST, que varia
+# entre WAL e SST compactado (blocos snappy + prefix-compression).
+WINDOW = 64
+token_re = re.compile(rb'[A-Za-z0-9_-]{43}')
+
 leveldb_globs = [
     home + '/.config/google-chrome/*/Local Storage/leveldb',
     home + '/.config/chromium/*/Local Storage/leveldb',
@@ -436,21 +449,20 @@ leveldb_globs = [
     home + '/snap/chromium/common/chromium/*/Local Storage/leveldb',
     home + '/.var/app/org.chromium.Chromium/config/chromium/*/Local Storage/leveldb',
 ]
-# Token: 32 bytes em base64url sem padding = 43 chars de [A-Za-z0-9_-]
-token_re = re.compile(r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])')
-needle_utf8 = b'auth-token'
-needle_utf16 = 'auth-token'.encode('utf-16-le')
 
 files = []
 for pattern in leveldb_globs:
     for d in glob.glob(pattern):
         files.extend(
             os.path.join(d, name) for name in os.listdir(d)
-            if name.endswith(('.ldb', '.log'))
-        )
-# Arquivo mais recente primeiro: se o usuário regenerou o token, o valor
-# atual costuma estar no WAL (.log) ou no .ldb mais novo.
-files.sort(key=os.path.getmtime, reverse=True)
+            if name.endswith(('.ldb', '.log')))
+# Ordem de geração do LevelDB: número do arquivo maior = write mais recente.
+def file_num(path):
+    try:
+        return int(os.path.basename(path).split('.')[0])
+    except ValueError:
+        return -1
+files.sort(key=file_num, reverse=True)
 
 for path in files:
     try:
@@ -458,16 +470,16 @@ for path in files:
             raw = fh.read()
     except OSError:
         continue
-    if needle_utf8 not in raw and needle_utf16 not in raw:
-        continue
-    # O valor pode estar gravado em UTF-8 ou UTF-16LE no LevelDB —
-    # decodifica o arquivo nas duas visões e procura o padrão.
-    for view in (raw.decode('utf-8', errors='ignore'),
-                 raw.decode('utf-16-le', errors='ignore')):
-        match = token_re.search(view)
-        if match:
-            print(match.group(0))
+    idx = 0
+    while True:
+        i = raw.find(KEY_NEEDLE, idx)
+        if i < 0:
+            break
+        m = token_re.search(raw, i + len(KEY_NEEDLE), i + len(KEY_NEEDLE) + WINDOW)
+        if m:
+            print(m.group(0).decode('ascii'))
             sys.exit(0)
+        idx = i + 1
 sys.exit(1)
 PY
 }
@@ -493,6 +505,20 @@ if ! grep -qE '^PLAYWRIGHT_MCP_EXTENSION_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
   fi
 else
   ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN já existe em $ENV_FILE."
+  # Verificação de drift — o mecanismo de autenticação da extensão: a
+  # connect.html compara o 'token' da URL com o 'auth-token' do localStorage;
+  # divergência = "Invalid token provided" em TODA conexão (o servidor manda o
+  # token velho do env). Se o token do .env não é o valor atual da extensão
+  # (regenerado na status.html), atualiza o .env; o re-registro adiante derruba
+  # a sessão do @playwright/mcp no mcp_manager, que respawna com o token novo.
+  if token="$(extract_playwright_token)" && [ -n "$token" ]; then
+    current="$(get_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN)"
+    if [ "$current" != "$token" ]; then
+      warn "PLAYWRIGHT_MCP_EXTENSION_TOKEN divergente: a extensão está usando outro token (regenerado?)."
+      set_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN "$token"
+      ok "PLAYWRIGHT_MCP_EXTENSION_TOKEN atualizado → $ENV_FILE (o re-registro adiante respawna o servidor)."
+    fi
+  fi
 fi
 
 # ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
@@ -503,24 +529,43 @@ fi
 MCP_MANAGER_URL="http://127.9.12.22:4008"
 
 register_playwright_mcp() {
-  local payload
-  payload='{
+  # O env do registro é autocontido (o mcp_manager mescla server.env sobre o
+  # ambiente herdado — a linha vale mesmo sem o tray injetando o env):
+  #   • PLAYWRIGHT_MCP_EXTENSION_TOKEN — a connect.html da extensão compara o
+  #     'token' da URL com o 'auth-token' do localStorage; igual → a conexão é
+  #     aprovada sozinha (sem diálogo manual por chamada).
+  #   • PLAYWRIGHT_EXTENSION_PROTOCOL=2 — a extensão exige exatamente a
+  #     protocolVersion 2 (v<2 → "unsupported protocol version", v>2 →
+  #     versionMismatch); forçar 2 mantém o par testado com a extensão 0.4.x
+  #     da loja mesmo se o @playwright/mcp@latest subir o default do relay
+  #     (o env é lido pelo relay no spawn: process.env.PLAYWRIGHT_EXTENSION_PROTOCOL).
+  local payload token
+  token="$(get_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN)"
+  local env_json='{"DISPLAY": ":0", "PLAYWRIGHT_EXTENSION_PROTOCOL": "2"}'
+  if [ -n "$token" ]; then
+    env_json="$(printf '{"DISPLAY": ":0", "PLAYWRIGHT_EXTENSION_PROTOCOL": "2", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "%s"}' "$token")"
+  fi
+  payload="$(printf '{
   "name": "playwright",
   "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
   "transport": "stdio",
   "command": "npx",
   "args": ["-y", "@playwright/mcp@latest", "--extension"],
-  "env": {"DISPLAY": ":0"}
-}'
+  "env": %s
+}' "$env_json")"
 
   # A extensão precisa ser instalada manualmente na Chrome Web Store —
-  # o Playwright MCP no modo --extension conecta a ela via bridge.
-  info "Abrindo a Chrome Web Store para instalar a extensão do Playwright..."
-  info "$PLAYWRIGHT_EXTENSION_URL"
-  open_url "$PLAYWRIGHT_EXTENSION_URL" || {
-    warn "Não encontrei um opener de URLs — instale a extensão manualmente:"
-    printf '  %s\n' "$PLAYWRIGHT_EXTENSION_URL"
-  }
+  # o Playwright MCP no modo --extension conecta a ela via bridge. Com o
+  # token já no .env (extensão instalada em execução anterior) a abertura é
+  # pulada: re-executar o instalador não deve reabrir a loja.
+  if ! grep -qE '^PLAYWRIGHT_MCP_EXTENSION_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
+    info "Abrindo a Chrome Web Store para instalar a extensão do Playwright..."
+    info "$PLAYWRIGHT_EXTENSION_URL"
+    open_url "$PLAYWRIGHT_EXTENSION_URL" || {
+      warn "Não encontrei um opener de URLs — instale a extensão manualmente:"
+      printf '  %s\n' "$PLAYWRIGHT_EXTENSION_URL"
+    }
+  fi
 
   # Se o token ainda não foi extraído (extensão instalada agora), abre a
   # status.html — a extensão então grava o token no localStorage do perfil —

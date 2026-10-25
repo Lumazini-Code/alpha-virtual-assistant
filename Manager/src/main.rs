@@ -152,7 +152,7 @@ fn main() -> anyhow::Result<()> {
         let state = shared_state.clone();
         let tx = cmd_tx.clone();
         rt.spawn(async move {
-            let url = format!("{}/conversation/stream", chat::orchestrator_url());
+            let url = format!("{}/conversation/stream", chat::orchestrator_url(&state).await);
             let mut retries: u32 = 0;
             loop {
                 let token = match chat::auth_header(&state).await {

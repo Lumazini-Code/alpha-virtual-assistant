@@ -43,6 +43,14 @@ services:
       start_period: 240s
       retries: 5
 
+    # Rotação dos logs do driver json-file (docker logs) — sem max-size o
+    # json-file cresce sem controle. Logs de aplicação ficam no volume ava-logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
   # ── Pipeline de busca web (websearch-mcp consome os três abaixo) ──────────
   # Portas publicadas só em 127.9.12.22: o ava roda com network_mode: host no
   # override linux e alcança tudo via localhost; nada fica exposto na rede.
@@ -62,8 +70,8 @@ services:
     container_name: ava-valkey
     ports:
       - "127.9.12.22:6379:6379"
-    volumes:
-      - websearch-cache:/data
+    # Sem persistência (appendonly no + save "") — o cache vive só em RAM;
+    # não há mais volume websearch-cache montado (era sempre vazio no disco).
     command: ["valkey-server", "--appendonly", "no", "--save", ""]
 
   crawl4ai:
@@ -102,6 +110,12 @@ services:
       CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # ── Proxy do socket Docker — o websearch não tem acesso direto ao socket ──
   # Allowlist mínima: apenas listar/inspecionar containers e start/stop do
   # crawl4ai (on-demand, economia de ~490MB RAM). Tudo mais (exec, images,
@@ -125,5 +139,5 @@ volumes:
     driver: local
   ava-logs:
     driver: local
-  websearch-cache:
-    driver: local
+  # websearch-cache removido — o valkey roda sem persistência
+  # (--appendonly no, --save ""), o volume nunca recebia dado algum.

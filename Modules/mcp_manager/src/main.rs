@@ -966,10 +966,27 @@ const DEFAULT_INHERITED_ENV_VARS: &[&str] = &[
     "TEMP",
     "USERNAME",
     "USERPROFILE",
+    // Autenticação da extensão "Playwright MCP Bridge" (@playwright/mcp
+    // --extension): o tray injeta o token do Modules/.env no processo do
+    // manager; herdá-lo aqui é o que faz a extensão aprovar a conexão
+    // sozinha (sem diálogo manual por chamada).
+    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
 ];
 
 #[cfg(not(windows))]
-const DEFAULT_INHERITED_ENV_VARS: &[&str] = &["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
+const DEFAULT_INHERITED_ENV_VARS: &[&str] = &[
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "USER",
+    // Autenticação da extensão "Playwright MCP Bridge" (@playwright/mcp
+    // --extension): o tray injeta o token do Modules/.env no processo do
+    // manager; herdá-lo aqui é o que faz a extensão aprovar a conexão
+    // sozinha (sem diálogo manual por chamada).
+    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+];
 
 fn default_environment() -> IndexMap<String, String> {
     let mut env = IndexMap::new();

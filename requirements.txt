@@ -63,8 +63,6 @@ scikit-image
 
 scipy
 
-pytest-playwright
-
 iceoryx2
 
 msgpack

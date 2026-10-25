@@ -8,7 +8,6 @@ use crate::platform::NoWindow;
 use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
 use crate::transcript;
 use anyhow::{bail, Context, Result};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -341,8 +340,8 @@ pub async fn touch_docker_activity(state: &SharedState) {
 /// chamar de novo é barato e sem efeito colateral. Nada aqui bloqueia o
 /// chamador — o /docker/start responde sem esperar o boot dos serviços.
 ///
-/// Nota: o Chrome de depuração NÃO entra aqui — por design ele é controle
-/// manual (/browser/start), pois a janela deve ficar aberta ao usuário.
+/// Nota: o Chrome NÃO entra aqui — por design ele é controle manual
+/// (/browser/start), pois a janela deve ficar aberta ao usuário.
 fn spawn_auto_start_host_services(state: &SharedState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -511,92 +510,32 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Browser: Chrome em modo depuração (CDP :9222) para o Playwright MCP
+// Browser: Chrome normal do usuário para o Playwright MCP (--extension)
 // ════════════════════════════════════════════════════════════════════════
 //
-// O mcp_manager registra o @playwright/mcp com `--cdp-endpoint
-// http://localhost:9222` — ou seja, o Playwright dentro do container
-// CONECTA a um Chrome do HOST. Este módulo garante esse Chrome:
+// O @playwright/mcp é registrado com `--extension` — ele NÃO lança browser
+// nem usa CDP: conecta ao Chrome REAL do usuário via extensão "Playwright
+// MCP Bridge" (instalada no perfil padrão). Este módulo só garante o
+// Chrome aberto:
 //
-//   1. Copia o perfil padrão do usuário (sem caches) para um
-//      --user-data-dir próprio — requisito do Chrome ≥136, que recusa
-//      CDP no perfil padrão
-//   2. Spawn detached: o Chrome vive INDEPENDENTE do tray/docker —
+//   1. Chrome já rodando (qualquer instância, a do usuário incluída) →
+//      não abre NADA — nem janela nova, nem modo depuração;
+//   2. Chrome fechado → abre o Chrome NORMAL, com o perfil padrão do
+//      usuário (sem --remote-debugging-port, sem --user-data-dir, sem
+//      cópia de perfil);
+//   3. Spawn detached: o Chrome vive INDEPENDENTE do tray/docker —
 //      sobrevive ao fim das ações do modelo e ao stop do docker de
-//      propósito (a janela fica aberta para o usuário)
+//      propósito (a janela fica aberta para o usuário).
+//
+// A autenticação da extensão fica por conta de
+// PLAYWRIGHT_MCP_EXTENSION_TOKEN (Modules/.env → tray → mcp_manager →
+// @playwright/mcp): com o token no ambiente do servidor, a extensão
+// aprova a conexão sozinha, sem diálogo manual a cada chamada.
 
 /// Dados de retorno do /browser/start.
 pub struct BrowserStartInfo {
-    pub cdp_url: String,
     pub pid: Option<u32>,
-    pub profile_dir: PathBuf,
     pub already_running: bool,
-}
-
-/// Porta do CDP (default no state.rs; mesma porta do --cdp-endpoint no
-/// mcp_manager.py). O valor efetivo vem de BrowserState.cdp_port.
-const CDP_WAIT_SECS: u64 = 20;
-
-/// Diretórios do perfil que NÃO valem copiar: caches enormes e voláteis
-/// que o Chrome recria sozinho. Sem isso, a cópia arrastaria GBs
-/// (File System/OPFS de sites + Service Worker sozinhos já passam de 3 GB
-/// num perfil real). Logins/sessões vivem em Cookies, Local Storage e
-/// IndexedDB — esses ficam.
-const PROFILE_EXCLUDED_DIRS: &[&str] = &[
-    "Cache",
-    "Cache_Data",
-    "Code Cache",
-    "GPUCache",
-    "GrShaderCache",
-    "ShaderCache",
-    "DawnWebGPUCache",
-    "DawnGraphiteCache",
-    "Service Worker",
-    "Media Cache",
-    "Crashpad",
-    "CrashpadMetrics",
-    "CrashpadMetrics-old",
-    "component_crx_cache",
-    "extensions_crx_cache",
-    "OptimizationGuidePredictionModels",
-    "BrowserMetrics",
-    "BrowserMetrics-spdy",
-    "File System",
-    "Shared Dictionary",
-];
-
-/// Arquivos de lock/instância: copiá-los faria o Chrome da CÓPIA se achar
-/// dono e recusar subir ("profile in use"). Symlinks idem — apontam para
-/// a instância real.
-const PROFILE_EXCLUDED_FILES: &[&str] = &[
-    "SingletonLock",
-    "SingletonCookie",
-    "SingletonSocket",
-    "SingletonPid",
-    "lockfile",
-    "LOCK",
-    // Credenciais/sessões — NUNCA copiar para o perfil CDP (Plano 1 — T7).
-    // Contêm cookies, senhas salvas, autofill e dados de cartão.
-    "Cookies",
-    "Cookies-journal",
-    "Login Data",
-    "Login Data-journal",
-    "Web Data",
-    "Web Data-journal",
-];
-
-/// Onde ficam os dados do Chrome do usuário ("User Data" — pai de
-/// `Default/` e `Local State`).
-fn chrome_user_data_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|v| PathBuf::from(v).join(r"Google\Chrome\User Data"))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("google-chrome"))
-    }
 }
 
 /// Localiza o executável do Chrome. Override: AVA_CHROME_PATH.
@@ -641,81 +580,67 @@ fn find_chrome() -> Option<PathBuf> {
     None
 }
 
-/// Cópia recursiva do perfil, pulando caches/locks/symlinks.
-/// Retorna o total de bytes copiados.
-fn copy_profile_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    fs::create_dir_all(dst)?;
-    let mut bytes = 0u64;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let name = entry.file_name();
-        let name_lossy = name.to_string_lossy();
-
-        if file_type.is_symlink() {
-            continue; // apontam para a instância real — não copiar
-        }
-        if file_type.is_dir() {
-            if PROFILE_EXCLUDED_DIRS
-                .iter()
-                .any(|x| name_lossy.eq_ignore_ascii_case(x))
-            {
-                continue;
-            }
-            bytes += copy_profile_dir(&entry.path(), &dst.join(&name))?;
+/// O Chrome já está aberto? Vale QUALQUER instância (a do usuário
+/// incluída) — com a extensão "Playwright MCP Bridge" no perfil padrão,
+/// o Playwright MCP conecta nela do mesmo jeito; abrir outra janela só
+/// atrapalharia. Falha aberta: detecção indisponível → reporta fechado
+/// (o Chrome é single-instance, então um spawn redundante vira apenas
+/// uma janela nova na instância existente).
+async fn chrome_running() -> bool {
+    let output = if cfg!(target_os = "windows") {
+        Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq chrome.exe", "/NH"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .no_window()
+            .output()
+            .await
+    } else {
+        // Linux: o processo do Google Chrome se chama "chrome";
+        // macOS: "Google Chrome" (comm truncado a 15 chars — cabe).
+        let name = if cfg!(target_os = "macos") {
+            "Google Chrome"
         } else {
-            if PROFILE_EXCLUDED_FILES
-                .iter()
-                .any(|x| name_lossy.eq_ignore_ascii_case(x))
-                || name_lossy.ends_with(".tmp")
-            {
-                continue;
+            "chrome"
+        };
+        Command::new("pgrep")
+            .arg("-x")
+            .arg(name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .no_window()
+            .output()
+            .await
+    };
+
+    match output {
+        Ok(out) if out.status.success() => {
+            if cfg!(target_os = "windows") {
+                // tasklist sai 0 mesmo sem match ("INFO: No tasks are
+                // running...") — o nome no stdout é que decide.
+                String::from_utf8_lossy(&out.stdout).contains("chrome.exe")
+            } else {
+                true
             }
-            fs::copy(entry.path(), dst.join(&name))?;
-            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
         }
+        _ => false,
     }
-
-    Ok(bytes)
 }
 
-/// Onde a cópia do perfil vive (junto ao executável do tray — na
-/// instalação isso é <install>/cache/chrome-profile-cdp).
-fn browser_profile_dir() -> PathBuf {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("cache").join("chrome-profile-cdp")
-}
-
-/// CDP está no ar? Um TCP connect basta: o Chrome só abre a porta
-/// quando o servidor DevTools está pronto.
-async fn cdp_alive(port: u16) -> bool {
-    tokio::net::TcpStream::connect(("127.9.12.22", port))
-        .await
-        .is_ok()
-}
-
-/// Garante um Chrome do host aberto em modo depuração (CDP :9222).
+/// Garante o Chrome do host aberto — JANELA NORMAL, sem modo depuração.
 ///
-/// Idempotente: se o CDP já responde, sincroniza o estado e retorna
-/// sem relançar nada (mesma semântica do start_docker "já estava ativo").
+/// Idempotente: se o Chrome já está rodando (qualquer instância), não
+/// abre nada e apenas sincroniza o estado (mesma semântica do start_docker
+/// "já estava ativo"). O Playwright MCP conecta via extensão, não via CDP.
 pub async fn start_browser(state: &SharedState) -> Result<BrowserStartInfo> {
-    let port = state.browser.lock().await.cdp_port;
-
-    if cdp_alive(port).await {
+    if chrome_running().await {
         let mut browser = state.browser.lock().await;
         if browser.status != ProcStatus::Running {
-            tracing::info!("Chrome CDP já estava ativo (porta {port}) — reaproveitando.");
+            tracing::info!("Chrome já estava aberto — reaproveitando (sem nova janela).");
         }
         browser.status = ProcStatus::Running;
         return Ok(BrowserStartInfo {
-            cdp_url: format!("http://127.9.12.22:{port}"),
             pid: browser.pid,
-            profile_dir: browser.profile_dir.clone(),
             already_running: true,
         });
     }
@@ -723,126 +648,48 @@ pub async fn start_browser(state: &SharedState) -> Result<BrowserStartInfo> {
     let chrome = find_chrome()
         .context("Chrome não encontrado (defina AVA_CHROME_PATH ou instale o Google Chrome)")?;
 
-    let src = chrome_user_data_dir().context(
-        "Diretório de dados do Chrome não encontrado — o Chrome já foi aberto alguma vez?",
-    )?;
-    let dst = browser_profile_dir();
-    let dst_clone = dst.clone();
-    let src_clone = src.clone();
-
     {
         let mut browser = state.browser.lock().await;
         browser.status = ProcStatus::Starting;
     }
 
-    // Cópia em thread de blocking (pode ser dezenas de MB) — não trava
-    // o runtime tokio.
-    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        let _ = fs::remove_dir_all(&dst_clone);
-        let mut bytes = 0u64;
-
-        // `Local State` na raiz do User Data (perfil default, prefs globais)
-        let local_state = src_clone.join("Local State");
-        if local_state.exists() {
-            fs::create_dir_all(&dst_clone)?;
-            fs::copy(&local_state, dst_clone.join("Local State"))?;
-            bytes += local_state.metadata().map(|m| m.len()).unwrap_or(0);
-        }
-
-        // `Default/` — o perfil padrão de fato
-        let default_dir = src_clone.join("Default");
-        if !default_dir.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Perfil 'Default' não existe em {}", src_clone.display()),
-            ));
-        }
-        bytes += copy_profile_dir(&default_dir, &dst_clone.join("Default"))?;
-        Ok(bytes)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking falhou: {e}"))?
-    .map_err(|e| anyhow::anyhow!("cópia do perfil do Chrome falhou: {e}"))?;
-
-    if copied == 0 {
-        bail!("Perfil do Chrome vazio — nada foi copiado de {}", src.display());
-    }
-
-    tracing::info!(
-        "Perfil copiado: {:.1} MB -> {} (caches excluídos)",
-        copied as f64 / 1_048_576.0,
-        dst.display()
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // cookies/sessões dentro da cópia — só o dono lê
-        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o700));
-    }
-
     // Spawn DETACHED: não fazemos wait nem guardamos o Child (mem::forget)
-    // — o Chrome tem que sobreviver ao tray e ao docker.
+    // — o Chrome tem que sobreviver ao tray e ao docker. Perfil PADRÃO do
+    // usuário (é nele que vive a extensão do Playwright MCP) e NENHUMA
+    // flag de depuração — só os antídotos contra wizard de primeira vez.
     let child = Command::new(&chrome)
-        .arg(format!("--user-data-dir={}", dst.display()))
-        .arg(format!("--remote-debugging-port={port}"))
-        .args([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--window-size=1280,900",
-            "about:blank",
-        ])
+        .args(["--no-first-run", "--no-default-browser-check"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .no_window()
         .spawn()
         .with_context(|| format!("Falha ao iniciar Chrome ({})", chrome.display()))?;
     let pid = child.id();
     std::mem::forget(child);
 
-    // Espera o servidor DevTools abrir a porta
-    let mut up = false;
-    for _ in 0..(CDP_WAIT_SECS * 2) {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if cdp_alive(port).await {
-            up = true;
-            break;
-        }
-    }
-
     {
         let mut browser = state.browser.lock().await;
-        browser.status = if up {
-            ProcStatus::Running
-        } else {
-            ProcStatus::Stopped
-        };
+        browser.status = ProcStatus::Running;
         browser.pid = pid;
-        browser.profile_dir = dst.clone();
     }
 
-    if !up {
-        bail!("Chrome não abriu o CDP na porta {port} em {CDP_WAIT_SECS}s.");
-    }
-
-    tracing::info!(
-        "Chrome em modo depuração ativo: pid {pid:?}, CDP :{port}, perfil {}",
-        dst.display()
-    );
+    tracing::info!("Chrome aberto: pid {pid:?}, perfil padrão (modo normal, sem CDP).");
 
     Ok(BrowserStartInfo {
-        cdp_url: format!("http://127.9.12.22:{port}"),
         pid,
-        profile_dir: dst,
         already_running: false,
     })
 }
 
-/// Encerra o Chrome de depuração (controle MANUAL — nada disso roda
-/// automaticamente; a janela deve ficar aberta para o usuário).
-pub async fn stop_browser(state: &SharedState) -> Result<()> {
-    let (pid, profile_dir) = {
+/// Encerra APENAS o Chrome que o próprio tray abriu (pid rastreado).
+///
+/// Controle manual — nada disso roda automaticamente. O Chrome aberto
+/// pelo USUÁRIO nunca é alvo: sem pid rastreado, o stop não mata nada.
+/// Retorna true se matou a instância rastreada, false se não havia uma.
+pub async fn stop_browser(state: &SharedState) -> Result<bool> {
+    let pid = {
         let browser = state.browser.lock().await;
-        (browser.pid, browser.profile_dir.clone())
+        browser.pid
     };
 
     let mut killed = false;
@@ -865,60 +712,28 @@ pub async fn stop_browser(state: &SharedState) -> Result<()> {
                 .await
         };
         killed = result.map(|s| s.success()).unwrap_or(false);
-    }
-
-    // Fallback preciso: mata QUALQUER processo que use o nosso
-    // --user-data-dir. Cobre o caso "tray reiniciou e perdeu o pid" —
-    // o spawn detached sobrevive ao tray, então isso é o caminho comum.
-    if !killed && !profile_dir.as_os_str().is_empty() {
-        let flag = format!("--user-data-dir={}", profile_dir.display());
-        let result = if cfg!(target_os = "windows") {
-            Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ $_.CommandLine -like '*{flag}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
-                    ),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .no_window()
-                .status()
-                .await
-        } else {
-            Command::new("pkill")
-                .arg("-f")
-                .arg(flag)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .no_window()
-                .status()
-                .await
-        };
-        let matched = result.map(|s| s.success()).unwrap_or(false);
-        tracing::debug!("Fallback de kill do Chrome: matched={matched}");
+        tracing::debug!("Kill do Chrome rastreado (pid {pid}): {killed}");
     }
 
     let mut browser = state.browser.lock().await;
     browser.status = ProcStatus::Stopped;
     browser.pid = None;
 
-    tracing::info!("Chrome de depuração encerrado.");
-    Ok(())
+    if killed {
+        tracing::info!("Chrome aberto pelo tray encerrado.");
+    } else {
+        tracing::info!("Nenhum Chrome aberto pelo tray para encerrar.");
+    }
+    Ok(killed)
 }
 
-/// Snapshot do estado do browser + liveness do CDP.
-pub async fn browser_status(state: &SharedState) -> (bool, Option<u32>, bool, PathBuf) {
-    let (running, pid, port, profile_dir) = {
+/// Snapshot do browser: o Chrome está aberto no host (qualquer instância)
+/// e qual o pid rastreado (Some = instância aberta pelo próprio tray).
+pub async fn browser_status(state: &SharedState) -> (bool, Option<u32>) {
+    let running = chrome_running().await;
+    let pid = {
         let browser = state.browser.lock().await;
-        (
-            browser.status == ProcStatus::Running,
-            browser.pid,
-            browser.cdp_port,
-            browser.profile_dir.clone(),
-        )
+        browser.pid
     };
-    let alive = cdp_alive(port).await;
-    (running, pid, alive, profile_dir)
+    (running, pid)
 }

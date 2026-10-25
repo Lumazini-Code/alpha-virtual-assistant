@@ -37,7 +37,16 @@ const HEALTH_POLL_MS: u64 = 500;
 
 /// Variáveis que o mcp_manager consome do Modules/.env (mesma fonte dos
 /// demais serviços): token de auth interna + URL do memory_api + porta.
-const MCP_CHILD_ENV_KEYS: &[&str] = &["AVA_INTERNAL_TOKEN", "MEMORY_API_URL", "MCP_MANAGER_PORT"];
+/// PLAYWRIGHT_MCP_EXTENSION_TOKEN é repassado ao @playwright/mcp
+/// (--extension): com o token no ambiente do servidor, a extensão
+/// "Playwright MCP Bridge" aprova a conexão sozinha — sem diálogo
+/// manual a cada chamada.
+const MCP_CHILD_ENV_KEYS: &[&str] = &[
+    "AVA_INTERNAL_TOKEN",
+    "MEMORY_API_URL",
+    "MCP_MANAGER_PORT",
+    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+];
 
 /// Lê o Modules/.env do projeto e devolve APENAS as variáveis que o
 /// mcp_manager consome. O tray pode ter sido lançado sem essas vars

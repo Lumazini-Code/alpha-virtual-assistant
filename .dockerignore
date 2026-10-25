@@ -54,3 +54,24 @@ docker-start.sh
 docker-start.bat
 
 Manager/*
+
+# ── Otimização de contexto (fase 2 — armazenamento) ─────────────────────────
+# O Dockerfile do ava só faz COPY requirements.txt; tudo abaixo é bind mount
+# de runtime ou artefato local regenerável. Sem estas exclusões, ~2 GB eram
+# enviados ao daemon a CADA build (não vão para a imagem, mas são I/O morto).
+node_modules/
+package.json
+package-lock.json
+bun.lock
+graphify-out/
+Modules/graphify-out/
+cache/
+.opencode/
+__pycache__/
+# Bind mounts de runtime — montados pelo compose, nunca copiados:
+#   Modules/Models      (997M — modelos ONNX/GGUF, montado :ro)
+#   Modules/transcribe  (723M — libs nativas Linux/Windows do transcribe)
+Modules/Models/
+Modules/transcribe/
+
+

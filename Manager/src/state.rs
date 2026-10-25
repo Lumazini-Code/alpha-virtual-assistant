@@ -49,23 +49,19 @@ impl Default for DockerState {
     }
 }
 
-/// Porta padrão do CDP — mesma usada pelo @playwright/mcp no
-/// mcp_manager.py (`--cdp-endpoint http://localhost:9222`).
-pub const CDP_DEFAULT_PORT: u16 = 9222;
-
-/// Informações sobre o Chrome em modo depuração (CDP :9222).
+/// Informações sobre o Chrome do host.
 ///
 /// O Chrome é um processo DO HOST, spawnado detached — sobrevive ao
 /// stop do docker e ao timer de inatividade de propósito: a intenção
 /// é que a janela fique aberta para o usuário depois que o modelo
-/// terminar as ações (o Playwright MCP conecta via --cdp-endpoint).
+/// terminar as ações (o Playwright MCP conecta via extensão no perfil
+/// padrão — sem CDP, sem modo depuração).
 #[derive(Debug, Clone)]
 pub struct BrowserState {
     pub status: ProcStatus,
+    /// PID do Chrome aberto PELO TRAY. None = nada aberto pelo tray
+    /// (o Chrome do usuário pode estar rodando por conta própria).
     pub pid: Option<u32>,
-    pub cdp_port: u16,
-    /// Cópia do perfil padrão do usuário usada como --user-data-dir.
-    pub profile_dir: PathBuf,
 }
 
 impl Default for BrowserState {
@@ -73,8 +69,6 @@ impl Default for BrowserState {
         Self {
             status: ProcStatus::Stopped,
             pid: None,
-            cdp_port: CDP_DEFAULT_PORT,
-            profile_dir: PathBuf::new(),
         }
     }
 }

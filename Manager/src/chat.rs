@@ -8,9 +8,41 @@ use crate::state::SharedState;
 use serde::Serialize;
 use serde_json::Value;
 
+/// Host de bind dos serviços — mesma resolução da TUI (constants.ts):
+/// env AVA_BIND_HOST → Modules/.env (gravado pelo install.sh) → 127.9.12.22.
+/// `localhost` NÃO serve: o orchestrator escuta SÓ no IP dedicado
+/// (127.9.12.22) — no loopback 127.0.0.1 não há nada escutando.
+async fn services_bind_host(state: &SharedState) -> String {
+    if let Ok(host) = std::env::var("AVA_BIND_HOST") {
+        if !host.trim().is_empty() {
+            return host.trim().to_string();
+        }
+    }
+    let env_file = state.project_root.join("Modules").join(".env");
+    if let Ok(content) = tokio::fs::read_to_string(&env_file).await {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("AVA_BIND_HOST=") {
+                let host = rest.trim().trim_matches('"').trim_matches('\'');
+                if !host.is_empty() {
+                    return host.to_string();
+                }
+            }
+        }
+    }
+    "127.9.12.22".to_string()
+}
+
 /// URL base do orchestrator (mesma do tool loop; sobrescrevível via env).
-pub fn orchestrator_url() -> String {
-    std::env::var("AVA_ORCHESTRATOR_URL").unwrap_or_else(|_| "http://localhost:9000".to_string())
+/// Resolução: AVA_ORCHESTRATOR_URL → http://<AVA_BIND_HOST>:9000. O bind
+/// padrão é 127.9.12.22 (não localhost) — com localhost o SSE do
+/// Conversation Hub nunca conecta e o chat do Manager fica sem respostas.
+pub async fn orchestrator_url(state: &SharedState) -> String {
+    if let Ok(url) = std::env::var("AVA_ORCHESTRATOR_URL") {
+        if !url.trim().is_empty() {
+            return url.trim().trim_end_matches('/').to_string();
+        }
+    }
+    format!("http://{}:9000", services_bind_host(state).await)
 }
 
 #[derive(Serialize)]
@@ -30,7 +62,7 @@ pub async fn send_chat_turn(state: &SharedState, text: &str) -> anyhow::Result<(
     if text.trim().is_empty() {
         anyhow::bail!("turno vazio");
     }
-    let url = format!("{}/execute", orchestrator_url());
+    let url = format!("{}/execute", orchestrator_url(state).await);
     let body = ChatExecuteRequest {
         input: text,
         source: "chat",
@@ -143,12 +175,14 @@ impl ConversationEvent {
         None
     }
 
-    /// Indica se o turno é de voz (tts=true, evento meta). Turnos digitados
-    /// (TUI/chat do Manager) chegam com tts=false.
-    pub fn tts_flag(&self) -> bool {
+    /// Fonte do turno (evento meta): "voice" = pipeline de voz (transcribe
+    /// C++), "tui" = TUI (não envia source → default), "chat" = chat do
+    /// Manager. APENAS "voice" (transcribe) pode abrir a tela de chat
+    /// automaticamente — turnos da TUI ou digitados nunca roubam o foco.
+    pub fn source_name(&self) -> Option<&str> {
         if self.event == "meta" {
-            return self.data.get("tts").and_then(Value::as_bool).unwrap_or(false);
+            return self.data.get("source").and_then(Value::as_str);
         }
-        false
+        None
     }
 }
