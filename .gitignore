@@ -66,7 +66,7 @@ AGENTS.md
 
 *.so
 Modules/transcribe/linux/
-Modules/transcribe/windows/
+Modules/transcribe/windows/*
 
 install-playwright-mcp.sh
 
@@ -79,3 +79,4 @@ alpha-promo
 resource/Alpha Icon.svg
 
 skills-lock.json
+
