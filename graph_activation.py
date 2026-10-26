@@ -2014,7 +2014,7 @@ es.onmessage = (ev) => {
 """
 
 
-def main():
+def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser(description="Visualização em tempo real do grafo Hebbiano (memórias + tools + planos + people cards)")
     ap.add_argument("--db", default="./Modules/memory/db/ava_memory.db")
     ap.add_argument("--tools-db", default="./Modules/memory/db/ava_tools.db",
@@ -2035,7 +2035,7 @@ def main():
                          "standalone (tailers por escopo, sem badge)")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--poll", type=float, default=1.0, help="intervalo de polling do diff (s)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     memory_api_url = args.memory_api
     if memory_api_url == "__default__":

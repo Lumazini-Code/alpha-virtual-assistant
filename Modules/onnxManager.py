@@ -510,11 +510,12 @@ async def lifespan(app: FastAPI):
     # ort.InferenceSession. Valida existência + tamanho mínimo ANTES e
     # captura falha de carga com mensagem acionável — em vez de crash
     # opaque + loop de restart.
+    # Só o EMBED é exigido no boot (toda turn faz recall). O RERANKER é
+    # lazy (ver _ensure_rerank_model): seus ~35MB ficam fora da RAM
+    # enquanto ninguém pede rerank.
     for path, label in [
         (EMBED_MODEL_PATH,  "Embedding model"),
         (EMBED_TOKENIZER,   "Embedding tokenizer"),
-        (RERANK_MODEL_PATH, "Reranker model"),
-        (RERANK_TOKENIZER,  "Reranker tokenizer"),
     ]:
         p = Path(path)
         if not p.exists():
@@ -527,13 +528,12 @@ async def lifespan(app: FastAPI):
 
     try:
         state.embed_model  = EmbeddingModel(EMBED_MODEL_PATH, EMBED_TOKENIZER)
-        state.rerank_model = RerankerModel(RERANK_MODEL_PATH, RERANK_TOKENIZER)
     except Exception as e:
         name = type(e).__name__
         hint = ""
         if "INVALID_PROTOBUF" in str(e) or "Protobuf" in name:
             hint = f" — arquivo do modelo CORROMPIDO. {_FATAL_FIX_HINT}"
-        _fatal_exit(f"[FATAL] falha ao carregar modelos ONNX: {name}: {e}{hint}")
+        _fatal_exit(f"[FATAL] falha ao carregar modelo ONNX de embedding: {name}: {e}{hint}")
 
     # Create thread pools — isolate workloads to avoid contention
     state.embed_pool  = concurrent.futures.ThreadPoolExecutor(
@@ -546,9 +546,7 @@ async def lifespan(app: FastAPI):
     # Warm up models — first inference is always slower (kernel compilation, etc.)
     log.info("Warming up embedding model...")
     _ = state.embed_model.embed(["warmup text"])
-    log.info("Warming up reranker model...")
-    _ = state.rerank_model.score("warmup", ["test passage"])
-    log.info("Warm-up complete")
+    log.info("Reranker fica LAZY — carrega na 1ª chamada de rerank (economia de ~35MB)")
 
     # Watchdog de memória: devolve heap glibc ao OS a cada minuto.
     _malloc_trim_watchdog()
@@ -557,13 +555,74 @@ async def lifespan(app: FastAPI):
     log.info(
         f"AVA ONNX Serving ready — embed({state.embed_model.provider}, "
         f"dim={EMBED_DIM}, max_batch={EMBED_MAX_BATCH}) "
-        f"+ rerank({state.rerank_model.provider})"
+        f"+ rerank(lazy — carrega na 1ª chamada)"
     )
     yield
 
     state.embed_pool.shutdown(wait=False)
     state.rerank_pool.shutdown(wait=False)
     log.info("AVA ONNX Serving shut down")
+
+
+# ── Reranker lazy (carrega na 1ª chamada) ──────────────────────────────────────
+
+_rerank_lock = threading.Lock()
+
+_RERANK_FIX_HINT = (
+    "Correção: rode `python3 scripts/verify_models.py` dentro do container "
+    "e reinicie — o serviço de embedding segue no ar."
+)
+
+
+def _ensure_rerank_model() -> RerankerModel:
+    """Garante o reranker carregado — cria na 1ª chamada (lazy).
+
+    O ms-marco-MiniLM só é usado quando o pipeline de memória/busca pede
+    rerank; carregá-lo no boot custava ~35MB de RAM residente mesmo sem
+    uso. Com o lock, chamadas concorrentes esperam a carga em vez de
+    duplicar sessões do ORT. Falha de carga → HTTP 503 acionável — o
+    embedding segue de pé (não é EX_CONFIG).
+    """
+    if state.rerank_model is not None:
+        return state.rerank_model
+    with _rerank_lock:
+        if state.rerank_model is not None:  # double-checked locking
+            return state.rerank_model
+        # Mesma validação de integridade do boot (arquivo truncado →
+        # InvalidProtobuf opaque); aqui a falha é SOFT (503), não fatal.
+        for path, label in [
+            (RERANK_MODEL_PATH,  "Reranker model"),
+            (RERANK_TOKENIZER,   "Reranker tokenizer"),
+        ]:
+            p = Path(path)
+            if not p.exists():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Reranker indisponível: {label} não encontrado: {path} — {_RERANK_FIX_HINT}",
+                )
+            if p.suffix == ".onnx" and p.stat().st_size < MIN_MODEL_BYTES:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Reranker indisponível: {label} TRUNCADO/corrompido: "
+                        f"{path} tem {p.stat().st_size} bytes (< {MIN_MODEL_BYTES} "
+                        f"esperados) — {_RERANK_FIX_HINT}"
+                    ),
+                )
+        try:
+            log.info("Carregando reranker (lazy — 1ª chamada de rerank)...")
+            model = RerankerModel(RERANK_MODEL_PATH, RERANK_TOKENIZER)
+            _ = model.score("warmup", ["test passage"])  # kernels do 1º run
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Reranker indisponível (falha ao carregar: {type(e).__name__}: {e}) — {_RERANK_FIX_HINT}",
+            )
+        state.rerank_model = model
+        log.info(f"Reranker pronto — provider: {model.provider}")
+        return model
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
@@ -634,9 +693,10 @@ async def rerank(req: RerankRequest):
     t0   = time.perf_counter()
     loop = asyncio.get_event_loop()
 
+    model = _ensure_rerank_model()  # lazy-load na 1ª chamada (503 se indisponível)
     scored = await loop.run_in_executor(
         state.rerank_pool,
-        state.rerank_model.rerank,
+        model.rerank,
         req.query,
         req.passages,
     )
@@ -677,9 +737,10 @@ async def score(req: ScoreRequest):
     t0   = time.perf_counter()
     loop = asyncio.get_event_loop()
 
+    model = _ensure_rerank_model()  # lazy-load na 1ª chamada (503 se indisponível)
     scores = await loop.run_in_executor(
         state.rerank_pool,
-        state.rerank_model.score,
+        model.score,
         req.query,
         req.passages,
     )

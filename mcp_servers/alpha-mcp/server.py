@@ -55,6 +55,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -230,6 +231,181 @@ def _schedule_crawl_stop() -> None:
             return
 
     _crawl_watchdog = asyncio.create_task(_watch())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Web stack on-demand (searxng + valkey) — o mesmo padrão do crawl4ai.
+# Os dois containers (~250-350MB somados) só rodam quando há busca web; sobem
+# na 1ª web_search e são parados após WEB_STACK_IDLE_STOP_S sem uso, via
+# docker-socket-proxy (allowlist: start/stop de containers apenas).
+# WEB_STACK_ON_DEMAND=0 volta ao comportamento "sempre ligado" (compose).
+# ══════════════════════════════════════════════════════════════════════════════
+
+SEARXNG_CONTAINER   = os.getenv("SEARXNG_CONTAINER", "ava-searxng")
+VALKEY_CONTAINER    = os.getenv("VALKEY_CONTAINER", "ava-valkey")
+WEB_STACK_ON_DEMAND = os.getenv("WEB_STACK_ON_DEMAND", "1").strip().lower() in ("1", "true", "yes", "on")
+WEB_STACK_IDLE_STOP_S  = max(120, int(os.getenv("WEB_STACK_IDLE_STOP_S", "300")))
+WEB_STACK_BOOT_TIMEOUT = max(30, int(os.getenv("WEB_STACK_BOOT_TIMEOUT_S", "90")))
+
+_web_stack_watchdog: asyncio.Task | None = None
+_web_stack_last_use = 0.0
+_web_stack_started_by_us = False
+_web_stack_ensure_lock = asyncio.Lock()
+
+
+async def _searxng_healthy() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            # Sem format=json: dependeria da flag formats da config — qualquer
+            # resposta HTTP do SearXNG (mesmo 403 de bot detection) prova que
+            # o serviço está de pé.
+            r = await c.get(CFG["searxng"]["url"], follow_redirects=False)
+            return r.status_code < 500
+    except Exception:
+        return False
+
+
+async def _valkey_healthy() -> bool:
+    # RESP binário não é HTTP — health check real é TCP connect na porta.
+    try:
+        u = urlparse(CFG["valkey"]["url"])
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(u.hostname or "127.9.12.22", u.port or 6379),
+            timeout=3.0,
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _ensure_web_stack() -> None:
+    """Garante searxng + valkey no ar (subindo on-demand se necessário).
+    Falha NUNCA quebra a busca: o pipeline já degrada sem cache e sem
+    searxng (retorna 'Nenhum resultado encontrado')."""
+    global _web_stack_last_use, _web_stack_started_by_us, _redis
+    _web_stack_last_use = time.monotonic()
+    if not WEB_STACK_ON_DEMAND:
+        return
+    searxng_ok = await _searxng_healthy()
+    valkey_ok = await _valkey_healthy()
+    if searxng_ok and valkey_ok:
+        return
+    d = _docker()
+    if d is None:
+        return
+    async with _web_stack_ensure_lock:  # só 1 buscas simultâneas sobem o stack
+        # Recheck sob o lock (N buscas chegando juntas)
+        if not searxng_ok:
+            searxng_ok = await _searxng_healthy()
+        if not valkey_ok:
+            valkey_ok = await _valkey_healthy()
+        if searxng_ok and valkey_ok:
+            return
+        try:
+            started_any = False
+            for name in (SEARXNG_CONTAINER, VALKEY_CONTAINER):
+                try:
+                    c = d.containers.get(name)
+                    if c.status != "running":
+                        log.info(f"[web-stack] subindo {name} on-demand...")
+                        c.start()
+                        started_any = True
+                except Exception as e:
+                    log.warning(f"[web-stack] {name} não pôde ser iniciado ({e})")
+            if started_any:
+                _web_stack_started_by_us = True
+                deadline = time.monotonic() + WEB_STACK_BOOT_TIMEOUT
+                while time.monotonic() < deadline:
+                    if await _searxng_healthy() and await _valkey_healthy():
+                        log.info("[web-stack] searxng + valkey prontos")
+                        break
+                    await asyncio.sleep(1)
+                else:
+                    log.warning("[web-stack] stack não ficou saudável dentro do timeout — busca segue degradada")
+                # Valkey voltou: limpa o sentinel de falha do _cache() para a
+                # conexão ser retentada (o cache volta a valer sem restart).
+                if _redis is False:
+                    _redis = None
+                _schedule_web_stack_stop()
+        except Exception as e:
+            log.warning(f"[web-stack] falha ao subir stack ({e}) — busca segue degradada")
+
+
+async def _stop_web_stack() -> None:
+    global _web_stack_started_by_us
+    try:
+        d = _docker()
+        if d is None:
+            return
+        for name in (VALKEY_CONTAINER, SEARXNG_CONTAINER):
+            try:
+                c = d.containers.get(name)
+                if c.status == "running":
+                    c.stop(timeout=10)
+            except Exception as e:
+                log.debug(f"[web-stack] stop de {name} falhou ({e})")
+        log.info(f"[web-stack] searxng + valkey parados após {WEB_STACK_IDLE_STOP_S}s sem busca (economia de RAM)")
+    finally:
+        _web_stack_started_by_us = False
+
+
+def _schedule_web_stack_stop() -> None:
+    """Watchdog idempotente: para o stack após TTL sem busca — só se NÓS o
+    subimos (não interfere em quem subiu manualmente/com WEB_STACK_ON_DEMAND=0)."""
+    global _web_stack_watchdog
+    if _web_stack_watchdog and not _web_stack_watchdog.done():
+        return
+
+    async def _watch():
+        while True:
+            await asyncio.sleep(WEB_STACK_IDLE_STOP_S)
+            if time.monotonic() - _web_stack_last_use < WEB_STACK_IDLE_STOP_S:
+                continue  # houve busca recente — segue esperando
+            if _web_stack_started_by_us:
+                await _stop_web_stack()
+            return
+
+    _web_stack_watchdog = asyncio.create_task(_watch())
+
+
+async def _bootstrap_stop_web_stack() -> None:
+    """Boot: o `docker compose up` nasce subindo searxng + valkey (e o
+    crawl4ai) — com on-demand ligado, derruba quem já nasceu rodando para a
+    RAM ficar livre desde o boot. Eles voltam on-demand na 1ª busca. Só
+    encerra se ninguém usou o stack (nenhum web_search em curso)."""
+    if not (WEB_STACK_ON_DEMAND or C4_ON_DEMAND):
+        return
+    await asyncio.sleep(5)  # margem p/ o compose assentar (evita corrida no start)
+    if _web_stack_last_use or _last_crawl_use:
+        return  # já houve uso — alguém está buscando agora
+    try:
+        d = _docker()
+        if d is None:
+            return
+        stopped = []
+        for name, enabled in (
+            (SEARXNG_CONTAINER,  WEB_STACK_ON_DEMAND),
+            (VALKEY_CONTAINER,   WEB_STACK_ON_DEMAND),
+            (C4_CONTAINER,       C4_ON_DEMAND),
+        ):
+            if not enabled:
+                continue
+            try:
+                c = d.containers.get(name)
+                if c.status == "running":
+                    c.stop(timeout=10)
+                    stopped.append(name)
+            except Exception as e:
+                log.debug(f"[web-stack] boot-stop de {name} falhou ({e})")
+        if stopped:
+            log.info(f"[web-stack] boot: containers parados até a 1ª busca: {', '.join(stopped)}")
+    except Exception as e:
+        log.debug(f"[web-stack] boot-stop falhou ({e})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -629,7 +805,11 @@ def _format(chunks: list[dict], query: str) -> str:
 
 
 async def run_pipeline(query: str, max_results: int) -> str:
-    # 0) cache da busca inteira
+    # 0) web stack on-demand — sobe searxng + valkey antes de qualquer acesso
+    #    (sem isso a 1ª busca após o boot degrada sem cache/sem resultados)
+    await _ensure_web_stack()
+
+    # 0.1) cache da busca inteira
     ck = f"ws:search:{_hash(f'{query}::{max_results}')}"
     cached = await cache_get(ck)
     if cached:
@@ -1043,6 +1223,12 @@ async def memory_identity_edit(
 
 
 if __name__ == "__main__":
+    # Boot: com on-demand ligado, derruba searxng/valkey/crawl4ai que o
+    # `docker compose up` nasceu subindo — RAM livre desde o boot; sobem
+    # on-demand na 1ª busca. Thread própria: mcp.run() bloqueia o event loop.
+    threading.Thread(
+        target=lambda: asyncio.run(_bootstrap_stop_web_stack()), daemon=True
+    ).start()
     mcp.run(
         transport="streamable-http",
         host=os.getenv("ALPHA_MCP_HOST", "127.9.12.22"),

@@ -229,6 +229,29 @@ if (Test-Node24) {
   Write-Ok "Node 24 instalado no host ($(& node --version))."
 }
 
+# -- 1c. .wslconfig: teto de RAM do WSL2 ---------------------------------------
+# Sem cap, o vmmem (Docker Desktop / WSL2) engole até 50-80% da RAM livre e
+# sufoca o resto da máquina. Só grava se o arquivo NÃO existe — nunca
+# sobrescreve tuning do usuário. Cap = metade da RAM, entre 4 e 8 GB.
+$WslConfigPath = Join-Path $env:USERPROFILE '.wslconfig'
+if (Test-Path $WslConfigPath) {
+  Write-Ok ".wslconfig existente mantido ($WslConfigPath)."
+} else {
+  try {
+    $TotalGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+    $Cap = [math]::Max(4, [math]::Min(8, [math]::Floor($TotalGb / 2)))
+    @"
+[wsl2]
+memory=${Cap}GB
+swap=2GB
+"@ | Set-Content -Path $WslConfigPath -Encoding ASCII
+    Write-Ok ".wslconfig criado: WSL2 limitado a ${Cap}GB de RAM (maquina tem ${TotalGb}GB)."
+    Write-Warn2 'O teto vale apos `wsl --shutdown` (ou reiniciar o PC).'
+  } catch {
+    Write-Warn2 "Nao foi possivel criar .wslconfig ($($_.Exception.Message)) — Docker pode consumir RAM sem controle."
+  }
+}
+
 # -- 2. Download do ultimo release ---------------------------------------------
 Write-Info "Consultando ultimo release de https://github.com/$Repo..."
 
@@ -563,6 +586,27 @@ if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
 } else {
   Write-Ok "CRAWL4AI_API_TOKEN ja existe em $EnvFile"
 }
+
+# -- 5b''. Perfil de recursos (RAM) --------------------------------------------
+# Escreve as flags de consumo no Modules\.env. Economico (default): TTS
+# (~470MB), visualizador de grafo (~80MB) e voz do host (~600MB) desligados —
+# tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
+# AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
+# pergunta seguinte o reergue sozinho.
+$ans = Read-Host 'Perfil de recursos? [1]=Economico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS+grafo, ~1.4GB) [1/2, default 1]'
+if ($ans -match '^[2]') {
+  Set-EnvVar 'AVA_TTS_ENABLED' '1'
+  Set-EnvVar 'AVA_GRAPH_UI' '1'
+  Set-EnvVar 'AVA_VOICE' '1'
+  Write-Ok 'Perfil completo: voz + TTS + visualizador de grafo ligados.'
+} else {
+  Set-EnvVar 'AVA_TTS_ENABLED' '0'
+  Set-EnvVar 'AVA_GRAPH_UI' '0'
+  Set-EnvVar 'AVA_VOICE' '0'
+  Write-Ok 'Perfil economico: TTS, visualizador de grafo e voz desligados (ligue flags em Modules\.env quando quiser).'
+}
+Set-EnvVar 'AVA_DOCKER_IDLE_MINUTES' '15'
+Write-Ok 'Docker dorme apos 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15).'
 
 # -- 5b. Registro do Playwright MCP (dependencia direta do sistema) -----------
 # Cadastra o @playwright/mcp no mcp_manager (:4008) logo apos o `up` do stack.

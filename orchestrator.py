@@ -4244,6 +4244,90 @@ async def delete_project(slug: str):
     return {"deleted": True, "slug": slug, "active": _project_active()}
 
 
+# ── Serviços mesclados (AVA_MERGED_SERVICES, default 1) ──────────────────────
+# LLM (:4003, proxy puro do OpenRouter) e o visualizador do grafo (:8777)
+# rodam em THREADS deste processo — um único interpreter Python. Cada serviço
+# FastAPI pago a parte custa ~60-100MB de interpreter+libs; mesclar economiza
+# isso SEM mudar o contrato: as portas continuam existindo nos mesmos
+# endereços (TUI/tray/healthchecks não mudam nada).
+# start.sh só sobe os standalone quando AVA_MERGED_SERVICES=0.
+# Falha ao carregar serviço mesclado → saída 78 (EX_CONFIG): o restart_on_fail
+# do start.sh NÃO reinicia em loop config quebrada (mesma convenção do
+# onnxManager p/ modelo corrompido).
+
+def _fatal_merged(msg: str) -> None:
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    log.critical(msg)
+    os._exit(78)
+
+
+def _run_uvicorn_app(app_obj, host: str, port: int, name: str) -> None:
+    """uvicorn.Server em thread própria (loop asyncio isolado por thread)."""
+    import uvicorn
+    server = uvicorn.Server(uvicorn.Config(app_obj, host=host, port=port, log_level="info"))
+    log.info(f"[merged] {name} servindo em http://{host}:{port}")
+    server.run()
+
+
+def _merged_enabled() -> bool:
+    return os.getenv("AVA_MERGED_SERVICES", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _start_merged_services() -> None:
+    if not _merged_enabled():
+        log.info("[merged] AVA_MERGED_SERVICES=0 — LLM/grafo sobem standalone no start.sh")
+        return
+
+    import threading
+    import sys as _sys
+    _root = Path(__file__).resolve().parent
+    _mods = str(_root / "Modules")
+    if _mods not in _sys.path:
+        _sys.path.insert(0, _mods)
+
+    # ── LLM (:4003) — proxy do OpenRouter; import não carrega modelo ──
+    try:
+        import LLM as _llm
+    except Exception as e:
+        _fatal_merged(
+            f"[merged] falha ao importar LLM.py ({type(e).__name__}: {e}) — config/dados "
+            f"inválidos; para isolar, rode com AVA_MERGED_SERVICES=0 e observe o restart_on_fail do LLM."
+        )
+    _llm_host = (
+        _llm.internal_bind_host()
+        if hasattr(_llm, "internal_bind_host")
+        else os.getenv("AVA_BIND_HOST", "127.9.12.22")
+    )
+    threading.Thread(
+        target=_run_uvicorn_app, args=(_llm.app, _llm_host, 4003, "LLM"),
+        daemon=True, name="uvicorn-llm",
+    ).start()
+
+    # ── Visualizador do grafo (:8777) — opt-in AVA_GRAPH_UI (default 0) ──
+    if os.getenv("AVA_GRAPH_UI", "0").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import graph_activation as _ga
+        except Exception as e:
+            _fatal_merged(
+                f"[merged] falha ao importar graph_activation.py ({type(e).__name__}: {e}) — "
+                f"para isolar, rode com AVA_MERGED_SERVICES=0."
+            )
+        # argv=["--memory-api"]: mesmo contrato do standalone no start.sh —
+        # publica o badge do escopo ativo (lê GET /status da memory API).
+        threading.Thread(
+            target=_ga.main, kwargs={"argv": ["--memory-api"]},
+            daemon=True, name="graph-activation",
+        ).start()
+        log.info("[merged] Graph UI ativo em :8777 (AVA_GRAPH_UI=1)")
+    else:
+        log.info("[merged] Graph UI desligado (AVA_GRAPH_UI=0) — economia de ~80MB")
+
+
 if __name__ == "__main__":
     import uvicorn
+    _start_merged_services()
     uvicorn.run("orchestrator:app", host=internal_bind_host(), port=9000, log_level="info")

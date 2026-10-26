@@ -106,6 +106,7 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 O pipeline completo (**Depth Anything V2** → clusterização por camadas → **EdgeSAM** → crops → **DINOv3** → consulta ao dicionário visual, mais **YuNet** + **EdgeFace** para rostos, tudo ONNX/CPU) existe e funciona, mas **não sobe por default**: a forma como foi projetado para ser usado (agente totalmente autônomo com visão constante) ainda não é suportada. Com `VISION_OBJECTS_ENABLED=0` (default), `start.sh` não inicia vision.py, a tool `vision_objects` não é oferecida e as imagens vão embutidas direto no contexto do modelo principal. Com a flag em `1`, o fluxo antigo volta (face recognition + segmentação → crops → resposta do modelo multimodal).
 
 ### Voz
+- **Opt-in**: `AVA_VOICE=1` em `Modules/.env` (o instalador pergunta o perfil — econômico deixa desligado). O ASR nemotron GGUF fica residente no host (~600 MB); desligado, o tray pula o transcript no auto-init e `POST /transcript/start` sobe manualmente.
 - **Pipeline C++ no host** (transcribe): wake word + ASR streaming + speaker verification, com gate de ASR por wake word (nenhuma inferência gasta sem comando). Supervisionado pelo tray como um processo do host (liveness por pid, restart-on-fail).
 - **Identificação de falante**: embeddings CAM++ pré-ingestados injetam "quem está falando" no turno — o assistente sabe diferenciar usuários cadastrados no `voice_dict`.
 - **TTS** (Supertonic, :3004): pipeline estilo Piper (worker pool, fila de texto, heap de áudio ordenado, miniaudio 40 ms): `/speak`, `/stream` (síntese paralela por sentença em ordem), `/cancel`. Disparado automaticamente sobre a resposta final; o modelo nunca decide chamar TTS.
@@ -188,14 +189,14 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 | orchestrator.py | container | 9000 | API de chat (SSE) + tool loop + Conversation Hub |
 | ava-tray (Manager) | host | 9001 | Controle do docker/browser/mcp_manager + chat widget |
 | memory_api.py | container | 3000 | Memória (grafo/vetores/dicionários/planos) |
-| TTS.py | container | 3004 | Síntese e playback de fala (Supertonic) |
-| LLM.py | container | 4003 | Inferência (OpenRouter) |
+| TTS.py | container | 3004 | Síntese e playback de fala (Supertonic) — **opt-in** (`AVA_TTS_ENABLED=1`) |
+| LLM.py | container | 4003 | Inferência (OpenRouter) — mesclado no processo do orchestrator (`AVA_MERGED_SERVICES=1`) |
 | onnxManager.py | container | 2002 | E5 embeddings + rerank (API única ONNX) |
-| graph_activation.py | container | 8777 | Grafo em tempo real (SSE, diff polling) |
+| graph_activation.py | container | 8777 | Grafo em tempo real (SSE, diff polling) — **opt-in** (`AVA_GRAPH_UI=1`) |
 | **mcp_manager (Rust)** | **host** | 4008 | Registro + execução de servidores MCP (supervisionado pelo tray) |
 | **transcript (C++)** | **host** | 9100 | `/health` + `/speaker/embed` (voz contínua, VAD/ASR/CAM++) |
-| searxng | container | 8081 | Meta-busca (loopback) |
-| valkey | container | 6379 | Cache da busca web (loopback) |
+| searxng | container | 8081 | Meta-busca (loopback) — on-demand (`WEB_STACK_ON_DEMAND=1`: sobe na 1ª busca, dorme após 5 min) |
+| valkey | container | 6379 | Cache da busca web (loopback) — on-demand junto com o searxng |
 | crawl4ai | container | 11235 | Crawl com navegador (loopback, on-demand) |
 | alpha-mcp | container | 4010 | Tool `web_search` (loopback) |
 | docker-socket-proxy | container | — (rede interna) | Allowlist do socket Docker p/ alpha-mcp |
@@ -208,8 +209,8 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - **Linux** (recomendado; `network_mode: host`, áudio via PulseAudio, GPU opcional via Vulkan `/dev/dri`) ou **Windows** (Docker Desktop + WSL2; portas publicadas em `127.9.12.22` no override).
 - Docker Engine + plugin compose v2; arquitetura **x86_64**.
 - ~2,5 GB livres além do Docker (pesos extraídos) e internet no primeiro boot (build + download do Supertonic no HF).
-- Áudio e GPU são **opcionais** — tudo roda em CPU (ONNX Runtime). Otimizações de memória já embutidas (`MALLOC_ARENA_MAX`, threads limitados do ONNX/Supertonic): o stack rodou de ~4,5 GB para ~1,4 GB de RAM.
-- Para voz: microfone + `arecord`/`parec`/`ffmpeg` no Linux (gravação de voz na TUI ainda não suportada no Windows — o pipeline C++ de voz contínua tem build para ambas as plataformas).
+- Áudio e GPU são **opcionais** — tudo roda em CPU (ONNX Runtime). Otimizações de memória já embutidas (`MALLOC_ARENA_MAX`, threads limitados do ONNX/Supertonic): o stack rodou de ~4,5 GB para ~1,4 GB — e, com o **perfil econômico** do instalador (default), fica em **~500 MB** sem voz (LLM + grafo mesclados no processo do orchestrator, TTS/graph UI/voz desligados, web stack on-demand). Voz ligada: ~1,1 GB.
+- Para voz: microfone + `arecord`/`parec`/`ffmpeg` no Linux (gravação de voz na TUI ainda não suportada no Windows — o pipeline C++ de voz contínua tem build para ambas as plataformas). A voz é **opt-in**: `AVA_VOICE=1` em `Modules/.env` (o tray pulando o transcript economiza ~600 MB de RAM no host; `POST /transcript/start` sobe manualmente sem reiniciar nada).
 
 ## Instalação
 
@@ -252,7 +253,12 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `LLM_MODEL` | `Modules/.env` | `z-ai/glm-5.3-flash:floor` | Modelo principal do provider ativo |
 | `AVA_INTERNAL_TOKEN` | `Modules/.env` | — | Bearer token interno (memory/orchestrator/mcp_manager/TUI) |
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
-| `AVA_DOCKER_IDLE_MINUTES` | tray | 45 | Minutos de inatividade antes do `docker down` |
+| `AVA_DOCKER_IDLE_MINUTES` | tray | 15 | Minutos de inatividade antes do `docker down` (a pergunta seguinte reergue o stack sozinho) |
+| `AVA_TTS_ENABLED` | `start.sh` | `0` | Liga o serviço de TTS (Supertonic, ~470 MB/worker na RAM). Desligado = fala não sintetiza |
+| `AVA_GRAPH_UI` | orchestrator/start.sh | `0` | Liga o visualizador do grafo (:8777, ~80 MB) — dentro do processo do orchestrator no modo mesclado |
+| `AVA_VOICE` | tray | `0` | Liga o pipeline de voz no host (wake word + ASR, ~600 MB). Desligado = transcript não sobe no auto-init; `POST /transcript/start` sobe à mão |
+| `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) e grafo (:8777) mesclados no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
+| `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
 | `AVA_CDP_SERVERS` | orchestrator | `playwright` | Servidores MCP que usam o Chrome do host |

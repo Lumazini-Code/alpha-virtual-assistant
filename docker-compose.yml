@@ -7,6 +7,11 @@ services:
     image: ava:latest
     container_name: ava
 
+    # Teto de RAM — rede de proteção em máquina fraca: o stack não pode
+    # sufocar as outras apps. Valores folgados (OOM kill é pior que RAM alta);
+    # com os defaults econômicos (TTS/grafo off) o uso real fica ~600-800MB.
+    mem_limit: 1500m
+
     volumes:
       - ./mcp_servers:/app/mcp_servers
       - ./start.sh:/app/start.sh
@@ -71,6 +76,7 @@ services:
   searxng:
     image: searxng/searxng:latest
     container_name: ava-searxng
+    mem_limit: 350m
     volumes:
       - ./resource/searxng/settings.yml:/etc/searxng/settings.yml:ro
     ports:
@@ -81,6 +87,7 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     container_name: ava-valkey
+    mem_limit: 96m
     ports:
       - "127.9.12.22:6379:6379"
     # Sem persistência (appendonly no + save "") — o cache vive só em RAM;
@@ -90,6 +97,7 @@ services:
   crawl4ai:
     image: unclecode/crawl4ai:latest
     container_name: ava-crawl4ai
+    mem_limit: 1200m
     shm_size: 1g
     ports:
       - "127.9.12.22:11235:11235"
@@ -104,6 +112,7 @@ services:
       dockerfile: Dockerfile
     image: ava-alpha-mcp:latest
     container_name: ava-alpha-mcp
+    mem_limit: 400m
     volumes:
       - ./resource:/app/resource:ro
       # crawl4ai on-demand via docker-socket-proxy (abaixo): o socket do host
@@ -137,6 +146,7 @@ services:
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:latest
     container_name: ava-docker-socket-proxy
+    mem_limit: 64m
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:

@@ -514,6 +514,31 @@ else
   ok "CRAWL4AI_API_TOKEN já existe em $ENV_FILE."
 fi
 
+# ── 5b-1. Perfil de recursos (RAM) ───────────────────────────────────────────
+# Escreve as flags de consumo no Modules/.env. Econômico (default): TTS
+# (~470MB), visualizador de grafo (~80MB) e voz do host (~600MB) desligados —
+# tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
+# AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
+# pergunta seguinte o reergue sozinho.
+printf 'Perfil de recursos? [1]=Econômico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS+grafo, ~1.4GB) [1/2, default 1] '
+read -r ans || ans=""
+case "$ans" in
+  2)
+    set_env_var AVA_TTS_ENABLED 1
+    set_env_var AVA_GRAPH_UI 1
+    set_env_var AVA_VOICE 1
+    ok "Perfil completo: voz + TTS + visualizador de grafo ligados."
+    ;;
+  *)
+    set_env_var AVA_TTS_ENABLED 0
+    set_env_var AVA_GRAPH_UI 0
+    set_env_var AVA_VOICE 0
+    ok "Perfil econômico: TTS, visualizador de grafo e voz desligados (ligue as flags em Modules/.env quando quiser)."
+    ;;
+esac
+set_env_var AVA_DOCKER_IDLE_MINUTES 15
+ok "Docker dorme após 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15)."
+
 # ── 5b-2. Token da extensão do Playwright (PLAYWRIGHT_MCP_EXTENSION_TOKEN) ───
 # O @playwright/mcp roda com --extension e pareia com a extensão oficial do
 # Chrome via este token. O token NÃO é gerado pelo instalador: a própria

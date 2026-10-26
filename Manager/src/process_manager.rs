@@ -356,15 +356,50 @@ fn spawn_auto_start_host_services(state: &SharedState) {
             return;
         }
 
-        match transcript::start(&state).await {
-            Ok(()) => tracing::info!("Auto-init: transcript de voz ativo."),
-            Err(e) => tracing::warn!("Auto-init: transcript não subiu: {e:#}"),
+        // ── Voz é opt-in (AVA_VOICE, default 0) ──────────────────────────
+        // O pipeline C++ de voz carrega o ASR nemotron GGUF (~473MB) + KWS +
+        // CAM++ residentes no host — ~600MB de RAM. Com a flag em 0 (default)
+        // o transcript NÃO sobe no auto-init (o /transcript/start manual
+        // continua funcionando; e o mcp_manager sobe independente disso).
+        if voice_enabled(&state).await {
+            match transcript::start(&state).await {
+                Ok(()) => tracing::info!("Auto-init: transcript de voz ativo."),
+                Err(e) => tracing::warn!("Auto-init: transcript não subiu: {e:#}"),
+            }
+        } else {
+            tracing::info!(
+                "Auto-init: transcript PULADO (AVA_VOICE=0) — economia de ~600MB de RAM. \
+                 Ligue a voz com AVA_VOICE=1 em Modules/.env (ou POST /transcript/start)."
+            );
         }
         match mcp_manager::start(&state).await {
             Ok(()) => tracing::info!("Auto-init: MCP manager ativo."),
             Err(e) => tracing::warn!("Auto-init: MCP manager não subiu: {e:#}"),
         }
     });
+}
+
+/// Lê AVA_VOICE do Modules/.env (fonte única dos serviços do host — o tray
+/// pode ter sido lançado sem a var exportada). Default 0 (voz desligada —
+/// perfil econômico); "1"/"true"/"yes"/"on" liga.
+async fn voice_enabled(state: &SharedState) -> bool {
+    let path = state.project_root.join("Modules").join(".env");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "AVA_VOICE" {
+                let v = v.trim().trim_matches('"').to_ascii_lowercase();
+                return matches!(v.as_str(), "1" | "true" | "yes" | "on");
+            }
+        }
+    }
+    false
 }
 
 /// Derruba, em background, os serviços do HOST quando o container cai —

@@ -4,7 +4,7 @@
 //! há quanto tempo o docker está sem atividade. Se passar do limite,
 //! derruba o processo automaticamente.
 //!
-//!   - docker: 45 min sem atividade -> stop (AVA_DOCKER_IDLE_MINUTES
+//!   - docker: 15 min sem atividade -> stop (AVA_DOCKER_IDLE_MINUTES
 //!     sobrescreve)
 //!
 //! "Atividade" = cada chamada a POST /docker/start (a TUI faz uma por
@@ -17,8 +17,10 @@ use crate::state::{ProcStatus, SharedState};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Timeout de inatividade. Default 45 min; configurável via
-/// AVA_DOCKER_IDLE_MINUTES (parse uma vez no primeiro uso).
+/// Timeout de inatividade. Default 15 min (perfil econômico — em máquina
+/// com outras apps, o stack dorme cedo e devolve a RAM; sobe on-demand na
+/// próxima pergunta); configurável via AVA_DOCKER_IDLE_MINUTES (parse uma
+/// vez no primeiro uso).
 ///
 /// "Atividade" = cada POST /docker/start (a TUI chama a cada pergunta —
 /// ver process_manager::start_docker).
@@ -29,7 +31,7 @@ fn docker_idle_timeout() -> Duration {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&m| m > 0)
-            .unwrap_or(45);
+            .unwrap_or(15);
         tracing::info!("Timer de inatividade do docker: {minutes} min.");
         Duration::from_secs(minutes * 60)
     })

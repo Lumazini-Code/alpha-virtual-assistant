@@ -29,7 +29,7 @@ function GraphLink({ online }: { online: ServiceStatus }) {
     );
   }
   return (
-    <Text color={COLORS.dim}>🔗 grafo offline (python graph_activation.py)</Text>
+    <Text color={COLORS.dim}>🔗 grafo offline (AVA_GRAPH_UI=1 em Modules/.env sobe o :8777)</Text>
   );
 }
 

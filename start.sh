@@ -36,13 +36,21 @@ _cleanup() {
 }
 trap _cleanup SIGTERM SIGINT
 
-# Baixa Supertonic se não estiver em cache
-python3 -c "
+# ── TTS é opt-in (AVA_TTS_ENABLED, default 0) ────────────────────────────────
+# O Supertonic carrega ~470MB de pesos+arena por worker na RAM. Com a flag em
+# 0 (default), o TTS.py não sobe e o pre-download é pulado — economia de
+# ~500MB. Quem usa fala liga AVA_TTS_ENABLED=1 no Modules/.env.
+if [ "${AVA_TTS_ENABLED:-0}" = "1" ]; then
+    # Baixa Supertonic se não estiver em cache
+    python3 -c "
 import os; os.environ['HF_HUB_TIMEOUT'] = '600'
 try:
     from supertonic import TTS; TTS(auto_download=True); print('✓ Supertonic pronto')
 except Exception as e: print(f'⚠ Supertonic: {e}')
 "
+else
+    echo "  • TTS desligado (AVA_TTS_ENABLED=0) — economia de ~500MB de RAM"
+fi
 echo "🚀 Iniciando AVA..."
 
 # Função que reinicia serviços que caem.
@@ -73,10 +81,27 @@ echo "  • Orchestrator..."
 restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
 sleep 1
 
-# NEW (multi-escopo): --memory-api lê o escopo ativo (GET /status) e publica o
-# badge scope_switch — SEM a flag o watcher não sobe e os tailers por projeto
-# (db/<slug>/activation_log.jsonl) nunca publicam ativação (bug runtime).
-restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py --memory-api" &
+# ── Modo mesclado (AVA_MERGED_SERVICES, default 1) ───────────────────────────
+# O orchestrator sobe LLM (:4003) e o visualizador do grafo (:8777) em
+# threads do PRÓPRIO processo — um único interpreter Python (~120-150MB
+# economizados; as portas continuam as mesmas). Com a flag em 0, os dois
+# voltam a ser processos standalone (abaixo) — fallback em caso de problema
+# de import/config no modo mesclado.
+# Graph UI continua opt-in (AVA_GRAPH_UI, default 0): é o visualizador do
+# grafo (SSE + polling de 1s no SQLite), útil para debug, ~80-100MB.
+if [ "${AVA_MERGED_SERVICES:-1}" = "1" ]; then
+    echo "  • LLM + Graph UI mesclados no processo do orchestrator (AVA_MERGED_SERVICES=1)"
+else
+    # NEW (multi-escopo): --memory-api lê o escopo ativo (GET /status) e
+    # publica o badge scope_switch — SEM a flag o watcher não sobe e os
+    # tailers por projeto (db/<slug>/activation_log.jsonl) nunca publicam
+    # ativação (bug runtime).
+    if [ "${AVA_GRAPH_UI:-0}" = "1" ]; then
+        restart_on_fail "Graph Activation Server" "python3 /app/graph_activation.py --memory-api" &
+    else
+        echo "  • Graph UI desligado (AVA_GRAPH_UI=0) — visualização em :8777 não sobe"
+    fi
+fi
 sleep 1
 
 
@@ -88,19 +113,32 @@ restart_on_fail "onnx Manager" "python3 onnxManager.py" &
 
 # Deep Search removido — busca web agora é um servidor MCP próprio
 # (mcp_servers/alpha-mcp, serviço alpha-mcp no docker-compose).
+# LLM não sobe aqui no modo mesclado (default): ele roda dentro do processo
+# do orchestrator — ver bloco AVA_MERGED_SERVICES acima.
+if [ "${AVA_MERGED_SERVICES:-1}" = "0" ]; then
+    echo "  • LLM (standalone)..."
+    restart_on_fail "LLM" "python3 LLM.py" &
+fi
 
-echo "  • LLM..."
-restart_on_fail "LLM" "python3 LLM.py" &
+# ── TTS (ver gate AVA_TTS_ENABLED no topo do script) ─────────────────────────
+# O Supertonic carrega ~470MB/worker na RAM — por default (AVA_TTS_ENABLED=0)
+# o serviço não sobe. A forma como ele foi projetado (agente totalmente
+# autônomo, com fala constante) ainda não é suportada; quem usa fala liga a
+# flag no Modules/.env.
+if [ "${AVA_TTS_ENABLED:-0}" = "1" ]; then
+    echo "  • TTS API..."
+    restart_on_fail "TTS" "python3 TTS.py" &
+fi
 
-# Desativando o TTS por enquanto — a forma com que ele foi projetado para ser usado (agente totalmente outônomo, com fala constante) ainda não é suportada.
+# ── Vision (gate VISION_OBJECTS_ENABLED, default 0) ──────────────────────────
+# Pipeline pesado (Depth Anything V2 + EdgeSAM + DINOv3). O vision.py só faz
+# sentido com VISION_OBJECTS_ENABLED=1 no orchestrator (que então oferece a
+# tool vision_objects); a forma autônoma ainda não é suportada.
+if [ "${VISION_OBJECTS_ENABLED:-0}" = "1" ]; then
+    echo "  • Vision API..."
+    restart_on_fail "Vision" "python3 vision.py" &
+fi
 
-#echo "  • TTS API..."
-restart_on_fail "TTS" "python3 TTS.py" &
-
-# Desativando o Vision API por enquanto — A forma com que ele foi projetado para ser usado (agente totalmente outônomo, com visão constante) ainda não é suportada.
-
-#echo "  • Vision API..."
-#restart_on_fail "Vision" "python3 vision.py" &
 
 
 
