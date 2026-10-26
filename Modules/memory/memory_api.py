@@ -327,6 +327,13 @@ async def tools_delete(name: str):
     return await mem.tools_delete(name)
 
 
+# ── NEW: Agent Skills (SKILL.md) — seleção semântica (mesmo ToolsDB, filtro por prefixo)
+
+@app.post("/agent-skills/select", response_model=mem.AgentSkillSelectResponse)
+async def agent_skills_select(req: mem.AgentSkillSelectRequest):
+    return await mem.agent_skills_select(req)
+
+
 # ── Planos de execução híbridos (macro + modelo) ─────────────────────────────────
 
 @app.post("/plans/write", response_model=mem.PlanCreateResponse)

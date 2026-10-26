@@ -20,6 +20,19 @@ setlocal enabledelayedexpansion
 set "ENV_ARGS="
 if exist "Modules\.env" set "ENV_ARGS=--env-file Modules\.env"
 
+REM ── Agent Skills GLOBAIS do Windows ────────────────────────────────────
+REM `npx skills add -g` instala em %USERPROFILE%\.agents\skills. Na rota A
+REM (compose no Windows) o caminho literal serve; na rota B (compose dentro
+REM do WSL) ele e traduzido via wslpath abaixo — mesmo esquema do diretorio
+REM do projeto. O docker-compose.windows.yml interpola essa var no mount
+REM /root/.agents-win/skills (fallback /tmp quando vazia — nunca derruba).
+set "AVA_WIN_GLOBAL_SKILLS=%USERPROFILE%\.agents\skills"
+REM O wsl.exe SO exporta env do Windows p/ o Linux se a var estiver listada
+REM no WSLENV (flag /w = Win32 -> WSL). Sem isso a rota B perde a var e o
+REM override cai no fallback /tmp. Rota A nao atravessa o wsl.exe (compose
+REM roda no host) — declarar aqui e inofensivo.
+if defined WSLENV (set "WSLENV=AVA_WIN_GLOBAL_SKILLS/w:%WSLENV%") else set "WSLENV=AVA_WIN_GLOBAL_SKILLS/w"
+
 REM ── Rota A: docker.exe responde no host? (Docker Desktop) ──────────
 where docker >nul 2>&1
 if not errorlevel 1 (
@@ -52,6 +65,12 @@ REM Converte o diretorio do projeto para o path da VM e executa o compose
 REM dentro dela — o build/up acontece na distro, os relays socat/portproxy
 REM do install.ps1 fazem a ponte host ^<-^> VM.
 for /f "usebackq delims=" %%i in (`wsl -d Debian-slim -- wslpath -a "%CD%"`) do set "WSL_DIR=%%i"
+
+REM Skills globais do Windows no formato da VM (wslpath). Comeca VAZIA: se o
+REM wslpath falhar, a var fica vazia e o override usa o fallback /tmp — em
+REM vez de passar um caminho Windows-style que o Docker da VM nao monta.
+set "AVA_WIN_GLOBAL_SKILLS="
+for /f "usebackq delims=" %%i in (`wsl -d Debian-slim -- wslpath -a "%USERPROFILE%\.agents\skills" 2^>nul`) do set "AVA_WIN_GLOBAL_SKILLS=%%i"
 
 wsl -d Debian-slim --cd "!WSL_DIR!" -- docker compose !ENV_ARGS! -f docker-compose.yml -f docker-compose.windows.yml %*
 endlocal & exit /b %ERRORLEVEL%

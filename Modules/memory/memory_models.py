@@ -19,6 +19,8 @@ from memory_config import (
     FD_TOP_K,
     IF_MIN_SCORE,
     READ_MIN_SCORE,
+    SKILLS_MIN_SCORE,
+    SKILLS_TOP_K,
     ST_READ_DEFAULT_PAIRS,
     TOOLS_MIN_SCORE,
     TOOLS_TOP_K,
@@ -622,6 +624,32 @@ class ToolUsageRequest(BaseModel):
     query:      str = ""
 
 
+# ── NEW: Agent Skills (SKILL.md) — seleção no MESMO ToolsDB, namespace próprio ─
+#
+# Mesma mecânica do ToolSelect* (kNN + PPR + queries aprendidas), mas o
+# endpoint só devolve linhas com o prefixo AGENT_SKILL_PREFIX (o seletor de
+# MCP /tools/select exclui o prefixo — skills não competem por slots de
+# servidores). `name` no match é o nome NU da skill (sem prefixo) — é o que a
+# tool `use_skill` do orchestrator recebe.
+
+class AgentSkillSelectRequest(BaseModel):
+    query:           str
+    top_k:           int   = SKILLS_TOP_K
+    min_score:       float = SKILLS_MIN_SCORE
+    include_related: bool  = True
+
+class AgentSkillMatch(BaseModel):
+    name:        str
+    description: str
+    score:       float
+    match_type:  Literal["primary", "related", "core"]
+
+class AgentSkillSelectResponse(BaseModel):
+    skills:         list[AgentSkillMatch]
+    top1_score:     float
+    low_confidence: bool
+
+
 # ── NEW: Modelos — planos de execução híbridos (macro + modelo) ────────────────
 #
 # Um plano é uma lista ordenada de passos, cada um marcado como "macro"
@@ -818,6 +846,9 @@ __all__ = [
     'ScopeDeleteResponse',
     'ScopeInfoResponse',
     'ScopeSwitchRequest',
+    'AgentSkillMatch',
+    'AgentSkillSelectRequest',
+    'AgentSkillSelectResponse',
     'ToolMatch',
     'ToolRegisterBatchRequest',
     'ToolRegisterBatchResponse',

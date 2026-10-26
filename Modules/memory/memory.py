@@ -34,7 +34,7 @@ Regras de ouro:
 
 # Submódulos importados explicitamente: ficam acessíveis como atributos
 # da fachada (ex.: memory.memory_search.state) para depuração/patches.
-import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
+import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
 
 from memory_config import *  # noqa: F401,F403
 from memory_models import *  # noqa: F401,F403
@@ -48,6 +48,7 @@ from memory_ops_memory import *  # noqa: F401,F403
 from memory_ops_files import *  # noqa: F401,F403
 from memory_ops_dicts import *  # noqa: F401,F403
 from memory_ops_tools import *  # noqa: F401,F403
+from memory_ops_agent_skills import *  # noqa: F401,F403
 from memory_ops_plans import *  # noqa: F401,F403
 from memory_ops_scope import *  # noqa: F401,F403
 from memory_status import *  # noqa: F401,F403

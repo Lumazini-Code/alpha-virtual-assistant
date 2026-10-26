@@ -69,4 +69,9 @@ Modules/transcribe/linux/
 Modules/transcribe/windows/
 
 install-playwright-mcp.sh
-./.playwright-mcp
+
+alpha-promo
+
+.playwright-mcp
+
+.agents

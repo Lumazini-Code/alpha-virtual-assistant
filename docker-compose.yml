@@ -18,6 +18,17 @@ services:
       - ava-cache:/root/.cache
       - ava-logs:/app/logs
       - ./graph_activation.py:/app/graph_activation.py
+      # Agent Skills (SKILL.md — padrão skills.sh): o usuário instala/atualiza
+      # com `npx skills add` NO HOST; o mount ro faz o container enxergar na
+      # hora (o orchestrator re-sincroniza o índice semântico por assinatura).
+      # PROJECT: .agents/skills do repo; GLOBAL: ~/.agents/skills do usuário
+      # (npx skills add -g) montado em /root/.agents/skills — o default do
+      # orchestrator (Path.home()) resolve igual nos dois lados. Skills de
+      # projeto vence global em duplicata. Se ~/.agents/skills não existir no
+      # host, o Docker cria o dir vazio (inofensivo — scan devolve nada).
+      - ./.agents/skills:/app/.agents/skills:ro
+      - ./skills-lock.json:/app/skills-lock.json:ro
+      - ~/.agents/skills:/root/.agents/skills:ro
 
     # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
     # CRAWL4AI_API_TOKEN...) + o provider de inferência (LLM_BASE_URL/

@@ -285,6 +285,19 @@ TOOLS_MAX_PER_SERVER        = 4      # cota de slots por servidor MCP no top_k �
                                      # (a seleção final é por SERVIDOR, então 1 hit já
                                      # libera as 24; sem cota, o de 1 tool nunca entra)
 
+# ── NEW: Agent Skills (SKILL.md) — mesmo ToolsDB, namespace próprio ───────────
+# Skills (playbooks SKILL.md, instaladas pelo CLI `skills`/skills.sh em
+# .agents/skills/) compartilham a tabela de tools + índice vetorial com um
+# PREFIXO no nome: o seletor de servidores MCP (/tools/select) EXCLUI o
+# prefixo e o endpoint próprio (/agent-skills/select) FILTRA por ele — skills
+# não competem por slots de servidores. Co-uso continua cruzando os dois
+# mundos (arestas skill↔tool no mesmo grafo).
+AGENT_SKILL_PREFIX      = "agentskill__"
+SKILLS_TOP_K            = 3      # skills "primary" por seleção — mais que isso
+                                 # vira ruído no system prompt
+SKILLS_MIN_SCORE        = 0.40   # cosine mínimo p/ uma skill entrar como primary
+SKILLS_FALLBACK_TOP_K   = 5      # teto em modo low-confidence (sem threshold)
+
 # ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
 DICT_GRAPH_MAX_RELATED = 3
 

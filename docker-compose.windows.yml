@@ -56,6 +56,11 @@ services:
       # NO HOST (microfone) — dentro do container "localhost" não é o host.
       # Mesmo tratamento do PROCESS_MANAGER_URL (extra_hosts já tem o gateway).
       TRANSCRIBE_HTTP_URL: "http://host.docker.internal:9100"
+      # Skills dirs no container (substitui o default do orchestrator.py):
+      # projeto (.agents/skills do repo) + global do WSL (mount ~ do base
+      # compose) + global do WINDOWS (mount AVA_WIN_GLOBAL_SKILLS abaixo).
+      # Ordem = prioridade — projeto vence global em duplicata.
+      AVA_SKILLS_DIRS: "/app/.agents/skills,/root/.agents/skills,/root/.agents-win/skills"
 
     # ── DBs da memory em volume nomeado (fs Linux da VM) ──
     # SQLite + WAL sobre o bind mount do Docker Desktop (drvfs/9p) não é
@@ -65,6 +70,18 @@ services:
     volumes:
       - ava-memory:/app/Modules/memory/db
       - /mnt/wslg/runtime-dir/pulse/native:/run/user/1000/pulse/native:rw
+      # Agent Skills GLOBAIS instaladas no WINDOWS: `npx skills add -g` grava
+      # em %USERPROFILE%\.agents\skills. Na rota B o compose roda DENTRO do
+      # WSL — o caminho do perfil vira /mnt/c/Users/<user>/... e quem traduz
+      # é o docker-start.bat / install.ps1 (wslpath, MESMO esquema do
+      # diretório do projeto), injetando AVA_WIN_GLOBAL_SKILLS no ambiente
+      # via WSLENV (o wsl.exe só exporta env Windows→WSL de vars listadas
+      # lá — flag /w). Fallback /tmp
+      # quando a var não veio (compose chamado "na mão" sem wrapper): mount
+      # vazio, NUNCA derruba o stack. Na rota A (Docker Desktop) o mount ~ do
+      # base compose já aponta pro perfil do Windows — o extra só duplica o
+      # scan, e o dedup por nome do orchestrator resolve.
+      - ${AVA_WIN_GLOBAL_SKILLS:-/tmp/alpha-ai-no-global-skills}:/root/.agents-win/skills:ro
 
 volumes:
   ava-memory:

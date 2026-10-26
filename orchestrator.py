@@ -31,6 +31,11 @@ Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
     GATE por VISION_OBJECTS_ENABLED (default 0 — vision.py fora do ar): com a
     flag desligada a tool NÃO é oferecida e as imagens vão embutidas direto
     no contexto do modelo principal (blocos image_url multi-parte).
+  - use_skill / skill_file: Agent Skills (SKILL.md — padrão skills.sh,
+    instaladas em .agents/skills/ pelo CLI `skills` do npm). Leitura direto
+    do disco (Modules/agent_skills.py); índice semântico no MESMO ToolsDB
+    com prefixo "agentskill__" (bloco "Agent Skills" abaixo de _load_mcp_tools).
+    NÃO confundir com as "skills" MCP (servidores do mcp_manager).
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
@@ -144,6 +149,55 @@ MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 ALWAYS_ON_MCP_SERVERS = {
     s.strip() for s in os.getenv("AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp").split(",") if s.strip()
 }
+
+# ── Agent Skills (SKILL.md — padrão "Agent Skills"/skills.sh) ─────────────────
+# Playbooks SKILL.md instalados pelo CLI `skills` (npx skills add owner/repo —
+# PROJECT: .agents/skills/ + skills-lock.json na raiz; GLOBAL: npx skills add -g
+# instala em ~/.agents/skills/ + ~/.agents/.skill-lock.json). Leitura DIRETO do
+# disco (mounts ro no compose; defaults em _default_skills_dirs — projeto vence
+# global em duplicata). Nomenclatura: "Agent Skills" ≠ as "skills" MCP acima
+# (servidores do mcp_manager) — aqui o ativo é um DOCUMENTO de instruções que
+# o modelo lê com as tools nativas use_skill/skill_file.
+# Índice semântico: cada skill é uma linha "agentskill__<name>" no ToolsDB
+# (mesmo grafo hebbiano das MCP tools; kNN + PPR + queries aprendidas). O
+# seletor de servidores (/tools/select) exclui o prefixo; a seleção de skills
+# usa o endpoint próprio (/agent-skills/select). Co-uso numa mesma lista de
+# record-usage cria arestas skill↔tool (PPR espalha de um pro outro).
+try:
+    from Modules.agent_skills import AgentSkill, read_skill_body, resolve_skill_file, scan_agent_skills
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from agent_skills import AgentSkill, read_skill_body, resolve_skill_file, scan_agent_skills
+AGENT_SKILL_PREFIX  = "agentskill__"  # tem que bater com memory_config.AGENT_SKILL_PREFIX
+
+
+def _default_skills_dirs() -> list[str]:
+    """Skills PROJECT (.agents/skills ao lado do orchestrator.py — no
+    container /app/.agents/skills) + GLOBAIS do CLI `skills`
+    (`npx skills add -g` instala em ~/.agents/skills). A ordem é prioridade:
+    projeto vence global em skill de mesmo nome (scan_agent_skills dedup).
+    No container, o compose monta ~/.agents/skills (do HOST) em
+    /root/.agents/skills — então Path.home() resolve igual nos dois lados,
+    sem env."""
+    dirs = [str(Path(__file__).resolve().parent / ".agents" / "skills")]
+    try:
+        dirs.append(str(Path.home() / ".agents" / "skills"))
+    except Exception:  # HOME indefinido — só o dir do projeto
+        pass
+    return dirs
+
+
+# Env substitui a lista INTEIRA (vírgula-separada, ordem = prioridade).
+AGENT_SKILLS_DIRS = [
+    d.strip() for d in os.getenv("AVA_SKILLS_DIRS", ",".join(_default_skills_dirs())).split(",") if d.strip()
+]
+# Skills "core" no ToolsDB (always-on — entram em TODA seleção, como os
+# servidores MCP always-on acima). Env p/ override sem tocar em código.
+ALWAYS_ON_AGENT_SKILLS = {
+    s.strip() for s in os.getenv("AVA_ALWAYS_ON_AGENT_SKILLS", "").split(",") if s.strip()
+}
+AGENT_SKILLS_TOP_K   = int(os.getenv("AVA_SKILLS_TOP_K", "3"))
+SKILL_BODY_MAX_CHARS = int(os.getenv("AVA_SKILL_BODY_MAX_CHARS", "64000"))
+SKILL_FILE_MAX_CHARS = int(os.getenv("AVA_SKILL_FILE_MAX_CHARS", "32000"))
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 # Env: no Windows o container precisa alcançar o tray NO HOST —
 # host.docker.internal (docker-compose.windows.yml injeta o valor);
@@ -205,6 +259,7 @@ EXECUTOR_TIMEOUTS: dict[str, float] = {
     "read_url": 30.0, "deep_search": 9999999.0, "vision_objects": 300.0, "tts": 60.0,
     "alpha_code": 9999999.0,
     "run_plan": 9999999.0,  # planos podem ser longos (vários passos de browser)
+    "use_skill": 15.0, "skill_file": 15.0,  # leitura local (disco) — rápido
 }
 
 MAX_CONTEXT_CHARS = 3000
@@ -746,6 +801,11 @@ async def lifespan(app: FastAPI):
     # NEW (projetos): re-afirma o escopo ativo do registry na memory recém
     # (re)iniciada — boot é o ponto crítico do restart_on_fail do start.sh.
     await _ensure_memory_scope()
+
+    # NEW (Agent Skills): sincroniza o índice semântico no ToolsDB
+    # (best-effort — memory offline não bloqueia o boot; o retry acontece
+    # no próximo turno via assinatura do scan).
+    await _ensure_agent_skills_index(force=True)
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
@@ -2094,6 +2154,48 @@ async def _tool_run_plan(args: dict, req: ExecuteRequest, sid: str = ""):
     }
 
 
+async def _tool_use_skill(args: dict, req: ExecuteRequest, sid: str = ""):
+    """Tool nativa: carrega o corpo do SKILL.md de um Agent Skill instalado
+    (leitura DIRETO do disco — sem round-trip pra memory). O playbook diz o
+    que fazer: pode mandar ler mais arquivos (skill_file) e rodar comandos
+    no host (tools MCP de shell do usuário)."""
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return ("[use_skill: pass the `name` of an installed agent skill — "
+                "the matching ones are listed in the system prompt.]")
+    skills, _ = _agent_skills_cached()
+    skill = next((s for s in skills if s.name == name), None)
+    if skill is None:
+        available = ", ".join(s.name for s in skills) or "(none installed)"
+        return (f"ERROR: agent skill '{name}' is not installed. "
+                f"Available skills: {available}.")
+    try:
+        return read_skill_body(skill.path, SKILL_BODY_MAX_CHARS)
+    except Exception as e:
+        return f"ERROR: could not read SKILL.md of '{name}': {type(e).__name__}: {e}"
+
+
+async def _tool_skill_file(args: dict, req: ExecuteRequest, sid: str = ""):
+    """Tool nativa: lê um arquivo DENTRO da pasta de um Agent Skill
+    (references/, assets/... — caminho relativo à pasta da skill). Guarda de
+    traversal (realpath) e recusa de binário — ver Modules/agent_skills.py."""
+    name = str(args.get("name") or "").strip()
+    rel = str(args.get("path") or "").strip()
+    if not name or not rel:
+        return ("[skill_file: pass `name` (agent skill) and `path` relative to the "
+                "skill's folder, e.g. 'references/format.md'.]")
+    skills, _ = _agent_skills_cached()
+    skill = next((s for s in skills if s.name == name), None)
+    if skill is None:
+        available = ", ".join(s.name for s in skills) or "(none installed)"
+        return (f"ERROR: agent skill '{name}' is not installed. "
+                f"Available skills: {available}.")
+    try:
+        return resolve_skill_file(skill.dir, rel, SKILL_FILE_MAX_CHARS)
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
@@ -2145,6 +2247,28 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "fields": [("prompt", "string", False)],
         "executor": _tool_vision_objects,
+    },
+    "use_skill": {
+        "description": (
+            "Load the full playbook (SKILL.md) of an installed Agent Skill. Call this "
+            "BEFORE doing work in a domain covered by a skill listed in the system prompt "
+            "('Agent skills matching this request') — the playbook holds the working "
+            "contract, references and exact commands for that domain, and may direct you "
+            "to read more files with skill_file and to run commands via other tools. Pass "
+            "the skill's `name` exactly as listed."
+        ),
+        "fields": [("name", "string", True)],
+        "executor": _tool_use_skill,
+    },
+    "skill_file": {
+        "description": (
+            "Read a file that lives INSIDE an installed Agent Skill's folder (its "
+            "references, schemas, presets...), e.g. when the playbook told you to read "
+            "'references/format.md'. Pass `name` (the skill) and `path` relative to the "
+            "skill's folder. Text files only."
+        ),
+        "fields": [("name", "string", True), ("path", "string", True)],
+        "executor": _tool_skill_file,
     },
     # NÃO há tool "finish": responder em texto puro sem chamar nenhuma tool É
     # o encerramento do turno (ver docstring do módulo e _tools_system_prompt).
@@ -2311,6 +2435,119 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
 
     log.debug(f"[_load_mcp_tools] tools MCP disponíveis nesta rodada: {list(dispatch.keys())}")
     return schema, dispatch
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent Skills (SKILL.md) — índice no ToolsDB + seleção semântica
+# ══════════════════════════════════════════════════════════════════════════════
+# As skills são lidas DIRETO do disco (scan com TTL — um `npx skills add` no
+# host aparece no mount na hora). O ÍNDICE semântico vive no ToolsDB da
+# memory: cada skill vira uma linha "agentskill__<name>" via /tools/register
+# (idempotente por doc_hash — mudou o SKILL.md, re-embeda; sumiu do disco,
+# prune no /tools/list). A seleção por turno consulta /agent-skills/select
+# (kNN + PPR) e o resultado vira hint no system prompt.
+
+_agent_skills_sync_lock = asyncio.Lock()
+_agent_skills_last_sig: Optional[str] = None
+_agent_skills_scan: dict[str, Any] = {"at": 0.0, "skills": [], "lock": {}}
+AGENT_SKILLS_SCAN_TTL_S = 20.0
+
+
+def _agent_skills_cached(rescan: bool = False) -> tuple[list[AgentSkill], dict[str, str]]:
+    """Scan do disco com TTL (skills instaladas no host aparecem no mount sem
+    restart; rescan é barato — meia dúzia de arquivos pequenos)."""
+    now = time.time()
+    if rescan or now - _agent_skills_scan["at"] > AGENT_SKILLS_SCAN_TTL_S:
+        skills, lock = scan_agent_skills(AGENT_SKILLS_DIRS)
+        _agent_skills_scan.update(at=now, skills=skills, lock=lock)
+    return _agent_skills_scan["skills"], _agent_skills_scan["lock"]
+
+
+def _agent_skills_signature(skills: list[AgentSkill]) -> str:
+    """Assinatura do conjunto instalado (nome + hash + always-on) — muda →
+    re-sincroniza o índice no próximo turno."""
+    return "\n".join(
+        f"{s.name}\x00{s.doc_hash}\x00{int(s.name in ALWAYS_ON_AGENT_SKILLS)}"
+        for s in skills
+    )
+
+
+async def _sync_agent_skills_index() -> dict:
+    """Registra/pruneia as skills no ToolsDB (POST /tools/register — idempotente
+    por doc_hash, com self-heal; stale → DELETE /tools/{name}). Best-effort:
+    memory offline → loga e mantém a assinatura velha (retry no próximo
+    turno/boot). Nunca levanta."""
+    global _agent_skills_last_sig
+    async with _agent_skills_sync_lock:
+        skills, _ = _agent_skills_cached()
+        sig = _agent_skills_signature(skills)
+        if sig == _agent_skills_last_sig:
+            return {"changed": False, "skills": len(skills)}
+        try:
+            for s in skills:
+                await _memory_request("POST", "/tools/register", {
+                    "name": AGENT_SKILL_PREFIX + s.name,
+                    "description": s.description or s.name,
+                    "examples": [],
+                    "core": s.name in ALWAYS_ON_AGENT_SKILLS,
+                })
+            data = await _memory_request("GET", "/tools/list")
+            disk_names = {s.name for s in skills}
+            for row in data.get("tools", []):
+                nm = str(row.get("name") or "")
+                if nm.startswith(AGENT_SKILL_PREFIX) and nm[len(AGENT_SKILL_PREFIX):] not in disk_names:
+                    await _memory_request("DELETE", f"/tools/{nm}")
+                    log.info(f"Agent Skills: '{nm[len(AGENT_SKILL_PREFIX):]}' saiu do disco — removida do índice")
+            _agent_skills_last_sig = sig
+            log.info(f"Agent Skills: índice sincronizado ({len(skills)} skill(s): "
+                     f"{', '.join(s.name for s in skills) or 'nenhuma'})")
+            return {"changed": True, "skills": len(skills)}
+        except Exception as e:
+            log.warning(f"Agent Skills: sincronização do índice falhou ({type(e).__name__}: {e}) — "
+                        "tenta de novo no próximo turno")
+            return {"changed": False, "skills": len(skills), "error": str(e)}
+
+
+async def _ensure_agent_skills_index(force: bool = False) -> None:
+    """Re-sincroniza SÓ quando o disco mudou (assinatura sobre o scan com
+    TTL). Nunca levanta."""
+    try:
+        skills, _ = _agent_skills_cached()
+        if force or _agent_skills_signature(skills) != _agent_skills_last_sig:
+            await _sync_agent_skills_index()
+    except Exception as e:
+        log.debug(f"Agent Skills: ensure-index ignorou falha: {type(e).__name__}: {e}")
+
+
+async def _select_agent_skills(user_input: str) -> Optional[str]:
+    """Seleção semântica de Agent Skills para ESTE pedido: /agent-skills/select
+    (kNN + PPR no ToolsDB — barato, sem tocar no disco além do scan com TTL) →
+    bloco de hint pro system prompt com as skills casadas. Falha → None (turno
+    segue sem hint, mesma postura do _recall_plans)."""
+    if not user_input:
+        return None
+    await _ensure_agent_skills_index()
+    try:
+        data = await _memory_request("POST", "/agent-skills/select", {
+            "query": user_input, "top_k": AGENT_SKILLS_TOP_K, "include_related": True,
+        })
+    except Exception as e:
+        log.warning(f"[_select_agent_skills] seleção falhou ({type(e).__name__}: {e}) — turno segue sem skills")
+        return None
+    matched = [s for s in (data.get("skills") or []) if s.get("description")]
+    if not matched:
+        return None
+    log.info(f"[_select_agent_skills] skills escolhidas: {[s['name'] for s in matched]}")
+    lines = [
+        "## Agent skills matching this request (playbooks you can load)",
+        "Installed Agent Skills whose description matches this request. For work in the "
+        "matched domain, call use_skill(name) FIRST and follow the loaded playbook — it is "
+        "authoritative for its domain and may point to more files via skill_file and to "
+        "commands you can run via other tools:",
+    ]
+    for s in matched:
+        lines.append(f"- {s['name']}: {s['description']}")
+    return "\n".join(lines)
 
 
 async def _ensure_browser() -> None:
@@ -2545,12 +2782,16 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
                           mcp_tool_names: Optional[dict[str, str]] = None,
                           plans_hint: Optional[str] = None,
+                          skills_hint: Optional[str] = None,
                           active_project: Optional[str] = None) -> str:
     """`mcp_tool_names`: nome da tool MCP -> descrição, já carregadas pela
     etapa 2 da descoberta (_load_mcp_tools) para ESTA rodada específica —
     somadas às tools nativas (TOOLS) na listagem final do prompt.
     `plans_hint`: bloco opcional com planos salvos relevantes ao pedido
     (gerado por _recall_plans) — orienta o modelo a preferir run_plan.
+    `skills_hint`: bloco opcional com Agent Skills (SKILL.md) casadas com o
+    pedido (gerado por _select_agent_skills) — orienta o modelo a carregar o
+    playbook com use_skill antes de agir no domínio da skill.
     `active_project`: slug do projeto ativo (escopo de memória) — injeta o
     hint de escopo (NEW projetos)."""
     lang_names = {
@@ -2651,6 +2892,9 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     if plans_hint:
         lines.append("")
         lines.append(plans_hint)
+    if skills_hint:
+        lines.append("")
+        lines.append(skills_hint)
     if think_instruction:
         lines.append("")
         lines.append(think_instruction)
@@ -2735,6 +2979,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # ── Recall de planos salvos (em paralelo) — orienta o modelo a preferir
     # run_plan quando existe plano compatível com o pedido (ver _recall_plans).
     plans_task = asyncio.ensure_future(_recall_plans(req.input)) if req.input else None
+    # ── Agent Skills (SKILL.md): seleção semântica (kNN+PPR no ToolsDB) em
+    # paralelo — hint no system prompt quando algo casa com o pedido
+    # (ver _select_agent_skills).
+    skills_task = asyncio.ensure_future(_select_agent_skills(req.input)) if req.input else None
 
     # ── Descoberta de tools em duas etapas ──
     # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
@@ -2750,16 +2998,20 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # levar mais; se não, esperamos aqui mesmo).
     recall_block, st_turns = ("", []) if recall_task is None else await recall_task
     plans_hint = None if plans_task is None else await plans_task
+    skills_hint = None if skills_task is None else await skills_task
 
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang,
                                          mcp_tool_names=mcp_descriptions,
                                          plans_hint=plans_hint,
+                                         skills_hint=skills_hint,
                                          active_project=(
                                              active_project
                                              if active_project != "general" else None
                                          ))
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
+    if skills_hint:
+        log.info(f"[{eid[:8]}] Agent Skills casadas injetadas no system prompt")
     if recall_block:
         # Recall entra no system prompt (não como mensagem user/assistant) —
         # preserva a alternância estrita do chat template e mantém o bloco
@@ -2877,6 +3129,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # MCP tools bem-sucedidas nesta execução, NA ORDEM — vai pro /tools/usage
     # no fim do loop (arestas de co-uso + exemplos aprendidos na ToolsDB).
     used_mcp_tools: list[str] = []
+    # Agent Skills cujo playbook foi carregado (use_skill) nesta execução —
+    # entram no MESMO registro de uso (grafo namespaced "agentskill__<name>"):
+    # arestas de co-uso skill↔tool + a query vira exemplo aprendido dos dois.
+    used_agent_skills: list[str] = []
 
     # Tools cujo resultado já É a resposta final ao usuário — nenhuma
     # segunda chamada ao modelo de texto acontece depois delas. Hoje só
@@ -2979,6 +3235,15 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                         TOOLS[tool_name]["executor"](args, req, sid),
                         timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
                     )
+                    # use_skill bem-sucedida → aprendizado do grafo (mesmo
+                    # registro das MCP tools). Resultado de erro (string
+                    # "ERROR: ...") não conta como uso.
+                    if (tool_name == "use_skill" and isinstance(result, str)
+                            and not result.startswith("ERROR")
+                            and str(args.get("name") or "").strip()):
+                        used_agent_skills.append(
+                            AGENT_SKILL_PREFIX + str(args["name"]).strip()
+                        )
                 else:
                     # MCP: proxy via mcp_manager (o executante). O timeout
                     # vai AMBOS no wait_for daqui (teto do round-trip HTTP)
@@ -3111,8 +3376,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # viram arestas de co-uso/sequência e exemplos aprendidos na ToolsDB —
     # é isso que faz o kNN da _select_skills acertar nas próximas vezes
     # ("anunciadas na última minecon" aprende que web_search resolve).
-    if used_mcp_tools:
-        asyncio.ensure_future(_record_tool_usage(req.input, used_mcp_tools))
+    # Agent Skills entram na MESMA lista (grafo namespaced): co-uso
+    # skill↔tool cruza os dois mundos e a query vira exemplo aprendido da skill.
+    if used_agent_skills or used_mcp_tools:
+        asyncio.ensure_future(_record_tool_usage(req.input, used_agent_skills + used_mcp_tools))
 
     return step_results, final_response
 
@@ -3839,6 +4106,45 @@ async def set_watch_confidence(req: WatchConfidenceRequest):
         raise HTTPException(500, f"Falha ao persistir settings: {e}")
     log.info(f"Memory Watch {'ATIVADO' if _WATCH_CONFIDENCE else 'DESATIVADO'} — {SETTINGS_FILE}")
     return {"enabled": _WATCH_CONFIDENCE}
+
+
+# ── NEW: Agent Skills (SKILL.md) — inspeção/sincronização (aba da TUI depois) ──
+# Instaladas (disco + proveniência do skills-lock.json) e estado do índice no
+# ToolsDB. Rescan barato a cada chamada — depois de um `npx skills add` no
+# host, a TUI chama aqui e já vê a skill nova.
+
+@app.get("/skills")
+async def list_agent_skills():
+    skills, lock = _agent_skills_cached(rescan=True)
+    indexed: dict[str, dict] = {}
+    try:
+        data = await _memory_request("GET", "/tools/list")
+        for row in data.get("tools", []):
+            nm = str(row.get("name") or "")
+            if nm.startswith(AGENT_SKILL_PREFIX):
+                indexed[nm[len(AGENT_SKILL_PREFIX):]] = row
+    except Exception as e:
+        log.debug(f"[GET /skills] /tools/list indisponível ({type(e).__name__}: {e})")
+    return {
+        "dirs": [str(d) for d in AGENT_SKILLS_DIRS],
+        "count": len(skills),
+        "skills": [
+            {
+                "name": s.name, "description": s.description, "dir": str(s.dir),
+                "doc_hash": s.doc_hash[:12],
+                "source": lock.get(s.name),
+                "indexed": s.name in indexed,
+                "use_count": (indexed.get(s.name) or {}).get("use_count"),
+            }
+            for s in skills
+        ],
+    }
+
+
+@app.post("/skills/sync")
+async def sync_agent_skills():
+    """Força a re-sincronização do índice semântico (boot/retry manual)."""
+    return await _sync_agent_skills_index()
 
 
 # ── NEW: Projetos (escopos de memória) — aba /projects da TUI ─────────────────

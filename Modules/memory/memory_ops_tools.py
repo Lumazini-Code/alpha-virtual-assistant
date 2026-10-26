@@ -15,6 +15,7 @@ import hashlib
 import time
 
 from memory_config import (
+    AGENT_SKILL_PREFIX,
     EDGE_CO_ACTIVATION,
     EDGE_LEARNING_RATE,
     EDGE_TEMPORAL,
@@ -231,11 +232,16 @@ async def tools_select(req: ToolSelectRequest):
             best[tid] = score
     ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
 
-    top1 = ranked[0][1] if ranked else 0.0
-    low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
-    # nomes das tools rankeadas (pra cota por servidor) — um único get_by_ids
+    # Agent Skills (SKILL.md) compartilham ESTA tabela, mas NÃO competem na
+    # seleção de servidores MCP — o prefixo sai daqui e é servido pelo
+    # endpoint próprio (/agent-skills/select, memory_ops_agent_skills.py).
     rank_names = {r["id"]: r["name"] for r in state.tl_db.get_by_ids(
         [t for t, _ in ranked])}
+    ranked = [(t, s) for t, s in ranked
+              if not rank_names.get(t, "").startswith(AGENT_SKILL_PREFIX)]
+
+    top1 = ranked[0][1] if ranked else 0.0
+    low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
     if low_confidence:
         # confiança baixa: recall > precisão — rede mais larga, sem threshold
         primary = _ranked_with_quota(ranked, rank_names, TOOLS_FALLBACK_TOP_K, None)
@@ -243,18 +249,26 @@ async def tools_select(req: ToolSelectRequest):
         primary = _ranked_with_quota(ranked, rank_names, req.top_k, req.min_score)
 
     # tools alcançadas SÓ pelo grafo de co-uso/sequência (listar → ler → editar)
-    related: list[tuple[int, float]] = []
+    related_raw: list[tuple[int, float]] = []
     if req.include_related and primary:
         ctx = await _ppr_spread_on(state.tl_db, primary, loop)
         taken = {t for t, _ in primary}
-        related = [(t, s) for t, s in ctx["related_raw"] if t not in taken][:TOOLS_MAX_RELATED]
+        related_raw = [(t, s) for t, s in ctx["related_raw"] if t not in taken][:TOOLS_MAX_RELATED]
 
-    core_rows = state.tl_db.list_core()
-    core_ids = {r["id"] for r in core_rows}
+    # skills "core" (always-on) NÃO vazam aqui — core é filtrado pelo prefixo
+    # (skills core são servidas só pelo endpoint de agent skills).
+    core_ids = {r["id"] for r in state.tl_db.list_core()
+                if not r["name"].startswith(AGENT_SKILL_PREFIX)}
 
     rows = {r["id"]: r for r in state.tl_db.get_by_ids(
-        [t for t, _ in primary] + [t for t, _ in related] + list(core_ids)
+        [t for t, _ in primary] + [t for t, _ in related_raw] + list(core_ids)
     )}
+    # Co-uso skill↔tool EXISTE no grafo (PPR pode alcançar a skill por uma
+    # tool) — mas skill não vira "related" de servidor MCP: não há servidor
+    # "agentskill" no manager. O espelho vale aqui: este endpoint só devolve
+    # MCP tools; /agent-skills/select só devolve skills.
+    related = [(t, s) for t, s in related_raw
+               if t in rows and not rows[t]["name"].startswith(AGENT_SKILL_PREFIX)]
     out: list[ToolMatch] = []
     seen: set[int] = set()
 

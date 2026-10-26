@@ -961,6 +961,21 @@ netsh advfirewall firewall add rule name="Alpha AI WSL relay" dir=in action=allo
 function Invoke-Compose {
   if ($script:UseWSLDocker) {
     $wslDir = ((wsl -d Debian-slim -- wslpath -a $InstallDir | Out-String) -replace "`0", '').Trim()
+    # Skills globais do WINDOWS (%USERPROFILE%\.agents\skills) no formato da
+    # VM — mesmo esquema do docker-start.bat. O docker-compose.windows.yml
+    # interpola AVA_WIN_GLOBAL_SKILLS no mount /root/.agents-win/skills
+    # (fallback /tmp quando vazia — nunca derruba o stack).
+    $winSkills = ((wsl -d Debian-slim -- wslpath -a "$env:USERPROFILE\.agents\skills" 2>$null | Out-String) -replace "`0", '').Trim()
+    if ($winSkills) { $env:AVA_WIN_GLOBAL_SKILLS = $winSkills }
+    else { Remove-Item Env:\AVA_WIN_GLOBAL_SKILLS -ErrorAction SilentlyContinue }
+    # WSLENV: o wsl.exe so exporta env do Windows p/ o Linux se a var estiver
+    # listada aqui (flag /w = Win32 -> WSL). Sem isso o compose dentro da VM
+    # nao ve a var e o override cai no fallback /tmp. Guarda p/ nao duplicar
+    # a entrada quando a funcao roda varias vezes no mesmo install.
+    if ($env:WSLENV -notlike '*AVA_WIN_GLOBAL_SKILLS*') {
+      if ($env:WSLENV) { $env:WSLENV = "AVA_WIN_GLOBAL_SKILLS/w:$env:WSLENV" }
+      else { $env:WSLENV = 'AVA_WIN_GLOBAL_SKILLS/w' }
+    }
     $envArgs = @()
     if (Test-Path (Join-Path $InstallDir 'Modules\.env')) { $envArgs = @('--env-file', 'Modules/.env') }
     wsl -d Debian-slim --cd $wslDir -- docker compose @envArgs -f docker-compose.yml -f docker-compose.windows.yml @args

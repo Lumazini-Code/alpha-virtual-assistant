@@ -1,10 +1,11 @@
 {
-  "active": "willsure",
+  "active": "lumazini_code",
   "projects": [
     {
       "slug": "lumazini_code",
       "name": "Lumazini Code",
-      "created_at": 1792945911.5504978
+      "created_at": 1792945911.5504978,
+      "last_activated_at": 1793034567.4027832
     },
     {
       "slug": "willsure",
