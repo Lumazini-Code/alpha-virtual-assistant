@@ -3,10 +3,14 @@
 #
 # Fluxo:
 #   1. Valida/instala prereqs (Node 24, Docker Engine + compose v2, curl, unzip, x86_64)
-#   2. Baixa o asset `*linux*.zip` do último release no GitHub
+#   2. Baixa o asset `*linux*.zip` do último release no GitHub — MODO TESTE:
+#      ALPHA_RELEASE_ZIP=/caminho.zip (exportada) usa um zip local e pula o
+#      GitHub inteiro (para testar antes do release oficial)
 #   3. Extrai em ~/.local/opt/alpha-ai (override: ALPHA_INSTALL_DIR ou --install-dir)
 #   3b. Agent Skills: npx skills add heygen-com/hyperframes → .agents/skills
 #       (gitignored; flags -a universal -y; falha = aviso, não morte)
+#   3c. OfficeCLI: npm install -g @officecli/officecli + skill
+#       officecli.ai/SKILL.md → .agents/skills/officecli (falha = aviso)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
 #   5. Pede o provider de inferência: LLM_BASE_URL (Enter = OpenRouter) e, se
 #      o provider NÃO for local, a LLM_API_KEY — grava em Modules/.env
@@ -55,6 +59,10 @@ Uso: install.sh [opções]
   --skip-build        Pula o build/up do Docker (útil para reinstalar)
   --no-launch         Não abre a TUI ao final
   -h, --help          Esta ajuda
+
+Env:
+  ALPHA_RELEASE_ZIP=ARQUIVO.zip  Usa um zip local em vez do release do GitHub
+                                 (modo teste antes do release oficial)
 EOF
   exit 0
 }
@@ -241,24 +249,37 @@ ok "Pré-requisitos validados."
 TMP_DIR="$(mktemp -d -t alpha-install-XXXXXX)"
 trap 'rm -rf "$TMP_DIR" "$_SELF_TMP"' EXIT
 
-info "Consultando último release de https://github.com/$REPO..."
+# ALPHA_RELEASE_ZIP (MODO TESTE, antes do release oficial): quando a env var
+# aponta para um zip local, o GitHub é pulado inteiro e esse zip é o que
+# instala. O arquivo é COPIADO para o TMP_DIR (o unzip extraí dele) — o
+# original nunca é apagado pelo trap. Uso:
+#   ALPHA_RELEASE_ZIP=/caminho/alpha-ai-linux.zip ./install.sh
+# (a var precisa estar EXPORTADA para sobreviver ao re-exec via /tmp.)
+if [ -n "${ALPHA_RELEASE_ZIP:-}" ]; then
+  [ -f "$ALPHA_RELEASE_ZIP" ] || \
+    die "ALPHA_RELEASE_ZIP aponta para arquivo inexistente: $ALPHA_RELEASE_ZIP"
+  info "MODO TESTE (ALPHA_RELEASE_ZIP): zip local '$ALPHA_RELEASE_ZIP' — pulando o GitHub."
+  cp -f -- "$ALPHA_RELEASE_ZIP" "$TMP_DIR/alpha-ai.zip"
+else
+  info "Consultando último release de https://github.com/$REPO..."
 
-API_URL="https://api.github.com/repos/$REPO/releases/latest"
-RELEASE_JSON="$(curl -fsSL --max-time 30 "$API_URL" 2>/dev/null)" || \
-  die "Falha ao consultar a API do GitHub (sem releases publicados? sem internet?)"
+  API_URL="https://api.github.com/repos/$REPO/releases/latest"
+  RELEASE_JSON="$(curl -fsSL --max-time 30 "$API_URL" 2>/dev/null)" || \
+    die "Falha ao consultar a API do GitHub (sem releases publicados? sem internet?)"
 
-TAG="$(printf '%s' "$RELEASE_JSON" | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)" || true
-[ -n "$TAG" ] || die "Não encontrei tag_name no payload do release."
+  TAG="$(printf '%s' "$RELEASE_JSON" | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)" || true
+  [ -n "$TAG" ] || die "Não encontrei tag_name no payload do release."
 
-ASSET_URL="$(printf '%s' "$RELEASE_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -i 'linux' | grep -i '\.zip$' | head -1)" || true
-[ -n "$ASSET_URL" ] || die "Release $TAG não tem asset *linux*.zip. Verifique: https://github.com/$REPO/releases"
+  ASSET_URL="$(printf '%s' "$RELEASE_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -i 'linux' | grep -i '\.zip$' | head -1)" || true
+  [ -n "$ASSET_URL" ] || die "Release $TAG não tem asset *linux*.zip. Verifique: https://github.com/$REPO/releases"
 
-info "Release $TAG — baixando $(basename "$ASSET_URL")..."
+  info "Release $TAG — baixando $(basename "$ASSET_URL")..."
 
-curl -fL --connect-timeout 15 --progress-bar -o "$TMP_DIR/alpha-ai.zip" "$ASSET_URL" || \
-  die "Download falhou. Verifique a conexão e tente de novo."
+  curl -fL --connect-timeout 15 --progress-bar -o "$TMP_DIR/alpha-ai.zip" "$ASSET_URL" || \
+    die "Download falhou. Verifique a conexão e tente de novo."
 
-ok "Download concluído."
+  ok "Download concluído."
+fi
 
 # ── 3. Extração ───────────────────────────────────────────────────────────────
 info "Extraindo em $INSTALL_DIR ..."
@@ -292,6 +313,43 @@ if command -v npx >/dev/null 2>&1; then
   fi
 else
   warn "npx ausente no host — pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes)."
+fi
+
+# ── 3c. OfficeCLI (binário npm -g + skill SKILL.md) ───────────────────────────
+# `officecli` = leitura/edição de .docx/.xlsx/.pptx (o binário nativo vem no
+# postinstall do pacote). npm -g com prefix do usuário (nvm) não pede root;
+# com node de apt/pacman o prefix não é escrevível → as_root. A SKILL.md do
+# site oficial vai direto para o store canônico .agents/skills/officecli/
+# (gitignored; o mount ro entrega ao container e o scanner do orchestrator
+# descobre na próxima pergunta, sem restart). Download em arquivo temporário +
+# mv — SKILL.md truncado por rede não entra no índice. Falha é AVISO, não
+# morte — o sistema sobe sem o OfficeCLI/skill.
+OFFICE_FAIL=0
+if command -v npm >/dev/null 2>&1; then
+  info "OfficeCLI: npm install -g @officecli/officecli ..."
+  GPREFIX="$(npm prefix -g 2>/dev/null || echo /usr/lib)"
+  if [ -w "$GPREFIX" ]; then
+    npm install -g @officecli/officecli || OFFICE_FAIL=1
+  else
+    as_root npm install -g @officecli/officecli || OFFICE_FAIL=1
+  fi
+else
+  warn "npm ausente no host — pulei o OfficeCLI (rode: npm install -g @officecli/officecli)."
+fi
+if [ "$OFFICE_FAIL" -eq 0 ] && command -v npm >/dev/null 2>&1; then
+  ok "OfficeCLI instalado ($(command -v officecli 2>/dev/null || echo 'via npm -g'))."
+elif [ "$OFFICE_FAIL" -ne 0 ]; then
+  warn "npm install -g @officecli/officecli falhou — o sistema sobe sem o OfficeCLI."
+  warn "Para instalar depois: npm install -g @officecli/officecli"
+fi
+
+mkdir -p .agents/skills/officecli
+if curl -fsSL https://officecli.ai/SKILL.md -o .agents/skills/officecli/.SKILL.md.tmp; then
+  mv .agents/skills/officecli/.SKILL.md.tmp .agents/skills/officecli/SKILL.md
+  ok "Skill officecli instalada (.agents/skills/officecli/SKILL.md)."
+else
+  rm -f .agents/skills/officecli/.SKILL.md.tmp
+  warn "curl https://officecli.ai/SKILL.md falhou — skill ausente (o CLI, se instalado, funciona)."
 fi
 
 # ── 4. Modelos ────────────────────────────────────────────────────────────────

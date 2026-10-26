@@ -83,7 +83,7 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - **Persona editável em runtime**: `GET/PUT /persona` no orchestrator — a 1ª linha do system prompt vive em `resource/persona.json` e é trocada pela TUI (Settings → Persona) sem restart (a cláusula de tools é sempre anexada pelo orchestrator).
 
 ### Agent Skills (SKILL.md) — playbooks no padrão skills.sh
-- Skills no padrão **Agent Skills** (o mesmo do CLI `skills` do npm: `npx skills add owner/repo`) são lidas **direto do disco** (mounts ro no container — `npx skills` roda no host, o container enxerga na hora). Os dois instaladores já fazem a instalação automática (etapa 3b): `npx --yes skills add heygen-com/hyperframes -a universal -y` — `-a universal` grava só em `.agents/skills` (store canônico, sem linkar em `.claude`/`.cursor`/etc), `-y` pula os prompts, re-run é idempotente e falha (rede) é aviso, não morte. Duas origens, mesma mecânica:
+- Skills no padrão **Agent Skills** (o mesmo do CLI `skills` do npm: `npx skills add owner/repo`) são lidas **direto do disco** (mounts ro no container — `npx skills` roda no host, o container enxerga na hora). Os dois instaladores já fazem a instalação automática: etapa 3b instala o pacote hyperframes (`npx --yes skills add heygen-com/hyperframes -a universal -y` — `-a universal` grava só em `.agents/skills` (store canônico, sem linkar em `.claude`/`.cursor`/etc), `-y` pula os prompts, re-run é idempotente e falha (rede) é aviso, não morte) e a etapa 3c instala o **OfficeCLI** (`npm install -g @officecli/officecli`, prefix do usuário; no Linux com node de apt/pacman usa `as_root`) + a skill `officecli` baixada de `officecli.ai/SKILL.md` direto para o store (temp + `mv` — SKILL.md truncado não entra no índice). Duas origens, mesma mecânica:
   - **Projeto**: `.agents/skills/` + lock `skills-lock.json` na raiz do repo;
   - **Global**: `npx skills add -g` instala em `~/.agents/skills/` + lock `~/.agents/.skill-lock.json` (ou `$XDG_STATE_HOME/skills/` — variante do próprio CLI), montado em `/root/.agents/skills` no container. **Skill de projeto vence global em nome duplicado** (ordem = prioridade em `AVA_SKILLS_DIRS`); a proveniência segue o lock de cada diretório.
   - **Windows**: `npx skills add -g` grava em `%USERPROFILE%\.agents\skills`. Na rota A (Docker Desktop) o caminho literal entra direto na interpolação; na rota B (Docker Engine dentro do WSL) o `docker-start.bat`/`install.ps1` traduz com `wslpath` (mesmo esquema do diretório do projeto) e exporta a var via **`WSLENV`** (`AVA_WIN_GLOBAL_SKILLS/w` — sem isso o `wsl.exe` não leva env do Windows pro Linux). O override Windows interpola no mount `/root/.agents-win/skills` e o `AVA_SKILLS_DIRS` do perfil já inclui os três diretórios; fallback `/tmp` quando a var não vem (compose "na mão") — mount vazio, nunca derruba o stack.
@@ -226,6 +226,17 @@ curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Co
 ```
 
 O instalador pede o provider de inferência (`LLM_BASE_URL` — Enter = OpenRouter; `LLM_API_KEY` só se o provider não for local) e gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles.
+
+**Modo teste (antes do release oficial)**: com a env var `ALPHA_RELEASE_ZIP` apontando para um zip local, o instalador pula o GitHub inteiro e instala desse zip — mesmo fluxo, mesma validação:
+
+```bash
+# Linux
+export ALPHA_RELEASE_ZIP=/caminho/alpha-ai-linux.zip && ./install.sh
+```
+```powershell
+# Windows
+$env:ALPHA_RELEASE_ZIP = 'C:\caminho\alpha-ai-windows.zip'; .\install.ps1
+```
 
 ## Uso
 

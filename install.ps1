@@ -2,10 +2,14 @@
 #
 # Espelha o fluxo do install.sh:
 #   1. Valida prereqs (Node 24 no host; Docker Desktop OU Docker Engine no WSL)
-#   2. Baixa o asset *windows*.zip do ultimo release no GitHub
+#   2. Baixa o asset *windows*.zip do ultimo release no GitHub - MODO TESTE:
+#      $env:ALPHA_RELEASE_ZIP = 'caminho.zip' usa um zip local e pula o
+#      GitHub inteiro (para testar antes do release oficial)
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
 #   3b. Agent Skills: npx skills add heygen-com/hyperframes -> .agents\skills
 #       (gitignored; flags -a universal -y; falha = aviso, nao morte)
+#   3c. OfficeCLI: npm install -g @officecli/officecli + skill
+#       officecli.ai/SKILL.md -> .agents\skills\officecli (falha = aviso)
 #   4. Extrai Modules/Models.zip em Modules/Models
 #   5. Pede o provider de inferencia: LLM_BASE_URL (Enter = OpenRouter) e, se
 #      o provider NAO for local, a LLM_API_KEY - grava em Modules\.env ANTES
@@ -18,6 +22,8 @@
 #   9. Inicia a TUI
 #
 # Uso: powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 [-InstallDir DIR] [-SkipBuild] [-NoLaunch]
+# Env: $env:ALPHA_RELEASE_ZIP = 'caminho.zip' -> usa zip local em vez do
+#      release do GitHub (modo teste antes do release oficial)
 
 param(
   [string]$InstallDir = $env:ALPHA_INSTALL_DIR,
@@ -255,25 +261,40 @@ swap=2GB
 }
 
 # -- 2. Download do ultimo release ---------------------------------------------
-Write-Info "Consultando ultimo release de https://github.com/$Repo..."
+# ALPHA_RELEASE_ZIP (MODO TESTE, antes do release oficial): quando a env var
+# aponta para um zip local, o GitHub e pulado inteiro e esse zip e o que
+# instala. O arquivo e COPIADO para %TEMP% (o Remove-Item apos o
+# Expand-Archive apaga a copia, nunca o original). Uso:
+#   $env:ALPHA_RELEASE_ZIP = 'C:\caminho\alpha-ai-windows.zip'; .\install.ps1
+if ($env:ALPHA_RELEASE_ZIP) {
+  if (-not (Test-Path $env:ALPHA_RELEASE_ZIP -PathType Leaf)) {
+    Die "ALPHA_RELEASE_ZIP aponta para arquivo inexistente: $($env:ALPHA_RELEASE_ZIP)"
+  }
+  Write-Info "MODO TESTE (ALPHA_RELEASE_ZIP): zip local '$($env:ALPHA_RELEASE_ZIP)' - pulando o GitHub."
+  $Tag = 'local-test'
+  $TmpZip = Join-Path $env:TEMP "alpha-ai-$Tag.zip"
+  Copy-Item -Force $env:ALPHA_RELEASE_ZIP $TmpZip
+} else {
+  Write-Info "Consultando ultimo release de https://github.com/$Repo..."
 
-try {
-  $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
-} catch {
-  Die "Falha ao consultar a API do GitHub (sem releases? sem internet?): $($_.Exception.Message)"
+  try {
+    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
+  } catch {
+    Die "Falha ao consultar a API do GitHub (sem releases? sem internet?): $($_.Exception.Message)"
+  }
+
+  $Asset = $Release.assets | Where-Object { $_.name -match 'windows' -and $_.name -match '\.zip$' } | Select-Object -First 1
+  if (-not $Asset) {
+    Die "Release $($Release.tag_name) nao tem asset *windows*.zip. Veja: https://github.com/$Repo/releases"
+  }
+
+  $Tag = $Release.tag_name
+  Write-Info "Release $Tag - baixando $($Asset.name) (~700 MB)..."
+
+  $TmpZip = Join-Path $env:TEMP "alpha-ai-$Tag.zip"
+  Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $TmpZip -UseBasicParsing
+  Write-Ok 'Download concluido.'
 }
-
-$Asset = $Release.assets | Where-Object { $_.name -match 'windows' -and $_.name -match '\.zip$' } | Select-Object -First 1
-if (-not $Asset) {
-  Die "Release $($Release.tag_name) nao tem asset *windows*.zip. Veja: https://github.com/$Repo/releases"
-}
-
-$Tag = $Release.tag_name
-Write-Info "Release $Tag - baixando $($Asset.name) (~700 MB)..."
-
-$TmpZip = Join-Path $env:TEMP "alpha-ai-$Tag.zip"
-Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $TmpZip -UseBasicParsing
-Write-Ok 'Download concluido.'
 
 # -- 3. Extracao ---------------------------------------------------------------
 Write-Info "Extraindo em $InstallDir ..."
@@ -310,6 +331,45 @@ if ($Npx) {
   }
 } else {
   Write-Warn2 'npx ausente no host - pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes).'
+}
+
+# -- 3c. OfficeCLI (binario npm -g + skill SKILL.md) ---------------------------
+# `officecli` = leitura/edicao de .docx/.xlsx/.pptx (o binario nativo vem no
+# postinstall do pacote). npm -g usa o prefix do usuario (%APPDATA%\npm, sem
+# admin). A SKILL.md do site oficial vai direto para o store canonico
+# .agents\skills\officecli\ (gitignored; o mount ro entrega ao container e o
+# scanner do orchestrator descobre na proxima pergunta, sem restart).
+# Download em arquivo temporario + Move-Item — SKILL.md truncado por rede nao
+# entra no indice. Obs.: no PS 5.1 `curl` e alias de Invoke-WebRequest, entao
+# o cmdlet e chamado explicitamente. Falha e aviso, nao morte.
+$NpmCmd = Get-Command npm -ErrorAction SilentlyContinue
+$OfficeFail = $false
+if ($NpmCmd) {
+  Write-Info 'OfficeCLI: npm install -g @officecli/officecli...'
+  & npm install -g '@officecli/officecli'
+  if ($LASTEXITCODE -ne 0) { $OfficeFail = $true }
+} else {
+  Write-Warn2 'npm ausente no host - pulei o OfficeCLI (rode: npm install -g @officecli/officecli).'
+}
+if ($OfficeFail) {
+  Write-Warn2 'npm install -g @officecli/officecli falhou - o sistema sobe sem o OfficeCLI.'
+  Write-Warn2 'Para instalar depois: npm install -g @officecli/officecli'
+} elseif ($NpmCmd) {
+  $Ocli = Get-Command officecli -ErrorAction SilentlyContinue
+  $OcliLabel = 'via npm -g'
+  if ($Ocli) { $OcliLabel = $Ocli.Source }
+  Write-Ok "OfficeCLI instalado ($OcliLabel)."
+}
+
+$OfficeSkillDir = Join-Path $InstallDir '.agents\skills\officecli'
+New-Item -ItemType Directory -Force -Path $OfficeSkillDir | Out-Null
+try {
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://officecli.ai/SKILL.md' -OutFile (Join-Path $OfficeSkillDir 'SKILL.md.tmp') -ErrorAction Stop
+  Move-Item -Force (Join-Path $OfficeSkillDir 'SKILL.md.tmp') (Join-Path $OfficeSkillDir 'SKILL.md')
+  Write-Ok 'Skill officecli instalada (.agents\skills\officecli\SKILL.md).'
+} catch {
+  Remove-Item (Join-Path $OfficeSkillDir 'SKILL.md.tmp') -Force -ErrorAction SilentlyContinue
+  Write-Warn2 "Download do SKILL.md (officecli.ai) falhou ($($_.Exception.Message)) - skill ausente (o CLI, se instalado, funciona)."
 }
 
 # -- 4. Modelos ----------------------------------------------------------------
