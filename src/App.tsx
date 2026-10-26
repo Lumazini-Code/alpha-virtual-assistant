@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -9,6 +9,7 @@ import { InputBar } from "./components/InputBar.js";
 import { DockerLogPanel } from "./components/DockerLogPanel.js";
 import { SettingsPanel } from "./components/SettingsPanel.js";
 import { ProjectsPanel } from "./components/ProjectsPanel.js";
+import { FilePickerModal } from "./components/FilePickerModal.js";
 import { useSystemStats } from "./hooks/useSystemStats.js";
 import { useDockerLogs } from "./hooks/useDockerLogs.js";
 import { useOrchestratorStream } from "./hooks/useOrchestratorStream.js";
@@ -17,6 +18,13 @@ import { useServiceStatus } from "./hooks/useServiceStatus.js";
 import { useActiveProject } from "./hooks/useActiveProject.js";
 import { ProcessStatusLine } from "./components/ProcessStatusLine.js";
 import { COLORS, GRAPH_VIEWER_URL } from "./lib/constants.js";
+import {
+  isImageFile,
+  isDocumentFile,
+  imageToBase64,
+  extractTextContent,
+  type AttachedFile,
+} from "./lib/fileAttach.js";
 
 export function App() {
   const { exit } = useApp();
@@ -26,11 +34,6 @@ export function App() {
   const stats = useSystemStats(2000, suspended);
   const procStatus = useProcessManagerStatus(3000, suspended);
   const graphOnline = useServiceStatus(GRAPH_VIEWER_URL, 10000, suspended);
-  // NEW (projetos): badge do escopo ativo (polling leve, 10s) — some no
-  // modo geral e quando o orchestrator está offline. `projectOverride`
-  // reflete na hora o switch feito no painel /projects (o polling está
-  // congelado enquanto o painel está aberto); ao fechar o painel, o polling
-  // retoma e volta a mandar.
   const polledProject = useActiveProject(10000, suspended || showProjects);
   const [projectOverride, setProjectOverride] = useState<string | null>(null);
   const activeProject = projectOverride ?? polledProject;
@@ -47,37 +50,99 @@ export function App() {
   } = useOrchestratorStream();
 
   const [showDocker, setShowDocker] = useState(false);
-  const [imageError, setImageError] = useState<string | null>(null);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [showFilePicker, setShowFilePicker] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState<AttachedFile | null>(null);
 
-  // Comando "/image <caminho>" — anexa uma imagem local à PRÓXIMA pergunta
-  // enviada. O caminho é lido e convertido para base64 aqui no cliente
-  // (useOrchestratorStream), na hora do envio; o orchestrator nunca lê
-  // esse arquivo do disco, só recebe os bytes já em base64. Habilita a
-  // tool vision_objects no /execute. Qualquer outro texto vira pergunta normal.
-  const handleSubmit = (value: string) => {
-    const match = value.match(/^\/image\s+(.+)$/i);
-    if (match) {
-      const rawPath = match[1].trim().replace(/^["']|["']$/g, "");
-      const fullPath = resolve(rawPath);
-      if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
-        setImageError(`Arquivo não encontrado: ${fullPath}`);
-        return;
-      }
-      setImageError(null);
+  // Handler para processar arquivo selecionado (via picker ou comando)
+  const handleAttachFile = useCallback(async (rawPath: string) => {
+    const fullPath = resolve(rawPath);
+    if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
+      setAttachError(`Arquivo não encontrado: ${fullPath}`);
+      return;
+    }
+    setAttachError(null);
+
+    if (isImageFile(fullPath)) {
+      // Fluxo imagem: converter para base64
+      const { base64, mime } = imageToBase64(fullPath);
+      setPendingAttachment({ kind: "image", base64, path: fullPath, mime });
+      // Também setar no hook para compatibilidade com useOrchestratorStream
       setPendingImagePath(fullPath);
       return;
     }
-    if (value.trim().toLowerCase() === "/settings") {
+
+    if (isDocumentFile(fullPath)) {
+      // Fluxo documento: leitura direta (com markitdown para PDF/DOCX/HTML)
+      try {
+        const content = await extractTextContent(fullPath);
+        setPendingAttachment({
+          kind: "document",
+          path: fullPath,
+          content,
+        });
+      } catch (err) {
+        setAttachError(`Falha ao ler documento: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    setAttachError(`Tipo de arquivo não suportado: ${fullPath}`);
+  }, []);
+
+  // Handler para múltiplos arquivos (drag-and-drop / paste)
+  const handleAttachFiles = useCallback(async (rawPaths: string[]) => {
+    for (const rawPath of rawPaths) {
+      await handleAttachFile(rawPath);
+      // Pequeno delay para não sobrecarregar se muitos arquivos
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }, [handleAttachFile]);
+
+  // Comando "/attach <caminho>" — anexa imagem ou documento à próxima pergunta
+  // Imagem: segue fluxo antigo (base64 no image_base64 do /execute)
+  // Documento: leitura direta do arquivo (markitdown p/ PDF/DOCX/HTML) e
+  // injeção do conteúdo completo no prompt do turno.
+  const handleSubmit = useCallback(async (value: string) => {
+    const trimmed = value.trim();
+
+    // /attach <caminho>
+    const attachMatch = trimmed.match(/^\/attach\s+(.+)$/i);
+    if (attachMatch) {
+      const rawPath = attachMatch[1].trim().replace(/^["']|["']$/g, "");
+      await handleAttachFile(rawPath);
+      return;
+    }
+
+    // /attach sem argumento -> abre file picker
+    if (trimmed.toLowerCase() === "/attach") {
+      setShowFilePicker(true);
+      return;
+    }
+
+    if (trimmed.toLowerCase() === "/settings") {
       setShowSettings(true);
       return;
     }
-    // NEW (projetos): /projects abre o painel de escopos de memória.
-    if (value.trim().toLowerCase() === "/projects") {
+
+    if (trimmed.toLowerCase() === "/projects") {
       setShowProjects(true);
       return;
     }
-    submit(value);
-  };
+
+    // Se há documento anexado, enviar o conteúdo como document_content
+    // (o modelo recebe, mas a tela mostra só o texto da pergunta)
+    let documentContent: string | undefined;
+    if (pendingAttachment?.kind === "document" && trimmed) {
+      documentContent = pendingAttachment.content;
+    }
+
+    submit(value, documentContent);
+
+    // Anexo é one-shot: limpa após envio
+    setPendingAttachment(null);
+    setPendingImagePath(null);
+  }, [handleAttachFile, pendingAttachment, submit]);
 
   // Equivalente aos BINDINGS do Textual (ctrl+k toggle code, ctrl+d docker,
   // ctrl+s settings, ctrl+p projetos, ctrl+l clear...)
@@ -119,7 +184,7 @@ export function App() {
       <Box flexDirection="column" marginY={1}>
         {messages.length === 0 ? (
           <Text color={COLORS.dim}>
-            {"  "}(/settings também lista/edita planos · /projects gerencia escopos de memória)
+            {"  "}(/settings também lista/edita planos · /projects gerencia escopos de memória · /attach para anexar arquivo)
           </Text>
         ) : (
           messages.map((m) => <ChatMessage key={m.id} message={m} />)
@@ -153,25 +218,34 @@ export function App() {
         </Box>
       )}
 
-      {imageError && (
+      {attachError && (
         <Box marginBottom={1}>
-          <Text color={COLORS.red}>⚠ {imageError}</Text>
+          <Text color={COLORS.red}>⚠ {attachError}</Text>
         </Box>
       )}
 
-      {pendingImagePath && (
+      {pendingAttachment && (
         <Box marginBottom={1}>
           <Text color={COLORS.amber}>
-            🖼 imagem anexada à próxima pergunta: {pendingImagePath}
+            {pendingAttachment.kind === "image"
+              ? `🖼 imagem anexada à próxima pergunta: ${pendingAttachment.path}`
+              : `📄 documento anexado: ${pendingAttachment.path}`}
           </Text>
         </Box>
       )}
 
+      <FilePickerModal
+        isOpen={showFilePicker}
+        onClose={() => setShowFilePicker(false)}
+        onSelect={handleAttachFile}
+      />
+
       <InputBar
         disabled={isStreaming || suspended}
         codeMode={codeMode}
-        focus={!showSettings && !showProjects && !suspended}
+        focus={!showSettings && !showProjects && !suspended && !showFilePicker}
         onSubmit={handleSubmit}
+        onAttachFiles={handleAttachFiles}
       />
     </Box>
   );

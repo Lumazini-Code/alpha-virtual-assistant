@@ -542,6 +542,12 @@ class ExecuteRequest(BaseModel):
     # orchestrator rodando em container sem o filesystem do host).
     # Limite ~10MB de payload base64 (DoS guard — Plano 1, T10).
     image_base64:  Optional[str]  = Field(None, max_length=10_000_000)
+    # Conteúdo textual de um documento anexado via /attach na TUI. O cliente
+    # (TUI) lê o arquivo do host (com markitdown para PDF/DOCX/HTML) e envia
+    # o texto já extraído aqui — o orchestrator NUNCA lê arquivo de disco.
+    # O conteúdo é injetado no user_content enviado ao modelo, mas a TUI só
+    # exibe o nome do arquivo (não o conteúdo) na mensagem do usuário.
+    document_content: Optional[str] = Field(None, max_length=2_000_000)
     search_pdfs:   bool           = False
     stream:        bool           = True
 
@@ -2775,6 +2781,19 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     time_hint = datetime.datetime.now().strftime('%H:%M:%S')
     req.input = f"[Current local time: {time_hint}]\n\n{req.input}"
     user_content: str | list[dict] = req.input
+
+    # Documento anexado via /attach na TUI: injeta o conteúdo extraído
+    # no user_content que vai ao modelo, sem poluir a mensagem exibida no
+    # terminal (a TUI renderiza apenas o nome do arquivo).
+    if req.document_content:
+        doc_nudge = (
+            f"\n\n[Documento anexado ao prompt — conteúdo abaixo]\n"
+            f"{req.document_content}"
+        )
+        if isinstance(user_content, str):
+            user_content += doc_nudge
+        elif isinstance(user_content, list) and len(user_content) > 0 and user_content[0].get("type") == "text":
+            user_content[0]["text"] += doc_nudge
     if req.image_base64:
         if VISION_OBJECTS_ENABLED:
             # Fluxo vision_objects (flag ligada): sem o nudge, o LLM não tem

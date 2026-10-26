@@ -5,8 +5,9 @@
 #   2. Baixa o asset *windows*.zip do ultimo release no GitHub
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
 #   4. Extrai Modules/Models.zip em Modules/Models
-#   5. Pede a OPENROUTER_API_KEY e grava em Modules\.env - ANTES do up,
-#      porque Modules/LLM.py le a chave no import
+#   5. Pede o provider de inferencia: LLM_BASE_URL (Enter = OpenRouter) e, se
+#      o provider NAO for local, a LLM_API_KEY - grava em Modules\.env ANTES
+#      do up, porque Modules/LLM.py le no import
 #   6. Build; inicia o Manager (ava-tray.exe, API :9001), pede a ele o start do
 #      Docker (POST /docker/start) e garante o mcp_manager (/mcp/start); registra
 #      os MCPs e espera o /status responder (falha do Manager: compose up -d direto)
@@ -329,35 +330,107 @@ function New-RandomToken {
 }
 
 function Test-ExistingKey {
+  # Aceita a key nova (LLM_API_KEY) ou a de instalacoes antigas (OPENROUTER_API_KEY)
   if (-not (Test-Path $EnvFile)) { return $false }
-  $line = Select-String -Path $EnvFile -Pattern '^OPENROUTER_API_KEY=.+' -Quiet
+  $line = Select-String -Path $EnvFile -Pattern '^(LLM_API_KEY|OPENROUTER_API_KEY)=.+' -Quiet
   return [bool]$line
 }
 
-function Write-Key {
-  param([string]$Key)
-  Set-EnvVar 'OPENROUTER_API_KEY' $Key
+# LLM_PROVIDER_LOCAL=1 aceita qualquer url como "local" (ex.: IP na LAN)
+function Test-LlmLocalFlag {
+  if ($env:LLM_PROVIDER_LOCAL -eq '1') { return $true }
+  if ((Get-EnvVar 'LLM_PROVIDER_LOCAL') -eq '1') { return $true }
+  return $false
 }
 
+# Local para uma url ja digitada (avaliada antes de gravar no .env)
+function Test-LlmUrlLocal {
+  param([string]$Base)
+  if (Test-LlmLocalFlag) { return $true }
+  if (-not $Base) { return $false }
+  if ($Base -match '^https?://(localhost|127\.0\.0\.1|127\.9\.12\.22|\[::1\])([:/]|$)') { return $true }
+  if ($Base -match '^https?://[^/]+\.local([:/]|$)') { return $true }
+  return $false
+}
+
+# Local segundo o .env (health check). Sem LLM_BASE_URL o LLM.py usa OpenRouter.
+function Test-LlmIsLocal {
+  if (Test-LlmLocalFlag) { return $true }
+  return (Test-LlmUrlLocal (Get-EnvVar 'LLM_BASE_URL'))
+}
+
+# Pede a API key do provider ($Base) e devolve em $Script:PromptKey.
+# Nada e gravado aqui - o caller escreve no .env depois de coletar tudo.
 function Prompt-Key {
+  param([string]$Base)
+  $isOr = ($Base -like '*openrouter.ai*')
+  $Script:PromptKey = ''
   while ($true) {
-    $secure = Read-Host -Prompt 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys)' -AsSecureString
+    if ($isOr) {
+      $secure = Read-Host -Prompt 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys)' -AsSecureString
+    } else {
+      $secure = Read-Host -Prompt "Cole a API key do provider ($Base) - Enter = sem key" -AsSecureString
+    }
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
     $Key = $plain.Trim()
-    if (-not $Key) { Write-Warn2 'Chave vazia - tente de novo.'; continue }
-    if ($Key -notlike 'sk-or-*') { Write-Warn2 "Chaves do OpenRouter normalmente comecam com 'sk-or-'. Prosseguindo mesmo assim." }
-    Write-Key $Key
+    if ($Key) {
+      if ($isOr -and ($Key -notlike 'sk-or-*')) { Write-Warn2 "Chaves do OpenRouter normalmente comecam com 'sk-or-'. Prosseguindo mesmo assim." }
+      $Script:PromptKey = $Key
+      return
+    }
+    # Enter vazio: OpenRouter exige key; provider generico aceita sem key
+    # (o caller oferece marcar como local / segue e o health check avisa)
+    if ($isOr) { Write-Warn2 'Chave vazia - tente de novo.'; continue }
     return
   }
 }
 
-if (Test-ExistingKey) {
-  $ans = Read-Host 'Ja existe uma OPENROUTER_API_KEY em Modules\.env. Manter a chave existente? [S/n]'
-  if ($ans -match '^[nN]') { Prompt-Key }
-} else {
-  Prompt-Key
+function Prompt-LlmConfig {
+  # (1) endereco base da API
+  $base = ''
+  while ($true) {
+    $base = Read-Host 'Endereco base da API de inferencia (LLM_BASE_URL) [Enter = OpenRouter]'
+    $base = ($base.Trim() -replace '/+$', '')
+    if (-not $base) { $base = 'https://openrouter.ai/api/v1' }
+    if ($base -match '^https?://') { break }
+    Write-Warn2 'O endereco deve comecar com http:// ou https:// - tente de novo.'
+  }
+
+  # (2) API key - so quando o provider NAO e local
+  $key = ''
+  $localFlag = $false
+  if (Test-LlmUrlLocal $base) {
+    Write-Ok "Provider local detectado ($base) - API key nao e necessaria."
+  } else {
+    while ($true) {
+      Prompt-Key $base
+      $key = $Script:PromptKey
+      if ($key) { break }
+      Write-Host 'Sem API key - em provider remoto a inferencia vai falhar no runtime.'
+      $ans = Read-Host 'Marcar como LOCAL (LLM_PROVIDER_LOCAL=1 - ex.: servidor na LAN) e seguir sem key? [S/n]'
+      if ($ans -notmatch '^[nN]') { $localFlag = $true; break }
+    }
+  }
+
+  # (3) coletado -> "ai sim" escritos no .env
+  Set-EnvVar 'LLM_BASE_URL' $base
+  if ($key) { Set-EnvVar 'LLM_API_KEY' $key }
+  if ($localFlag) { Set-EnvVar 'LLM_PROVIDER_LOCAL' '1' }
+  Write-Ok "LLM_BASE_URL=$base gravada em $EnvFile"
+  if ($key) { Write-Ok "LLM_API_KEY gravada em $EnvFile" }
+  if ($localFlag) { Write-Ok 'LLM_PROVIDER_LOCAL=1 - provider marcado como local, sem key.' }
 }
-Write-Ok "OPENROUTER_API_KEY configurada em $EnvFile"
+
+# Ja existe configuracao de provider (base e/ou key) -> manter ou reconfigurar.
+# Instalacao antiga so com OPENROUTER_API_KEY e sem LLM_BASE_URL mantem o
+# comportamento original (default = OpenRouter + aquela key).
+if ((Get-EnvVar 'LLM_BASE_URL') -or (Test-ExistingKey)) {
+  $ans = Read-Host "Ja existe configuracao de provider em Modules\.env (LLM_BASE_URL=$(Get-EnvVar 'LLM_BASE_URL')). Manter? [S/n]"
+  if ($ans -match '^[nN]') { Prompt-LlmConfig }
+  else { Write-Ok 'Configuracao de provider mantida.' }
+} else {
+  Prompt-LlmConfig
+}
 
 # -- 5a. Token de autenticacao interna (AVA_INTERNAL_TOKEN) -------------------
 # Todos os servicos internos (orchestrator, LLM, TTS, vision, memory, mcp_manager,
@@ -947,14 +1020,21 @@ if (-not $SkipBuild) {
   }
 
   try {
-    $Status = Invoke-WebRequest -Uri $StatusUrl -UseBasicParsing -TimeoutSec 5
-    if ($Status.Content -match '"openrouter_key":\s*"missing"') {
-      Write-Warn2 'O orchestrator reportou openrouter_key: missing.'
-      $ans = Read-Host 'Deseja re-informar a chave agora? [S/n]'
-      if ($ans -notmatch '^[nN]') {
-        Prompt-Key
-        Write-Info 'Reiniciando container ava para reler a chave...'
-        Invoke-Compose restart ava
+    # Detecta API key ausente no /health do LLM.py (llm_key: "missing" =
+    # provider remoto sem key; "not-required" = provider local, ok - nao reclama)
+    if (-not (Test-LlmIsLocal)) {
+      $h = Invoke-WebRequest -Uri 'http://127.9.12.22:4003/health' -UseBasicParsing -TimeoutSec 5
+      if ($h.Content -match '"llm_key":\s*"missing"') {
+        Write-Warn2 'O LLM.py reportou llm_key: missing (provider remoto sem API key).'
+        $ans = Read-Host 'Deseja re-informar a chave agora? [S/n]'
+        if ($ans -notmatch '^[nN]') {
+          $b = Get-EnvVar 'LLM_BASE_URL'
+          if (-not $b) { $b = 'https://openrouter.ai/api/v1' }
+          Prompt-Key $b
+          if ($Script:PromptKey) { Set-EnvVar 'LLM_API_KEY' $Script:PromptKey }
+          Write-Info 'Reiniciando container ava para reler a chave...'
+          Invoke-Compose restart ava
+        }
       }
     }
   } catch { }

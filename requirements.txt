@@ -42,6 +42,9 @@ miniaudio>=1.59
 # TTS Engine
 supertonic>=0.1.0
 
+# Document conversion
+markitdown>=0.1.9
+
 # Supervisord Python companion (opcional)
 supervisor>=4.2.5
 

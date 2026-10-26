@@ -56,3 +56,22 @@ export const COLORS = {
 } as const;
 
 export const TAGLINE = "Any model. Every tool. Zero limits.";
+
+// ── Extensões suportadas para /attach ────────────────────────────────────────
+
+export const IMAGE_EXTS = new Set<string>([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "avif", "svg",
+]);
+
+export const DOC_EXTS = new Set<string>([
+  "txt", "md", "markdown", "pdf", "docx", "doc", "rtf",
+  "py", "js", "ts", "tsx", "jsx", "json", "yaml", "yml",
+  "toml", "ini", "cfg", "conf", "html", "htm", "css",
+  "csv", "xml", "sql", "sh", "bash", "zsh", "fish",
+  "rs", "go", "java", "kt", "kts", "swift",
+  "cpp", "cc", "cxx", "hpp", "h", "c",
+  "rb", "php", "pl", "pm", "lua", "r",
+  "scala", "sc", "clj", "cljs", "ex", "exs",
+  "dart", "ml", "mli", "fs", "fsi", "fsx",
+  "vim", "dockerfile", "makefile", "gradle", "sbt",
+]);

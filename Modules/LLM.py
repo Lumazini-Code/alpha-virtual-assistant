@@ -1,9 +1,10 @@
 """
-AVA — LLM Inference API (OpenRouter Edition)
-=============================================
+AVA — LLM Inference API (provider genérico OpenAI-compatible)
+==============================================================
 REST API para inferência conversacional com:
-  - Backend 100% via OpenRouter (sem llama-server local)
-  - Modelo principal: z-ai/glm-5.3-flash
+  - Backend via QUALQUER API OpenAI-compatible (LLM_BASE_URL/LLM_API_KEY/
+    LLM_MODEL — default = OpenRouter, comportamento original idêntico)
+  - Modelo principal: env LLM_MODEL (default z-ai/glm-5.3-flash)
   - Modelo extrator de memórias: env MEMORY_EXTRACTOR_MODEL (com fallback p/ MAIN_MODEL)
   - Integração com API de Memória via MCP (LT + ST via session_id)
   - Integração com API de TTS (localhost:3004)
@@ -35,6 +36,7 @@ import math
 import difflib
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 import re
 import httpx
 import uvicorn
@@ -54,7 +56,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM
 log = logging.getLogger("ava.llm")
 
 
-load_dotenv()  # Carrega variáveis de ambiente do arquivo .env
+# Carrega variáveis de ambiente do Modules/.env — caminho EXPLÍCITO: o
+# find_dotenv() implícito depende do frame/cwd da invocação (falha em
+# `python -c`, stdin e qualquer rodada fora de Modules/).
+load_dotenv(Path(__file__).parent / ".env")
 
 # ─────────────────────────────────────────────────────────────
 #                          CONFIG
@@ -66,19 +71,59 @@ HOST_BIND = os.getenv("AVA_BIND_HOST", "127.9.12.22")
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{HOST_BIND}:3000")
 TTS_URL    = f"http://{HOST_BIND}:3004"
 
-# OpenRouter API
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+# ── NEW: Provider de inferência genérico (qualquer API OpenAI-compatible) ─────
+# Um único provider ativo por vez, escolhido por env (arquivo Modules/.env):
+#   LLM_BASE_URL  endpoint /v1 do provider (default = OpenRouter →
+#                 comportamento atual idêntico). Exemplos:
+#                   Ollama      http://localhost:11434/v1
+#                   vLLM        http://localhost:8000/v1
+#                   llama.cpp   http://localhost:8080/v1
+#                   LM Studio   http://localhost:1234/v1
+#                   Groq/DeepSeek/Together → a url /v1 do próprio provider
+#   LLM_API_KEY   Opcional em provider LOCAL (localhost/127.0.0.1 — roda sem
+#                 header Authorization). OPENROUTER_API_KEY continua aceito
+#                 como fallback (compat com install.sh/docker já configurados).
+#   LLM_MODEL     Modelo principal (default = modelo OpenRouter atual).
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+LLM_API_KEY  = (
+    os.getenv("LLM_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+)
+LLM_MODEL    = os.getenv("LLM_MODEL", "z-ai/glm-5.3-flash:floor")
+
+# Host do provider — decide se API key é exigida (local: nunca é) e alimenta
+# o /health (llm_key: "ok" | "not-required" | "missing"). LLM_PROVIDER_LOCAL=1
+# aceita qualquer url como local (ex.: servidor de inferência na LAN) — a
+# mesma env que o install.sh usa p/ pular o prompt de OPENROUTER_API_KEY.
+_LLM_HOST = (urlparse(LLM_BASE_URL).hostname or "").lower()
+LLM_LOCAL_PROVIDER = (
+    _LLM_HOST in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+    or _LLM_HOST.endswith(".local")
+    or os.getenv("LLM_PROVIDER_LOCAL", "").strip() == "1"
+)
+
+# Gate de capabilities: só o OpenRouter entende o bloco `provider` (roteamento
+# curl `provider.only`) e os headers de atribuição (HTTP-Referer/X-Title).
+# Campos que qualquer backend pode rejeitar (logprobs/reasoning/
+# response_format) são stripados em 400 e memorizados — ver _llm_post().
+LLM_IS_OPENROUTER = "openrouter.ai" in LLM_BASE_URL
+
+# Compat: os nomes antigos continuam válidos (mesmos valores das envs acima).
+OPENROUTER_BASE_URL = LLM_BASE_URL
+OPENROUTER_API_KEY  = LLM_API_KEY
 
 # Modelos
-MAIN_MODEL  = "z-ai/glm-5.3-flash:floor"
+MAIN_MODEL  = LLM_MODEL
 # Extrator de memórias pós-turno. Env-configurável: modelos free/pequenos
 # frequentemente NÃO suportam o `response_format: json_schema` do OpenRouter
 # e retornam 200 com `content` vazio — a cadeia de tentativas do extrator
 # (ver _extract_and_save_memories) cai para: (1) extrator sem response_format,
 # (2) modelo de fallback (default = MAIN_MODEL).
+# Em provider DIFERENTE do OpenRouter os nomes de modelo são locais/do seu
+# provedor — o default vira o próprio LLM_MODEL (sobrescreva com
+# MEMORY_EXTRACTOR_MODEL p/ um extrator dedicado).
 MEMORY_EXTRACTOR_MODEL = os.getenv(
-    "MEMORY_EXTRACTOR_MODEL", "meta-llama/llama-3.1-8b-instruct",
+    "MEMORY_EXTRACTOR_MODEL",
+    "meta-llama/llama-3.1-8b-instruct" if LLM_IS_OPENROUTER else LLM_MODEL,
 )
 # "" (default) = usa MAIN_MODEL como último recurso da cadeia.
 MEMORY_EXTRACTOR_FALLBACK_MODEL = os.getenv("MEMORY_EXTRACTOR_FALLBACK_MODEL", "")
@@ -277,7 +322,9 @@ async def _classify_memory_correction(previous_context: str, window_text: str, e
     (sem API key, timeout, resposta inválida), cai em "complementacao" —
     o fallback mais seguro (prefill vazio, geração só é enriquecida com o
     contexto extra, sem afirmar uma correção que não foi confirmada)."""
-    if not OPENROUTER_API_KEY:
+    # Sem key em provider REMOTO o request morreria em 401 — nem tenta.
+    # Provider local (LLM_LOCAL_PROVIDER) roda sem key e é chamado normal.
+    if not LLM_API_KEY and not LLM_LOCAL_PROVIDER:
         return "complementacao"
     payload = {
         "model": MEMORY_EXTRACTOR_MODEL,
@@ -301,8 +348,10 @@ async def _classify_memory_correction(previous_context: str, window_text: str, e
         },
     }
     try:
-        client = await _get_openrouter_client()
-        r = await client.post("/chat/completions", json=payload, timeout=httpx.Timeout(8.0, connect=5.0))
+        r = await _llm_post(
+            payload, timeout=httpx.Timeout(8.0, connect=5.0),
+            max_retries=0, label="LLM classificador",
+        )
         if r.status_code != 200:
             log.info(f"[MEMORY-WATCH] Classificador: {r.status_code} — {r.text[:200]}")
             return "complementacao"
@@ -321,7 +370,7 @@ async def _classify_memory_correction(previous_context: str, window_text: str, e
 # inicialização e reutilizamos em todas as requests. Essa é a maior
 # otimização de latência para TTFT.
 
-_openrouter_client: httpx.AsyncClient | None = None
+_llm_client: httpx.AsyncClient | None = None
 _tts_http: httpx.AsyncClient | None = None
 _memory_http: httpx.AsyncClient | None = None
 
@@ -330,32 +379,37 @@ _memory_http: httpx.AsyncClient | None = None
 # usado para OpenRouter/TTS. Ver _get_memory_client().
 
 
-async def _get_openrouter_client() -> httpx.AsyncClient:
-    """Persistent client para OpenRouter — connection pooling + keep-alive."""
-    global _openrouter_client
-    if _openrouter_client is None or _openrouter_client.is_closed:
-        if not OPENROUTER_API_KEY:
-            raise RuntimeError(
-                "OPENROUTER_API_KEY não configurada. Defina a variável de "
-                "ambiente OPENROUTER_API_KEY (arquivo .env ou shell)."
-            )
-        _openrouter_client = httpx.AsyncClient(
-            base_url=OPENROUTER_BASE_URL,
+async def _get_llm_client() -> httpx.AsyncClient:
+    """Persistent client do provider configurado (LLM_BASE_URL) — connection
+    pooling + keep-alive.
+
+    API key OPCIONAL: provider local (LLM_LOCAL_PROVIDER) roda sem header
+    Authorization; em provider remoto sem key o 401 volta com um hint claro
+    (ver _llm_post) em vez de estourar aqui na criação do client."""
+    global _llm_client
+    if _llm_client is None or _llm_client.is_closed:
+        headers = {"Content-Type": "application/json"}
+        if LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+        if LLM_IS_OPENROUTER:
+            # OpenRouter usa esses cabeçalhos para ranking/atribuição
+            headers["HTTP-Referer"] = "http://localhost:4003"
+            headers["X-Title"] = "AVA-LLM"
+        _llm_client = httpx.AsyncClient(
+            base_url=LLM_BASE_URL,
             timeout=httpx.Timeout(9999999.0, connect=10.0),
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=6,
                 keepalive_expiry=60.0,       # Mantém conexões quentes por 60s
             ),
-            headers={
-                "Content-Type":   "application/json",
-                "Authorization":   f"Bearer {OPENROUTER_API_KEY}",
-                # OpenRouter usa esses cabeçalhos para ranking/atribuição
-                "HTTP-Referer":    "http://localhost:4003",
-                "X-Title":         "AVA-LLM",
-            },
+            headers=headers,
         )
-    return _openrouter_client
+    return _llm_client
+
+
+# Compat: nome antigo (só o provider era "openrouter" quando este helper nasceu).
+_get_openrouter_client = _get_llm_client
 
 
 def _get_internal_auth_headers() -> dict[str, str]:
@@ -567,32 +621,222 @@ def _reasoning_payload_extra(thinking_depth: int) -> dict:
 
 async def _execute_inference(json_payload: dict, stream: bool = False, model: str = MAIN_MODEL):
     """
-    Executa a inferência contra a API OpenRouter.
+    Executa a inferência contra o provider configurado (LLM_BASE_URL).
 
     `stream=True` retorna um context manager pronto para iteração SSE.
     `stream=False` retorna a resposta síncrona completa.
     """
-    client = await _get_openrouter_client()
-    messages = json_payload.get("messages", [])
+    client = await _get_llm_client()
     payload = {**json_payload, "model": model, "stream": stream}
-
     if stream:
-        ctx = client.stream("POST", "/chat/completions", json=payload)
-        return client, model, ctx
-    else:
-        r = await client.post("/chat/completions", json=payload)
-        return client, model, r
+        return client, model, await _llm_post(payload, stream=True, label="LLM stream")
+    r = await _llm_post(payload, label="LLM stream")
+    return client, model, r
+
+
+# ─────────────────────────────────────────────────────────────
+#          TRANSPORTE ÚNICO (qualquer API OpenAI-compatible)
+# ─────────────────────────────────────────────────────────────
+# TODO POST em /chat/completions passa por _llm_post — um único ponto de
+# troca de provider (LLM_BASE_URL/LLM_API_KEY/LLM_MODEL, ver CONFIG). Ele
+# concentra:
+#   - retry de falhas transitórias (rede/5xx/429 com Retry-After);
+#   - capability gating: 400 → strip dos campos OPCIONAIS que o backend não
+#     suporta (logprobs, reasoning, response_format, provider), memorizado
+#     em _LLM_UNSUPPORTED p/ os requests seguintes (aviso único). Backends
+#     genéricos (Ollama, vLLM, llama.cpp...) costumam rejeitar justamente
+#     esses campos — sem o strip um 400 viraria erro pro usuário.
+
+LLM_MAX_RETRIES   = 2      # retries de rede/5xx/429
+LLM_RETRY_BACKOFF = 1.0
+# Compat: nomes antigos continuam valendo (usados no resto do arquivo/TUI).
+OPENROUTER_MAX_RETRIES   = LLM_MAX_RETRIES
+OPENROUTER_RETRY_BACKOFF = LLM_RETRY_BACKOFF
+
+# Campos opcionais passíveis de strip quando o backend responde 400.
+# tools/tool_choice NUNCA entram aqui — sem tool calling o request perde o
+# sentido; nesse caso o 400 original sobe para o caller.
+_LLM_STRIP_CANDIDATES = ("logprobs", "top_logprobs", "reasoning",
+                         "response_format", "provider")
+
+# Campos já rejeitados por este backend nesta sessão (400 com campo citado).
+_LLM_UNSUPPORTED: set[str] = set()
+
+
+def _llm_mark_unsupported(field: str, err_body: str = "") -> None:
+    """Memoriza `field` como não-suportado — aviso único, não reenvia mais."""
+    if field in _LLM_UNSUPPORTED:
+        return
+    _LLM_UNSUPPORTED.add(field)
+    log.warning(
+        f"LLM: backend rejeitou `{field}` — desativado p/ os próximos requests "
+        f"desta sessão (provider: {LLM_BASE_URL})."
+        + (f" Erro: {err_body[:160]}" if err_body else "")
+    )
+
+
+def _llm_payload_prepare(payload: dict) -> None:
+    """Remove do payload campos já marcados como não-suportados (400 anterior)."""
+    for field in list(_LLM_UNSUPPORTED):
+        if field in payload:
+            payload.pop(field)
+
+
+def _llm_strip_unsupported(payload: dict, err_body: str) -> bool:
+    """400 → remove do payload TODAS as capabilities opcionais presentes nele
+    e devolve True (caller reenvia imediatamente, sem contar tentativa).
+
+    Só MEMORIZA como não-suportado o(s) campo(s) citado(s) nominalmente no
+    erro (sinal claro de "esse backend não aceita X") — os demais são
+    stripados TRANSIENTEMENTE, só neste request: um 400 por outro motivo
+    (modelo inexistente, mensagem inválida) não desativa features da sessão
+    inteira. Strip-all de uma vez evita a cascata de 400s: backends hostis
+    costumam nomear UM campo por request, e stripar só o citado gastaria um
+    request por campo."""
+    body = (err_body or "").lower()
+    mentioned = [f for f in _LLM_STRIP_CANDIDATES if f in payload and f in body]
+    to_strip = [f for f in _LLM_STRIP_CANDIDATES if f in payload]
+    if not to_strip:
+        return False
+    for field in to_strip:
+        payload.pop(field)
+    for field in mentioned:
+        _llm_mark_unsupported(field, err_body)
+    log.warning(
+        f"LLM: HTTP 400 — strip {to_strip} e reenvio (provider: {LLM_BASE_URL}); "
+        f"memorizados: {mentioned or '[] (transiente)'}; "
+        f"erro: {(err_body or '?')[:200]}"
+    )
+    return True
+
+
+class _LLMStreamCtx:
+    """Context manager de streaming JÁ ABERTO. Mantém o contrato dos callers
+    (`async with ctx as r:`) depois do _llm_post ter entrado no stream para
+    checar o status — o strip de capability em 400 acontece ANTES do primeiro
+    byte de SSE, e o caller enxerga o resultado (200 ou o 400 original)."""
+
+    def __init__(self, ctx, r):
+        self._ctx, self._r = ctx, r
+
+    async def __aenter__(self):
+        return self._r
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            await self._ctx.__aexit__(exc_type, exc, tb)
+        except Exception:
+            pass
+        return False
+
+
+async def _llm_post(
+    payload: dict,
+    *,
+    stream: bool = False,
+    timeout: Optional[httpx.Timeout] = None,
+    max_retries: int = LLM_MAX_RETRIES,
+    retry_backoff: float = LLM_RETRY_BACKOFF,
+    label: str = "LLM",
+):
+    """POST genérico em {LLM_BASE_URL}/chat/completions.
+
+    - Síncrono: devolve o httpx.Response FINAL (inclusive 4xx — o caller
+      decide, ex.: _is_request_too_large_error em /chat/tools).
+    - Stream: devolve context manager p/ `async with ... as r:` (status
+      visível; 400 stripável é reenviado aqui dentro antes do SSE).
+    - 401/403 sem API key configurada ganham hint claro.
+    """
+    client = await _get_llm_client()
+    payload = dict(payload)          # strip nunca muta o dict do caller
+    _llm_payload_prepare(payload)
+
+    def _post():
+        kw = {"timeout": timeout} if timeout is not None else {}
+        return client.post("/chat/completions", json=payload, **kw)
+
+    # ── STREAMING ──
+    if stream:
+        strip_passes = 0
+        while True:
+            ctx = client.stream("POST", "/chat/completions", json=payload)
+            r = await ctx.__aenter__()
+            if r.status_code == 400 and strip_passes < 2:
+                try:
+                    err_body = (await r.aread()).decode("utf-8", errors="replace")
+                except Exception:
+                    err_body = ""
+                if _llm_strip_unsupported(payload, err_body):
+                    strip_passes += 1
+                    await ctx.__aexit__(None, None, None)
+                    continue
+            return _LLMStreamCtx(ctx, r)
+
+    # ── SÍNCRONO ──
+    strip_passes = 0
+    attempt = 0
+    while True:
+        try:
+            r = await _post()
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            log.warning(
+                f"{label}: erro de rede ({type(e).__name__}), "
+                f"tentativa {attempt + 1}/{max_retries + 1} ({LLM_BASE_URL})."
+            )
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"LLM provider inacessível ({LLM_BASE_URL}): {e}"
+                ) from e
+            attempt += 1
+            await asyncio.sleep(retry_backoff)
+            continue
+
+        # 400 → strip de capability + reenvio imediato (não conta tentativa)
+        if r.status_code == 400 and strip_passes < 2:
+            try:
+                err_body = r.text
+            except Exception:
+                err_body = ""
+            if _llm_strip_unsupported(payload, err_body):
+                strip_passes += 1
+                continue
+
+        # 429: rate limit — respeita Retry-After se presente
+        if r.status_code == 429 and attempt < max_retries:
+            try:
+                wait_s = float(r.headers.get("Retry-After") or "") or retry_backoff
+            except ValueError:
+                wait_s = retry_backoff
+            log.warning(
+                f"{label}: 429 (rate limit). Aguardando {wait_s}s "
+                f"antes de tentar {attempt + 2}/{max_retries + 1}."
+            )
+            attempt += 1
+            await asyncio.sleep(wait_s)
+            continue
+
+        if r.status_code >= 500 and attempt < max_retries:
+            log.warning(f"{label}: {r.status_code} (tentativa {attempt + 1}/{max_retries + 1}).")
+            attempt += 1
+            await asyncio.sleep(retry_backoff)
+            continue
+
+        if r.status_code in (401, 403) and not LLM_API_KEY:
+            raise RuntimeError(
+                f"{label}: HTTP {r.status_code} — nenhuma API key configurada "
+                f"para {LLM_BASE_URL}. Defina LLM_API_KEY (ou "
+                f"OPENROUTER_API_KEY) no Modules/.env; provider local em "
+                f"localhost não exige key."
+            )
+
+        return r
 
 
 # ─────────────────────────────────────────────────────────────
 #          INFERÊNCIA SÍNCRONA COM RETRY (falhas transitórias)
 # ─────────────────────────────────────────────────────────────
-# Único backend: OpenRouter. Pequeno retry para 5xx ou erro de rede
-# transitório. Erros 429 (rate limit) respeitam Retry-After quando presente.
-
-OPENROUTER_MAX_RETRIES   = 2
-OPENROUTER_RETRY_BACKOFF = 1.0
-
+# Casca fina sobre _llm_post: retry de 5xx / 429 / rede transitória e
+# capability gating já moram no transporte único.
 
 async def _openrouter_post_with_retry(
     json_payload: dict,
@@ -600,59 +844,21 @@ async def _openrouter_post_with_retry(
     model: str = MAIN_MODEL,
 ):
     """
-    Executa POST no /chat/completions do OpenRouter, com um pequeno retry
-    em caso de 5xx / 429 / erro de rede transitório.
+    Executa POST no /chat/completions do provider configurado, com retry
+    em caso de 5xx / 429 / erro de rede transitório (via _llm_post).
 
     Retorna tupla: (client, model_name, response_obj | stream_ctx).
     """
-    client = await _get_openrouter_client()
-    messages = json_payload.get("messages", [])
+    client = await _get_llm_client()
     payload = {**json_payload, "model": model, "stream": stream}
 
     if stream:
         # No streaming, devolvemos o context manager — 5xx/erro de rede
         # dentro do stream é tratado por quem consome (ver /chat/stream).
-        ctx = client.stream("POST", "/chat/completions", json=payload)
-        return client, model, ctx
+        return client, model, await _llm_post(payload, stream=True, label="LLM /chat")
 
-    last_error: Optional[Exception] = None
-    for attempt in range(OPENROUTER_MAX_RETRIES + 1):
-        try:
-            r = await client.post("/chat/completions", json=payload)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            last_error = e
-            log.warning(
-                f"OpenRouter: erro de rede ({type(e).__name__}), "
-                f"tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1}."
-            )
-            if attempt < OPENROUTER_MAX_RETRIES:
-                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
-                continue
-            raise RuntimeError(f"OpenRouter inacessível: {e}") from e
-
-        # 429: rate limit — respeita Retry-After se presente
-        if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
-            retry_after = r.headers.get("Retry-After")
-            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
-            log.warning(
-                f"OpenRouter: 429 (rate limit). Aguardando {wait_s}s "
-                f"antes de tentar {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1}."
-            )
-            await asyncio.sleep(wait_s)
-            continue
-
-        if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
-            log.warning(
-                f"OpenRouter: {r.status_code} (tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
-            )
-            await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
-            continue
-
-        return client, model, r
-
-    raise RuntimeError(
-        f"OpenRouter: falhou após {OPENROUTER_MAX_RETRIES + 1} tentativa(s): {last_error}"
-    )
+    r = await _llm_post(payload, label="LLM /chat")
+    return client, model, r
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1375,8 +1581,10 @@ async def _extract_and_save_memories(
     """
     if not user_input or not assistant_response:
         return []
-    if not OPENROUTER_API_KEY:
-        log.info("[MEMORY-EXTRACT] OPENROUTER_API_KEY ausente — extração pulada.")
+    # Sem key em provider REMOTO o request morreria em 401 — nem tenta.
+    # Provider local (LLM_LOCAL_PROVIDER) roda sem key e extrai normal.
+    if not LLM_API_KEY and not LLM_LOCAL_PROVIDER:
+        log.info("[MEMORY-EXTRACT] LLM_API_KEY ausente — extração pulada.")
         return []
 
     # ── Contexto anterior + candidatos ──────────────────────────────────────
@@ -1446,9 +1654,11 @@ async def _extract_and_save_memories(
     fallback_model = MEMORY_EXTRACTOR_FALLBACK_MODEL or MAIN_MODEL
     # Bloco de roteamento de provider (curl `provider.only`) — só acompanha as
     # tentativas com o MODELO EXTRATOR: o fallback pode rodar em outro modelo
-    # que não esteja no provider configurado.
+    # que não esteja no provider configurado. Só o OpenRouter entende este
+    # campo — em qualquer outro backend ele viraria 400 (gate aqui + strip
+    # defensivo em _llm_post).
     provider_block: Optional[dict] = None
-    if MEMORY_EXTRACTOR_PROVIDERS.strip():
+    if LLM_IS_OPENROUTER and MEMORY_EXTRACTOR_PROVIDERS.strip():
         provider_block = {
             "only": [p.strip() for p in MEMORY_EXTRACTOR_PROVIDERS.split(",") if p.strip()],
             "allow_fallbacks": True,
@@ -1459,7 +1669,6 @@ async def _extract_and_save_memories(
         (fallback_model, json_schema_fmt, "", False),
     ]
 
-    client = await _get_openrouter_client()
     content = ""
     last_err = ""
     for attempt_i, (model, fmt, suffix, use_provider) in enumerate(attempts, start=1):
@@ -1476,7 +1685,10 @@ async def _extract_and_save_memories(
         if use_provider and provider_block:
             payload["provider"] = provider_block
         try:
-            r = await client.post("/chat/completions", json=payload)
+            # max_retries=0: a cadeia de tentativas (json_schema → plain JSON →
+            # modelo fallback) é o retry desta função — o _llm_post só faz o
+            # strip de capability em 400 (ex.: backend sem json_schema).
+            r = await _llm_post(payload, max_retries=0, label="[MEMORY-EXTRACT]")
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             log.warning(
@@ -2090,17 +2302,21 @@ class ToolUseResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    """Verifica a OPENROUTER_API_KEY e faz uma chamada de teste (memory_status)
+    """Verifica a API key do provider e faz uma chamada de teste (memory_status)
     pra API REST de memória (memory_api.py), só pra logar conectividade —
     o client em si é lazy (ver _get_memory_client) e reconecta sozinho a
     qualquer momento, então uma falha aqui não impede a API de subir."""
-    if not OPENROUTER_API_KEY:
+    if not LLM_API_KEY and not LLM_LOCAL_PROVIDER:
         log.warning(
-            "[STARTUP] OPENROUTER_API_KEY não configurada — inferência vai falhar "
-            "até a variável ser definida."
+            f"[STARTUP] LLM_API_KEY não configurada para {LLM_BASE_URL} — "
+            "inferência vai falhar até a variável ser definida (provider "
+            "local não exige key; LLM_PROVIDER_LOCAL=1 marca url LAN como local)."
         )
     else:
-        log.info(f"[STARTUP] OpenRouter configurado. Modelo principal: {MAIN_MODEL}")
+        log.info(
+            f"[STARTUP] Provider {LLM_BASE_URL} configurado. "
+            f"Modelo principal: {MAIN_MODEL}"
+        )
 
     try:
         await _call_memory_tool("memory_status", {})
@@ -2133,10 +2349,16 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    """Verifica se a API está no ar e se a chave OpenRouter está configurada."""
+    """Verifica se a API está no ar e se o provider de inferência (LLM_*)
+    está configurado. `llm_key`: "ok" (key presente), "not-required"
+    (provider local — localhost/127.0.0.1 sem key é válido) ou "missing"
+    (provider remoto sem key). `openrouter_key` é o alias de compat."""
+    llm_key = "ok" if LLM_API_KEY else ("not-required" if LLM_LOCAL_PROVIDER else "missing")
     return {
         "api":               "ok",
-        "openrouter_key":    "ok" if OPENROUTER_API_KEY else "missing",
+        "base_url":          LLM_BASE_URL,
+        "llm_key":           llm_key,
+        "openrouter_key":    llm_key,   # compat: checks antigos do install.sh
         "main_model":        MAIN_MODEL,
         "memory_extractor":  MEMORY_EXTRACTOR_MODEL,
     }
@@ -2207,7 +2429,7 @@ async def chat(req: ChatRequest):
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"openrouter error {e.response.status_code}: {e.response.text[:300]}",
+            detail=f"provider error {e.response.status_code}: {e.response.text[:300]}",
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"inference error: {e}")
@@ -2341,6 +2563,12 @@ async def chat_stream(req: ChatRequest):
     # streaming impede a interrupção com tool_calls em montagem; a leitura de
     # correção usa req.session_id (o orchestrator manda o sid do /execute).
     watch_confidence = req.watch_confidence
+    # ── NEW: backend sem logprobs (400 memorizado em _LLM_UNSUPPORTED) →
+    # vigia desligado já na hora, sem gastar um request p/ descobrir. O probe
+    # do vigia continua p/ o caso do backend ACEITAR logprobs e só ignorá-los.
+    if watch_confidence and "logprobs" in _LLM_UNSUPPORTED:
+        log.warning("LLM: watch_confidence ignorado — o backend rejeitou logprobs nesta sessão.")
+        watch_confidence = False
 
     # TTS só existe no modo chat (modo tools é stateless — caller cuida do áudio)
     
@@ -2454,7 +2682,9 @@ async def chat_stream(req: ChatRequest):
         while True:
             interrupted_for_correction = False
 
-            # Retry simples para falhas transitórias (5xx/rede/429) do OpenRouter
+            # Retry simples p/ falhas transitórias (5xx/rede/429) do provider
+            # (strip de capability em 400 acontece dentro de _llm_post, antes
+            # do SSE — aqui só sobra 4xx definitivo p/ reportar).
             for attempt in range(OPENROUTER_MAX_RETRIES + 1):
                 client_used, model_used, r_ctx = await _execute_inference(
                     json_payload={**payload, "messages": current_messages},
@@ -2465,17 +2695,19 @@ async def chat_stream(req: ChatRequest):
                 try:
                     async with r_ctx as r:
                         if r.status_code == 429 and attempt < OPENROUTER_MAX_RETRIES:
-                            retry_after = r.headers.get("Retry-After")
-                            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
+                            try:
+                                wait_s = float(r.headers.get("Retry-After") or "") or OPENROUTER_RETRY_BACKOFF
+                            except ValueError:
+                                wait_s = OPENROUTER_RETRY_BACKOFF
                             log.warning(
-                                f"OpenRouter stream: 429. Aguardando {wait_s}s "
+                                f"LLM stream: 429. Aguardando {wait_s}s "
                                 f"(tentativa {attempt + 2}/{OPENROUTER_MAX_RETRIES + 1})."
                             )
                             await asyncio.sleep(wait_s)
                             continue
                         if r.status_code >= 500 and attempt < OPENROUTER_MAX_RETRIES:
                             log.warning(
-                                f"OpenRouter stream: {r.status_code} "
+                                f"LLM stream: {r.status_code} "
                                 f"(tentativa {attempt + 1}/{OPENROUTER_MAX_RETRIES + 1})."
                             )
                             await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
@@ -2490,9 +2722,9 @@ async def chat_stream(req: ChatRequest):
                             except Exception:
                                 err_body = ""
                             log.warning(
-                                f"OpenRouter stream: {r.status_code} — {err_body[:200]}"
+                                f"LLM stream: {r.status_code} — {err_body[:200]}"
                             )
-                            yield f"data: {json.dumps({'error': f'openrouter {r.status_code}: {err_body[:400]}', 'too_large': _is_request_too_large_error(err_body)})}\n\n"
+                            yield f"data: {json.dumps({'error': f'provider {r.status_code}: {err_body[:400]}', 'too_large': _is_request_too_large_error(err_body)})}\n\n"
                             return
 
                         # Conexão aceita. Processa as linhas SSE:
@@ -2875,35 +3107,36 @@ async def _openrouter_tool_call(
     reasoning_effort: Optional[str] = None,
 ) -> tuple[dict, str, bool]:
     """
-    Executa tool call no OpenRouter, com retry em falhas transitórias.
+    Executa tool call no provider configurado (LLM_BASE_URL).
 
-    Estratégia:
-      - Erro de rede (ConnectError/ReadTimeout/RemoteProtocolError): retry com backoff.
-      - 429 (rate limit): retry respeitando Retry-After.
-      - 5xx: retry com backoff.
-      - Erro de contexto grande demais: NÃO retenta — levanta RequestTooLargeError.
+    Estratégia (retry e capability gating moram no transporte único
+    _llm_post — um único ponto de troca de provider):
+      - Erro de rede / 429 (Retry-After) / 5xx: retry com backoff.
+      - 400 com capability stripável (logprobs/reasoning/response_format):
+        strip + reenvio, invisível pro caller.
+      - Erro de contexto grande demais: NÃO retenta — RequestTooLargeError.
       - Outros 4xx: não retry.
 
     MODO GRAMMAR (compatibilidade com chamadores antigos do llama-server):
       Quando `grammar` (string GBNF) é fornecida, o payload NÃO inclui
       `tools`/`tool_choice` e ativamos `response_format: {type: "json_object"}`
-      no OpenRouter — isso força o output em JSON válido (sem validação de
+      no provider — isso força o output em JSON válido (sem validação de
       schema estrito). A resposta vem em `message.content` (não em
       `message.tool_calls`) e o caller é responsável por parsear.
       Nota: o OpenRouter não aceita GBNF nativamente; a gramática é
-      interpretada como "forçar JSON".
+      interpretada como "forçar JSON" (backends sem response_format caem
+      no strip de 400 e seguem sem a força-de-JSON).
 
-    Retorna (message_dict, model_used, fallback_used=False sempre — não há
-    mais fallback entre provedores, só OpenRouter).
+    Retorna (message_dict, model_used, fallback_used=False sempre — um
+    único provider configurado, sem fallback entre provedores).
     """
-    client = await _get_openrouter_client()
     payload: dict = {
         "model":       MAIN_MODEL,
         "messages":    messages,
         "temperature": temperature,
     }
     if reasoning_effort:
-        # reasoning.effort é o formato OpenRouter para controlar raciocínio
+        # reasoning.effort é o formato OpenAI/OpenRouter p/ controlar raciocínio
         payload["reasoning"] = {"effort": reasoning_effort}
 
     # ── Modo grammar vs. tool-calling nativo ─────────────────────────────
@@ -2915,59 +3148,26 @@ async def _openrouter_tool_call(
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
 
-    last_error: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            r = await client.post("/chat/completions", json=payload)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            last_error = e
-            log.warning(
-                f"OpenRouter /chat/tools: erro de rede ({type(e).__name__}), "
-                f"tentativa {attempt + 1}/{max_retries + 1}."
-            )
-            if attempt < max_retries:
-                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
-                continue
-            raise RuntimeError(f"OpenRouter inacessível: {e}") from e
+    r = await _llm_post(payload, max_retries=max_retries, label="LLM /chat/tools")
 
-        if r.status_code == 200:
-            data = r.json()
-            return data["choices"][0]["message"], MAIN_MODEL, False
+    if r.status_code == 200:
+        data = r.json()
+        return data["choices"][0]["message"], MAIN_MODEL, False
 
-        # Erro de contexto grande demais: não faz sentido retentar
-        try:
-            body = r.json()
-            err_msg = body.get("error", {}).get("message", "") or r.text
-        except Exception:
-            err_msg = r.text
+    # Erro de contexto grande demais: não faz sentido retentar
+    try:
+        body = r.json()
+        err_msg = body.get("error", {}).get("message", "") or r.text
+    except Exception:
+        err_msg = r.text
 
-        if _is_request_too_large_error(err_msg):
-            log.warning(f"OpenRouter /chat/tools: contexto excede o limite. Erro: {err_msg[:200]}")
-            raise RequestTooLargeError(f"Contexto excede o limite do modelo: {err_msg[:300]}")
+    if _is_request_too_large_error(err_msg):
+        log.warning(f"LLM /chat/tools: contexto excede o limite. Erro: {err_msg[:200]}")
+        raise RequestTooLargeError(f"Contexto excede o limite do modelo: {err_msg[:300]}")
 
-        # 429: rate limit — respeita Retry-After
-        if r.status_code == 429 and attempt < max_retries:
-            retry_after = r.headers.get("Retry-After")
-            wait_s = float(retry_after) if retry_after else OPENROUTER_RETRY_BACKOFF
-            log.warning(
-                f"OpenRouter /chat/tools: 429. Aguardando {wait_s}s "
-                f"(tentativa {attempt + 2}/{max_retries + 1})."
-            )
-            await asyncio.sleep(wait_s)
-            continue
-
-        # 5xx: retry com backoff
-        if r.status_code >= 500:
-            log.warning(f"OpenRouter /chat/tools: {r.status_code} (tentativa {attempt + 1}/{max_retries + 1}).")
-            if attempt < max_retries:
-                await asyncio.sleep(OPENROUTER_RETRY_BACKOFF)
-                continue
-            raise RuntimeError(f"OpenRouter /chat/tools: {r.status_code} persistente. Erro: {err_msg[:300]}")
-
-        # Outros 4xx: não retry
-        raise RuntimeError(f"OpenRouter /chat/tools: {r.status_code} - {err_msg[:300]}")
-
-    raise RuntimeError(f"OpenRouter /chat/tools: falhou após {max_retries + 1} tentativa(s): {last_error}")
+    # Rede/429/5xx já esgotaram o retry dentro de _llm_post — aqui só sobra
+    # 4xx definitivo (ou 5xx persistente).
+    raise RuntimeError(f"LLM /chat/tools: {r.status_code} - {err_msg[:300]}")
 
 
 @app.post("/chat/tools", response_model=ToolUseResponse)

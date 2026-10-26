@@ -48,7 +48,7 @@ export function useOrchestratorStream() {
   );
 
   const submit = useCallback(
-    async (input: string) => {
+    async (input: string, documentContent?: string) => {
       if (isStreaming || !input.trim()) return;
 
       const userMsg: ChatMessageState = {
@@ -159,6 +159,7 @@ export function useOrchestratorStream() {
             // miniaudio) é opt-in via env AVA_TTS_OUTPUT=device.
             tts_output: process.env.AVA_TTS_OUTPUT === "device" ? "device" : "client",
             image_base64: imageBase64,
+            document_content: documentContent ?? null,
             search_pdfs: false,
             stream: true,
           };
@@ -187,7 +188,11 @@ export function useOrchestratorStream() {
       logger.info("submit: enviando pergunta ao orchestrator", {
         endpoint,
         url: `${ORCHESTRATOR_URL}${endpoint}`,
-        body: { ...body, image_base64: imageBase64 ? `<${imageBase64.length} chars omitidos>` : null },
+        body: {
+          ...body,
+          image_base64: imageBase64 ? `<${imageBase64.length} chars omitidos>` : null,
+          document_content: documentContent ? `<${documentContent.length} chars omitidos>` : null,
+        },
       });
 
       try {

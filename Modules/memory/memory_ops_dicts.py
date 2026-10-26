@@ -1014,10 +1014,20 @@ async def identity_seed() -> None:
         row = state.pd_db.get_identity()
         if row is None:
             persona = _load_persona_identity()
-            # memória PRIMEIRO (insert já grava o memory_id — mesmo fluxo do
-            # people_card create; se falhar, o card nasce sem nó e o auto-heal
-            # do próximo boot tenta de novo)
-            memory_id = await _identity_memory("Alpha", persona, None)
+            # Memória PRIMEIRO (insert já grava o memory_id — mesmo fluxo do
+            # people_card create). O embedding pode ESTOURAR exceção (ONNX
+            # serving ainda subindo no boot) — sem este try o insert nunca
+            # rodaria e a tabela nasceria VAZIA. Agora: falha → card nasce
+            # sem vínculo e o retry em background (memory_state.
+            # _identity_seed_retry) cria o vínculo quando o ONNX responder.
+            memory_id = None
+            try:
+                memory_id = await _identity_memory("Alpha", persona, None)
+            except Exception as e:
+                log.warning(
+                    f"Identity: memória de identidade falhou no seed "
+                    f"({type(e).__name__}: {e}) — card nasce sem vínculo"
+                )
             state.pd_db.insert_identity(
                 name="Alpha", description=persona, memory_id=memory_id,
             )

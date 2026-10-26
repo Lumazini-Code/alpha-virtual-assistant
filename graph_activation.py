@@ -763,6 +763,14 @@ class GraphState:
                 elif node["kind"] == "person":
                     sig = (node["name"], node["text"], node["memory_id"],
                            node["voice_count"], node["face_count"], node["access_count"])
+                elif node["kind"] == "identity":
+                    # Card de identidade da Alpha (tabela `identity`): sem
+                    # confidence/forgettable (NÃO cai no else das memórias —
+                    # KeyError derrubava o refresh e o poller mantinha o
+                    # snapshot sem o nó "a1"). memory_id/roles/updated_at
+                    # cobrem o vínculo auto-curativo e a edição do card.
+                    sig = (node["name"], node["text"], node.get("memory_id"),
+                           node.get("roles"), node.get("updated_at"))
                 else:
                     sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
                 old_sig = self.nodes_sig.get(nid)

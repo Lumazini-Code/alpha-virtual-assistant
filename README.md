@@ -215,7 +215,7 @@ curl -fsSL -o /tmp/alpha-install.sh \
 curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\install.bat"
 ```
 
-O instalador gera os tokens internos (`AVA_INTERNAL_TOKEN`, `OPENROUTER_API_KEY`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles.
+O instalador pede o provider de inferência (`LLM_BASE_URL` — Enter = OpenRouter; `LLM_API_KEY` só se o provider não for local) e gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles.
 
 ## Uso
 
@@ -237,7 +237,10 @@ curl -s localhost:9001/browser/status   # Chrome do host
 
 | Variável | Onde | Default | O que faz |
 |---|---|---|---|
-| `OPENROUTER_API_KEY` | `Modules/.env` | — | Chave do OpenRouter (gerada pelo install.sh) |
+| `OPENROUTER_API_KEY` | `Modules/.env` | — | Chave do OpenRouter (gerada pelo install.sh; fallback de `LLM_API_KEY`) |
+| `LLM_BASE_URL` | `Modules/.env` | OpenRouter | Provider de inferência — qualquer API OpenAI-compatible (tabela abaixo) |
+| `LLM_API_KEY` | `Modules/.env` | `OPENROUTER_API_KEY` | API key do provider (opcional em provider local: localhost/127.0.0.1) |
+| `LLM_MODEL` | `Modules/.env` | `z-ai/glm-5.3-flash:floor` | Modelo principal do provider ativo |
 | `AVA_INTERNAL_TOKEN` | `Modules/.env` | — | Bearer token interno (memory/orchestrator/mcp_manager/TUI) |
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
 | `AVA_DOCKER_IDLE_MINUTES` | tray | 45 | Minutos de inatividade antes do `docker down` |
@@ -252,6 +255,38 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_API_BASE` / `AVA_ORCHESTRATOR_URL` | TUI / Manager | :9001 / :9000 | Endpoints dos componentes |
 | `AVA_TTS_OUTPUT` | TUI | `client` | Onde a fala toca: `client` (a TUI toca no host via pacat/aplay/ffplay) ou `device` (container, via PulseAudio) |
 | `ONNX_PROVIDERS` | compose | `CPUExecutionProvider` | Provedores do ONNX Runtime |
+
+### Providers de inferência (OpenAI-compatible)
+
+Todos os endpoints que requisitam LLM diretamente (`/chat`, `/chat/stream`,
+`/chat/tools`, `/memories/extract` + extrator pós-turno e classificador do
+confidence-watch) falam com **um provider ativo por vez**, escolhido por env
+em `Modules/.env` — trocar de provider = mudar a env e reiniciar (sem rebuild,
+sem código). Qualquer API que implemente `POST /v1/chat/completions` serve:
+
+| Provider | `LLM_BASE_URL` | `LLM_API_KEY` | Exemplo de `LLM_MODEL` |
+|---|---|---|---|
+| OpenRouter (default) | `https://openrouter.ai/api/v1` | obrigatória (`OPENROUTER_API_KEY` funciona como fallback) | `z-ai/glm-5.3-flash:floor` |
+| Ollama | `http://localhost:11434/v1` | não precisa | `llama3.1:8b-instruct` |
+| vLLM | `http://localhost:8000/v1` | opcional | nome do modelo servido |
+| llama.cpp server | `http://localhost:8080/v1` | não precisa | nome do modelo servido |
+| LM Studio | `http://localhost:1234/v1` | não precisa | nome do modelo servido |
+| Groq | `https://api.groq.com/openai/v1` | obrigatória | `llama-3.3-70b-versatile` |
+| DeepSeek | `https://api.deepseek.com/v1` | obrigatória | `deepseek-chat` |
+| Together | `https://api.together.xyz/v1` | obrigatória | `meta-llama/Llama-3-70b-chat-hf` |
+
+- **Capability gating**: campos que o backend não aceita (`logprobs`,
+  `reasoning`, `response_format`, bloco `provider`) recebem 400 → strip
+  automático + reenvio, e ficam omitidos nos requests seguintes (aviso único
+  no log). O confidence-watch se desliga sozinho em backend sem logprobs.
+- **Modelos extras**: `MEMORY_EXTRACTOR_MODEL`/`MEMORY_EXTRACTOR_FALLBACK_MODEL`
+  já são env; em provider ≠ OpenRouter o default do extrator vira o próprio
+  `LLM_MODEL`.
+- **Key opcional**: provider local não exige key (o `install.sh`/`install.ps1`
+  pedem o `LLM_BASE_URL` primeiro e só cobram a key se o provider não for
+  local; `/health` reporta `llm_key: "not-required"`). `LLM_PROVIDER_LOCAL=1`
+  marca como local qualquer outra url (ex.: servidor de inferência na LAN —
+  o próprio instalador oferece a opção quando a key é deixada em branco).
 
 ## Roadmap
 

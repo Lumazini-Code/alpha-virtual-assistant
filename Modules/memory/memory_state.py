@@ -154,6 +154,9 @@ class AppState:
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
+    # Auto-heal do seed de identidade (pode falhar no boot se o ONNX serving
+    # subir depois da memory — re-tenta em background até o vínculo nascer).
+    identity_seed_task: asyncio.Task = field(default=None)
     # ── ESCOPOS (projetos × geral) ──────────────────────────────────────────
     # `scopes` mantém TODO escopo já aberto em cache (switch = troca de
     # ponteiro, O(1) — sem reabrir DBs). "general" nasce aberto no startup.
@@ -416,13 +419,17 @@ async def startup():
     # Só popula se a tabela estiver vazia (ou existir sem vínculo de memória).
     # Import local de propósito: memory_ops_dicts importa memory_state — um
     # import de topo aqui criaria ciclo. Falha (ex.: ONNX ainda fora do ar)
-    # vira warning — o boot da memory nunca quebra por causa disso; o seed
-    # tenta de novo no boot seguinte.
+    # vira warning — o boot da memory nunca quebra por causa disso.
     try:
         from memory_ops_dicts import identity_seed
         await identity_seed()
     except Exception as e:
         log.warning(f"Identity: seed do card de identidade pulado: {e}")
+    # Auto-heal em BACKGROUND: no boot a memory API pode subir ANTES do ONNX
+    # serving (embeddings) — o seed direto falha com ConnectError e, sem este
+    # retry, o card (e o nó "a1" no graph activation) só nasceria no próximo
+    # restart. A task retorna de imediato se o seed deu certo.
+    state.identity_seed_task = asyncio.create_task(_identity_seed_retry())
 
     state.decay_task   = asyncio.create_task(decay_job())
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
@@ -440,6 +447,44 @@ async def startup():
     )
 
 
+async def _identity_seed_retry(max_attempts: int = 40, delay: float = 15.0) -> None:
+    """Auto-heal do seed de identidade em background.
+
+    No boot a memory API pode subir ANTES do ONNX serving (embeddings) — o
+    seed direto falha com ConnectError e, sem este retry, o card de
+    identidade (e o nó "a1" no graph activation) só nasceria no próximo
+    restart. Idempotente: pronto quando o card existe COM memory_id; se o
+    seed direto do boot deu certo, a 1ª checagem já encerra a task."""
+    from memory_ops_dicts import identity_seed   # import local (ciclo)
+
+    def _ok() -> bool:
+        try:
+            row = state.pd_db.get_identity()
+            return row is not None and row["memory_id"] is not None
+        except Exception:
+            return False
+
+    if _ok():
+        return
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await identity_seed()
+        except Exception as e:
+            log.info(
+                f"Identity: retry {attempt}/{max_attempts} do seed — "
+                f"{type(e).__name__}: {e}"
+            )
+        if _ok():
+            log.info(f"Identity: seed em background concluído (tentativa {attempt})")
+            return
+        await asyncio.sleep(delay)
+    log.warning(
+        f"Identity: retry do seed esgotado ({max_attempts} tentativas de "
+        f"{delay}s) — o card só ganha vínculo de memória quando o ONNX "
+        f"serving responder (ou no próximo boot)."
+    )
+
+
 async def shutdown():
     """Encerra o estado global da memória de forma limpa. Chamado pelo MCP
     server no shutdown do processo — substitui a parte pós-`yield` do antigo
@@ -452,6 +497,8 @@ async def shutdown():
         state.cleanup_task.cancel()
     if state.flush_task is not None:
         state.flush_task.cancel()
+    if state.identity_seed_task is not None:
+        state.identity_seed_task.cancel()
 
     # Flush final e síncrono de todos os índices (globais + todos os escopos
     # abertos) — garante que nada gravado desde o último ciclo do
