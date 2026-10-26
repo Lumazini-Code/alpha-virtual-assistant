@@ -5,6 +5,8 @@
 #   1. Valida/instala prereqs (Node 24, Docker Engine + compose v2, curl, unzip, x86_64)
 #   2. Baixa o asset `*linux*.zip` do último release no GitHub
 #   3. Extrai em ~/.local/opt/alpha-ai (override: ALPHA_INSTALL_DIR ou --install-dir)
+#   3b. Agent Skills: npx skills add heygen-com/hyperframes → .agents/skills
+#       (gitignored; flags -a universal -y; falha = aviso, não morte)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
 #   5. Pede o provider de inferência: LLM_BASE_URL (Enter = OpenRouter) e, se
 #      o provider NÃO for local, a LLM_API_KEY — grava em Modules/.env
@@ -270,6 +272,27 @@ cd "$INSTALL_DIR"
 
 chmod +x tui/alpha-ai Manager/ava-tray docker-start.sh 2>/dev/null || true
 ok "Arquivos extraídos."
+
+# ── 3b. Agent Skills (SKILL.md — hyperframes) ─────────────────────────────────
+# `.agents/` e `skills-lock.json` são gitignored: um install novo NÃO traz as
+# skills. O CLI `skills` roda via npx (sem install global — o --yes do NPX
+# baixa o pacote no cache). Flags testadas contra o CLI:
+#   -a universal → grava SÓ em .agents/skills (store canônico; sem linkar em
+#                  .claude/.cursor/etc do usuário)
+#   -y           → pula os prompts (escopo = projeto; -y = non-interactive)
+# Idempotente (re-run re-sincroniza pelo lock). Falha (rede, p.ex.) é AVISO,
+# não morte — o sistema sobe sem skills.
+if command -v npx >/dev/null 2>&1; then
+  info "Agent Skills: baixando heygen-com/hyperframes (npx skills add)..."
+  if npx --yes skills add heygen-com/hyperframes -a universal -y; then
+    ok "Agent Skills instaladas em .agents/skills ($(ls .agents/skills 2>/dev/null | wc -l) skills)."
+  else
+    warn "npx skills add falhou (sem rede?) — o sistema sobe sem as skills."
+    warn "Para instalar depois, na pasta $INSTALL_DIR: npx skills add heygen-com/hyperframes"
+  fi
+else
+  warn "npx ausente no host — pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes)."
+fi
 
 # ── 4. Modelos ────────────────────────────────────────────────────────────────
 info "Extraindo Models.zip (~1,4 GB) para Modules/Models ..."

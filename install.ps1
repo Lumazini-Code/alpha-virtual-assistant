@@ -4,6 +4,8 @@
 #   1. Valida prereqs (Node 24 no host; Docker Desktop OU Docker Engine no WSL)
 #   2. Baixa o asset *windows*.zip do ultimo release no GitHub
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
+#   3b. Agent Skills: npx skills add heygen-com/hyperframes -> .agents\skills
+#       (gitignored; flags -a universal -y; falha = aviso, nao morte)
 #   4. Extrai Modules/Models.zip em Modules/Models
 #   5. Pede o provider de inferencia: LLM_BASE_URL (Enter = OpenRouter) e, se
 #      o provider NAO for local, a LLM_API_KEY - grava em Modules\.env ANTES
@@ -285,6 +287,30 @@ if (-not (Test-Path $ModelsZip)) {
 }
 Set-Location $InstallDir
 Write-Ok 'Arquivos extraidos.'
+
+# -- 3b. Agent Skills (SKILL.md - hyperframes) ---------------------------------
+# .agents\ e skills-lock.json sao gitignored: um install novo NAO traz as
+# skills. O CLI `skills` roda via npx (sem install global - o --yes do NPX
+# baixa o pacote no cache). Flags testadas contra o CLI:
+#   -a universal -> grava SO em .agents\skills (store canonico; sem linkar em
+#                   .claude/.cursor/etc do usuario)
+#   -y           -> pula os prompts (escopo = projeto; -y = non-interactive)
+# Idempotente (re-run re-sincroniza pelo lock). Falha (rede, p.ex.) e aviso,
+# nao morte - o sistema sobe sem skills.
+$Npx = Get-Command npx -ErrorAction SilentlyContinue
+if ($Npx) {
+  Write-Info 'Agent Skills: baixando heygen-com/hyperframes (npx skills add)...'
+  & npx --yes skills add heygen-com/hyperframes -a universal -y
+  if ($LASTEXITCODE -eq 0) {
+    $NSkills = @(Get-ChildItem (Join-Path $InstallDir '.agents\skills') -Directory -ErrorAction SilentlyContinue).Count
+    Write-Ok "Agent Skills instaladas em .agents\skills ($NSkills skills)."
+  } else {
+    Write-Warn2 'npx skills add falhou (sem rede?) - o sistema sobe sem as skills.'
+    Write-Warn2 "Para instalar depois, em $InstallDir`: npx skills add heygen-com/hyperframes"
+  }
+} else {
+  Write-Warn2 'npx ausente no host - pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes).'
+}
 
 # -- 4. Modelos ----------------------------------------------------------------
 Write-Info 'Extraindo Models.zip (~1,4 GB) para Modules/Models...'
