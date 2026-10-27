@@ -4,6 +4,11 @@ import SelectInput from "ink-select-input";
 import TextInput from "ink-text-input";
 import { COLORS } from "../lib/constants.js";
 import { logger } from "../lib/logger.js";
+import {
+  getReasoningEffort,
+  setReasoningEffort,
+  type ReasoningEffort,
+} from "../lib/settings.js";
 import { listPlans, updatePlan, type PlanEntry } from "../lib/plans.js";
 import { spawnPlanRecorder } from "../lib/planRecorder.js";
 import {
@@ -27,6 +32,15 @@ import {
   splitArgs,
   type MCPServerEntry,
 } from "../lib/mcpServers.js";
+
+/** Rótulos do esforço de pensamento (menu de settings + mensagens). */
+const REASONING_LABELS: Record<ReasoningEffort, string> = {
+  auto: "AUTO (nativo do modelo)",
+  low: "BAIXO (respostas mais rápidas)",
+  medium: "MÉDIO (equilíbrio)",
+  high: "ALTO (raciocínio profundo)",
+  none: "NENHUM (sem thinking)",
+};
 
 type View = "menu" | "plans" | "edit" | "record" | "mcp" | "mcp-install" | "mcp-delete"
   | "voices" | "person-card" | "voice-edit" | "persona";
@@ -151,6 +165,11 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
   const [watchBusy, setWatchBusy] = useState(false);
   const [watchMsg, setWatchMsg] = useState<string | null>(null);
 
+  // ── Esforço de pensamento (reasoning.effort — ciclo via orchestrator) ─────
+  const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort | null>(null);
+  const [reasoningBusy, setReasoningBusy] = useState(false);
+  const [reasoningMsg, setReasoningMsg] = useState<string | null>(null);
+
   const backTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { stdin, isRawModeSupported, setRawMode } = useStdin() as {
     stdin?: { pause?: () => void; resume?: () => void };
@@ -165,7 +184,8 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
     };
   }, []);
 
-  // Carrega o estado do Memory Watch quando o painel abre (1 GET leve).
+  // Carrega o estado do Memory Watch e do reasoning effort quando o painel
+  // abre (2 GETs leves).
   useEffect(() => {
     let cancelled = false;
     getWatchConfidence()
@@ -176,6 +196,15 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn("settings: GET /settings/watch-confidence falhou", { message: msg });
         if (!cancelled) setWatchMsg(`orchestrator offline ou sem resposta: ${msg}`);
+      });
+    getReasoningEffort()
+      .then((info) => {
+        if (!cancelled) setReasoningEffortState(info.effort);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn("settings: GET /settings/reasoning-effort falhou", { message: msg });
+        if (!cancelled) setReasoningMsg(`orchestrator offline ou sem resposta: ${msg}`);
       });
     return () => {
       cancelled = true;
@@ -284,6 +313,28 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
       setWatchBusy(false);
     }
   }, [watchBusy, watchEnabled]);
+
+  /** Cicla o esforço de pensamento: auto → baixo → médio → alto → nenhum →
+   * auto (PUT imediato — vale no próximo turno, sem restart). "auto" não
+   * envia o campo: o orchestrator usa settings.json/env/nativo. */
+  const cycleReasoningEffort = useCallback(async () => {
+    if (reasoningBusy) return;
+    const order: ReasoningEffort[] = ["auto", "low", "medium", "high", "none"];
+    const next = order[(order.indexOf(reasoningEffort ?? "auto") + 1) % order.length];
+    setReasoningBusy(true);
+    setReasoningMsg(null);
+    try {
+      await setReasoningEffort(next);
+      setReasoningEffortState(next);
+      setReasoningMsg(`✓ esforço de pensamento: ${REASONING_LABELS[next]}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("settings: PUT /settings/reasoning-effort falhou", { message: msg });
+      setReasoningMsg(`✗ falhou: ${msg}`);
+    } finally {
+      setReasoningBusy(false);
+    }
+  }, [reasoningBusy, reasoningEffort]);
 
   // ── MCP: listar / instalar / remover (via mcp_manager :4008) ────────────
   const loadMCPServers = useCallback(async () => {
@@ -730,6 +781,12 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
         (watchEnabled === null ? "…" : watchEnabled ? "ATIVADO" : "DESATIVADO"),
       value: "watch",
     },
+    {
+      label:
+        `💭  Esforço de pensamento: ` +
+        (reasoningEffort === null ? "…" : REASONING_LABELS[reasoningEffort]),
+      value: "reasoning",
+    },
     { label: "↩  Fechar (Esc)", value: "close" },
   ];
 
@@ -772,6 +829,8 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
                 void enterPersona();
               } else if (item.value === "watch") {
                 void toggleWatch();
+              } else if (item.value === "reasoning") {
+                void cycleReasoningEffort();
               } else {
                 onClose();
               }
@@ -785,6 +844,16 @@ export function SettingsPanel({ onClose, onSuspendChange }: Props) {
               }
             >
               {watchMsg}
+            </Text>
+          )}
+          {reasoningBusy && <Text color={COLORS.amber}>▶ alternando esforço de pensamento…</Text>}
+          {reasoningMsg && (
+            <Text
+              color={
+                reasoningMsg.startsWith("✓") ? COLORS.green : reasoningMsg.startsWith("✗") ? COLORS.red : COLORS.dim
+              }
+            >
+              {reasoningMsg}
             </Text>
           )}
         </Box>

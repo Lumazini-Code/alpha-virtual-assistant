@@ -51,9 +51,22 @@ async def agent_skills_select(req: AgentSkillSelectRequest):
     loop = asyncio.get_event_loop()
 
     query_emb = await state.embed_engine.embed_query_one(query)
+    # kNN RESTRITO às skills — SEM isso o pool do kNN é o índice inteiro e as
+    # MCP tools (dezenas de vetores doc+exemplo+learned; p.ex. as de browser
+    # com queries aprendidas de sessões anteriores) ocupam os slots do top-k:
+    # o filtro de prefixo no push() derrubava TUDO e o turno seguia sem hint
+    # (26/10: 'pode gerar o documento...' → 0 skills → o modelo improvisou um
+    # gerador de DOCX em JS dentro do playwright). Skills só competem com
+    # skills — o ranque contra MCP tools é papel do /tools/select.
+    skill_tids = {r["id"] for r in state.tl_db.list_tools()
+                  if r["name"].startswith(AGENT_SKILL_PREFIX)}
+    skill_vids: list[int] = []
+    for tid in skill_tids:
+        skill_vids.extend(state.tl_db.get_vector_ids(tid))
     # sobre-amostra: doc + exemplos + queries aprendidas apontam p/ a mesma skill
     hits = await loop.run_in_executor(
-        None, state.tl_index.search, query_emb, max(req.top_k * 6, 30)
+        None, state.tl_index.search_subset, query_emb, skill_vids,
+        max(req.top_k * 6, 30)
     )
     vec_to_skill = state.tl_db.get_tool_ids_by_vectors([v for v, _ in hits])
     best: dict[int, float] = {}
@@ -112,7 +125,8 @@ async def agent_skills_select(req: AgentSkillSelectRequest):
 
     log.info(
         f"agent_skills_select query='{query[:50]}' top1={top1:.3f} low_conf={low_confidence} "
-        f"primary={len(primary)} related={len(related)} core={len(core_ids)} -> {len(out)} skills"
+        f"primary={len(primary)} related={len(related)} core={len(core_ids)} -> {len(out)} skills "
+        f"(pool={len(skill_vids)} vetor(es) de skill)"
     )
     return AgentSkillSelectResponse(skills=out, top1_score=round(top1, 4), low_confidence=low_confidence)
 

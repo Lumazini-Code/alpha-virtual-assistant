@@ -912,7 +912,10 @@ function Start-Manager {
   if (-not (Test-Path $exe)) { Write-Warn2 "Manager nao encontrado em $exe."; return $false }
 
   Write-Info 'Iniciando o Manager (ava-tray)...'
-  Start-Process -FilePath $exe -WorkingDirectory $InstallDir
+  # Captura do stderr do tray (panics, saida pre-init de logging) — o
+  # tracing do tray ja vai direto para logs\ava-tray.log por conta dele.
+  New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'logs') | Out-Null
+  Start-Process -FilePath $exe -WorkingDirectory $InstallDir -RedirectStandardError (Join-Path $InstallDir 'logs\ava-tray.stderr.log')
   for ($i = 0; $i -lt 30; $i++) {
     if (Test-ManagerUp) { Write-Ok "Manager respondeu em $ManagerUrl."; return $true }
     Start-Sleep -Seconds 2
@@ -1120,6 +1123,26 @@ $script:LogsHint = if ($script:UseWSLDocker) {
   "$InstallDir\docker-start.bat logs -f ava"
 }
 
+# -- 5f. Rebind dos containers (reinstall sobre stack rodando) -----------------
+# O Expand-Archive recria subarvores do diretorio de instalacao; containers de
+# um stack anterior ficam com bind nos handles VELHOS do filesystem — veem uma
+# arvore fantasma (codigo novo invisivel, db que "sumiu": manifest LanceDB em
+# cache apontando para fragmentos inexistentes -> /status 500 em loop, container
+# unhealthy). `up -d` simples nao recria container saudavel; so o
+# --force-recreate refaz os binds. Primeiro install: o ps nao lista containers
+# e o bloco e pulado. Falha aqui e aviso — a etapa 6 segue o fluxo normal.
+$rawPs = ((Invoke-Compose ps --quiet 2>$null | Out-String) -replace "`0", '')
+# O wrapper devolve o exit code no fim do pipeline (0) e o docker-start.bat ecoa
+# a rota usada ("Rota A/B...") — o filtro mantem SO linhas de container ID (hex
+# de 12-64 chars), imune a esse ruido.
+$ids = @($rawPs -split '\r?\n' | Where-Object { $_ -match '^[0-9a-f]{12,64}\s*$' })
+if ($LASTEXITCODE -eq 0 -and $ids.Count -gt 0) {
+  Write-Info 'Stack ja existia para este diretorio - recriando containers (rebind dos mounts)...'
+  Invoke-Compose up -d --force-recreate
+  if ($LASTEXITCODE -eq 0) { Write-Ok 'Containers recriados sobre a arvore nova.' }
+  else { Write-Warn2 'docker compose up -d --force-recreate falhou (o fluxo da etapa 6 segue normal).' }
+}
+
 # -- 6. Build + first up -------------------------------------------------------
 if (-not $SkipBuild) {
   Write-Info 'Build inicial das imagens Docker (pode levar 5-15 min na primeira vez)...'
@@ -1209,7 +1232,9 @@ if (Test-Path $TrayExe) {
   if (Test-ManagerUp) {
     Write-Ok 'ava-tray ja esta em execucao.'
   } else {
-    Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir
+    # Mesma captura de stderr do Start-Manager (secao 5d)
+    New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'logs') | Out-Null
+    Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir -RedirectStandardError (Join-Path $InstallDir 'logs\ava-tray.stderr.log')
     Write-Ok 'ava-tray iniciado agora.'
   }
 } else {
@@ -1222,6 +1247,7 @@ Write-Ok "Instalacao concluida ($InstallDir)"
 Write-Info 'Comandos uteis:'
 Write-Info '  alpha-ai                          # abre a TUI (novo terminal)'
 Write-Info "  $script:LogsHint   # logs do backend"
+Write-Info "  $InstallDir\logs    # logs do tray (ava-tray.log) e do mcp_manager (mcp_manager.log)"
 
 if (-not $NoLaunch) {
   Write-Info 'Abrindo a TUI...'

@@ -149,6 +149,20 @@ class LanceStore:
                 self._tables[dim] = tbl
             return tbl
 
+    def reopen_table(self, dim: int):
+        """Descarta a tabela em cache e reabre. Self-heal para o caso de o
+        diretório do db ser apagado/substituído com o processo de pé (bind
+        mount reinstalado por cima do stack, p.ex.): o objeto em cache fica
+        eternamente quebrado — o manifest segue referenciando fragmentos que
+        não existem mais e TODA leitura vira "lance error: Not found". Aqui o
+        diretório é recriado (mkdir) e a conexão refeita; create_table com
+        exist_ok=True devolve uma tabela vazia e o store volta a funcionar."""
+        with self.lock:
+            self._tables.pop(dim, None)
+            Path(self._path).mkdir(parents=True, exist_ok=True)
+            self._db = lancedb.connect(self._path)
+            return self.table(dim)
+
     def note_write(self, dim: int, n: int = 1):
         with self.lock:
             self._writes[dim] = self._writes.get(dim, 0) + n
@@ -436,7 +450,23 @@ class MemoryIndex:
     @property
     def total(self) -> int:
         with self._store.lock:
-            return int(self._table.count_rows(self._filter))
+            try:
+                return int(self._table.count_rows(self._filter))
+            except RuntimeError as e:
+                # Lance lança RuntimeError ("lance error: Not found: ...") quando o
+                # fragmento referenciado pelo manifest em cache não existe mais no
+                # disco — db apagado/substituído com o processo de pé (reinstalação
+                # por cima de um stack rodando, p.ex.). Sem self-heal, TODO
+                # count_rows falha para sempre e o /status da memory_api dá 500 em
+                # loop (container unhealthy). Reabrir recria a tabela vazia — o
+                # /status volta a 200 e o store volta a aceitar escritas.
+                log.warning(
+                    f"LanceDB [{self._memory_type}]: leitura de vectors_{self._embed_dim} "
+                    f"falhou ({e}) — reabrindo/recriando a tabela vazia"
+                )
+                self._table = self._store.reopen_table(self._embed_dim)
+                self._vector_cache.clear()  # T5: vetores da tabela velha não valem mais
+                return int(self._table.count_rows(self._filter))
 
 
 __all__ = [

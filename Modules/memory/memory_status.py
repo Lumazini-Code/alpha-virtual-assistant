@@ -67,6 +67,7 @@ from memory_config import (
     VO_MIN_SCORE,
     VO_TOP_K,
     VS_MIN_SCORE,
+    log,
 )
 
 from memory_state import state
@@ -83,11 +84,29 @@ def _gather_status_sync() -> dict:
     SQLite (embedding batch, decay job, cleanup de short-term — todas via
     run_in_executor em outra thread), travavam o event loop inteiro
     enquanto esperavam — inclusive impedindo o servidor de responder a
-    outros clientes HTTP (orchestrator, LLM.py, mcp_manager)."""
+    outros clientes HTTP (orchestrator, LLM.py, mcp_manager).
+
+    Hardening: nenhuma leitura de store pode derrubar o /status inteiro —
+    uma exceção aqui estoura até o FastAPI como 500 e o orchestrator marca
+    a memory_api como unhealthy (health do container fica vermelho, p.ex.
+    db LanceDB substituído com o processo de pé). Cada leitura frágil passa
+    pelo safe(): falha vira fallback + a seção entra em "degraded_sections"
+    no payload — o sistema degrada a memória, não o health do container."""
+    degraded: list[str] = []
+
+    def safe(section: str, fn, fallback=0):
+        """Executa fn(); em exceção, reporta a seção como degradada e devolve
+        o fallback (0). O /status segue 200 — o consumidor vê o que quebrou."""
+        try:
+            return fn()
+        except Exception as e:
+            degraded.append(f"{section}: {type(e).__name__}: {e}")
+            return fallback
+
     resp = {
         "long_term": {
-            "memories_total":       state.lt_db.count(),
-            "index_vectors":        state.lt_index.total,
+            "memories_total":       safe("long_term", state.lt_db.count),
+            "index_vectors":        safe("long_term", lambda: state.lt_index.total),
             "decay_half_life_days": DECAY_HALF_LIFE_DAYS,
             "dedup_threshold":      DEDUP_THRESHOLD,
             "update_sim_threshold": UPDATE_SIM_THRESHOLD,
@@ -96,7 +115,7 @@ def _gather_status_sync() -> dict:
         },
         # ── NEW: grafo Hebbiano de co-ativação ──
         "hebbian_graph": {
-            "edges_total":              state.lt_db.count_edges(),
+            "edges_total":              safe("hebbian_graph", state.lt_db.count_edges),
             "edge_decay_half_life_d":   EDGE_DECAY_HALF_LIFE_DAYS,
             "edge_prune_threshold":     EDGE_PRUNE_THRESHOLD,
             "edge_learning_rate":       EDGE_LEARNING_RATE,
@@ -117,17 +136,17 @@ def _gather_status_sync() -> dict:
         },
         # ── NEW: RAG de tools ──
         "tools": {
-            "tools_total":        state.tl_db.count(),
-            "vectors_total":      state.tl_index.total,
-            "edges_total":        state.tl_db.count_edges(),
+            "tools_total":        safe("tools", state.tl_db.count),
+            "vectors_total":      safe("tools", lambda: state.tl_index.total),
+            "edges_total":        safe("tools", state.tl_db.count_edges),
             "top_k":              TOOLS_TOP_K,
             "min_score":          TOOLS_MIN_SCORE,
             "low_confidence":     TOOLS_LOW_CONFIDENCE_SCORE,
             "fallback_top_k":     TOOLS_FALLBACK_TOP_K,
         },
         "short_term": {
-            "turn_groups_total":  state.st_db.count(),
-            "index_vectors":      state.st_index.total,
+            "turn_groups_total":  safe("short_term", state.st_db.count),
+            "index_vectors":      safe("short_term", lambda: state.st_index.total),
             "ttl_hours":          ST_TTL_HOURS,
             "cleanup_interval_s": ST_CLEANUP_INTERVAL_S,
         },
@@ -155,9 +174,9 @@ def _gather_status_sync() -> dict:
         },
         # ── NEW: Indexed files status ──
         "indexed_files": {
-            "files_total":    state.if_db.count_files(),
-            "chunks_total":   state.if_db.get_total_chunks(),
-            "index_vectors":  state.if_index.total,
+            "files_total":    safe("indexed_files", state.if_db.count_files),
+            "chunks_total":   safe("indexed_files", state.if_db.get_total_chunks),
+            "index_vectors":  safe("indexed_files", lambda: state.if_index.total),
             "min_score":      IF_MIN_SCORE,
             "chunk_size":     CHUNK_SIZE,
             "chunk_overlap":  CHUNK_OVERLAP,
@@ -166,8 +185,8 @@ def _gather_status_sync() -> dict:
         },
         # ── NEW: Visual dictionary status ──
         "visual_dict": {
-            "concepts_total":  state.vd_db.count(),
-            "embeddings_total": state.vd_index.total,
+            "concepts_total":  safe("visual_dict", state.vd_db.count),
+            "embeddings_total": safe("visual_dict", lambda: state.vd_index.total),
             "embed_dim":       VD_EMBED_DIM,
             "min_score":       VD_MIN_SCORE,
             "top_k":           VD_TOP_K,
@@ -175,8 +194,8 @@ def _gather_status_sync() -> dict:
         },
         # ── Unificação: Face dictionary status (card de pessoa) ──
         "face_dict": {
-            "people_total":     state.pd_db.count(),
-            "embeddings_total": state.fd_index.total,
+            "people_total":     safe("face_dict", state.pd_db.count),
+            "embeddings_total": safe("face_dict", lambda: state.fd_index.total),
             "embed_dim":        FD_EMBED_DIM,
             "min_score":        FD_MIN_SCORE,
             "top_k":            FD_TOP_K,
@@ -184,8 +203,8 @@ def _gather_status_sync() -> dict:
         },
         # ── Unificação: Voice dictionary status (card de pessoa) ──
         "voice_dict": {
-            "people_total":     state.pd_db.count(),
-            "embeddings_total": state.vo_index.total,
+            "people_total":     safe("voice_dict", state.pd_db.count),
+            "embeddings_total": safe("voice_dict", lambda: state.vo_index.total),
             "embed_dim":        VO_EMBED_DIM,
             "min_score":        VO_MIN_SCORE,
             "top_k":            VO_TOP_K,
@@ -193,15 +212,24 @@ def _gather_status_sync() -> dict:
         },
     }
     if state.vs is not None:
-        vs_status = state.vs.status()
-        resp["knowledge"] = {
-            "available":        True,
-            "chunks_in_db":     vs_status["chunks_in_db"],
-            "vectors_in_index": vs_status["vectors_in_index"],
-            "embed_dim":        vs_status["embed_dim"],
-            "dedup_threshold":  vs_status["dedup_threshold"],
-            "vs_min_score":     VS_MIN_SCORE,
-        }
+        try:
+            vs_status = state.vs.status()
+            resp["knowledge"] = {
+                "available":        True,
+                "chunks_in_db":     vs_status["chunks_in_db"],
+                "vectors_in_index": vs_status["vectors_in_index"],
+                "embed_dim":        vs_status["embed_dim"],
+                "dedup_threshold":  vs_status["dedup_threshold"],
+                "vs_min_score":     VS_MIN_SCORE,
+            }
+        except Exception as e:
+            degraded.append(f"knowledge: {type(e).__name__}: {e}")
+            resp["knowledge"] = {
+                "available":        False,
+                "chunks_in_db":     0,
+                "vectors_in_index": 0,
+                "error":            f"{type(e).__name__}: {e}",
+            }
     else:
         resp["knowledge"] = {
             "available":        False,
@@ -220,6 +248,9 @@ def _gather_status_sync() -> dict:
         "open_scopes":  sorted(state.scopes.keys()),
         "merged_read":  state.active_scope != GENERAL_SCOPE,
     }
+    if degraded:
+        resp["degraded_sections"] = degraded
+        log.warning(f"/status com {len(degraded)} seção(ões) degradada(s): {degraded}")
     return resp
 
 

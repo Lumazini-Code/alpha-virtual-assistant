@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { projectRoot } from "./paths.js";
 import { logger } from "./logger.js";
 
 export interface PlanRecorderResult {
@@ -9,12 +9,11 @@ export interface PlanRecorderResult {
   error?: string;
 }
 
-/** Raiz do projeto — resolve tanto com `tsx src/cli.tsx` (src/lib → raiz)
- * quanto com o build `dist/cli.js` (dist → raiz). */
-export function projectRoot(): string {
-  const here = dirname(fileURLToPath(import.meta.url)); // …/src/lib ou …/dist
-  return resolve(here, "..", "..");
-}
+/** Raiz do projeto — delega para lib/paths.js, que resolve também no
+ * binário compilado (bun compile): o dirname de import.meta.url vive no
+ * filesystem virtual $bunfs e o resolve() por ele desabava em "/" — o
+ * scripts/plan_recorder.py nunca era encontrado no build compilado. */
+export { projectRoot };
 
 /** Python do projeto: venv primeiro (tem httpx p/ o plan_recorder),
  * fallback para o python3 do sistema. */

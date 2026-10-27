@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { envFilePath } from "./paths.js";
 
 // Equivalente às constantes do topo do UI.py original.
 // Em Ink as cores viram hex direto na prop `color` dos componentes <Text>.
@@ -9,16 +8,16 @@ import { fileURLToPath } from "node:url";
 // O install.sh grava AVA_BIND_HOST no Modules/.env — fonte da verdade do
 // endereço dos serviços. A TUI carrega o valor daqui em vez de manter um
 // IP fixo: trocar o bind no .env basta para realinhar TUI e serviços.
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const projectRoot = path.resolve(__dirname, "..", "..");
+//
+// projectRoot vem de lib/paths.js: o resolve() por import.meta.url desaba
+// em "/" no binário compilado (bun build --compile → $bunfs virtual) e o
+// .env nunca era lido — o fallback 127.9.12.22 mascarava isso enquanto o
+// bind padrão não mudasse.
 const FALLBACK_HOST = "127.9.12.22";
 
 let bindHost = FALLBACK_HOST;
 try {
-  const envContent = readFileSync(
-    path.join(projectRoot, "Modules", ".env"),
-    "utf-8",
-  );
+  const envContent = readFileSync(envFilePath(), "utf-8");
   const match = envContent.match(/^AVA_BIND_HOST=(.+)$/m);
   if (match) {
     bindHost = match[1].trim();

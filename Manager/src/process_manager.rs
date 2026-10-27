@@ -491,6 +491,15 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
         "running",
         "--quiet",
     ]);
+    // CWD explícito: SEM isto o compose herda o cwd do tray — que uma
+    // reinstalação (dir apagado e recriado com o tray de pé) transforma em
+    // um cwd órfão. O docker CLI chama getwd antes de ler o -f e morre com
+    // "getwd: no such file or directory" 30s após CADA start — o health
+    // tick interpretava como "containers caíram" e derrubava a supervisão
+    // em loop (incidente de 26/10: docker "caía sozinho" sem NENHUM erro
+    // nos logs do docker). O path absoluto do project_root resolve mesmo
+    // que o dir tenha sido recriado (novo inode, mesmo caminho).
+    compose.current_dir(state.project_root.clone());
     compose.no_window();
     let output = compose
         .stdout(Stdio::piped())

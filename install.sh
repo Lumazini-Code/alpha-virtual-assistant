@@ -294,6 +294,23 @@ cd "$INSTALL_DIR"
 chmod +x tui/alpha-ai Manager/ava-tray docker-start.sh 2>/dev/null || true
 ok "Arquivos extraídos."
 
+# ── 3a. Rebind dos containers (reinstalação sobre stack rodando) ──────────────
+# O unzip recria subárvores do diretório de instalação; containers de um stack
+# anterior ficam com bind nos INODES VELHOS — enxergam uma árvore fantasma
+# (código novo invisível, db que "sumiu": manifest LanceDB em cache apontando
+# para fragmentos inexistentes → /status 500 em loop, container unhealthy).
+# `up -d` simples não recria container sadio; só o --force-recreate refaz os
+# binds. Sem stack anterior, o ps não lista nada e o bloco é pulado.
+if docker compose ps --quiet 2>/dev/null | grep -q .; then
+  info "Stack já existia para este diretório — recriando containers (rebind dos mounts)..."
+  if out="$(docker compose up -d --force-recreate 2>&1)"; then
+    ok "Containers recriados sobre a árvore nova."
+  else
+    warn "docker compose up -d --force-recreate falhou (o fluxo da etapa 6 segue normal):"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/    /'
+  fi
+fi
+
 # ── 3b. Agent Skills (SKILL.md — hyperframes) ─────────────────────────────────
 # `.agents/` e `skills-lock.json` são gitignored: um install novo NÃO traz as
 # skills. O CLI `skills` roda via npx (sem install global — o --yes do NPX
@@ -533,7 +550,16 @@ prompt_llm_config() {
   [ -n "$local_flag" ] && set_env_var LLM_PROVIDER_LOCAL 1
   ok "LLM_BASE_URL=$base gravada em $ENV_FILE (chmod 600)."
   [ -n "$key" ] && ok "LLM_API_KEY gravada em $ENV_FILE (chmod 600)."
-  [ -n "$local_flag" ] && ok "LLM_PROVIDER_LOCAL=1 — provider marcado como local, sem key."
+  # Última linha da função NÃO pode ser um `[ ... ] && ...` com o lado
+  # esquerdo podendo falhar: com set -euo pipefail, `[ -n "" ]` devolve 1 e
+  # o return da função vira 1 — o script MORRE silenciosamente logo após
+  # imprimir "(chmod 600)" (exatamente o relato: colar a API key fechava o
+  # instalador). No meio da função o compound é protegido do set -e; como
+  # ÚLTIMO comando da função, não.
+  if [ -n "$local_flag" ]; then
+    ok "LLM_PROVIDER_LOCAL=1 — provider marcado como local, sem key."
+  fi
+  return 0
 }
 
 # Já existe configuração de provider (base e/ou key) → manter ou reconfigurar.
@@ -843,7 +869,7 @@ register_playwright_mcp() {
 register_alpha_mcp() {
   # URL do MCP do alpha-mcp (server.py). Se o manager rodar dentro do Docker,
   # use o nome do serviço (http://alpha-mcp:4010/mcp) ou host.docker.internal.
-  local ws_url="${ALPHA_MCP_URL:-http://localhost:4010/mcp}"
+  local ws_url="${ALPHA_MCP_URL:-http://127.9.12.22:4010/mcp}"
   local payload
   payload=$(cat <<EOF
 {
@@ -964,7 +990,7 @@ register_desktop_commander_mcp() {
 # ── 5d. Manager (ava-tray) — API REST em :9001 ───────────────────────────────
 # O Manager sobe/derruba o stack Docker e supervisiona o mcp_manager do host.
 # O instalador o inicia primeiro e pede o start do Docker pela API dele.
-MANAGER_URL="http://localhost:9001"
+MANAGER_URL="http://127.9.12.22:9001"
 
 manager_up() {
   curl -fsS --max-time 5 -H "Authorization: Bearer $AVA_TOKEN" "$MANAGER_URL/status" >/dev/null 2>&1
@@ -982,7 +1008,10 @@ start_manager() {
   has_gui || { warn "Sem sessão gráfica — o Manager (tray) não pode iniciar agora."; return 1; }
 
   info "Iniciando o Manager (ava-tray)..."
-  nohup "$bin" >/dev/null 2>&1 &
+  # Captura do stderr/stdout do tray (panics, saída pré-init de logging) —
+  # o tracing do tray já vai direto para logs/ava-tray.log por conta dele.
+  mkdir -p "$INSTALL_DIR/logs"
+  nohup "$bin" >>"$INSTALL_DIR/logs/ava-tray.stderr.log" 2>&1 &
   disown || true
 
   local i
@@ -1060,7 +1089,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
 
   # Espera o /status do orchestrator (1º boot baixa Supertonic do HF)
-  STATUS_URL="http://localhost:9000/status"
+  STATUS_URL="http://127.9.12.22:9000/status"
   MAX_WAIT=1200   # 20 min
   ELAPSED=0
   info "Aguardando orchestrator em $STATUS_URL (primeiro boot pode demorar)..."
@@ -1156,6 +1185,7 @@ ok "Instalação concluída ($INSTALL_DIR)"
 info "Comandos úteis:"
 info "  alpha-ai                          # abre a TUI"
 info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
+info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log) e do mcp_manager (mcp_manager.log)"
 info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
 
 if [ "$NO_LAUNCH" -eq 0 ] && [ -t 0 ]; then

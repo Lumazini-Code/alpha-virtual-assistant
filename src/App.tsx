@@ -50,6 +50,10 @@ export function App() {
   } = useOrchestratorStream();
 
   const [showDocker, setShowDocker] = useState(false);
+  // Pensamento (💭) expandido globalmente — alterna com ctrl+e. Colapsado,
+  // o box mostra só o trecho mais recente do raciocínio (igual estilo ao
+  // box de tool calls).
+  const [reasoningExpanded, setReasoningExpanded] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingAttachment, setPendingAttachment] = useState<AttachedFile | null>(null);
@@ -159,6 +163,11 @@ export function App() {
       setShowDocker((prev) => !prev);
       return;
     }
+    if (key.ctrl && input === "e") {
+      // Expande/colapsa o box de pensamento (💭) das mensagens.
+      setReasoningExpanded((prev) => !prev);
+      return;
+    }
     if (key.ctrl && input === "s") {
       setShowSettings((prev) => !prev);
       return;
@@ -187,7 +196,9 @@ export function App() {
             {"  "}(/settings também lista/edita planos · /projects gerencia escopos de memória · /attach para anexar arquivo)
           </Text>
         ) : (
-          messages.map((m) => <ChatMessage key={m.id} message={m} />)
+          messages.map((m) => (
+            <ChatMessage key={m.id} message={m} reasoningExpanded={reasoningExpanded} />
+          ))
         )}
       </Box>
 

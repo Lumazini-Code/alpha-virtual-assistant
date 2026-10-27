@@ -318,21 +318,23 @@ class ShortTermDB:
             f"SELECT * FROM turn_groups WHERE id IN ({ph})", ids
         ).fetchall()
 
-    def get_recent_turns_text(self, session_id: str, n_groups: int,
+    def get_recent_turns_text(self, n_groups: int,
                               person_id: Optional[int] = None) -> list[str]:
-        """NEW (people cards): `person_id` filtra os grupos por card de pessoa
-        (None = sem filtro, comportamento anterior)."""
+        """SESSÕES REMOVIDAS: leitura GLOBAL — os N grupos mais recentes do ST,
+        independente de sessão (session_id virou metadado de proveniência da
+        escrita; o histórico tem que sobreviver a troca de sessão).
+        `person_id` filtra os grupos por card de pessoa (None = sem filtro)."""
         if person_id is not None:
             rows = self._conn.execute(
                 "SELECT turns_json FROM turn_groups "
-                "WHERE session_id = ? AND person_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, person_id, n_groups),
+                "WHERE person_id = ? ORDER BY created_at DESC LIMIT ?",
+                (person_id, n_groups),
             ).fetchall()
         else:
             rows = self._conn.execute(
                 "SELECT turns_json FROM turn_groups "
-                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, n_groups),
+                "ORDER BY created_at DESC LIMIT ?",
+                (n_groups,),
             ).fetchall()
         lines: list[str] = []
         for row in reversed(rows):
@@ -340,26 +342,27 @@ class ShortTermDB:
                 lines.append(f"{t['role']}: {t['content']}")
         return lines
 
-    def get_recent_turn_groups(self, session_id: str, n_groups: int,
+    def get_recent_turn_groups(self, n_groups: int,
                                person_id: Optional[int] = None) -> tuple[list[dict], int]:
         """
         Leitura crua (sem busca semântica) das N duplas pergunta-resposta mais
-        recentes de uma sessão, em ordem cronológica (mais antiga primeiro).
+        recentes do ST, em ordem cronológica (mais antiga primeiro) — GLOBAL,
+        sem filtro de sessão (session_id virou metadado de proveniência; o
+        histórico tem que sobreviver a troca de sessão).
         Usada pelo /read_st — contexto de conversa direto, sem embeddings.
-        NEW (people cards): `person_id` filtra os grupos por card de pessoa
-        (None = sem filtro, comportamento anterior).
+        `person_id` filtra os grupos por card de pessoa (None = sem filtro).
         """
         if person_id is not None:
             rows = self._conn.execute(
                 "SELECT turns_json FROM turn_groups "
-                "WHERE session_id = ? AND person_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, person_id, n_groups),
+                "WHERE person_id = ? ORDER BY created_at DESC LIMIT ?",
+                (person_id, n_groups),
             ).fetchall()
         else:
             rows = self._conn.execute(
                 "SELECT turns_json FROM turn_groups "
-                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, n_groups),
+                "ORDER BY created_at DESC LIMIT ?",
+                (n_groups,),
             ).fetchall()
         turns: list[dict] = []
         for row in reversed(rows):

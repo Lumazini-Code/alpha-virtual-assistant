@@ -270,7 +270,7 @@ export function useOrchestratorStream() {
  *   step_start  JSON  (só /code)                        StepStartPayload
  *   step_done   JSON  {step, executor, success, ...}    StepDonePayload
  *   result      texto puro (saída intermediária de uma tool)
- *   reasoning   texto puro (só /code)
+ *   reasoning   texto puro — pensamento do modelo (/execute e /code)
  *   delta       texto puro — fragmento INCREMENTAL do content do LLM
  *               (concatenar); pode vir em chunk único nos paths que não
  *               passam pelo content streamado (finish/vision/force_finish)
@@ -408,7 +408,8 @@ function handleFrame(
     }
 
     case "reasoning": {
-      // texto puro, só em /code
+      // Pensamento do modelo — texto puro. Chega no /execute (GLM thinking
+      // repassado pelo orchestrator, AVA_STREAM_REASONING) e no /code.
       updateLast((m) => ({ ...m, reasoning: (m.reasoning ?? "") + frame.raw }));
       break;
     }

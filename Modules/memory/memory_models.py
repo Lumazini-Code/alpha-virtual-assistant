@@ -91,7 +91,10 @@ class WriteBatchRequest(BaseModel):
     sequential: bool = False
 
 class WriteSTRequest(BaseModel):
-    session_id: str
+    # ── SESSÕES REMOVIDAS: session_id é só metadado de proveniência (fica na
+    # coluna p/ o DELETE /session/{id} e diagnóstico); não participa da
+    # leitura (global) nem do dedup (global).
+    session_id: str = ""
     turns:      list[Turn]
     # ── NEW (people cards): vincula o grupo de turnos a um card de pessoa
     # (people.id) — FK direta, filtrável no /read_st. Invalido → warning.
@@ -145,13 +148,16 @@ class WriteSTResponse(BaseModel):
     turn_ids: list[int] = []
 
 class ReadSTRequest(BaseModel):
-    session_id: str
+    # ── SESSÕES REMOVIDAS: a leitura do ST é GLOBAL (N duplas mais recentes,
+    # independente de sessão). O campo permanece opcional por compatibilidade
+    # de API — é aceito, ecoado na resposta e IGNORADO como filtro.
+    session_id: str = ""
     n_pairs:    int = ST_READ_DEFAULT_PAIRS
     # ── NEW (people cards): filtra os grupos de turnos por card de pessoa.
     person_id:  Optional[int] = None
 
 class ReadSTResponse(BaseModel):
-    session_id:     str
+    session_id:     str = ""   # eco do pedido (não filtra nada)
     turns:          list[Turn]
     pairs_returned: int
 

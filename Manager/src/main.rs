@@ -42,6 +42,65 @@ pub enum UiCommand {
     ChatEvent(chat::ConversationEvent),
 }
 
+/// Raiz do projeto = pai do diretório do executável — mesma regra do
+/// state.rs::new_shared_state (…/&lt;raiz&gt;/Manager/ava-tray → raiz).
+fn project_root() -> Option<std::path::PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    Some(exe_dir.join(".."))
+}
+
+/// Abre (append) &lt;raiz&gt;/logs/&lt;name&gt;. None se não der — nesses casos o log
+/// segue só no stderr e NADA aqui pode derrubar o boot.
+fn open_log_file(name: &str) -> Option<std::fs::File> {
+    let dir = project_root()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))
+        .ok()
+}
+
+/// Logging duplo: stderr (comportamento original — visível quando o tray é
+/// lançado de terminal em debug) + logs/ava-tray.log (append, ANSI off).
+///
+/// O arquivo é obrigatório, não luxo: o tray é lançado pelo instalador com
+/// stdout/stderr descartados (nohup >/dev/null) e pelo autostart sem console
+/// algum — sem captura em arquivo, a causa de qualquer morte se perdia para
+/// sempre (incidente do mcp_manager em 26/10: morreu ~2 min após o boot e
+/// não sobrou UMA linha para diagnosticar).
+fn install_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let stderr_layer = tracing_subscriber::fmt::layer();
+    let file_layer = open_log_file("ava-tray.log").map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Arc::new(file))
+    });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "ava_tray=info".into()),
+        )
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+}
+
+/// Panics também vão para o log em arquivo: o hook roda ANTES do abort
+/// (o crate compila com panic=abort) — sem ele, a mensagem do panic só
+/// existiria no stderr, que não existe no modo autostart/GUI.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!("PANIC: {info}\n{backtrace}");
+        default_hook(info);
+    }));
+}
+
 fn main() -> anyhow::Result<()> {
     // No Wayland o winit 0.29 ignora set_visible(false), então a janela não
     // some ao "fechar para a tray". Força o backend X11 (XWayland) no Linux.
@@ -60,12 +119,20 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ava_tray=info".into()),
-        )
-        .init();
+    install_panic_hook();
+    install_logging();
+
+    // Ancora o cwd do processo na raiz do projeto. O tray herda o cwd de
+    // quem o lança (instalador: $INSTALL_DIR; autostart: $HOME) — e uma
+    // reinstalação apaga/recria esse diretório com o tray de pé, deixando
+    // o cwd ÓRFÃO. Todo subprocesso herda esse cwd e o docker CLI, p.ex.,
+    // morre com "getwd: no such file or directory" antes de ler o -f
+    // (foi o que derrubava a supervisão do docker em loop 30s após cada
+    // start — 26/10). O current_dir explícito no health_check_docker
+    // cobre o caso "dir recriado"; este set cobre o boot em qualquer cwd.
+    if let Some(root) = project_root() {
+        let _ = std::env::set_current_dir(&root);
+    }
 
     // ── Runtime tokio compartilhado ────────────────────────────────────────
     let rt = tokio::runtime::Builder::new_multi_thread()

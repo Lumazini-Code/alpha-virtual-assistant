@@ -41,6 +41,7 @@ from memory_config import (
     READ_TOTAL_MAX_CHARS_MAX,
     RERANK_DUPLICATE_SCORE,
     RERANK_UPDATE_SCORE,
+    ST_DEDUP_WINDOW_S,
     ST_READ_DEFAULT_PAIRS,
     UPDATE_SIM_THRESHOLD,
     VS_MIN_SCORE,
@@ -615,41 +616,64 @@ async def write_short_term(req: WriteSTRequest):
     async with _st_write_lock:
         embedding = await state.embed_engine.embed_passage_one(embed_text)
 
-        max_sim = state.st_index.search_similar(embedding)
-        if max_sim >= DEDUP_THRESHOLD:
-            return WriteSTResponse(stored=False, reason=f"duplicate_semantic:{max_sim:.3f}")
+        # ── SESSÕES REMOVIDAS: dedup com JANELA TEMPORAL. O st_index é global,
+        # então sim ≥ threshold contra um grupo ANTIGO de outra sessão não pode
+        # recusar o turno novo (destruiria o conteúdo mais recente do histórico
+        # — bug 27/10). Só recusa quando o duplicado é RECENTE (corrida com o
+        # resumo episódico da extração / retry do _save_turn / reenvio imediato).
+        hits = await loop.run_in_executor(None, state.st_index.search, embedding, 5)
+        dups = [(gid, sim) for gid, sim in hits if sim >= DEDUP_THRESHOLD]
+        if dups:
+            created = {
+                r["id"]: r["created_at"] for r in state.st_db.get_by_ids([gid for gid, _ in dups])
+            }
+            now_ts = time.time()
+            recent = [(gid, sim) for gid, sim in dups
+                      if now_ts - created.get(gid, 0.0) < ST_DEDUP_WINDOW_S]
+            if recent:
+                gid, sim = max(recent, key=lambda t: t[1])
+                log.info(
+                    f"/write_st dedup: grupo #{gid} recente ({now_ts - created[gid]:.0f}s, "
+                    f"< {ST_DEDUP_WINDOW_S:.0f}s) com sim={sim:.3f} — recusado"
+                )
+                return WriteSTResponse(stored=False, reason=f"duplicate_semantic:{sim:.3f}")
+            log.info(
+                f"/write_st dedup: sim={dups[0][1]:.3f} apenas contra grupo(s) antigo(s) "
+                f"(fora da janela de {ST_DEDUP_WINDOW_S:.0f}s) — turno novo gravado"
+            )
 
         group_id = state.st_db.insert(req.session_id, req.turns, embed_text, person_id=person_id)
         await loop.run_in_executor(None, state.st_index.add, embedding, group_id)
 
     log.info(
-        f"ST #{group_id} gravado — session={req.session_id} turnos={len(req.turns)} "
+        f"ST #{group_id} gravado — session={req.session_id or '-'} turnos={len(req.turns)} "
         f"person_id={person_id}: {embed_text[:80]}"
     )
     return WriteSTResponse(stored=True, reason="ok", turn_ids=[group_id])
 
 
 # ── POST /read_st ────────────────────────────────────────────────────────────
-# Leitura crua do short-term: só as N duplas pergunta-resposta mais recentes
-# de uma sessão, sem embeddings/scoring — pensado para o LLM montar o
-# histórico de conversa como contexto (mais leve/rápido que /read).
+# Leitura crua do short-term: as N duplas pergunta-resposta mais recentes do
+# ST GLOBAL (sem filtro de sessão — sessões removidas; session_id no payload
+# é aceito por compatibilidade e ignorado), sem embeddings/scoring — pensado
+# para o LLM montar o histórico de conversa como contexto (mais leve/rápido
+# que /read).
 
 async def read_short_term(req: ReadSTRequest):
-    session_id = req.session_id.strip()
-    if not session_id:
-        raise MemoryToolError("session_id vazio")
-
+    # ── SESSÕES REMOVIDAS: a leitura é GLOBAL — o histórico tem que sobreviver
+    # à troca de sessão/restart (bug 26/10: cada sessão nova nascia amnésica).
+    # `person_id` (people cards) continua filtrável — o histórico devolvido
+    # pode se restringir a conversas com aquela pessoa.
     n_pairs = req.n_pairs if req.n_pairs > 0 else ST_READ_DEFAULT_PAIRS
     loop = asyncio.get_event_loop()
-    # ── NEW (people cards): person_id filtra os grupos de turnos por card de
-    # pessoa — o histórico devolvido só contém conversas com aquela pessoa.
     raw_turns, groups_fetched = await loop.run_in_executor(
-        None, state.st_db.get_recent_turn_groups, session_id, n_pairs, req.person_id
+        None, state.st_db.get_recent_turn_groups, n_pairs, req.person_id
     )
     turns = [Turn(**t) for t in raw_turns]
 
-    log.info(f"/read_st session={session_id} n_pairs={n_pairs} grupos={groups_fetched} turnos={len(turns)}")
-    return ReadSTResponse(session_id=session_id, turns=turns, pairs_returned=groups_fetched)
+    log.info(f"/read_st global n_pairs={n_pairs} grupos={groups_fetched} turnos={len(turns)} "
+             f"session_pedida={req.session_id or '-'}")
+    return ReadSTResponse(session_id=req.session_id, turns=turns, pairs_returned=groups_fetched)
 
 
 # ── POST /read ─────────────────────────────────────────────────────────────────
@@ -698,8 +722,10 @@ async def read_memory(req: ReadRequest):
     lt_raw_by_view: dict[str, list[tuple[int, float]]] = {v.name: [] for v in views}
     st_raw: list[tuple[int, float]] = []
 
-    if req.session_id and req.strategy != "none":
-        context_block = await loop.run_in_executor(None, _build_context_block, req.session_id)
+    if req.strategy != "none":
+        # SESSÕES REMOVIDAS: o contexto de expansão são os turnos recentes
+        # GLOBAIS do ST (session_id deixou de filtrar).
+        context_block = await loop.run_in_executor(None, _build_context_block)
 
         if context_block:
             if req.strategy == "auto":

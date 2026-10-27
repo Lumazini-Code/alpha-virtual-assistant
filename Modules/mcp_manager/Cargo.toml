@@ -14,7 +14,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 regex = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 which = "6"
 process-wrap = { version = "8.2", features = ["tokio1"] }
 rmcp = { version = "0.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }

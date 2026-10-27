@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { envFilePath } from "./paths.js";
 
 /**
  * Autenticação interna da TUI para as APIs locais (orchestrator, memory,
@@ -14,9 +13,6 @@ import { fileURLToPath } from "node:url";
  * quando o token está disponível; sem token, retorna os headers base sem
  * Authorization (as APIs locais podem rodar sem auth configurada).
  */
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const projectRoot = path.resolve(__dirname, "..", "..");
 
 let cachedToken: string | null = null;
 let cacheResolved = false;
@@ -33,10 +29,7 @@ export function internalToken(): string | null {
   }
 
   try {
-    const envContent = readFileSync(
-      path.join(projectRoot, "Modules", ".env"),
-      "utf-8",
-    );
+    const envContent = readFileSync(envFilePath(), "utf-8");
     const match = envContent.match(/^AVA_INTERNAL_TOKEN=(.+)$/m);
     if (match) {
       // Mesmo trim/clean de aspas feito pelo Manager e pelo install.sh.

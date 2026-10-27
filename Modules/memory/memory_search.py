@@ -331,8 +331,10 @@ def _classify_query(query: str) -> str:
     return strategy
 
 
-def _build_context_block(session_id: str) -> str:
-    lines = state.st_db.get_recent_turns_text(session_id, CONTEXT_TURNS_FETCH)
+def _build_context_block() -> str:
+    # SESSÕES REMOVIDAS: contexto de expansão = turnos recentes GLOBAIS do ST
+    # (as últimas CONTEXT_TURNS_FETCH mensagens, independente de sessão).
+    lines = state.st_db.get_recent_turns_text(CONTEXT_TURNS_FETCH)
     if not lines:
         return ""
     block = "\n".join(lines)

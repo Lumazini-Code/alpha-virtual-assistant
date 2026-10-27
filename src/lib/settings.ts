@@ -59,3 +59,45 @@ export async function setWatchConfidence(enabled: boolean): Promise<WatchConfide
   logger.info("settings: memory watch alterado", { enabled: state });
   return { enabled: state, default: false };
 }
+
+// ── Esforço de pensamento (reasoning.effort) ────────────────────────────────
+// "auto" = não envia o campo (o orchestrator usa settings.json/env/nativo).
+// O orchestrator resolve a precedência e injeta no tool loop do /execute.
+
+export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "none";
+
+export interface ReasoningEffortInfo {
+  /** Esforço atual (null do backend vira "auto"). */
+  effort: ReasoningEffort;
+  /** Default de fábrica (para exibir na UI) — sempre "auto" hoje. */
+  default: ReasoningEffort;
+}
+
+/** GET /settings/reasoning-effort — esforço atual do raciocínio. */
+export async function getReasoningEffort(): Promise<ReasoningEffortInfo> {
+  const res = await fetch(`${ORCHESTRATOR_URL}/settings/reasoning-effort`, {
+    method: "GET",
+    headers: authHeaders({}),
+  });
+  if (!res.ok) throw new Error(await errorDetail(res));
+  const data = (await res.json()) as { effort?: string | null; default?: string | null };
+  const toEnum = (v: string | null | undefined): ReasoningEffort =>
+    v === "low" || v === "medium" || v === "high" || v === "none" ? v : "auto";
+  return { effort: toEnum(data.effort), default: toEnum(data.default) };
+}
+
+/** PUT /settings/reasoning-effort — grava o esforço (imediato no próximo turno). */
+export async function setReasoningEffort(effort: ReasoningEffort): Promise<ReasoningEffortInfo> {
+  const res = await fetch(`${ORCHESTRATOR_URL}/settings/reasoning-effort`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders({}),
+    },
+    body: JSON.stringify({ effort: effort === "auto" ? null : effort }),
+  });
+  if (!res.ok) throw new Error(await errorDetail(res));
+  const data = (await res.json()) as { effort?: string | null };
+  logger.info("settings: reasoning effort alterado", { effort });
+  return { effort: effort, default: "auto" };
+}

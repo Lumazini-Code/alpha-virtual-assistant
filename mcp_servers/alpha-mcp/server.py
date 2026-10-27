@@ -24,6 +24,16 @@ Tools MCP expostas:
     card de identidade (só os campos enviados; None mantém o atual).
     Mesma autenticação do write LT: client persistente com Bearer token
     interno (Modules.internal_auth / AVA_INTERNAL_TOKEN).
+  - `project_create(name)` → cria um projeto (escopo de memória próprio) e
+    o ATIVA na hora, via o orchestrator (:9000, POST /projects) — mesmo
+    fluxo da TUI (criou → entrou). Registry em resource/projects.json.
+  - `project_list()` → lista os projetos e qual está ativo.
+  - `skill_create(name, description, content, files?, overwrite?)` → cria
+    uma skill do AGENTE (playbook SKILL.md em .agents/skills-created/) e
+    re-sincroniza o índice semântico na hora — disponível na próxima
+    pergunta. Via orchestrator (POST /skills/create).
+  - `skill_list()` → catálogo de TODAS as skills (CLI do projeto, globais e
+    criadas pelo agente) com nome, descrição, origem e status de índice.
 
 Fluxo da busca web:
   1. Cache de busca no Valkey (hash da query, TTL de horas) → hit retorna direto
@@ -858,6 +868,10 @@ async def run_pipeline(query: str, max_results: int) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.9.12.22:3000")
+# Orchestrator (:9000) — projetos (escopos de memória) e criação de skills
+# pelo agente (.agents/skills-created + re-sync do índice). No compose é o
+# serviço `ava`; em dev cai no default com a porta do orchestrator.
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://127.9.12.22:9000")
 
 _memory_client: httpx.AsyncClient | None = None
 
@@ -1220,6 +1234,186 @@ async def memory_identity_edit(
         return f"Erro ao editar card de identidade: {e}"
     log.info(f"[identity] card editado: campos={sorted(payload)}")
     return f"Card de identidade atualizado: {_format_identity(c)}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Projetos & Agent Skills — criação em runtime via orchestrator (:9000)
+# ══════════════════════════════════════════════════════════════════════════════
+# As duas faces "criar coisa duradoura" do AVA:
+#   - project_*: escopo de MEMÓRIA (LT/grafo/planos isolados por projeto);
+#     o orchestrator cria E ativa (mesmo fluxo da TUI: criou → entrou).
+#   - skill_*: playbook SKILL.md reutilizável (.agents/skills-created/); o
+#     orchestrator escreve e re-sincroniza o índice semântico na hora — a
+#     skill fica selecionável na próxima pergunta (use_skill carrega).
+
+_orchestrator_client: httpx.AsyncClient | None = None
+
+
+def _get_orchestrator_client() -> httpx.AsyncClient:
+    """Client persistente do orchestrator (connection pooling, Bearer interno
+    — mesmo padrão do _get_memory_client)."""
+    global _orchestrator_client
+    if _orchestrator_client is None or _orchestrator_client.is_closed:
+        try:
+            from Modules.internal_auth import internal_token as _tok_fn  # type: ignore
+        except Exception:
+            _tok_fn = lambda: os.getenv("AVA_INTERNAL_TOKEN", "").strip() or None  # type: ignore
+        _tok = _tok_fn()
+        _h: dict[str, str] = {"Authorization": f"Bearer {_tok}"} if _tok else {}
+        _orchestrator_client = httpx.AsyncClient(
+            base_url=ORCHESTRATOR_URL,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
+            headers=_h,
+        )
+    return _orchestrator_client
+
+
+async def _orchestrator_request(method: str, path: str, payload: dict | None = None) -> dict:
+    """Request autenticada ao orchestrator. Levanta MemoryToolError com o
+    `detail` do servidor em erro HTTP (mesmo contrato da _memory_api_request)."""
+    r = await _get_orchestrator_client().request(method, path, json=payload)
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError:
+        detail = None
+        try:
+            detail = r.json().get("error") or r.json().get("detail")
+        except Exception:
+            pass
+        raise MemoryToolError(detail or f"orchestrator respondeu HTTP {r.status_code}")
+    return r.json()
+
+
+@mcp.tool()
+async def project_create(name: str) -> str:
+    """Cria um projeto (escopo de memória próprio) e o ATIVA na hora — a
+    conversa passa a rodar DENTRO dele: memórias de longo prazo, grafo,
+    planos e arquivos ficam isolados por projeto (o modo "geral" continua
+    intacto e pode ser retomado pela TUI). Use quando o usuário pedir um
+    contexto novo e duradouro ("cria um projeto pra X", "quero separar as
+    coisas do Y"). O nome vira um slug minúsculo; se o projeto já existir, o
+    servidor recusa — use project_list para ver os existentes. NÃO use para
+    fatos soltos: isso é memory_write_batch."""
+    if not name.strip():
+        return "Erro: nome do projeto vazio."
+    try:
+        data = await _orchestrator_request("POST", "/projects", {"name": name.strip()})
+    except MemoryToolError as e:
+        return f"Erro ao criar projeto: {e.detail}"
+    except Exception as e:
+        log.exception("project_create falhou")
+        return f"Erro ao criar projeto: {e}"
+    p = data.get("project") or {}
+    log.info(f"[projects] criado+ativado: {data.get('active')!r}")
+    return (
+        f"Projeto criado e ATIVADO: '{p.get('slug')}' ({p.get('name')!r}). "
+        "Daqui em diante a memória/grafos/planos ficam no escopo dele — "
+        "mencione isso ao usuário."
+    )
+
+
+@mcp.tool()
+async def project_list() -> str:
+    """Lista os projetos registrados e qual está ATIVO agora. Use antes de
+    project_create (evitar duplicado) e quando o usuário se referir a um
+    projeto pelo nome (o slug é o identificador)."""
+    try:
+        data = await _orchestrator_request("GET", "/projects")
+    except MemoryToolError as e:
+        return f"Erro ao listar projetos: {e.detail}"
+    except Exception as e:
+        log.exception("project_list falhou")
+        return f"Erro ao listar projetos: {e}"
+    projects = data.get("projects") or []
+    active = data.get("active")
+    if not projects:
+        return f"Modo atual: '{active}'. Nenhum projeto registrado — use project_create para criar um."
+    lines = [f"Modo atual: '{active}'", "Projetos:"]
+    for p in projects:
+        slug = p.get("slug")
+        mark = " [ATIVO]" if slug == active else ""
+        lines.append(f"  {slug} — {p.get('name')}{mark}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def skill_create(
+    name: str,
+    description: str,
+    content: str,
+    files: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> str:
+    """Cria uma NOVA skill (playbook reutilizável, formato SKILL.md) que fica
+    permanentemente disponível: na PRÓXIMA pergunta ela já entra na seleção
+    semântica e pode ser carregada com use_skill. Use quando o usuário pedir
+    para salvar um procedimento/fluxo de trabalho para reuso ("transforma
+    isso em skill", "salva esse passo a passo") — NÃO para fatos de memória
+    (memory_write_batch) nem para instruções de UMA conversa.
+    Parâmetros:
+    - name: kebab-case (ex.: "deploy-frontend"); espaços/maíusculas viram
+      slug automaticamente.
+    - description: 1-2 linhas dizendo O QUE a skill faz e QUANDO usar — é
+      ELA que o seletor semântico usa para achar a skill; descrição vaga =
+      skill nunca selecionada.
+    - content: o playbook em markdown (passo a passo, regras, exemplos) —
+      SEM frontmatter (o servidor adiciona name/description).
+    - files: opcional {"references/api.md": "..."} — arquivos de apoio lidos
+      depois com skill_file.
+    Se já existir skill com esse nome no diretório de criação, recusa —
+    reenvie com overwrite=true para substituir (substituição total: arquivos
+    antigos da pasta são apagados). Skill de mesmo nome instalada pelo CLI
+    `skills` no projeto NÃO pode ser sombreada — o servidor pede outro nome."""
+    if not name.strip():
+        return "Erro: nome da skill vazio."
+    try:
+        data = await _orchestrator_request("POST", "/skills/create", {
+            "name": name.strip(),
+            "description": description,
+            "content": content,
+            "files": files,
+            "overwrite": overwrite,
+        })
+    except MemoryToolError as e:
+        return f"Erro ao criar skill: {e.detail}"
+    except Exception as e:
+        log.exception("skill_create falhou")
+        return f"Erro ao criar skill: {e}"
+    log.info(f"[skills] skill_create OK: {data.get('name')!r} (indexed={data.get('indexed')})")
+    note = data.get("note") or ""
+    return f"Skill '{data.get('name')}' criada em {data.get('dir')}. {note}"
+
+
+@mcp.tool()
+async def skill_list() -> str:
+    """Lista TODAS as skills instaladas (as do projeto via CLI `skills`, as
+    globais e as que você criou com skill_create) com nome, descrição, origem
+    e se já estão indexadas. Use antes de skill_create (não duplicar o que já
+    existe) e quando o usuário perguntar "quais skills você tem?". A seleção
+    por pergunta já injeta as relevantes automaticamente — isto é a visão
+    geral do catálogo."""
+    try:
+        data = await _orchestrator_request("GET", "/skills")
+    except MemoryToolError as e:
+        return f"Erro ao listar skills: {e.detail}"
+    except Exception as e:
+        log.exception("skill_list falhou")
+        return f"Erro ao listar skills: {e}"
+    skills = data.get("skills") or []
+    if not skills:
+        return "Nenhuma skill instalada (nem via `npx skills add`, nem criada com skill_create)."
+    lines = [f"{data.get('count')} skill(s):"]
+    for s in skills:
+        desc = (s.get("description") or "").strip()
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+        origin = "criada pelo agente" if "skills-created" in str(s.get("dir")) else (s.get("source") or "sem proveniência")
+        lines.append(
+            f"  {s.get('name')} — {desc} [{origin}]"
+            + ("" if s.get("indexed") else " [fora do índice]")
+        )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

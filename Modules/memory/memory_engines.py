@@ -97,9 +97,16 @@ class EmbeddingEngine:
 
         if miss_texts:
             embeddings = await self._client.embed(self._prefixed(miss_texts, EMBED_QUERY_PREFIX))
-            for idx, emb in zip(misses, embeddings):
+            # ── FIX (27/10): `misses` guarda índices ORIGINAIS em `texts`; o par
+            # (posição → embedding) é com `miss_texts`. O código antigo fazia
+            # miss_texts[idx] (índice original) → IndexError quando um HIT de
+            # cache vinha ANTES de um MISS no mesmo lote (ex.: /read com
+            # [query já cacheada, contexto novo]) — e, no caso idx < len,
+            # envenenava o cache com embedding do texto ERRADO. Com o contexto
+            # global do ST sempre presente, esse caminho virou o comum.
+            for idx, text, emb in zip(misses, miss_texts, embeddings):
                 results[idx] = emb
-                key = miss_texts[idx].strip().lower()
+                key = text.strip().lower()
                 self._query_cache[key] = (now, emb)
                 self._query_cache.move_to_end(key)
 

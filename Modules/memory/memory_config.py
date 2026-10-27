@@ -295,7 +295,13 @@ TOOLS_MAX_PER_SERVER        = 4      # cota de slots por servidor MCP no top_k �
 AGENT_SKILL_PREFIX      = "agentskill__"
 SKILLS_TOP_K            = 3      # skills "primary" por seleção — mais que isso
                                  # vira ruído no system prompt
-SKILLS_MIN_SCORE        = 0.40   # cosine mínimo p/ uma skill entrar como primary
+# 0.79 (26/10, medido ao vivo): o embed é multilingual (PT↔EN) e o piso de
+# ruído é ALTO — queries irrelevantes ("previsão do tempo", "preço do dólar")
+# devolvem 0.766-0.786 em QUALQUER skill, enquanto matches reais ficam em
+# ≥0.807 (officecli p/ documento/planilha 0.807-0.819, slideshow p/ slide
+# 0.861). Com o 0.40 antigo TODO mundo passava e o turno recebia hints de
+# skills irrelevantes. Recalibrar se trocar o modelo de embed.
+SKILLS_MIN_SCORE        = 0.79   # cosine mínimo p/ uma skill entrar como primary
 SKILLS_FALLBACK_TOP_K   = 5      # teto em modo low-confidence (sem threshold)
 
 # ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
@@ -443,6 +449,20 @@ RERANK_UPDATE_SCORE     = 0.55   # cross-encoder >= isso (e < duplicate) → pos
 
 ST_TTL_HOURS          = 24.0
 ST_CLEANUP_INTERVAL_S = 1800
+
+# ── SESSÕES REMOVIDAS: dedup do /write-short-term com JANELA TEMPORAL ──────
+# ST é global (o histórico sobrevive à troca de sessão), então o dedup global
+# puro passou a recusar turnos NOVOS cujo par cru parece com um turno ANTIGO
+# de outra sessão (ex.: mesma mensagem reenviada ~50 min depois → 0.960 de
+# similaridade: o texto do user idêntico domina a média mesmo com a resposta
+# completamente diferente). Recusar nesse caso DESTRÓI o conteúdo mais
+# recente do histórico (bug 27/10: 'pode gerar' foi respondido sobre a
+# janela VELHA — currículo/WhatsApp da noite anterior — porque o par novo
+# nunca entrou). Só faz sentido recusar duplicata RECENTE: a corrida com o
+# resumo episódico da extração (grava no mesmo st_index segundos antes),
+# o retry do _save_turn e o reenvio imediato. Duplicata contra grupo velho
+# (> janela) grava normal.
+ST_DEDUP_WINDOW_S     = 600.0
 
 # ── Otimização de tokens (reduzir payload enviado ao LLM) ─────────────────────
 # Evita erros 413 Payload Too Large no Groq quando o /read é chamado múltiplas
@@ -664,6 +684,7 @@ __all__ = [
     'SEGMENT_TRIGGER_WORDS',
     'ST_CLEANUP_INTERVAL_S',
     'ST_DB_PATH',
+    'ST_DEDUP_WINDOW_S',
     'ST_FAISS_ID_MAP_PATH',
     'ST_FAISS_INDEX_PATH',
     'ST_READ_DEFAULT_PAIRS',

@@ -34,6 +34,11 @@ services:
       - ./.agents/skills:/app/.agents/skills:ro
       - ./skills-lock.json:/app/skills-lock.json:ro
       - ~/.agents/skills:/root/.agents/skills:ro
+      # Skills CRIADAS PELO AGENTE em runtime (POST /skills/create → alpha-mcp
+      # → orchestrator): dir SEPARADO do store do CLI (que segue ro — o CLI
+      # `skills` nunca reconcilia o que está aqui). rw porque o orchestrator
+      # escreve; bind mount = as skills aparecem no host também.
+      - ./.agents/skills-created:/app/.agents/skills-created:rw
 
     # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
     # CRAWL4AI_API_TOKEN...) + o provider de inferência (LLM_BASE_URL/
@@ -55,7 +60,12 @@ services:
       HF_HUB_ETAG_TIMEOUT: "600"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.9.12.22:9000/status"]
+      # curl NÃO existe na imagem (health ficava eternamente em "starting":
+      # "exec: curl: executable file not found") — o probe roda com o python
+      # que já está nela. /status responde 200 sem token. O container roda
+      # com network_mode host (override linux), então 127.9.12.22 aqui É o
+      # loopback do host — o orchestrator em 9000 é alcançável.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.9.12.22:9000/status', timeout=5)"]
       interval: 30s
       timeout: 10s
       start_period: 240s
@@ -122,6 +132,16 @@ services:
     ports:
       - "127.9.12.22:4010:4010"
     environment:
+      # Bind do uvicorn DENTRO do container: precisa ser 0.0.0.0. O default
+      # do server.py é 127.9.12.22 (correto p/ execução nativa no host, mas
+      # errado na bridge: a porta publicada 127.9.12.22:4010 encaminha pelo
+      # IP do container, onde o loopback interno não escuta — o docker-proxy
+      # aceita a conexão e fecha na sequência, e o cliente vê
+      # "Connection reset by peer" → alpha-mcp UNHEALTHY em loop, como
+      # visto no mcp_manager.log da instalação de 26/10. O playwright nunca
+      # sofre disso porque é stdio). A publicação continua restrita ao
+      # loopback do HOST (127.9.12.22:4010) — nada fica exposto na rede.
+      ALPHA_MCP_HOST: "0.0.0.0"
       ALPHA_MCP_CONFIG: "/app/resource/alpha-mcp/config.json"
       SEARXNG_URL: "http://searxng:8080"
       CRAWL4AI_URL: "http://crawl4ai:11235"
@@ -129,6 +149,12 @@ services:
       # memory_write_batch: a tool de gravação de memórias fala com a
       # memory_api direto (mesmo contrato REST do LLM.py /write/batch)
       MEMORY_API_URL: "http://ava:3000"
+      # project_create/project_list e skill_create/skill_list falam com o
+      # orchestrator (:9000) — criação de projetos e de skills pelo agente
+      ORCHESTRATOR_URL: "http://ava:9000"
+      # Auth interna: o orchestrator exige Bearer (mesmo token da memory).
+      # Sem ele as rotas /projects e /skills/create devolvem 401.
+      AVA_INTERNAL_TOKEN: "${AVA_INTERNAL_TOKEN:?Defina AVA_INTERNAL_TOKEN no Modules/.env — install.sh/install.ps1 geram}"
       CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Defina CRAWL4AI_API_TOKEN no Modules/.env — install.sh gera}"
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
 

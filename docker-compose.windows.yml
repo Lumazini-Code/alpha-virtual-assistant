@@ -57,10 +57,12 @@ services:
       # Mesmo tratamento do PROCESS_MANAGER_URL (extra_hosts já tem o gateway).
       TRANSCRIBE_HTTP_URL: "http://host.docker.internal:9100"
       # Skills dirs no container (substitui o default do orchestrator.py):
-      # projeto (.agents/skills do repo) + global do WSL (mount ~ do base
-      # compose) + global do WINDOWS (mount AVA_WIN_GLOBAL_SKILLS abaixo).
-      # Ordem = prioridade — projeto vence global em duplicata.
-      AVA_SKILLS_DIRS: "/app/.agents/skills,/root/.agents/skills,/root/.agents-win/skills"
+      # projeto (.agents/skills do repo) + skills CRIADAS PELO AGENTE
+      # (POST /skills/create — mount rw do base compose) + global do WSL
+      # (mount ~ do base compose) + global do WINDOWS (mount
+      # AVA_WIN_GLOBAL_SKILLS abaixo). Ordem = prioridade — projeto vence
+      # em duplicata.
+      AVA_SKILLS_DIRS: "/app/.agents/skills,/app/.agents/skills-created,/root/.agents/skills,/root/.agents-win/skills"
 
     # ── DBs da memory em volume nomeado (fs Linux da VM) ──
     # SQLite + WAL sobre o bind mount do Docker Desktop (drvfs/9p) não é

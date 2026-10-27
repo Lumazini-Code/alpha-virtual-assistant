@@ -90,6 +90,64 @@ fn env_parse<T: FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Abre logs/<name> em append, com base no diretório do executável — a
+/// MESMA regra do Config::from_env para o db_dir (o binário vive na raiz do
+/// projeto). None se não der: o log segue só no stderr e nada aqui pode
+/// derrubar o boot por causa de telemetria.
+fn open_log_file(name: &str) -> Option<std::fs::File> {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
+    let dir = base.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))
+        .ok()
+}
+
+/// Logging duplo: stderr + logs/mcp_manager.log (append, ANSI off).
+///
+/// O arquivo é obrigatório, não luxo: o tray lança este binário com
+/// stdout/stderr redirecionados (ou null) — sem arquivo próprio, a causa de
+/// uma morte se perdia para sempre (incidente de 26/10: o manager morreu
+/// ~2 min após o boot e o stderr registrado era vazio, porque ia para
+/// Stdio::null). Com o arquivo, qualquer modo de lançamento (spawn do
+/// tray, manual, debug) produz o mesmo log.
+fn install_logging(max_level: tracing::Level) {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let level = LevelFilter::from(max_level);
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(level);
+    let file_layer = open_log_file("mcp_manager.log").map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::sync::Arc::new(file))
+            .with_filter(level)
+    });
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+}
+
+/// Panics também vão para o arquivo: o hook roda ANTES do unwind — se o
+/// processo morrer em seguida, a mensagem e a backtrace já estão em disco.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!("PANIC: {info}\n{backtrace}");
+        default_hook(info);
+    }));
+}
+
 impl Config {
     fn from_env() -> Self {
         // Banco local do manager (registry de servidores + cache de
@@ -2443,10 +2501,9 @@ async fn wait_all(events: Vec<Event>) {
 #[tokio::main]
 async fn main() {
     let debug_on = std::env::var("AVA_DEBUG").map(|v| !v.is_empty()).unwrap_or(false);
-    tracing_subscriber::fmt()
-        .with_max_level(if debug_on { tracing::Level::DEBUG } else { tracing::Level::INFO })
-        .with_target(false)
-        .init();
+    let max_level = if debug_on { tracing::Level::DEBUG } else { tracing::Level::INFO };
+    install_panic_hook();
+    install_logging(max_level);
 
     let cfg = Config::from_env();
     info!("Iniciando MCP Manager (registro + executor de servidores MCP)...");

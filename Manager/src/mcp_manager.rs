@@ -173,11 +173,36 @@ pub async fn start(state: &SharedState) -> Result<()> {
     let injected: Vec<&str> = child_env.iter().map(|(k, _)| k.as_str()).collect();
     tracing::info!("MCP manager: env injetado do Modules/.env: {:?}", injected);
 
+    // Redirect do stdout/stderr do filho → logs/mcp_manager.stderr.log
+    // (append). O binário loga por conta própria em logs/mcp_manager.log
+    // (tracing); este redirect cobre o que ESCAPA do tracing: panics antes
+    // do init, prints avulsos e o caso de o arquivo de log do próprio
+    // filho não abrir. Sem isso, uma morte do filho não deixava NENHUMA
+    // evidência — foi o que aconteceu no incidente de 26/10: o manager
+    // morreu e o stderr ia para /dev/null (Stdio::null).
+    let log_dir = cwd.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let open_capture = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("mcp_manager.stderr.log"))
+    };
+    let (stdout, stderr) = match (open_capture(), open_capture()) {
+        (Ok(o), Ok(e)) => (Stdio::from(o), Stdio::from(e)),
+        (o, e) => {
+            tracing::warn!(
+                "MCP manager: redirect de logs falhou (out={o:?} err={e:?}) — filho roda sem captura"
+            );
+            (Stdio::null(), Stdio::null())
+        }
+    };
+
     let mut cmd = Command::new(&binary);
     cmd.current_dir(&cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .no_window()
         .kill_on_drop(false);
     for (k, v) in child_env {
@@ -187,7 +212,19 @@ pub async fn start(state: &SharedState) -> Result<()> {
         .spawn()
         .with_context(|| format!("Falha ao iniciar MCP manager ({})", binary.display()))?;
     let pid = child.id(); // Option<u32> — None se o filho morrer já na saída
-    std::mem::forget(child); // detached: sobrevive ao tray (igual docker/browser)
+
+    // Reap do filho: task bloquante no wait(). Enquanto o tray vive, o fim
+    // do filho é coletado — nada de zumbi; se o TRAY morrer primeiro, o
+    // filho fica órfão e o init reaps (detached: sobrevive ao tray, igual
+    // docker/browser). O antigo std::mem::forget deixava um <defunct>
+    // PERMANENTE por ciclo de crash/respawn — 3 acumulados em 3 minutos no
+    // incidente de 26/10 (cada auto-stop criava um que ninguém nunca coletava).
+    {
+        let mut child = child;
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+        });
+    }
 
     // Espera o /health abrir (o port pode carregar DB/registry no boot).
     let deadline = Instant::now() + Duration::from_secs(HEALTH_WAIT_SECS);

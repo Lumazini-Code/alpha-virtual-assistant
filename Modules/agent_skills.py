@@ -9,9 +9,11 @@ cada skill é uma PASTA com um SKILL.md que começa com frontmatter YAML
   - GLOBAL:    `~/.agents/skills/` (mesmo layout flat) + lock
                `~/.agents/.skill-lock.json` (ou $XDG_STATE_HOME/skills/ —
                variante do próprio CLI).
-Este módulo NÃO instala nada — só LÊ o que está no disco (o usuário
-instala/atualiza com `npx skills add [-g]` no host; os mounts ro do compose
-fazem o container enxergar na hora).
+Este módulo NÃO instala nada do CLI `skills` — só LÊ o que está no disco
+(o usuário instala/atualiza com `npx skills add [-g]` no host; os mounts ro
+do compose fazem o container enxergar na hora). Ele CRIA um tipo especial:
+skills escritas PELO AGENTE em runtime (`.agents/skills-created/` — dir
+separado do store do CLI, que nunca as reconcilia/limpa).
 
 Responsabilidades (tudo stdlib, sem dependência nova):
   - scan_agent_skills(dirs): descobre as skills (frontmatter + doc_hash) em
@@ -20,6 +22,9 @@ Responsabilidades (tudo stdlib, sem dependência nova):
   - read_skill_body / resolve_skill_file: leitura usada pelas tools nativas
     `use_skill` / `skill_file` do orchestrator, com guarda de path traversal
     (symlinks resolvidos via os.path.realpath) e recusa de binário;
+  - create_agent_skill: cria skill do AGENTE (SKILL.md + arquivos extras)
+    com validação de nome/description, recusa de duplicata (salvo overwrite)
+    e escrita atômica — usado pelo POST /skills/create do orchestrator;
   - load_lockfile: proveniência (`owner/repo`) de AMBOS os lockfiles — só
     informativa (GET /skills do orchestrator).
 
@@ -32,6 +37,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -257,3 +265,157 @@ def resolve_skill_file(skill_dir: Path, rel_path: str, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + f"\n\n[... truncated at {max_chars} chars ...]"
     return text
+
+
+# ── Criação (skill escrita PELO AGENTE — POST /skills/create) ─────────────────
+# Skills criadas em runtime pelo próprio modelo vão para um diretório SEPARADO
+# do store do CLI (`.agents/skills-created/` — o `.gitignore` já cobre via
+# `.agents`): o CLI `skills` só reconcilia o que está no lock dele e nunca
+# toca aqui; o GET /skills distingue a origem pelo dir. Prioridade no scan:
+# projeto CLI > skills-created > global (uma skill criada SOMBREIA a global
+# de mesmo nome, mas nunca a de projeto — a rota recusa nesse caso).
+
+class SkillCreateError(Exception):
+    """Recusa de criação (validação, duplicata). `status` sugere o HTTP —
+    a rota do orchestrator converte em HTTPException(status, detail)."""
+
+    def __init__(self, detail: str, status: int = 400):
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+MIN_SKILL_DESCRIPTION_CHARS = 10   # description é o driver da seleção semântica
+MAX_SKILL_DESCRIPTION_CHARS = 500
+MAX_SKILL_BODY_CHARS        = 96_000   # corpo do SKILL.md (frontmatter à parte)
+MAX_SKILL_EXTRA_FILES       = 20       # arquivos extras por skill
+MAX_SKILL_EXTRA_FILE_CHARS  = 64_000   # por arquivo extra
+
+
+def slugify_skill_name(raw: str) -> str:
+    """Nome vindo do modelo → slug determinístico (mesmo espírito do
+    `_slugify` dos projetos, mas kebab-case — convenção do ecossistema
+    skills.sh: hyperframes-cli, reverse-engineer-anything). Acentos NFKD
+    decompõem ("relatório" → "relatorio") antes da limpeza. Vazio/inválido
+    após a limpeza → '' (caller recusa)."""
+    text = unicodedata.normalize("NFKD", (raw or "").strip().lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    slug = re.sub(r"[^a-z0-9_-]+", "-", text)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-_")
+    return slug if SKILL_NAME_RE.match(slug or "") else ""
+
+
+def _clean_extra_file_path(rel: str) -> Path:
+    """Valida o caminho de um arquivo extra (relativo, sem traversal,
+    reservado SKILL.md fora). Devolve o relativo normalizado (POSIX)."""
+    p = (rel or "").strip().replace("\\", "/")
+    if not p:
+        raise SkillCreateError("caminho de arquivo extra vazio")
+    if p.startswith("/") or re.match(r"^[A-Za-z]:", p):
+        raise SkillCreateError(f"caminho absoluto não permitido: {rel!r}")
+    parts = p.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise SkillCreateError(f"caminho inválido (traversal): {rel!r}")
+    if parts[-1].lower() == SKILL_MD_NAME.lower() and len(parts) == 1:
+        raise SkillCreateError("'SKILL.md' é o playbook — use `content`")
+    return Path(*parts)
+
+
+def create_agent_skill(
+    root,
+    name: str,
+    description: str,
+    content: str,
+    files: Optional[dict[str, str]] = None,
+    overwrite: bool = False,
+) -> Path:
+    """Cria a skill do AGENTE `<root>/<slug>/SKILL.md` (+ arquivos extras) e
+    devolve a PASTA da skill. Validações: slug ([a-z0-9_-], kebab-case),
+    description com conteúdo útil (a seleção semântica usa SÓ ela), corpo
+    não-vazio, arquivos extras de texto com caminho relativo seguro. Escrita
+    atômica: os extras primeiro, SKILL.md por último (tmp + os.replace) —
+    uma skill nunca aparece no scan pela metade. Recusa duplicata no MESMO
+    dir salvo `overwrite=True` (colisão com dir de prioridade MAIOR é da
+    rota — aqui só enxerga o próprio root)."""
+    slug = slugify_skill_name(name)
+    if not slug:
+        raise SkillCreateError(
+            f"nome inválido: {name!r} — use letras/números/-/_ (kebab-case, "
+            "começando com letra ou número)"
+        )
+    desc = (description or "").strip()
+    if len(desc) < MIN_SKILL_DESCRIPTION_CHARS:
+        raise SkillCreateError(
+            "description muito curta — a seleção semântica usa SÓ ela: diga "
+            "O QUE a skill faz e QUANDO usar (1-2 linhas)"
+        )
+    if len(desc) > MAX_SKILL_DESCRIPTION_CHARS:
+        desc = desc[:MAX_SKILL_DESCRIPTION_CHARS].rstrip()
+    body = (content or "").strip()
+    if not body:
+        raise SkillCreateError("content vazio — o corpo do playbook é obrigatório")
+    if len(body) > MAX_SKILL_BODY_CHARS:
+        raise SkillCreateError(
+            f"content muito grande ({len(body)} chars; máx {MAX_SKILL_BODY_CHARS})"
+        )
+
+    extras: list[tuple[Path, str]] = []
+    for rel, text in (files or {}).items():
+        if not isinstance(text, str):
+            raise SkillCreateError(f"arquivo extra {rel!r} deve ser texto (str)")
+        rel_path = _clean_extra_file_path(str(rel))
+        if not text.strip():
+            raise SkillCreateError(f"arquivo extra vazio: {rel!r}")
+        if len(text) > MAX_SKILL_EXTRA_FILE_CHARS:
+            raise SkillCreateError(
+                f"arquivo extra muito grande ({rel!r}: {len(text)} chars; "
+                f"máx {MAX_SKILL_EXTRA_FILE_CHARS})"
+            )
+        extras.append((rel_path, text))
+    if len(extras) > MAX_SKILL_EXTRA_FILES:
+        raise SkillCreateError(
+            f"máximo de {MAX_SKILL_EXTRA_FILES} arquivos extras (recebi {len(extras)})"
+        )
+
+    root_real = Path(os.path.realpath(root))
+    skill_dir = root_real / slug
+    if os.path.islink(skill_dir):
+        raise SkillCreateError(f"symlink no lugar da skill: {skill_dir}")
+    if skill_dir.exists():
+        if not skill_dir.is_dir():
+            raise SkillCreateError(f"o caminho existe e não é pasta: {skill_dir}")
+        if not overwrite:
+            raise SkillCreateError(
+                f"skill '{slug}' já existe (reenvie com overwrite=true para substituir)",
+                status=409,
+            )
+        shutil.rmtree(skill_dir)
+    try:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SkillCreateError(f"falha ao criar pasta da skill: {e}")
+
+    def _atomic_write(target: Path, text: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+
+    # Extras ANTES do SKILL.md: sem SKILL.md a pasta é invisível pro scan —
+    # uma falha no meio nunca expõe skill pela metade.
+    base_real = Path(os.path.realpath(skill_dir))
+    for rel_path, text in extras:
+        target = skill_dir / rel_path
+        if base_real not in Path(os.path.realpath(target)).parents:
+            raise SkillCreateError(f"caminho escapa da pasta da skill: {rel_path!r}")
+        _atomic_write(target, text)
+    front = (
+        "---\n"
+        f"name: {slug}\n"
+        "description: |-\n"
+        + "".join(f"  {line}\n" for line in desc.splitlines())
+        + "---\n\n"
+    )
+    _atomic_write(skill_dir / SKILL_MD_NAME, front + body + "\n")
+    return skill_dir

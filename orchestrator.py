@@ -147,8 +147,16 @@ MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # Ainda filtered pelo /skills do manager, então um servidor desabilitado ou
 # offline não é injetado. Env para override sem tocar em código.
 ALWAYS_ON_MCP_SERVERS = {
-    s.strip() for s in os.getenv("AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp").split(",") if s.strip()
+    s.strip() for s in os.getenv(
+        "AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp,desktop-commander"
+    ).split(",") if s.strip()
 }
+# desktop-commander SEMPRE-on (26/10): é o EXECUTOR do agente (shell/arquivos/
+# processos). Sem ele no schema, o modelo improvise execução pela única tool
+# de "código" disponível — playwright__browser_run_code_unsafe (contexto de
+# PÁGINA, sem require/process) → 'ReferenceError' ao tentar rodar o CLI que o
+# playbook do officecli pedia. Executor é base: não pode depender do kNN (que
+# hoje é dominado pelas queries aprendidas das sessões de browser).
 
 # ── Agent Skills (SKILL.md — padrão "Agent Skills"/skills.sh) ─────────────────
 # Playbooks SKILL.md instalados pelo CLI `skills` (npx skills add owner/repo —
@@ -164,24 +172,46 @@ ALWAYS_ON_MCP_SERVERS = {
 # usa o endpoint próprio (/agent-skills/select). Co-uso numa mesma lista de
 # record-usage cria arestas skill↔tool (PPR espalha de um pro outro).
 try:
-    from Modules.agent_skills import AgentSkill, read_skill_body, resolve_skill_file, scan_agent_skills
+    from Modules.agent_skills import (
+        AgentSkill,
+        SkillCreateError,
+        create_agent_skill,
+        read_skill_body,
+        resolve_skill_file,
+        scan_agent_skills,
+        slugify_skill_name,
+    )
 except ImportError:  # execução fora da raiz do projeto (CWD diferente)
-    from agent_skills import AgentSkill, read_skill_body, resolve_skill_file, scan_agent_skills
+    from agent_skills import (
+        AgentSkill,
+        SkillCreateError,
+        create_agent_skill,
+        read_skill_body,
+        resolve_skill_file,
+        scan_agent_skills,
+        slugify_skill_name,
+    )
 AGENT_SKILL_PREFIX  = "agentskill__"  # tem que bater com memory_config.AGENT_SKILL_PREFIX
 
 
 def _default_skills_dirs() -> list[str]:
     """Skills PROJECT (.agents/skills ao lado do orchestrator.py — no
-    container /app/.agents/skills) + GLOBAIS do CLI `skills`
+    container /app/.agents/skills) + skills CRIADAS PELO AGENTE em runtime
+    (.agents/skills-created — POST /skills/create; dir separado do store do
+    CLI `skills`, que nunca as reconcilia) + GLOBAIS do CLI `skills`
     (`npx skills add -g` instala em ~/.agents/skills). A ordem é prioridade:
-    projeto vence global em skill de mesmo nome (scan_agent_skills dedup).
-    No container, o compose monta ~/.agents/skills (do HOST) em
-    /root/.agents/skills — então Path.home() resolve igual nos dois lados,
-    sem env."""
-    dirs = [str(Path(__file__).resolve().parent / ".agents" / "skills")]
+    projeto vence skills-created, que vence global em skill de mesmo nome
+    (scan_agent_skills dedup). No container, o compose monta ~/.agents/skills
+    (do HOST) em /root/.agents/skills — então Path.home() resolve igual nos
+    dois lados, sem env."""
+    base = Path(__file__).resolve().parent
+    dirs = [
+        str(base / ".agents" / "skills"),           # CLI `skills add` (projeto)
+        str(base / ".agents" / "skills-created"),   # POST /skills/create (agente)
+    ]
     try:
         dirs.append(str(Path.home() / ".agents" / "skills"))
-    except Exception:  # HOME indefinido — só o dir do projeto
+    except Exception:  # HOME indefinido — só os dirs do projeto
         pass
     return dirs
 
@@ -190,6 +220,10 @@ def _default_skills_dirs() -> list[str]:
 AGENT_SKILLS_DIRS = [
     d.strip() for d in os.getenv("AVA_SKILLS_DIRS", ",".join(_default_skills_dirs())).split(",") if d.strip()
 ]
+# Onde o AGENTE cria skills em runtime (POST /skills/create). O segundo item
+# de AGENT_SKILLS_DIRS aponta pra cá — o compose monta em rw (a pasta do CLI
+# continua ro). No host é o caminho do repo; no container /app/... (mount).
+AGENT_SKILLS_CREATED_DIR = str(Path(__file__).resolve().parent / ".agents" / "skills-created")
 # Skills "core" no ToolsDB (always-on — entram em TODA seleção, como os
 # servidores MCP always-on acima). Env p/ override sem tocar em código.
 ALWAYS_ON_AGENT_SKILLS = {
@@ -278,6 +312,9 @@ ORCH_RECALL_TOP_K_FINAL = int(os.getenv("ORCH_RECALL_TOP_K_FINAL", "5"))
 ORCH_RECALL_MAX_CHARS   = int(os.getenv("ORCH_RECALL_MAX_CHARS", "3000"))
 ORCH_ST_PAIRS           = int(os.getenv("ORCH_ST_PAIRS", "5"))
 ORCH_ST_MAX_CHARS       = int(os.getenv("ORCH_ST_MAX_CHARS", "2400"))
+# Teto do par cru gravado no ST (cabeça + cauda com marcador). Mantém o recall
+# da sessão inteira dentro do orçamento ORCH_ST_MAX_CHARS.
+ST_SAVE_MAX_CHARS       = int(os.getenv("ST_SAVE_MAX_CHARS", "2000"))
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. Respond naturally and briefly. No reasoning needed.",
@@ -397,7 +434,7 @@ _PERSONA = _load_persona()
 # do usuário (feita na aba /settings da TUI) e o orchestrator injeta o flag
 # nos requests de chat — no proxy /chat (modo CHAT) e no _llm_chat_stream
 # (modo TOOLS do /execute; o LLM.py protege tool_calls em montagem).
-SETTINGS_DEFAULT = {"watch_confidence": False}
+SETTINGS_DEFAULT = {"watch_confidence": False, "reasoning_effort": ""}
 
 SETTINGS_FILE = Path(
     os.getenv("SETTINGS_FILE")
@@ -605,6 +642,19 @@ class ExecuteRequest(BaseModel):
     document_content: Optional[str] = Field(None, max_length=2_000_000)
     search_pdfs:   bool           = False
     stream:        bool           = True
+    # ── Eficiência de uso de tokens (custo/tempo) ────────────────────────────
+    # Teto de turnos do tool loop ReAct. Sem teto, o loop só termina quando o
+    # MODELO quiser — e "turismo" de leitura (read/snapshot/search alternados)
+    # NUNCA aciona o anti-loop de MESMA tool (same_tool_streak zera a cada
+    # troca), drenando minutos de thinking + tokens (26/10: ~10 min lendo sem
+    # executar nada). Ao atingir o teto, _force_finish faz UMA chamada final
+    # SEM tools sintetizando o que foi coletado (histórico intacto). None =
+    # usa AVA_EXECUTE_MAX_STEPS (default 12).
+    max_steps:     Optional[int]  = Field(None, ge=1, le=100)
+    # Esforço de raciocínio do OpenRouter (reasoning.effort). Precedência:
+    # request > resource/settings.json (aba settings da TUI) > env
+    # AVA_REASONING_EFFORT > nativo (template do modelo decide).
+    reasoning_effort: Optional[Literal["low", "medium", "high", "none"]] = None
 
 class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
@@ -1018,14 +1068,65 @@ class _StreamedTTS:
         self._next_seq = 0
         self._next_emit = 0
 
+# ── Tasks em background (fire-and-forget) ────────────────────────────────────
+# asyncio.create_task SEM referência forte é o footgun documentado do asyncio:
+# o event loop só guarda refs FRACAS — a task pode ser coletada pelo GC no
+# meio da execução e sumir silenciosamente (suspeito no 26/10: o save do
+# par ST de um turno existiu, o do outro não — sem nenhum log nos dois).
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """create_task com referência forte (discard no done)."""
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+
 async def _save_turn(u, a, sid):
-    try:
-        await _memory_request("POST", "/write-short-term", {
-            "session_id": sid,
-            "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
-        })
-    except Exception:
-        pass
+    """Grava o par cru (user, assistant) no ST da sessão. É o ÚNICO histórico
+    de conversa que o próximo turno recebe (via /read-short-term) — se falhar,
+    o turno seguinte nasce AMNÉSICO ('Pode gerar' sem saber do documento).
+
+    O dedup semântico da memory compara o par contra o st_index COMPARTILHADO
+    (que contém TAMBÉM as memórias episódicas que a extração pós-turno grava
+    — resumos do próprio turno): se o resumo entrar primeiro, o par cru é
+    recusado (duplicate_semantic ~0.95) — por isso o await ANTES da extração
+    no fim do turno (ver _execute_stream_generator)."""
+    # Resposta longa é truncada (cabeça = o que foi feito; cauda = oferta/
+    # próximo passo — onde fica o 'quer que eu gere?'). O recall do ST tem
+    # orçamento de ORCH_ST_MAX_CHARS (2400) p/ a SESSÃO INTEIRA; um turno
+    # gigante sozinho já o estoura e a sanitizer descartaria os demais.
+    def _clip(t: str) -> str:
+        if len(t) <= ST_SAVE_MAX_CHARS:
+            return t
+        return t[:ST_SAVE_MAX_CHARS - 400] + "\n[…trecho omitido…]\n" + t[-400:]
+
+    u, a = _clip(u), _clip(a)
+    payload = {
+        "session_id": sid,
+        "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
+    }
+    for attempt in (1, 2):
+        try:
+            r = await _memory_request("POST", "/write-short-term", payload)
+            stored = bool(r.get("stored")) if isinstance(r, dict) else False
+            reason = str(r.get("reason") or "?") if isinstance(r, dict) else str(r)
+            if stored:
+                log.info(f"[save_turn] ST gravado (session={sid[:8]})")
+            elif reason.startswith("duplicate_semantic"):
+                log.info(f"[save_turn] ST recusado por dedup ({reason}) — "
+                         "resumo episódico já cobre o turno")
+            else:
+                log.warning(f"[save_turn] ST NÃO gravado (reason={reason}) — "
+                            f"session={sid[:8]} — turno seguinte nasce sem histórico!")
+            return
+        except Exception as e:
+            log.warning(f"[save_turn] write-short-term falhou (tentativa {attempt}/2): "
+                        f"{type(e).__name__}: {e}")
+            if attempt == 1:
+                await asyncio.sleep(1.0)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Recall de memória pré-loop (A) — LT semântico + ST cru, em paralelo
@@ -2596,7 +2697,8 @@ ORCHESTRATOR_LLM_BACKOFF_S = 2.0
 
 
 async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
-                     temperature: float = 0.0, max_tokens: Optional[int] = None) -> dict:
+                     temperature: float = 0.0, max_tokens: Optional[int] = None,
+                     reasoning_effort: Optional[str] = None) -> dict:
     """
     Chama o LLM.py (porta 4003) via seu endpoint real de tool-calling,
     /chat/tools, e retorna a mensagem completa (content + tool_calls).
@@ -2616,6 +2718,10 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
         payload["tool_choice"] = "auto"
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if reasoning_effort:
+        # O LLM.py traduz p/ reasoning.effort do OpenRouter (campo
+        # reasoning_effort do ToolUseRequest).
+        payload["reasoning_effort"] = reasoning_effort
 
     last_error: Optional[Exception] = None
     for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
@@ -2666,7 +2772,9 @@ class _LLMNoRetryError(RuntimeError):
 
 async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = None,
                            temperature: float = 0.0, max_tokens: Optional[int] = None,
-                           on_delta=None, session_id: Optional[str] = None) -> dict:
+                           on_delta=None, on_thinking=None,
+                           reasoning_effort: Optional[str] = None,
+                           session_id: Optional[str] = None) -> dict:
     """
     Variante STREAMING de _llm_chat: fala com o /chat/stream do LLM.py no modo
     TOOLS (messages + tools) e consome o SSE devolvido. Cada fragmento de
@@ -2679,6 +2787,13 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     (watch_confidence) na leitura de memória da correção; sem o flag ligado
     não tem efeito prático, mas custa nada.
 
+    `on_thinking`: mesmo contrato do on_delta para o RACIOCÍNIO NATIVO do
+    modelo (GLM thinking — o LLM.py repassa delta.reasoning /
+    delta.reasoning_content como eventos {"reasoning": ...} quando
+    stream_reasoning=True; ligado por padrão, desligável com
+    AVA_STREAM_REASONING=0). Repassado na hora e só na tentativa 0, igual
+    ao on_delta — retentativas não reemitem (dedupe idêntico).
+
     As tool_calls do backend só ficam completas no fim da geração — o LLM.py
     as acumula e emite UMA vez no evento {"tool_calls": [...]}, logo antes do
     done. Por isso o retorno é o MESMO contrato do _llm_chat:
@@ -2690,9 +2805,18 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     curado no fim pelo `done` (final_response) do /execute. Se os retries do
     stream se esgotarem, cai EM UM fallback para o /chat/tools síncrono.
     """
+    # stream_reasoning: o modelo já pensa por conta própria (template nativo
+    # do GLM); LIGAR o repasse não custa token nenhum a mais — desligar só
+    # ESCONDE o processo de pensamento da UI. AVA_STREAM_REASONING=0 volta a
+    # esconder. O esforço tem precedência: argumento (request TUI) > env
+    # AVA_REASONING_EFFORT > nativo — o LLM.py traduz p/ reasoning.effort.
     payload: dict = {"messages": messages, "temperature": temperature,
-                     "stream_reasoning": False,
+                     "stream_reasoning": os.environ.get("AVA_STREAM_REASONING", "1").strip() != "0",
                      "watch_confidence": _WATCH_CONFIDENCE}
+    _reasoning_effort = (reasoning_effort
+                         or os.environ.get("AVA_REASONING_EFFORT", "")).strip().lower() or None
+    if _reasoning_effort:
+        payload["reasoning_effort"] = _reasoning_effort
     if session_id:
         payload["session_id"] = session_id
     if tools:
@@ -2742,6 +2866,13 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                             content_acc.append(piece)
                             if on_delta is not None and attempt == 0:
                                 await on_delta(piece)
+                    elif "reasoning" in evt:
+                        # Raciocínio nativo do modelo (GLM thinking) — repassa
+                        # ao caller na hora, com a mesma dedupe do on_delta
+                        # (só na tentativa 0; retentativas não reemitem).
+                        piece = evt.get("reasoning") or ""
+                        if piece and on_thinking is not None and attempt == 0:
+                            await on_thinking(piece)
                     elif "tool_calls" in evt:
                         tool_calls_final = evt.get("tool_calls") or []
                     elif "error" in evt:
@@ -2776,7 +2907,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     # Stream esgotado após os retries — UM fallback síncrono (o _llm_chat tem
     # o próprio ciclo de retry; sem streaming, a resposta sai em bloco único).
     log.warning("LLM.py /chat/stream falhou após retries — caindo para /chat/tools síncrono")
-    return await _llm_chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+    return await _llm_chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
+                           reasoning_effort=_reasoning_effort)
 
 
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
@@ -2793,7 +2925,10 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     pedido (gerado por _select_agent_skills) — orienta o modelo a carregar o
     playbook com use_skill antes de agir no domínio da skill.
     `active_project`: slug do projeto ativo (escopo de memória) — injeta o
-    hint de escopo (NEW projetos)."""
+    hint de escopo (NEW projetos).
+    As tools de CRIAÇÃO (project_create/skill_create — alpha-mcp always-on)
+    têm um bloco fixo de orientação que SÓ entra quando elas estão na
+    listagem desta rodada (mcp_tool_names) — nunca anuncia tool ausente."""
     lang_names = {
         "pt": "Portuguese (Brazil)", "en": "English", "es": "Spanish",
         "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
@@ -2871,6 +3006,34 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "more reliable (fixed selectors + expected outcomes). Only fall back to direct "
         "browser_* tools when no plan matches, the user explicitly wants a fresh manual "
         "session, or the plan run fails and recovery didn't help.",
+
+        # ── NEW (projetos + skills criadas em runtime): ensinar que "criar
+        # coisa duradoura" existe como tool — sem isso o modelo improvisa a
+        # resposta em texto e perde a chance de criar escopo/playbook.
+        # CONDICIONADO à presença real das tools nesta rodada (alpha-mcp é
+        # always-on, mas se falhar/crashar elas não entram na listagem —
+        # nunca anunciar tool que não está disponível).
+        *([
+            "## Creating durable things (projects & skills — IMPORTANT)\n"
+            "You can create PERMANENT artifacts with tools, not just answer:\n"
+            "- `project_create(name)` creates a dedicated memory scope (a project) "
+            "and ACTIVATES it immediately — from that call on, long-term memories, "
+            "graphs and plans belong to that project; tell the user they are now "
+            "working inside it. Use it when the user asks for a new lasting context "
+            "(\"cria um projeto pra X\", \"let's separate everything about Y\"). Call "
+            "`project_list` first to avoid duplicates. Do NOT create a project for "
+            "loose facts — that is what the memory write tool is for.\n"
+            "- `skill_create(...)` saves a reusable playbook (Agent Skill, SKILL.md) "
+            "that becomes selectable on the NEXT user request. Use it when the user "
+            "asks to keep a procedure/workflow for reuse (\"transforma isso em skill\", "
+            "\"save these steps for next time\"). The `description` is what the "
+            "semantic selector matches on — write WHAT the skill does and WHEN to "
+            "use it; a vague description means the skill is never selected again. "
+            "Check `skill_list` first to avoid duplicating an installed skill. Not "
+            "for facts (memory write tool), not for one-off instructions.\n"
+            "- `project_list` / `skill_list` show what already exists — check them "
+            "when the user refers to a project by name or asks which skills you have."
+        ] if {"project_create", "skill_create"} & set((mcp_tool_names or {}).keys()) else []),
 
         "Deliver your final answer as plain text with NO tool call — write the COMPLETE "
         "response there: this text streams to the user live as you generate it, so never "
@@ -3152,17 +3315,66 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     if on_event is not None:
         async def on_delta(piece: str) -> None:
             await on_event("delta", piece)
+            # Houve content desde a última rajada de thinking: a próxima
+            # ganha separador (sem ele, as rajadas de turnos diferentes do
+            # tool loop se colam num bloco só na TUI).
+            _reason_sep["flush"] = True
+
+        # Processo de pensamento do modelo (GLM thinking via
+        # stream_reasoning — ver _llm_chat_stream): cada fragmento vira o
+        # evento "reasoning" NA HORA; a TUI renderiza no bloco dim "💭"
+        # acima da resposta. \n\n separa rajadas de turnos distintos.
+        _reason_sep = {"flush": False}
+
+        async def on_thinking(piece: str) -> None:
+            prefix = "\n\n" if _reason_sep["flush"] else ""
+            _reason_sep["flush"] = False
+            await on_event("reasoning", prefix + piece)
     else:
         on_delta = None
+        on_thinking = None
+
+    # ── Eficiência de uso de tokens (custo/tempo) ──────────────────────────
+    # Teto de turnos do loop: sem ele, "turismo" de leitura (read/snapshot/
+    # search alternados — que o anti-loop de MESMA tool não pega) roda até o
+    # modelo SE CANSAR. Precedência do esforço de reasoning: request >
+    # settings.json (aba settings da TUI) > env > nativo.
+    max_steps = req.max_steps or int(os.getenv("AVA_EXECUTE_MAX_STEPS", "12"))
+    reasoning_effort = (req.reasoning_effort
+                        or (_SETTINGS.get("reasoning_effort") or "")
+                        or os.getenv("AVA_REASONING_EFFORT", "")).strip().lower() or None
 
     while True:
+        # ── Guarda-corpo: teto de turnos ────────────────────────────────────
+        # UMA chamada final SEM tools (_force_finish) sintetizando o que já
+        # foi lido — o histórico fica intacto, nada é descartado. Mesmo
+        # padrão do hard-stop anti-loop (same_tool_streak).
+        if turn >= max_steps:
+            log.warning(
+                f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
+                "forçando resposta final sem tools."
+            )
+            final_response = await _force_finish(history, eid)
+            # Chamada de fechamento é síncrona (_llm_chat) — delta único.
+            if on_event:
+                await on_event("delta", final_response)
+            step_results.append(StepResult(
+                step=turn, executor="orchestrator",
+                action=f"teto de turnos ({max_steps}) — resposta forçada sem tools",
+                success=True, result=final_response,
+            ))
+            break
+
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
         if on_delta is not None:
             message = await _llm_chat_stream(history, tools=tools_schema,
                                              temperature=0.3, on_delta=on_delta,
+                                             on_thinking=on_thinking,
+                                             reasoning_effort=reasoning_effort,
                                              session_id=sid)
         else:
-            message = await _llm_chat(history, tools=tools_schema, temperature=0.3)
+            message = await _llm_chat(history, tools=tools_schema, temperature=0.3,
+                                      reasoning_effort=reasoning_effort)
         tool_calls = message.get("tool_calls") or []
         log.debug(
             f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "
@@ -3224,6 +3436,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
             if on_event:
                 await on_event("tool_call", {"step": turn, "tool": tool_name})
+                # Tool no meio = rajada de thinking nova vem depois.
+                _reason_sep["flush"] = True
 
             # ── Executa a tool: nativa (executor Python direto) ou MCP
             # (despachada pra sessão correspondente via call_tool) ──
@@ -3379,7 +3593,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # Agent Skills entram na MESMA lista (grafo namespaced): co-uso
     # skill↔tool cruza os dois mundos e a query vira exemplo aprendido da skill.
     if used_agent_skills or used_mcp_tools:
-        asyncio.ensure_future(_record_tool_usage(req.input, used_agent_skills + used_mcp_tools))
+        _spawn(_record_tool_usage(req.input, used_agent_skills + used_mcp_tools))
 
     return step_results, final_response
 
@@ -3503,6 +3717,14 @@ async def _execute_stream_generator(req: ExecuteRequest):
                     tts_streamer.dispatch(tts_streamer.take_chunk())
                 for payload in tts_streamer.drain():
                     yield _audio_frames(payload)
+        elif name == "reasoning":
+            # Processo de pensamento do modelo (GLM thinking, repassado pelo
+            # _llm_chat_stream com stream_reasoning ligado) — texto puro; a
+            # TUI acumula no bloco dim "💭" acima da resposta. Sem TTS
+            # (nunca é falado) e sem espelho no conversation hub (o chat do
+            # tray não tem onde renderizar — evento desconhecido lá é risco
+            # de desserialização no consumidor Rust).
+            yield _sse("reasoning", data)
         elif name == "tool_call":
             await _mirror_conversation(CONVERSATION_HUB, "tool_call", data)
             yield _sse("tool_call", data)
@@ -3541,14 +3763,21 @@ async def _execute_stream_generator(req: ExecuteRequest):
         yield _sse("audio_end", {})
     elif req.tts and req.tts_output == "device" and final_response:
         # Modo device (opt-in): TTS toca dentro do container.
-        asyncio.create_task(_fire_tts(final_response, req))
+        _spawn(_fire_tts(final_response, req))
 
     if final_response:
-        asyncio.create_task(_save_turn(req.input, final_response, sid))
+        # Await (não fire-and-forget): o par cru PRECISA entrar no ST antes da
+        # extração — as memórias episódicas do extrator vão pro MESMO st_index
+        # e o dedup do /write-short-term recusaria o par cru (~0.95 de simi-
+        # laridade com o resumo do próprio turno). Foi exatamente o que zerou
+        # o histórico entre o turno do WhatsApp e o 'Pode gerar' (26/10).
+        # Custo: um POST local (~100ms). Falha fica LOGADA (antes era
+        # except: pass — buraco negro).
+        await _save_turn(req.input, final_response, sid)
         # B+: extração real (modelo extrator do LLM.py, roteando semantic→LT /
         # episodic→ST) no lugar do antigo "_save_lt('Usuário disse: ...')" —
         # que gravava qualquer input como fato permanente de LT.
-        asyncio.create_task(_extract_memories_via_llm(req.input, final_response, sid))
+        _spawn(_extract_memories_via_llm(req.input, final_response, sid))
 
     lat = round((time.perf_counter() - t0) * 1000, 2)
     errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
@@ -4108,6 +4337,33 @@ async def set_watch_confidence(req: WatchConfidenceRequest):
     return {"enabled": _WATCH_CONFIDENCE}
 
 
+# ── Esforço de raciocínio (reasoning.effort do OpenRouter) ──────────────────
+# Aba /settings da TUI. Resolvido no _run_tool_loop com precedência:
+# request > settings.json (aqui) > env AVA_REASONING_EFFORT > nativo.
+# "" (vazio) = automático — o template do modelo decide.
+
+class ReasoningEffortRequest(BaseModel):
+    effort: Optional[Literal["low", "medium", "high", "none"]] = Field(
+        None, description="None = automático (comportamento nativo do modelo).")
+
+
+@app.get("/settings/reasoning-effort")
+async def get_reasoning_effort():
+    return {"effort": _SETTINGS.get("reasoning_effort") or None,
+            "default": SETTINGS_DEFAULT.get("reasoning_effort") or None}
+
+
+@app.put("/settings/reasoning-effort")
+async def set_reasoning_effort(req: ReasoningEffortRequest):
+    _SETTINGS["reasoning_effort"] = req.effort or ""
+    try:
+        _save_settings(_SETTINGS)
+    except Exception as e:
+        raise HTTPException(500, f"Falha ao persistir settings: {e}")
+    log.info(f"Reasoning effort = {req.effort or '(auto)'} — vale no próximo turno (sem restart).")
+    return {"effort": req.effort}
+
+
 # ── NEW: Agent Skills (SKILL.md) — inspeção/sincronização (aba da TUI depois) ──
 # Instaladas (disco + proveniência do skills-lock.json) e estado do índice no
 # ToolsDB. Rescan barato a cada chamada — depois de um `npx skills add` no
@@ -4145,6 +4401,74 @@ async def list_agent_skills():
 async def sync_agent_skills():
     """Força a re-sincronização do índice semântico (boot/retry manual)."""
     return await _sync_agent_skills_index()
+
+
+class SkillCreateRequest(BaseModel):
+    """Corpo do POST /skills/create (o agente cria skill em runtime)."""
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(..., min_length=1, max_length=2000)
+    content: str = Field(..., min_length=1, max_length=200_000)
+    files: Optional[dict[str, str]] = None
+    overwrite: bool = False
+
+
+@app.post("/skills/create")
+async def create_agent_skill_route(req: SkillCreateRequest):
+    """Cria uma skill do AGENTE em .agents/skills-created/<slug>/SKILL.md
+    (+ arquivos extras) e re-sincroniza o índice semântico NA HORA — a skill
+    fica selecionável na próxima pergunta, sem restart nem esperar o TTL do
+    scan. Colisão de nome: com skill do projeto CLI (prioridade maior) → 409
+    sempre (a criada nunca seria selecionada); com skill já criada → 409
+    salvo overwrite=true; com GLOBAL de mesmo nome → cria e SOMBREIA
+    (skill-created tem prioridade sobre global)."""
+    skills_now, _ = _agent_skills_cached(rescan=True)
+    existing = {s.name: s for s in skills_now}
+    slug = slugify_skill_name(req.name)
+    if not slug:
+        raise HTTPException(400, f"nome inválido: {req.name!r}")
+    if slug in existing:
+        prior_dir = Path(existing[slug].dir)
+        if prior_dir == Path(AGENT_SKILLS_CREATED_DIR) or prior_dir.parent == Path(AGENT_SKILLS_CREATED_DIR):
+            if not req.overwrite:
+                raise HTTPException(
+                    409, f"skill '{slug}' já existe (overwrite=true para substituir)"
+                )
+        elif AGENT_SKILLS_DIRS and prior_dir.is_relative_to(Path(AGENT_SKILLS_DIRS[0])):
+            raise HTTPException(
+                409,
+                f"skill '{slug}' existe em .agents/skills (gerenciada pelo CLI "
+                "`skills` — prioridade maior; uma criada nunca seria "
+                "selecionada). Escolha outro nome ou atualize pelo CLI.",
+            )
+        # global de mesmo nome: segue (skills-created tem prioridade sobre
+        # global) — a resposta avisa o sombreamento.
+        shadowed_global = True
+    else:
+        shadowed_global = False
+    try:
+        skill_dir = create_agent_skill(
+            AGENT_SKILLS_CREATED_DIR, slug, req.description, req.content,
+            req.files, req.overwrite,
+        )
+    except SkillCreateError as e:
+        raise HTTPException(e.status, e.detail)
+    _agent_skills_cached(rescan=True)   # cache fresco antes do sync
+    index = await _sync_agent_skills_index()
+    log.info(f"[skills] skill criada pelo agente: '{slug}' em {skill_dir} "
+             f"(index: {index.get('changed', '?')})")
+    resp = {
+        "created": True,
+        "name": slug,
+        "dir": str(skill_dir),
+        "indexed": bool(index.get("changed")),
+        "note": "disponível na próxima pergunta (seleção semântica)",
+    }
+    if shadowed_global:
+        resp["note"] = (
+            "sombreia a skill GLOBAL de mesmo nome (skills-created > global "
+            "no scan); " + resp["note"]
+        )
+    return resp
 
 
 # ── NEW: Projetos (escopos de memória) — aba /projects da TUI ─────────────────
