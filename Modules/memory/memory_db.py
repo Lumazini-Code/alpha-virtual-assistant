@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Camada de persistência SQLite (sem lógica de rede/vetor)
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 """
@@ -1407,6 +1421,15 @@ class ToolsDB(EdgeGraphMixin):
                 FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_tv_tool ON tool_vectors(tool_id);
+            CREATE TABLE IF NOT EXISTS tool_tips (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id    INTEGER NOT NULL,
+                text       TEXT    NOT NULL,
+                active     INTEGER NOT NULL DEFAULT 1,
+                created_at REAL    NOT NULL,
+                FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_ttips_tool ON tool_tips(tool_id);
         """)
         self._create_edge_table()
 
@@ -1477,6 +1500,59 @@ class ToolsDB(EdgeGraphMixin):
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0]
+
+    # ── Tool Tips (dicas de execução gravadas pelo modelo — ver memory_ops_tips) ──
+    def tips_active_for_tools(self, name_keys: list[str]) -> list[sqlite3.Row]:
+        """Dicas ATIVAS das tools pedidas (batch, mais antigas primeiro — ids
+        estáveis na exibição). Linhas com `name` da tool (JOIN) para o handler
+        montar o dicionário graph_name → [tips]."""
+        if not name_keys:
+            return []
+        ph = ",".join("?" * len(name_keys))
+        return self._conn.execute(
+            f"SELECT tt.id AS tip_id, tt.text, tt.created_at, t.name "
+            f"FROM tool_tips tt JOIN tools t ON t.id = tt.tool_id "
+            f"WHERE t.name_key IN ({ph}) AND tt.active = 1 "
+            f"ORDER BY tt.created_at ASC, tt.id ASC",
+            name_keys,
+        ).fetchall()
+
+    def tip_active_count(self, tool_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM tool_tips WHERE tool_id = ? AND active = 1",
+            (tool_id,),
+        ).fetchone()[0]
+
+    def tip_insert(self, tool_id: int, text: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tool_tips (tool_id, text, active, created_at) "
+                "VALUES (?, ?, 1, ?)",
+                (tool_id, text, time.time()),
+            )
+            return cur.lastrowid
+
+    def tip_update_text(self, tip_id: int, text: str):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tool_tips SET text = ? WHERE id = ?", (text, tip_id)
+            )
+
+    def tip_deactivate(self, tip_id: int) -> int:
+        """Retratação (soft delete) — a linha fica para auditoria."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE tool_tips SET active = 0 WHERE id = ? AND active = 1",
+                (tip_id,),
+            )
+            return cur.rowcount
+
+    def tip_get(self, tip_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT tt.*, t.name AS tool_name FROM tool_tips tt "
+            "JOIN tools t ON t.id = tt.tool_id WHERE tt.id = ?",
+            (tip_id,),
+        ).fetchone()
 
     # ── Vetores (mapeamento vector_id → tool_id) ──
     def insert_vector(self, tool_id: int, kind: str, text: str) -> int:

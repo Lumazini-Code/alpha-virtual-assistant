@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Modelos de request/response (Pydantic) + erros
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 """
@@ -630,6 +644,39 @@ class ToolUsageRequest(BaseModel):
     query:      str = ""
 
 
+# ── NEW: Tool Tips — dicas de execução gravadas pelo modelo sobre as tools ─────
+#
+# Não são snippets (descrição curada — sistema removido do mcp_manager): são
+# notas de USO REAL que o modelo grava via tool_tip_add (alpha-mcp) e que o
+# orquestrador busca SÓ das tools carregadas na rodada para o system prompt.
+# storage é SQLite puro (tool_tips no ToolsDB) — a dica anda junto da tool
+# selecionada, não é buscada semanticamente.
+
+class ToolTipAddRequest(BaseModel):
+    tool: str   # graph_name da tool no ToolsDB ('servidor__tool')
+    tip:  str
+
+class ToolTipAddResponse(BaseModel):
+    tool:       str
+    tip_id:     int
+    # "updated" = dica duplicada demais da existente → texto substituído
+    status:     Literal["created", "updated"]
+    tips_count: int   # dicas ativas da tool após a operação
+
+class ToolTipEntry(BaseModel):
+    id:         int
+    text:       str
+    created_at: float
+
+class ToolTipsListResponse(BaseModel):
+    # graph_name → dicas ativas (só tools com dica aparecem)
+    tips: dict[str, list[ToolTipEntry]]
+
+class ToolTipRemoveRequest(BaseModel):
+    tool:   str   # graph_name — confere se a dica é DESSA tool (sanidade)
+    tip_id: int
+
+
 # ── NEW: Agent Skills (SKILL.md) — seleção no MESMO ToolsDB, namespace próprio ─
 #
 # Mesma mecânica do ToolSelect* (kNN + PPR + queries aprendidas), mas o
@@ -862,6 +909,11 @@ __all__ = [
     'ToolRegisterResponse',
     'ToolSelectRequest',
     'ToolSelectResponse',
+    'ToolTipAddRequest',
+    'ToolTipAddResponse',
+    'ToolTipEntry',
+    'ToolTipRemoveRequest',
+    'ToolTipsListResponse',
     'ToolUsageRequest',
     'Turn',
     'VisualDictCandidate',

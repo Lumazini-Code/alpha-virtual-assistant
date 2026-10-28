@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Configuração central do AVA Memory
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 """
@@ -284,6 +298,29 @@ TOOLS_MAX_PER_SERVER        = 4      # cota de slots por servidor MCP no top_k �
                                      # 24 tools não pode monopolizar o kNN contra um de 1
                                      # (a seleção final é por SERVIDOR, então 1 hit já
                                      # libera as 24; sem cota, o de 1 tool nunca entra)
+
+# ── NEW: Tool Tips — dicas de execução gravadas PELO MODELO sobre as tools ─────
+# Não são snippets (descrição curada — sistema removido): são notas de USO REAL
+# ("falha com payload > 5MB", "chame X antes de Y") que o modelo grava via
+# tool_tip_add (alpha-mcp) e que voltam no system prompt SÓ das tools carregadas
+# na rodada. Cap firme + retratação pelo modelo (sem eviction silenciosa).
+TOOLS_TIP_MAX_PER_TOOL      = 5      # dicas ativas por tool — excedente REJEITA a
+                                     # nova com orientação de remoção (o modelo
+                                     # cura; nada é apagado por trás dele)
+TOOLS_TIP_MAX_CHARS         = 240    # teto de uma dica (1-2 frases imperativas)
+TOOLS_TIP_DEDUP_EMBED       = 0.98   # cosine (e5, passage-side) ≥ isso → UPDATE da
+                                     # dica existente (não cria). Calibração com o
+                                     # modelo REAL (onnxManager, multilingual-e5-small):
+                                     # 0.92 (plano original) FUNDIRIA dicas distintas —
+                                     # "corte a query" vs "corte o payload" dá 0.975 e
+                                     # "sempre vs nunca capture output" 0.957. Em 0.98 só
+                                     # reescritas quase literais fundem (o bug real: 0.986);
+                                     # "30s→300s"/"antes→depois" (0.984/0.988) também
+                                     # fundem, mas aí é o modelo CORRIGINDO a própria dica
+                                     # (update = comportamento desejado). Paráfrases
+                                     # distantes (0.94-0.97) NÃO fundem de propósito:
+                                     # duplicata é erro VISÍVEL e auto-curável (cap-rejeição
+                                     # + tool_tip_remove); merge silencioso é destrutivo.
 
 # ── NEW: Agent Skills (SKILL.md) — mesmo ToolsDB, namespace próprio ───────────
 # Skills (playbooks SKILL.md, instaladas pelo CLI `skills`/skills.sh em
@@ -697,6 +734,9 @@ __all__ = [
     'TOOLS_MAX_LEARNED_EXAMPLES',
     'TOOLS_MAX_RELATED',
     'TOOLS_MIN_SCORE',
+    'TOOLS_TIP_DEDUP_EMBED',
+    'TOOLS_TIP_MAX_CHARS',
+    'TOOLS_TIP_MAX_PER_TOOL',
     'TOOLS_TOP_K',
     'TOOLS_USAGE_MAX_SEQUENCE',
     'TOP_K_READ',

@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Orchestrator — Tool-Calling Execution Engine
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 AVA Orchestrator — Tool-Calling Execution Engine
 =================================================
@@ -42,13 +56,12 @@ resposta final (igual antes), o modelo nunca decide chamar TTS.
 Tools via MCP (descoberta em duas etapas — ver Modules/mcp_manager.py):
   Quaisquer servidores MCP que o usuário registrar via API REST no
   mcp_manager (porta 4008 — registro, sync e EXECUÇÃO ficam todos lá; este
-  orchestrator é só um cliente REST dele). Cada tool tem um snippet (o
-  "skill.md" da tool: o que ela realmente faz e como usar) gravado na
-  memória de grafos de tools (ToolsDB, via memory_api). O loop primeiro
+  orchestrator é só um cliente REST dele). Cada tool é indexada no grafo
+  de tools (ToolsDB, via memory_api) para a SELEÇÃO. O loop primeiro
   escolhe os servidores relevantes pelo GRAFO de tools (kNN + PPR no
   co-uso, via /skills/select — barato, sem conectar em nada) e SÓ ENTÃO
   carrega as tools reais dos servidores escolhidos (/servers/{name}/tools,
-  schemas + snippets do cache do manager); a execução vira
+  schemas + descrições reais do cache do manager); a execução vira
   POST /servers/{name}/call.
 
   Memory voltou a falar REST puro (`memory_api.py`, FastAPI sobre
@@ -232,6 +245,15 @@ ALWAYS_ON_AGENT_SKILLS = {
 AGENT_SKILLS_TOP_K   = int(os.getenv("AVA_SKILLS_TOP_K", "3"))
 SKILL_BODY_MAX_CHARS = int(os.getenv("AVA_SKILL_BODY_MAX_CHARS", "64000"))
 SKILL_FILE_MAX_CHARS = int(os.getenv("AVA_SKILL_FILE_MAX_CHARS", "32000"))
+# Skills cujo playbook referencia MCP tools POR NOME — só são anunciadas no
+# hint do system prompt quando TODAS as tools citadas estão de fato carregadas
+# na rodada (mcp_tool_names). Era o condicionamento do antigo bloco fixo de
+# projects/skills no _tools_system_prompt: o bloco virou a Agent Skill
+# projects-and-skills (prompts.txt), e o condicionamento sobreviveu como gate
+# de VISIBILIDADE da skill — nunca anunciar tool que não está disponível.
+MCP_GATED_AGENT_SKILLS: dict[str, set[str]] = {
+    "projects-and-skills": {"project_create", "skill_create"},
+}
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 # Env: no Windows o container precisa alcançar o tray NO HOST —
 # host.docker.internal (docker-compose.windows.yml injeta o valor);
@@ -273,12 +295,13 @@ PLANS_MAX_STEPS_SERVER = 50
 #
 # Etapa 1 (_select_skills): o grafo de tools (ToolsDB, na memory_api)
 # escolhe os servidores relevantes pro pedido — kNN semântico + PPR no
-# co-uso sobre os snippets das tools. Barato: nenhuma conexão MCP.
-# Etapa 2 (_load_mcp_tools): schemas reais + snippets das tools dos
-# servidores escolhidos (cache do manager) viram o payload OpenAI; cada
-# execução vira POST /servers/{name}/call.
+# co-uso sobre a descrição REAL de cada tool (a mesma que o modelo vê no
+# schema). Barato: nenhuma conexão MCP.
+# Etapa 2 (_load_mcp_tools): schemas reais + descrições reais das tools
+# dos servidores escolhidos (cache do manager) viram o payload OpenAI;
+# cada execução vira POST /servers/{name}/call.
 #
-# As tools + snippets vivem no grafo de tools (gravadas pelo /sync do
+# As tools + descrições vivem no grafo de tools (gravadas pelo /sync do
 # manager via /tools/register da memory_api) — é o que a etapa 1 consulta.
 
 HEALTH_PATHS: dict[str, str] = {
@@ -643,13 +666,13 @@ class ExecuteRequest(BaseModel):
     search_pdfs:   bool           = False
     stream:        bool           = True
     # ── Eficiência de uso de tokens (custo/tempo) ────────────────────────────
-    # Teto de turnos do tool loop ReAct. Sem teto, o loop só termina quando o
-    # MODELO quiser — e "turismo" de leitura (read/snapshot/search alternados)
-    # NUNCA aciona o anti-loop de MESMA tool (same_tool_streak zera a cada
-    # troca), drenando minutos de thinking + tokens (26/10: ~10 min lendo sem
-    # executar nada). Ao atingir o teto, _force_finish faz UMA chamada final
-    # SEM tools sintetizando o que foi coletado (histórico intacto). None =
-    # usa AVA_EXECUTE_MAX_STEPS (default 12).
+    # Teto de turnos do tool loop ReAct. Sem teto, "turismo" de leitura
+    # (read/snapshot/search alternados) drena minutos de thinking + tokens
+    # (26/10: ~10 min lendo sem executar nada). Ao atingir o teto,
+    # _force_finish faz UMA chamada final SEM tools sintetizando o que foi
+    # coletado (histórico intacto). None = usa AVA_EXECUTE_MAX_STEPS
+    # (default 25). É o ÚNICO guarda-corpo de loop — o anti-loop de MESMA
+    # tool (REPEAT_NUDGE_AT/REPEAT_HARD_LIMIT) foi removido a pedido.
     max_steps:     Optional[int]  = Field(None, ge=1, le=100)
     # Esforço de raciocínio do OpenRouter (reasoning.effort). Precedência:
     # request > resource/settings.json (aba settings da TUI) > env
@@ -1904,7 +1927,7 @@ async def _plan_tool_defs() -> list[dict]:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": t.get("description") or t.get("snippet") or name,
+                    "description": t.get("description") or name,
                     "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
                 },
             })
@@ -2441,14 +2464,15 @@ def _build_native_tools_schema() -> list[dict]:
 def _mcp_tool_to_openai_schema(tool: dict) -> dict:
     """Converte um registro de tool do mcp_manager (GET /servers/{name}/tools)
     pro formato OpenAI function-calling. O nome pro modelo é o GRAPH_NAME
-    (`servidor__tool` — único entre servidores); a descrição é o SNIPPET (o
-    "skill.md" gravado no grafo de tools — o que a tool realmente faz e como
-    usar). O schema JSON de input vem do próprio servidor MCP, via /sync."""
+    (`servidor__tool` — único entre servidores); a descrição é a DESCRIPTION
+    real devolvida pelo servidor MCP — a MESMA registrada no grafo de tools
+    (ToolsDB) pelo /sync. O schema JSON de input vem do próprio
+    servidor MCP, via /sync."""
     return {
         "type": "function",
         "function": {
             "name": tool["graph_name"],
-            "description": tool.get("snippet") or tool.get("description") or "",
+            "description": tool.get("description") or "",
             "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
         },
     }
@@ -2500,8 +2524,8 @@ async def _select_skills(user_input: str) -> list[str]:
 
 async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[str, str]]]:
     """ETAPA 2: carrega do mcp_manager (cache local dele — SEM conexão MCP)
-    o schema real das tools dos servidores escolhidos, com os snippets como
-    descrição. Devolve:
+    o schema real das tools dos servidores escolhidos, com as descrições
+    reais devolvidas pelo servidor MCP. Devolve:
       - o schema combinado no formato OpenAI (pra somar com as tools nativas)
       - um dispatch map: graph_name (`servidor__tool`) -> (servidor, nome
         real da tool), usado no loop pra encaminhar cada tool_call pro
@@ -2620,11 +2644,13 @@ async def _ensure_agent_skills_index(force: bool = False) -> None:
         log.debug(f"Agent Skills: ensure-index ignorou falha: {type(e).__name__}: {e}")
 
 
-async def _select_agent_skills(user_input: str) -> Optional[str]:
+async def _select_agent_skills(user_input: str) -> Optional[list[dict]]:
     """Seleção semântica de Agent Skills para ESTE pedido: /agent-skills/select
     (kNN + PPR no ToolsDB — barato, sem tocar no disco além do scan com TTL) →
-    bloco de hint pro system prompt com as skills casadas. Falha → None (turno
-    segue sem hint, mesma postura do _recall_plans)."""
+    lista de dicts name/description das skills casadas. O bloco de hint é
+    montado em _tools_system_prompt, que aplica o gate de MCP tools
+    (MCP_GATED_AGENT_SKILLS) antes de anunciar. Falha → None (turno segue sem
+    skills, mesma postura do _recall_plans)."""
     if not user_input:
         return None
     await _ensure_agent_skills_index()
@@ -2639,16 +2665,7 @@ async def _select_agent_skills(user_input: str) -> Optional[str]:
     if not matched:
         return None
     log.info(f"[_select_agent_skills] skills escolhidas: {[s['name'] for s in matched]}")
-    lines = [
-        "## Agent skills matching this request (playbooks you can load)",
-        "Installed Agent Skills whose description matches this request. For work in the "
-        "matched domain, call use_skill(name) FIRST and follow the loaded playbook — it is "
-        "authoritative for its domain and may point to more files via skill_file and to "
-        "commands you can run via other tools:",
-    ]
-    for s in matched:
-        lines.append(f"- {s['name']}: {s['description']}")
-    return "\n".join(lines)
+    return matched
 
 
 async def _ensure_browser() -> None:
@@ -2694,6 +2711,34 @@ async def _ensure_browser() -> None:
 # LLM.py.
 ORCHESTRATOR_LLM_RETRIES = 4
 ORCHESTRATOR_LLM_BACKOFF_S = 2.0
+
+
+# ── Tool Tips: dicas de execução gravadas pelo próprio modelo ─────────────────
+# O modelo grava via tool_tip_add (alpha-mcp → memory /tools/tips) notas de USO
+# REAL ("falha com payload > 5MB", "chame X antes de Y"). NÃO são snippets: a
+# description real do MCP continua sendo a única fonte da verdade no schema —
+# as dicas são ADITIVAS e entram só no tail dinâmico do system prompt (prefixo
+# cacheável intacto), e só das tools carregadas nesta rodada.
+
+async def _fetch_tool_tips(tool_names: list[str]) -> dict[str, list[dict]]:
+    """Busca as Tool Tips das tools MCP carregadas NESTA rodada (batch único na
+    memory — ver memory_ops_tips). Best-effort: memory offline → rodada segue
+    sem dicas (o custo é só o bloco ausente, nunca uma falha do loop)."""
+    if not tool_names:
+        return {}
+    try:
+        data = await _memory_request(
+            "GET", "/tools/tips",
+            params={"names": ",".join(tool_names)},
+        )
+        tips = (data or {}).get("tips") or {}
+        if tips:
+            log.info(f"Tool tips: {sum(len(v) for v in tips.values())} dica(s) "
+                     f"para {len(tips)} tool(s) desta rodada")
+        return tips
+    except Exception as e:
+        log.debug(f"Tool tips indisponíveis ({type(e).__name__}: {e}) — seguindo sem")
+        return {}
 
 
 async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
@@ -2912,23 +2957,41 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
 
 
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
-                          mcp_tool_names: Optional[dict[str, str]] = None,
+                          mcp_tool_names: Optional[list[str]] = None,
                           plans_hint: Optional[str] = None,
-                          skills_hint: Optional[str] = None,
+                          matched_agent_skills: Optional[list[dict]] = None,
+                          tool_tips: Optional[dict[str, list[dict]]] = None,
                           active_project: Optional[str] = None) -> str:
-    """`mcp_tool_names`: nome da tool MCP -> descrição, já carregadas pela
-    etapa 2 da descoberta (_load_mcp_tools) para ESTA rodada específica —
-    somadas às tools nativas (TOOLS) na listagem final do prompt.
+    """System prompt BASE do turno (BASE_PROMPT — prompts.txt): só o que vale
+    pra QUALQUER tarefa (papel, loop de execução, fim de turno, autonomia,
+    tools, memória, output, contexto). O que era específico de domínio saiu
+    daqui e virou Agent Skills em .agents/skills/ (web-research,
+    browser-plans, projects-and-skills), selecionadas por descrição
+    (_select_agent_skills) e carregadas sob demanda com use_skill.
+    `mcp_tool_names`: nomes das tools MCP carregadas pela etapa 2 da
+    descoberta (_load_mcp_tools) para ESTA rodada específica — usados como
+    gate de visibilidade das skills cujo playbook referencia MCP tools por
+    nome (MCP_GATED_AGENT_SKILLS) — nunca anuncia skill cuja tool esteja
+    ausente. As tools em si NÃO são listadas aqui: o modelo as recebe SÓ
+    via tool calling nativo (lista `tools` no payload, embutida pelo chat
+    template).
+    `tool_tips`: dicas de execução gravadas pelo PRÓPRIO modelo em turnos
+    passados (tool_tip_add — ver memory_ops_tips), SÓ das tools carregadas
+    nesta rodada. Bloco dinâmico no FIM (com plans_hint) — nunca na
+    description (a fonte da verdade da tool é o MCP) e nunca no prefixo
+    estático (prompt cache).
     `plans_hint`: bloco opcional com planos salvos relevantes ao pedido
     (gerado por _recall_plans) — orienta o modelo a preferir run_plan.
-    `skills_hint`: bloco opcional com Agent Skills (SKILL.md) casadas com o
-    pedido (gerado por _select_agent_skills) — orienta o modelo a carregar o
-    playbook com use_skill antes de agir no domínio da skill.
+    `matched_agent_skills`: Agent Skills (SKILL.md) casadas com o pedido
+    (lista de dicts name/description, gerada por _select_agent_skills) —
+    vira bloco de hint orientando o modelo a carregar o playbook com
+    use_skill antes de agir no domínio da skill.
     `active_project`: slug do projeto ativo (escopo de memória) — injeta o
-    hint de escopo (NEW projetos).
-    As tools de CRIAÇÃO (project_create/skill_create — alpha-mcp always-on)
-    têm um bloco fixo de orientação que SÓ entra quando elas estão na
-    listagem desta rodada (mcp_tool_names) — nunca anuncia tool ausente."""
+    project_line no <context>.
+    <context> fica por ÚLTIMO de propósito: o prefixo estático é idêntico
+    entre conversas e o llama-server reaproveita o cache. A data usa
+    granularidade de DIA (a hora exata vive na mensagem user — ver
+    _run_tool_loop), senão o prefixo muda a cada requisição."""
     lang_names = {
         "pt": "Portuguese (Brazil)", "en": "English", "es": "Spanish",
         "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
@@ -2936,128 +2999,140 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     }
     reply_lang = lang_names.get((lang_hint or "").lower(), None)
     # Persona editável (TUI settings → persona): a identidade vem de
-    # resource/persona.json (GET/PUT /persona); a cláusula de tools é fixa.
+    # resource/persona.json (GET/PUT /persona); o resto do prompt é fixo.
     persona = _PERSONA.strip().rstrip(".") or PERSONA_DEFAULT
-    lines = [
-        f"{persona}. You have access to a set of tools/functions.",
-        "",
-        "Always reply in the same language the user wrote their message in"
-        + (f" — for this conversation that is {reply_lang} ({lang_hint})." if reply_lang else ".")
-        + " Never switch languages mid-conversation unless the user does.",
-        # ── NEW (projetos): hint de escopo — o modelo precisa saber que as
-        # memórias recuperadas podem vir do escopo do projeto E do geral, e
-        # que fatos NOVOS devem ser gravados no contexto do projeto ativo.
-        *([
-            f"Active project: {active_project}. Your long-term memory currently "
-            f"merges this project's dedicated memory scope with your general memory; "
-            f"when you save new facts with the memory write tool, they belong to this "
-            f"project's context."
-        ] if active_project else []),
-        "",
-        "You have live tool access (web search, memory, etc.) — you are NOT "
-        "limited to a static training cutoff and you DO have a way to get current "
-        "information when a tool is available for it. Never tell the user you \"don't have "
-        "real-time access\", that your \"knowledge stops at [some date]\", or similar generic "
-        "disclaimers — that is false when you have tools and is especially false after you "
-        "have already called one. If a tool's result was thin, generic, or didn't contain the "
-        "specific fact needed, say exactly that (e.g. \"I searched but only found homepage "
-        "links, not the actual headlines\") instead of falling back to a canned refusal that "
-        "ignores what the tool actually returned.",
-        "",
-        "Call a tool whenever you need information or need to take an action. Ending your "
-        "turn with plain text and NO tool call is how you deliver your FINAL answer to the "
-        "user — that text is sent to the user verbatim and the task is considered complete "
-        "immediately. Therefore NEVER emit plain text by itself while you still intend to do "
-        "more work: if you want to comment, think out loud, announce a plan or say anything "
-        "mid-task, put it in the `content` of the message where you call the next tool. "
-        "Plain text with no tool call means you are done — there is no undo.",
-        "",
-        "BEFORE calling a tool again, read the content of the most recent role=\"tool\" message "
-        "in the conversation and check: does it already contain enough information to answer "
-        "the user, even partially? If yes, stop searching and use it — synthesize the answer "
-        "from what you already have instead of chasing a more perfect result. If a result is "
-        "irrelevant, empty, or off-topic, do NOT just reword the same query and try again — "
-        "that rarely fixes an irrelevant result. Instead: (a) try a genuinely different angle "
-        "(different tool, different entity, different assumption) at most once, or (b) end the "
-        "turn with a plain-text final answer (no tool call) telling the user honestly that you "
-        "could not find reliable/current information, rather than guessing or looping. Never "
-        "call the same tool with a near-identical query more than twice in a row.",
-        "",
-        "When a tool returns MULTIPLE results (e.g. `search` returns a list), do NOT pick just the "
-        "first one. Synthesize across all of them: identify the 2–3 distinct items that best match "
-        "the user's question, and compose a single coherent answer that mentions each one briefly "
-        "with its source. Picking the top result and discarding the rest is a failure mode.",
-        "",
-        "When answering about 'news' or 'today', present a brief digest of the top items found — "
-        "do NOT deep-dive into a single article unless the user asked for one specific topic. "
-        "Each item in the digest should carry: (a) the headline, (b) 1–2 sentences of what it is "
-        "about, (c) the source name. Cite source URLs at the end.",
-        "",
-        "Never paraphrase a snippet loosely — if you are translating, keep proper nouns (race names, "
-        "event names) in the original language to avoid mistranslation. If unsure about a date or "
-        "temporal relation in the source, omit it rather than guessing.",
-        "",
-        "## Stored plans (IMPORTANT — read before any browser work)\n"
-        "You have `list_plans` and `run_plan` tools backed by saved hybrid execution plans "
-        "(pre-recorded browser flows + LLM-judged steps). If the user's request could match a "
-        "saved task — running, repeating, checking or extracting something from a website the "
-        "user works with regularly — call `list_plans` FIRST and prefer `run_plan` over driving "
-        "the browser manually with individual browser_* tools. Plans are faster, cheaper and "
-        "more reliable (fixed selectors + expected outcomes). Only fall back to direct "
-        "browser_* tools when no plan matches, the user explicitly wants a fresh manual "
-        "session, or the plan run fails and recovery didn't help.",
-
-        # ── NEW (projetos + skills criadas em runtime): ensinar que "criar
-        # coisa duradoura" existe como tool — sem isso o modelo improvisa a
-        # resposta em texto e perde a chance de criar escopo/playbook.
-        # CONDICIONADO à presença real das tools nesta rodada (alpha-mcp é
-        # always-on, mas se falhar/crashar elas não entram na listagem —
-        # nunca anunciar tool que não está disponível).
-        *([
-            "## Creating durable things (projects & skills — IMPORTANT)\n"
-            "You can create PERMANENT artifacts with tools, not just answer:\n"
-            "- `project_create(name)` creates a dedicated memory scope (a project) "
-            "and ACTIVATES it immediately — from that call on, long-term memories, "
-            "graphs and plans belong to that project; tell the user they are now "
-            "working inside it. Use it when the user asks for a new lasting context "
-            "(\"cria um projeto pra X\", \"let's separate everything about Y\"). Call "
-            "`project_list` first to avoid duplicates. Do NOT create a project for "
-            "loose facts — that is what the memory write tool is for.\n"
-            "- `skill_create(...)` saves a reusable playbook (Agent Skill, SKILL.md) "
-            "that becomes selectable on the NEXT user request. Use it when the user "
-            "asks to keep a procedure/workflow for reuse (\"transforma isso em skill\", "
-            "\"save these steps for next time\"). The `description` is what the "
-            "semantic selector matches on — write WHAT the skill does and WHEN to "
-            "use it; a vague description means the skill is never selected again. "
-            "Check `skill_list` first to avoid duplicating an installed skill. Not "
-            "for facts (memory write tool), not for one-off instructions.\n"
-            "- `project_list` / `skill_list` show what already exists — check them "
-            "when the user refers to a project by name or asks which skills you have."
-        ] if {"project_create", "skill_create"} & set((mcp_tool_names or {}).keys()) else []),
-
-        "Deliver your final answer as plain text with NO tool call — write the COMPLETE "
-        "response there: this text streams to the user live as you generate it, so never "
-        "hold it back or bury it in tool arguments. There is no explicit \"finish\" tool: "
-        "replying in plain text without calling any tool IS the finish. Anything you want "
-        "to say before that (progress notes, findings so far, caveats) must ride along in "
-        "the same message where you call your next tool.",
-        "",
-        f"Today is {datetime.datetime.now().strftime('%Y-%m-%d')}.",
-        "",
-        "Available tools:",
+    # <context> — o que varia por conversa/rodada, concentrado no FIM do
+    # prompt de propósito: o prefixo estático é idêntico entre conversas e o
+    # llama-server reaproveita o cache. Data com granularidade de DIA (a hora
+    # exata vive na mensagem user — ver _run_tool_loop).
+    context_lines = [
+        f"Current date: {datetime.datetime.now().strftime('%Y-%m-%d')}",
     ]
-    for name, spec in TOOLS.items():
-        if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
-            continue  # flag off (vision.py fora do ar) — não anunciar a tool
-        lines.append(f"- {name}: {spec['description']}")
-    for name, description in (mcp_tool_names or {}).items():
-        lines.append(f"- {name}: {description}")
+    if reply_lang:
+        context_lines.append(f"Reply language: {reply_lang} ({lang_hint})")
+    elif lang_hint:
+        context_lines.append(f"Reply language: {lang_hint}")
+    if active_project:
+        # project_line (NEW projetos): o modelo precisa saber que as memórias
+        # recuperadas podem vir do escopo do projeto E do geral, e que fatos
+        # NOVOS devem ser gravados no contexto do projeto ativo.
+        context_lines.append(
+            f"Active project: {active_project}. Long-term memory merges this "
+            "project's scope with general memory; new facts you save belong to "
+            "this project."
+        )
+    lines = [
+        "<role>",
+        f"{persona}. You complete tasks by using tools, and you deliver a verified result.",
+        "</role>",
+        "",
+        "<execution_loop>",
+        "1. Understand the request. For multi-step work, write a short plan (3-7 items) in the",
+        "content of your first tool-call message and keep it updated as you progress.",
+        "2. Call tools whenever you need information or must take an action. Independent calls",
+        "go in parallel in the same message.",
+        "3. After every tool result, check: does it already contain enough to answer, even",
+        "partially? If yes, stop calling tools and answer from it.",
+        "4. If a result is empty, irrelevant or an error: retry at most once with a genuinely",
+        "different approach (another tool, entity or assumption). Rewording the same call",
+        "rarely helps. If the retry fails, answer with what you have and say plainly what",
+        "you could not find or do.",
+        "5. Before declaring success, verify the effect (re-read the file you wrote, check the",
+        "status the tool returned, confirm the output exists).",
+        "6. Do only what was asked. Stop when the goal is verified; no extra work.",
+        "</execution_loop>",
+        "",
+        "<ending_the_turn>",
+        "A message with NO tool call is your final answer: it is sent to the user as-is and the",
+        "task is over, with no undo. Therefore, while work remains, anything you want to say",
+        "(plan, progress, caveats) goes in the content of the message that carries your next",
+        "tool call. When you are done, write the complete answer as plain text.",
+        "</ending_the_turn>",
+        "",
+        "<autonomy>",
+        "Act without asking when the action is reversible and low-risk. Ask first before",
+        "deleting, overwriting, spending resources, sending anything outside the machine, or",
+        "when an ambiguity would change the result. Ask one precise question, not several.",
+        "</autonomy>",
+        "",
+        "<tools>",
+        "You have live tools (search, memory, files, browser and others — provided with this",
+        "conversation); you are not limited to your training data. If a tool result was thin or",
+        "off-target, say exactly what it did and did not contain instead of giving a generic",
+        "disclaimer. Do not call a tool for something already in the conversation.",
+        "Specialized procedures are provided as Agent Skills; when a skill is loaded for the",
+        "current task, follow it.",
+        "</tools>",
+        "",
+        "<memory>",
+        "Before asking the user something they may have told you already, check memory. Save",
+        "only durable facts (preferences, decisions, stable context), never secrets or",
+        "temporary states.",
+        "</memory>",
+        "",
+        "<output>",
+        "Answer in the language the user is writing in, directly and without generic",
+        "disclaimers. Lead with the result, then essentials only. The text is rendered in a",
+        "terminal: short paragraphs, minimal markdown, tables only when they truly help.",
+        "</output>",
+        "",
+        "<context>",
+        *context_lines,
+        "</context>",
+    ]
+
+    # Cláusula de gravação de Tool Tips — só quando as tools de dicas estão
+    # carregadas nesta rodada (alpha-mcp é always-on, mas o gate evita anunciar
+    # tool ausente se ele sair do always-on).
+    if "alpha-mcp__tool_tip_add" in (mcp_tool_names or []):
+        lines.extend([
+            "",
+            "<recording_tips>",
+            "When a tool result reveals a durable, non-obvious constraint (failure mode,",
+            "ordering requirement, parameter pitfall), record it for your future turns with",
+            "tool_tip_add — at most one per turn, one imperative sentence, general rather than",
+            "specific to this task. Never record task facts (memory tools do that), tool",
+            "preferences or rankings, or what the tool's description already says. If a tip you",
+            "recorded proved wrong or outdated, remove it with tool_tip_remove.",
+            "</recording_tips>",
+        ])
+
     if plans_hint:
         lines.append("")
         lines.append(plans_hint)
-    if skills_hint:
+    if tool_tips:
+        # Dicas de execução das tools DESTA rodada — tail dinâmico (o prefixo
+        # estático acima permanece cacheável no llama-server). Ids curtos
+        # (#n) para o modelo poder retratar via tool_tip_remove.
         lines.append("")
-        lines.append(skills_hint)
+        lines.append(
+            "## Tool tips (your own notes from past tool usage — may be "
+            "outdated; trust the current tool result over any tip)"
+        )
+        for _tip_tool, _tip_list in tool_tips.items():
+            for _t in _tip_list:
+                lines.append(f"- {_tip_tool} [#{_t['id']}]: {_t['text']}")
+    if matched_agent_skills:
+        # Gate por MCP tools carregadas nesta rodada: playbook que referencia
+        # tool ausente não entra no hint (o antigo bloco fixo condicionado de
+        # projects/skills virou a skill projects-and-skills — o condicionamento
+        # sobreviveu como visibilidade da skill, ver MCP_GATED_AGENT_SKILLS).
+        available_tools = set(mcp_tool_names or [])
+        visible_skills = [
+            s for s in matched_agent_skills
+            if not (MCP_GATED_AGENT_SKILLS.get(s.get("name") or "", set()) - available_tools)
+        ]
+        if visible_skills:
+            lines.append("")
+            lines.append(
+                "## Agent skills matching this request (playbooks you can load)\n"
+                "Installed Agent Skills whose description matches this request. For work in the "
+                "matched domain, call use_skill(name) FIRST and follow the loaded playbook — it is "
+                "authoritative for its domain and may point to more files via skill_file and to "
+                "commands you can run via other tools:"
+            )
+            for s in visible_skills:
+                lines.append(f"- {s['name']}: {s['description']}")
     if think_instruction:
         lines.append("")
         lines.append(think_instruction)
@@ -3066,14 +3141,13 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
 
 async def _force_finish(history: list[dict], eid: str) -> str:
     """
-    Rede de segurança do guarda-corpo anti-loop: chamada quando o modelo
-    insiste na mesma tool repetidas vezes sem nunca entregar a resposta
-    final (texto puro sem tool_calls). Faz UMA última chamada ao LLM sem
-    `tools` (nesse modo ele não tem como devolver tool_calls, então é
-    obrigado a responder em texto livre) pedindo explicitamente uma
-    resposta final com o que já foi coletado no histórico. Se isso falhar
-    por qualquer motivo, cai num texto fixo — nunca deixamos o loop rodar
-    indefinidamente.
+    Rede de segurança do teto de turnos (max_steps): chamada quando o loop
+    atinge o teto sem o modelo ter entregado a resposta final (texto puro
+    sem tool_calls). Faz UMA última chamada ao LLM sem `tools` (nesse modo
+    ele não tem como devolver tool_calls, então é obrigado a responder em
+    texto livre) pedindo explicitamente uma resposta final com o que já
+    foi coletado no histórico. Se isso falhar por qualquer motivo, cai num
+    texto fixo — nunca deixamos o loop rodar indefinidamente.
     """
     nudge = {
         "role": "user",
@@ -3118,13 +3192,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
          turno (não existe tool "finish").
       3. Se houver tool_calls: cada uma é executada e o resultado volta ao
          histórico como mensagem role="tool" (tool_call_id correspondente).
-      4. Fora isso, não há limite de rodadas — EXCETO um guarda-corpo
-         anti-loop: se a mesma tool for chamada REPEAT_HARD_LIMIT vezes
-         seguidas sem o modelo nunca entregar a resposta final (sinal de
-         que ele não está "absorvendo" o resultado retornado e só
-         reformulando a mesma chamada), o orquestrador força o
-         encerramento via `_force_finish` em vez de deixar o loop rodar
-         indefinidamente.
+      4. Fora isso, não há limite de rodadas — o teto é o max_steps
+         (AVA_EXECUTE_MAX_STEPS): atingido ele, `_force_finish` faz UMA
+         chamada final sem tools. (O guarda anti-loop de MESMA tool —
+         REPEAT_NUDGE_AT/REPEAT_HARD_LIMIT — foi removido a pedido:
+         interrompia trabalho legítimo e repetitivo mais do que loops.)
     """
     depth, think_instruction = await _think_instruction(req.input)
 
@@ -3154,26 +3226,29 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     
     # Etapa 2: conecta só nessas skills e carrega as tools reais delas.
     mcp_schema, mcp_dispatch = await _load_mcp_tools(chosen_skills)
-    mcp_descriptions = {name: spec["function"]["description"] for spec in mcp_schema
-                         for name in [spec["function"]["name"]]}
+    mcp_tool_names = [spec["function"]["name"] for spec in mcp_schema]
+    # Tool Tips (best-effort): notas de execução gravadas pelo próprio modelo
+    # em turnos passados — só das tools carregadas NESTA rodada.
+    tool_tips = await _fetch_tool_tips(mcp_tool_names)
 
     # Coleta o recall disparado acima (já deve ter terminado — o MCP costuma
     # levar mais; se não, esperamos aqui mesmo).
     recall_block, st_turns = ("", []) if recall_task is None else await recall_task
     plans_hint = None if plans_task is None else await plans_task
-    skills_hint = None if skills_task is None else await skills_task
+    matched_skills = None if skills_task is None else await skills_task
 
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang,
-                                         mcp_tool_names=mcp_descriptions,
+                                         mcp_tool_names=mcp_tool_names,
                                          plans_hint=plans_hint,
-                                         skills_hint=skills_hint,
+                                         tool_tips=tool_tips,
+                                         matched_agent_skills=matched_skills,
                                          active_project=(
                                              active_project
                                              if active_project != "general" else None
                                          ))
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
-    if skills_hint:
+    if matched_skills:
         log.info(f"[{eid[:8]}] Agent Skills casadas injetadas no system prompt")
     if recall_block:
         # Recall entra no system prompt (não como mensagem user/assistant) —
@@ -3269,25 +3344,15 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     final_response = ""
     turn = 0
 
-    # ── Guarda-corpo anti-repetição ──────────────────────────────────────
-    # O modelo às vezes não "entende" que um resultado de tool já é
-    # suficiente (ou já é irrelevante e reformular a query não vai ajudar)
-    # e fica preso chamando a mesma tool em loop (visto em produção: 7+
-    # chamadas seguidas de `search` sem nunca entregar a resposta final).
-    # Em vez de
-    # só confiar em instrução de prompt, rastreamos a sequência de tools
-    # chamadas e intervimos ativamente:
-    #   - a partir de REPEAT_NUDGE_AT chamadas seguidas da MESMA tool,
-    #     injetamos um lembrete visível pro modelo (role="tool" sintético)
-    #     apontando explicitamente o padrão, para forçar reavaliação;
-    #   - em REPEAT_HARD_LIMIT chamadas seguidas da MESMA tool, paramos o
-    #     loop nós mesmos e pedimos uma última resposta ao modelo usando
-    #     só o que já foi coletado (sem permitir nova tool_call), evitando
-    #     o loop indefinido que derrubou a sessão no log.
-    REPEAT_NUDGE_AT = 3
-    REPEAT_HARD_LIMIT = 5
-    last_tool_name: Optional[str] = None
-    same_tool_streak = 0
+    # ── Guarda-corpo anti-repetição: REMOVIDO ────────────────────────────
+    # O anti-loop de MESMA tool (REPEAT_NUDGE_AT=3 → nudge sintético;
+    # REPEAT_HARD_LIMIT=5 → _force_finish) foi removido a pedido: atrapalhava
+    # mais do que ajudava — cortava trabalho legítimo que chama a mesma tool
+    # muitas vezes seguidas (leitura sequencial de páginas, extração em
+    # lote), e o nudge poluía o histórico como mensagem role="tool" falsa.
+    # A contenção de loop fica por conta do prompt base (<execution_loop>:
+    # no máximo 1 retry com abordagem diferente, sintetizar o que já tem)
+    # e do teto de turnos (max_steps → _force_finish), abaixo.
 
     # MCP tools bem-sucedidas nesta execução, NA ORDEM — vai pro /tools/usage
     # no fim do loop (arestas de co-uso + exemplos aprendidos na ToolsDB).
@@ -3339,7 +3404,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # search alternados — que o anti-loop de MESMA tool não pega) roda até o
     # modelo SE CANSAR. Precedência do esforço de reasoning: request >
     # settings.json (aba settings da TUI) > env > nativo.
-    max_steps = req.max_steps or int(os.getenv("AVA_EXECUTE_MAX_STEPS", "12"))
+    max_steps = req.max_steps or int(os.getenv("AVA_EXECUTE_MAX_STEPS", "25"))
     reasoning_effort = (req.reasoning_effort
                         or (_SETTINGS.get("reasoning_effort") or "")
                         or os.getenv("AVA_REASONING_EFFORT", "")).strip().lower() or None
@@ -3347,8 +3412,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     while True:
         # ── Guarda-corpo: teto de turnos ────────────────────────────────────
         # UMA chamada final SEM tools (_force_finish) sintetizando o que já
-        # foi lido — o histórico fica intacto, nada é descartado. Mesmo
-        # padrão do hard-stop anti-loop (same_tool_streak).
+        # foi lido — o histórico fica intacto, nada é descartado. Único
+        # guarda-corpo de loop restante (o anti-loop de MESMA tool saiu).
         if turn >= max_steps:
             log.warning(
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
@@ -3541,45 +3606,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 finished = True
                 break
 
-            # ── Atualiza a sequência de repetição da mesma tool ──
-            if tool_name == last_tool_name:
-                same_tool_streak += 1
-            else:
-                last_tool_name = tool_name
-                same_tool_streak = 1
-
-            if same_tool_streak == REPEAT_NUDGE_AT:
-                log.warning(
-                    f"[{eid[:8]}] '{tool_name}' chamada {same_tool_streak}x seguidas "
-                    "sem resposta final — injetando lembrete anti-loop."
-                )
-                history.append({
-                    "role": "tool", "tool_call_id": call_id,
-                    "content": (
-                        f"SYSTEM NOTICE: you have called `{tool_name}` {same_tool_streak} times "
-                        "in a row without delivering a final answer. Stop and re-read the results "
-                        "above carefully — either they already answer the question well enough to "
-                        "respond now, or repeating this tool is not going to fix it. Do not call "
-                        f"`{tool_name}` again with a reworded query; end the turn NOW with your "
-                        "best final answer as plain text with NO tool call, being explicit about "
-                        "what you could and couldn't confirm."
-                    ),
-                })
-            elif same_tool_streak >= REPEAT_HARD_LIMIT:
-                log.warning(
-                    f"[{eid[:8]}] '{tool_name}' chamada {same_tool_streak}x seguidas — "
-                    "forçando encerramento do loop (guarda-corpo anti-loop)."
-                )
-                finished = True
-                final_response = await _force_finish(history, eid)
-                # Chamada de fechamento é síncrona (_llm_chat) — delta único.
-                if on_event:
-                    await on_event("delta", final_response)
-                step_results.append(StepResult(
-                    step=turn, executor="orchestrator",
-                    action="anti-loop hard stop", success=True, result=final_response,
-                ))
-                break
+            # ── Anti-loop de MESMA tool: REMOVIDO ──
+            # (nudge em REPEAT_NUDGE_AT e hard-stop em REPEAT_HARD_LIMIT —
+            # cortava trabalho legítimo repetitivo; ver comentário acima)
 
         if finished:
             break

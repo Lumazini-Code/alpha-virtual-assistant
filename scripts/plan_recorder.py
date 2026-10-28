@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Alpha AI (AVA) — CLI de gravação de planos híbridos (macro + modelo)
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 plan_recorder.py — CLI de gravação de planos híbridos (macro + modelo)
 ═══════════════════════════════════════════════════════════════════════
@@ -34,10 +48,11 @@ Uso:
 Pré-requisitos:
   - mcp_manager (4008) com servidor "playwright" registrado e habilitado
   - memory (3000) no ar (só para o --push / gravação final)
-  - o snippet do servidor playwright precisa incluir as tools de recording
-    (browser_start_recording / browser_stop_recording — capability
-    "devtools" do @playwright/mcp ≥ versão com recording; se o registro
-    do seu servidor filtrar capabilities, habilite devtools)
+  - a descrição das tools do servidor playwright (description do MCP) deve
+    cobrir as tools de recording (browser_start_recording /
+    browser_stop_recording — capability "devtools" do @playwright/mcp ≥
+    versão com recording; se o registro do seu servidor filtrar
+    capabilities, habilite devtools)
 """
 
 from __future__ import annotations

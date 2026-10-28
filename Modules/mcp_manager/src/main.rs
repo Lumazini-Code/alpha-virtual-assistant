@@ -1,3 +1,17 @@
+// Alpha AI (AVA) — mcp_manager — Controle de servidores MCP: registro (REST) + executor
+// Copyright (C) 2026  Felipe lumazini
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! mcp_manager — Controle de servidores MCP: registro (REST) + executor.
 //! =====================================================================
 //!
@@ -20,12 +34,11 @@
 //!   DELETE /servers/{name}               (remover + remover tools do grafo)
 //!   POST   /servers/{name}/sync          (list_tools → grafo + cache local)
 //!   POST   /servers/{name}/test          (conecta e conta tools; não grava nada)
-//!   GET    /servers/{name}/tools         (etapa 2: schemas + snippets)
+//!   GET    /servers/{name}/tools         (etapa 2: schemas + descrições reais)
 //!   POST   /servers/{name}/call          (executa tool; proxy do orchestrator)
 //!   GET    /skills                       (etapa 1a: servidores habilitados)
 //!   POST   /skills/select                (etapa 1b: seleção via grafo de tools)
 //!   GET    /tools                        (todas as tools conhecidas)
-//!   PUT    /tools/{graph_name}/snippet   (reescreve o skill.md de uma tool)
 //!
 //! Porta 4008 (env MCP_MANAGER_PORT). Memory em MEMORY_API_URL (default
 //! http://localhost:3000).
@@ -40,7 +53,7 @@ use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum::extract::DefaultBodyLimit;
 use indexmap::IndexMap;
@@ -408,11 +421,6 @@ struct SkillsSelectRequest {
     min_score: f64,
 }
 
-#[derive(Deserialize)]
-struct SnippetUpdateRequest {
-    snippet: String,
-}
-
 /// Instalação assistida de servidor MCP npm: resolve o pacote no registry,
 /// deriva o binário, registra como stdio `npx -y` e sincroniza.
 #[derive(Deserialize)]
@@ -679,14 +687,13 @@ struct ToolRow {
     name: String,
     server: String,
     description_raw: String,
-    snippet: String,
     input_schema_json: String,
     core: bool,
     // só preenchido por db_all_tools (JOIN com mcp_servers)
     server_enabled: bool,
 }
 
-const TOOL_COLS: &str = "name, server, description_raw, snippet, input_schema_json, core";
+const TOOL_COLS: &str = "name, server, description_raw, input_schema_json, core";
 
 impl ToolRow {
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -694,9 +701,8 @@ impl ToolRow {
             name: r.get(0)?,
             server: r.get(1)?,
             description_raw: r.get(2)?,
-            snippet: r.get(3)?,
-            input_schema_json: r.get(4)?,
-            core: r.get::<_, i64>(5)? != 0,
+            input_schema_json: r.get(3)?,
+            core: r.get::<_, i64>(4)? != 0,
             server_enabled: false,
         })
     }
@@ -727,7 +733,6 @@ fn open_db(cfg: &Config) -> rusqlite::Result<Connection> {
             name              TEXT NOT NULL,
             server            TEXT NOT NULL,
             description_raw   TEXT NOT NULL DEFAULT '',
-            snippet           TEXT NOT NULL DEFAULT '',
             input_schema_json TEXT NOT NULL DEFAULT '{}',
             core              INTEGER NOT NULL DEFAULT 0,
             updated_at        REAL NOT NULL,
@@ -859,21 +864,19 @@ impl AppState {
         server: &str,
         name: &str,
         description_raw: &str,
-        snippet: &str,
         input_schema: &Map<String, Value>,
         core: bool,
     ) -> rusqlite::Result<()> {
         self.db().execute(
-            "INSERT INTO mcp_tools (name, server, description_raw, snippet, \
-             input_schema_json, core, updated_at) VALUES (?,?,?,?,?,?,?) \
+            "INSERT INTO mcp_tools (name, server, description_raw, \
+             input_schema_json, core, updated_at) VALUES (?,?,?,?,?,?) \
              ON CONFLICT(name, server) DO UPDATE SET description_raw=excluded.description_raw, \
-             snippet=excluded.snippet, input_schema_json=excluded.input_schema_json, \
+             input_schema_json=excluded.input_schema_json, \
              core=excluded.core, updated_at=excluded.updated_at",
             params![
                 name,
                 server,
                 description_raw,
-                snippet,
                 serde_json::to_string(input_schema).unwrap_or_else(|_| "{}".into()),
                 core as i64,
                 now_ts(),
@@ -894,13 +897,13 @@ impl AppState {
     fn db_all_tools(&self) -> rusqlite::Result<Vec<ToolRow>> {
         let db = self.db();
         let mut stmt = db.prepare(
-            "SELECT t.name, t.server, t.description_raw, t.snippet, t.input_schema_json, t.core, \
+            "SELECT t.name, t.server, t.description_raw, t.input_schema_json, t.core, \
              s.enabled AS server_enabled \
              FROM mcp_tools t JOIN mcp_servers s ON s.name = t.server ORDER BY t.server, t.name",
         )?;
         let rows = stmt.query_map([], |r| {
             let mut t = ToolRow::from_row(r)?;
-            t.server_enabled = r.get::<_, i64>(6)? != 0;
+            t.server_enabled = r.get::<_, i64>(5)? != 0;
             Ok(t)
         })?;
         rows.collect()
@@ -909,24 +912,6 @@ impl AppState {
     fn db_delete_tool(&self, server: &str, name: &str) -> rusqlite::Result<()> {
         self.db()
             .execute("DELETE FROM mcp_tools WHERE name = ? AND server = ?", params![name, server])?;
-        Ok(())
-    }
-
-    fn db_get_tool(&self, server: &str, name: &str) -> rusqlite::Result<Option<ToolRow>> {
-        self.db()
-            .query_row(
-                &format!("SELECT {TOOL_COLS} FROM mcp_tools WHERE name = ? AND server = ?"),
-                params![name, server],
-                ToolRow::from_row,
-            )
-            .optional()
-    }
-
-    fn db_update_snippet(&self, server: &str, name: &str, snippet: &str) -> rusqlite::Result<()> {
-        self.db().execute(
-            "UPDATE mcp_tools SET snippet = ?, updated_at = ? WHERE name = ? AND server = ?",
-            params![snippet, now_ts(), name, server],
-        )?;
         Ok(())
     }
 
@@ -1784,9 +1769,10 @@ async fn list_tools_with_timeout(
 }
 
 /// Conecta no servidor, roda list_tools() e grava cada tool na memória de
-/// grafos de tools (ToolsDB, via memory /tools/register/batch) com o snippet
-/// como descrição — snippet inicial = description do próprio MCP. Tools que
-/// sumiram do servidor são removidas do grafo e do cache. Idempotente.
+/// grafos de tools (ToolsDB, via memory /tools/register/batch) com a
+/// DESCRIPTION real devolvida pelo próprio MCP como descrição — sem camada
+/// de snippet/skill.md (removida). Tools que sumiram do servidor são
+/// removidas do grafo e do cache. Idempotente.
 async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiError> {
     let row = st
         .db_get_server(name)?
@@ -1808,11 +1794,6 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
     for t in result.tools {
         live.insert(t.name.to_string(), t);
     }
-    let prev_rows: HashMap<String, ToolRow> = st
-        .db_tools_for_server(name)?
-        .into_iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
     let always_on = row.always_on;
     let examples_by_tool: IndexMap<String, Vec<String>> =
         serde_json::from_str(if row.examples_json.is_empty() { "{}" } else { &row.examples_json })
@@ -1822,21 +1803,15 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
     for tool in live.values() {
         let tool_name = tool.name.to_string();
         let raw = tool.description.as_deref().unwrap_or("").trim().to_string();
-        let mut snippet = if raw.is_empty() {
+        // Descrição registrada = a real do MCP; vazia → fallback mínimo (o
+        // ToolsDB exige description não vazia). A coluna local guarda só a
+        // description_raw — não há mais snippet/skill.md customizado.
+        let desc = if raw.is_empty() {
             format!("Tool '{tool_name}' do servidor MCP '{name}'.")
         } else {
             raw.clone()
         };
-        if let Some(prev) = prev_rows.get(&tool_name) {
-            // Snippet customizado (PUT /snippet): usuário escreveu um skill.md
-            // diferente da description crua do servidor — PRESERVA no re-sync
-            // (só a description_raw acompanha o servidor).
-            let custom = prev.snippet.trim() != prev.description_raw.trim();
-            if custom && !prev.snippet.trim().is_empty() {
-                snippet = prev.snippet.clone();
-            }
-        }
-        if let Err(e) = st.db_upsert_tool(name, &tool_name, &raw, &snippet, &tool.input_schema, always_on) {
+        if let Err(e) = st.db_upsert_tool(name, &tool_name, &raw, &tool.input_schema, always_on) {
             // Corrida rara: o servidor foi DELETADO durante o await do
             // list_tools — as rows filhas já foram removidas (FK cascade).
             if let rusqlite::Error::SqliteFailure(f, _) = &e {
@@ -1848,14 +1823,14 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
             return Err(e.into());
         }
         tools_out.push(json!({
-            "name": tool_name, "graph_name": graph_name(name, &tool_name), "snippet": snippet,
+            "name": tool_name, "graph_name": graph_name(name, &tool_name), "description": desc,
         }));
         // TODAS as tools vão no batch (não só as alteradas): o doc_hash na
         // ToolsDB já evita re-embed de tool inalterada, e o caminho "unchanged"
         // de lá aplica set_core — necessário quando o usuário flipa always_on e
         // re-sincroniza.
         to_register.push(json!({
-            "name": graph_name(name, &tool_name), "description": snippet,
+            "name": graph_name(name, &tool_name), "description": desc,
             "core": always_on,
             "examples": examples_by_tool.get(&tool_name).cloned().unwrap_or_default(),
         }));
@@ -2136,10 +2111,10 @@ async fn install_server(
     })))
 }
 
-// ── Etapa 2: schemas + snippets (do cache, sem conexão MCP) ─────────────────
+// ── Etapa 2: schemas + descrições reais (do cache, sem conexão MCP) ─────────
 
-/// Tools do servidor com schema real e snippet (o 'skill.md' que vira a
-/// descrição pro LLM). Lê do cache local — NÃO conecta MCP.
+/// Tools do servidor com schema real e a descrição REAL do MCP (a mesma
+/// registrada no grafo). Lê do cache local — NÃO conecta MCP.
 async fn server_tools(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
     if st.db_get_server(&name)?.is_none() {
         return Err(http_err(404, format!("Servidor MCP '{name}' não registrado")));
@@ -2152,7 +2127,7 @@ async fn server_tools(State(st): State<Arc<AppState>>, Path(name): Path<String>)
                 "name": t.name,
                 "graph_name": graph_name(&name, &t.name),
                 "description": t.description_raw,
-                "snippet": t.snippet,
+                "core": t.core,
                 "input_schema": parse_json_or(&t.input_schema_json, "{}"),
             })
         })
@@ -2168,48 +2143,13 @@ async fn all_tools(State(st): State<Arc<AppState>>) -> ApiResult {
             json!({
                 "graph_name": graph_name(&r.server, &r.name),
                 "server": r.server, "name": r.name,
-                "snippet": r.snippet, "description": r.description_raw,
+                "description": r.description_raw,
+                "core": r.core,
                 "server_enabled": r.server_enabled,
             })
         })
         .collect();
     Ok(Json(json!({ "total": rows.len(), "tools": tools })))
-}
-
-/// Reescreve o skill.md de uma tool. Grava no cache local E re-registra no
-/// grafo (ToolsDB): a nova descrição muda o doc_hash → re-embed; as queries
-/// 'learned' (uso real) são preservadas pelo memory.
-async fn update_snippet(
-    State(st): State<Arc<AppState>>,
-    Path(graph): Path<String>,
-    ApiJson(req): ApiJson<SnippetUpdateRequest>,
-) -> ApiResult {
-    let (server, tool) = split_graph_name(&graph).map_err(|e| http_err(400, e))?;
-    let row = st.db_get_tool(&server, &tool)?.ok_or_else(|| {
-        http_err(404, format!("Tool '{graph}' não encontrada (rode /servers/{server}/sync)"))
-    })?;
-    let snippet = req.snippet.trim().to_string();
-    if snippet.is_empty() {
-        return Err(http_err(400, "snippet vazio"));
-    }
-    st.db_update_snippet(&server, &tool, &snippet)?;
-    // Preserva o core atual da tool (re-register não pode zerar o flag de
-    // capability de base).
-    let core = match st.db_get_server(&server)? {
-        None => row.core,
-        Some(srv) => row.core || srv.always_on,
-    };
-    let body = json!({ "name": graph, "description": snippet, "core": core });
-    if let Err(e) = st.mem_post_ok("/tools/register", &body, REGISTER_TIMEOUT).await {
-        // Cache local já está atualizado; o grafo ficou pra trás — erro
-        // explícito pro caller retryar (o re-register é idempotente).
-        return Err(http_err(
-            502,
-            format!("Snippet salvo localmente, mas falhou re-registrar no grafo: {e}"),
-        ));
-    }
-    info!("MCP: snippet de '{graph}' atualizado ({} chars)", snippet.chars().count());
-    Ok(Json(json!({ "updated": true, "graph_name": graph, "snippet": snippet })))
 }
 
 // ── Etapa 1: seleção de servidores via grafo de tools ───────────────────────
@@ -2408,7 +2348,6 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/servers/{name}/tools", get(server_tools))
         .route("/servers/{name}/call", post(server_call))
         .route("/tools", get(all_tools))
-        .route("/tools/{graph_name}/snippet", put(update_snippet))
         .route("/skills", get(skills))
         .route("/skills/select", post(skills_select))
         .with_state(state)

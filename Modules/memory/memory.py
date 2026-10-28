@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Memory (fachada de compatibilidade)
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 memory.py — AVA Memory (fachada de compatibilidade).
 
@@ -34,7 +48,7 @@ Regras de ouro:
 
 # Submódulos importados explicitamente: ficam acessíveis como atributos
 # da fachada (ex.: memory.memory_search.state) para depuração/patches.
-import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
+import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_tips, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
 
 from memory_config import *  # noqa: F401,F403
 from memory_models import *  # noqa: F401,F403
@@ -48,6 +62,7 @@ from memory_ops_memory import *  # noqa: F401,F403
 from memory_ops_files import *  # noqa: F401,F403
 from memory_ops_dicts import *  # noqa: F401,F403
 from memory_ops_tools import *  # noqa: F401,F403
+from memory_ops_tips import *  # noqa: F401,F403
 from memory_ops_agent_skills import *  # noqa: F401,F403
 from memory_ops_plans import *  # noqa: F401,F403
 from memory_ops_scope import *  # noqa: F401,F403
@@ -240,6 +255,11 @@ __all__ = [
     'ToolRegisterResponse',
     'ToolSelectRequest',
     'ToolSelectResponse',
+    'ToolTipAddRequest',
+    'ToolTipAddResponse',
+    'ToolTipEntry',
+    'ToolTipRemoveRequest',
+    'ToolTipsListResponse',
     'ToolUsageRequest',
     'ToolsDB',
     'Turn',
@@ -363,6 +383,9 @@ __all__ = [
     'state',
     'status',
     'tools_delete',
+    'tool_tip_add',
+    'tool_tip_remove',
+    'tool_tips_list',
     'tools_list',
     'tools_record_usage',
     'tools_register',

@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — API REST (FastAPI) sobre a infraestrutura de memory.py
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 memory_rest_api.py — API REST (FastAPI) sobre a infraestrutura de memory.py
 ═══════════════════════════════════════════════════════════════════════════
@@ -325,6 +339,24 @@ async def tools_list():
 @app.delete("/tools/{name}")
 async def tools_delete(name: str):
     return await mem.tools_delete(name)
+
+
+# ── NEW: Tool Tips — dicas de execução gravadas pelo modelo (memory_ops_tips) ──
+
+@app.post("/tools/tips", response_model=mem.ToolTipAddResponse)
+async def tool_tip_add(req: mem.ToolTipAddRequest):
+    return await mem.tool_tip_add(req)
+
+
+@app.get("/tools/tips", response_model=mem.ToolTipsListResponse)
+async def tool_tips_list(names: str = Query("")):
+    """`names` = graph_names das tools carregadas na rodada, separados por vírgula."""
+    return await mem.tool_tips_list(names)
+
+
+@app.delete("/tools/tips/{tip_id}")
+async def tool_tip_remove(tip_id: int, tool: str = Query("")):
+    return await mem.tool_tip_remove(mem.ToolTipRemoveRequest(tool=tool, tip_id=tip_id))
 
 
 # ── NEW: Agent Skills (SKILL.md) — seleção semântica (mesmo ToolsDB, filtro por prefixo)

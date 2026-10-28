@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — Visualização em tempo real do grafo Hebbiano (memórias LT + tools)
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """graph_activation.py — Visualização em tempo real do grafo Hebbiano (memórias LT + tools).
 
 Arquitetura (v2 — polling de diff):
@@ -34,7 +48,7 @@ Arquitetura (v2 — polling de diff):
   de co-uso só existem na ToolsDB (ids inteiros), a fusão é por graph_name
   (`servidor__tool`):
     - tool presente nos DOIS: o nó `t{id}` MANTÉM o id (arestas intactas) e
-      o CONTEÚDO passa a vir da MCP DB (snippet como descrição, core,
+      o CONTEÚDO passa a vir da MCP DB (descrição real do MCP, core,
       transporte, enabled do servidor);
     - tool que só existe na MCP DB (sync pendente / memory offline): entra
       como nó extra id "m{servidor__tool}" (prefixo m, sem arestas);
@@ -197,16 +211,16 @@ def _mcp_tool_node_public(graph_name: str, srow: sqlite3.Row | None,
     (Modules/mcp_manager/db/ava_mcp_servers.db) — ainda sem sync na ToolsDB
     (ex.: memory offline na hora do /sync). Id string com prefixo "m" +
     graph_name — nunca colide com t{N}/p{N}/ids inteiros. Sem arestas (o
-    co-uso só existe na ToolsDB). O snippet (skill.md) é a descrição."""
-    snippet = ((trow["snippet"] or "").strip()
-               or (trow["description_raw"] or "").strip())
-    snippet = snippet or f"Tool '{trow['name']}' do servidor MCP '{trow['server']}'."
+    co-uso só existe na ToolsDB). A descrição real do MCP (description_raw)
+    é o texto — não há mais snippet/skill.md."""
+    desc = (trow["description_raw"] or "").strip()
+    desc = desc or f"Tool '{trow['name']}' do servidor MCP '{trow['server']}'."
     return {
         "id":          f"m{graph_name}",
         "kind":        "tool",
         "label":       graph_name[:40] + ("…" if len(graph_name) > 40 else ""),
-        "title":       html.escape(snippet[:400]),
-        "text":        snippet,              # p/ busca (mesma chave das demais)
+        "title":       html.escape(desc[:400]),
+        "text":        desc,                 # p/ busca (mesma chave das demais)
         "name":        graph_name,
         "server":      trow["server"],
         "core":        bool(trow["core"]),
@@ -364,7 +378,7 @@ class GraphState:
         kind="identity"; liga-se à memória LT que a representa no grafo;
       - MCP registry (mcp_manager Rust no HOST: Modules/mcp_manager/db/
         ava_mcp_servers.db) — GLOBAIS, opcional; FUSÃO por graph_name com
-        as tools da ToolsDB: conteúdo (snippet/core/enabled/transporte)
+        as tools da ToolsDB: conteúdo (descrição/core/enabled/transporte)
         vem daqui, ids t{N} e arestas ficam na ToolsDB; tools só-MCP
         entram como "m{servidor__tool}".
 
@@ -584,7 +598,7 @@ class GraphState:
         # ── MCP registry (opcional): fusão por graph_name ─────────────────
         # 1. Enriquece t-nodes da ToolsDB cujo name existe na MCP DB — o
         #    id t{N} MANTÉM (arestas de co-uso intactas) e o CONTEÚDO passa
-        #    a vir daqui (snippet como descrição, core, enabled/transporte).
+        #    a vir daqui (descrição real do MCP, core, enabled/transporte).
         # 2. Tools só na MCP DB (sync pendente / memory offline) entram
         #    como nós extras "m{graph_name}", sem arestas.
         if self.mcp_db_path:
@@ -601,7 +615,7 @@ class GraphState:
                     mcp_tools = {
                         f"{r['server']}__{r['name']}": (servers.get(r["server"]), r)
                         for r in mconn.execute(
-                            "SELECT server, name, description_raw, snippet, "
+                            "SELECT server, name, description_raw, "
                             "core FROM mcp_tools"
                         )
                     }
@@ -615,11 +629,10 @@ class GraphState:
                     if entry is None:
                         continue
                     srow, trow = entry
-                    snippet = ((trow["snippet"] or "").strip()
-                               or (trow["description_raw"] or "").strip())
-                    if snippet:
-                        node["text"] = snippet
-                        node["title"] = html.escape(snippet[:400])
+                    desc = (trow["description_raw"] or "").strip()
+                    if desc:
+                        node["text"] = desc
+                        node["title"] = html.escape(desc[:400])
                     node["core"] = bool(trow["core"])
                     node["transport"] = srow["transport"] if srow is not None else None
                     node["enabled"] = bool(srow["enabled"]) if srow is not None else True
@@ -1445,7 +1458,7 @@ function nodeTitle(meta) {
       ? `MCP${meta.transport ? ` · ${escapeHtml(meta.transport)}` : ''}${meta.enabled === false ? ' — <span style="color:#e0503c">desabilitado</span>' : ''}`
       : 'nativa';
     return `<b>${escapeHtml(meta.name || meta.label)}</b> ${meta.core ? '⭐ core' : ''}<br>` +
-           `<i>${meta.title || '(sem snippet — rode /sync ou defina o skill.md no mcp_manager)'}</i><br>` +
+           `<i>${meta.title || '(sem descrição — rode /sync no mcp_manager para puxar as descrições do servidor MCP)'}</i><br>` +
            `${mcpInfo} · usos: ${meta.use_count ?? 0} · última: ${lu}`;
   }
   const d = new Date((meta.created_at || 0) * 1000);
@@ -1841,7 +1854,7 @@ function showPanel(id) {
       <div class="meta">tool ${meta.server ? `MCP — servidor: <b>${escapeHtml(meta.server)}</b>` : 'nativa'} · grau: ${degreeOf(id)}</div>
       <div class="meta">usos: ${meta.use_count ?? 0} · última: ${lu}${pills ? ' · ' + pills : ''}</div>
       <div class="meta">registrada: ${isNaN(d) ? '?' : d.toLocaleString('pt-BR')}</div>
-      <div class="text">${escapeHtml(meta.description || '(sem snippet — defina o skill.md via PUT /tools/{graph}/snippet no mcp_manager)')}</div>`;
+      <div class="text">${escapeHtml(meta.description || '(sem descrição — rode /sync; a descrição vem do próprio servidor MCP)')}</div>`;
   } else {
     const conf = Math.round((meta.confidence || 0) * 100);
     const confColor = conf >= 80 ? '#51cf66' : conf >= 55 ? '#ffd166' : '#ff6b6b';
@@ -2026,7 +2039,7 @@ def main(argv: list[str] | None = None):
                          "Correlações virtuais: card ↔ memória de identidade, plano ↔ card, plano ↔ tools")
     ap.add_argument("--mcp-db", default="./Modules/mcp_manager/db/ava_mcp_servers.db",
                     help="registry do mcp_manager (Rust, HOST) — opcional; fusão por "
-                         "graph_name: conteúdo/snippet/enabled vêm daqui, arestas da ToolsDB")
+                         "graph_name: conteúdo/descrição/enabled vêm daqui, arestas da ToolsDB")
     ap.add_argument("--memory-api", nargs="?", const="__default__", default=None,
                     help="NEW (multi-escopo): URL da memory API — lê o ESCOPO ATIVO "
                          "(GET /status → project.active_scope) e publica o badge "

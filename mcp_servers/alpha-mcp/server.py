@@ -1,3 +1,17 @@
+# Alpha AI (AVA) — alpha-mcp — tools self-hosted do AVA (busca web + memória)
+# Copyright (C) 2026  Felipe lumazini
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """alpha-mcp — tools self-hosted do AVA (busca web + memória).
 
 Tools MCP expostas:
@@ -1234,6 +1248,70 @@ async def memory_identity_edit(
         return f"Erro ao editar card de identidade: {e}"
     log.info(f"[identity] card editado: campos={sorted(payload)}")
     return f"Card de identidade atualizado: {_format_identity(c)}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool Tips — dicas de execução que VOCÊ grava sobre suas próprias tools
+# ══════════════════════════════════════════════════════════════════════════════
+# Memória de USO REAL, aditiva à description (fonte da verdade da tool continua
+# sendo o MCP): as dicas voltam no bloco "Tool tips" do system prompt SÓ das
+# tools carregadas na rodada. Cap firme por tool (o servidor recusa a 6ª com
+# orientação de remoção) e dedup (refinamento atualiza a dica existente). A
+# política de O QUE gravar vive na description das tools abaixo — é o que o
+# modelo lê no schema.
+
+@mcp.tool()
+async def tool_tip_add(tool: str, tip: str) -> str:
+    """Grava uma dica de EXECUÇÃO sobre uma tool, para os seus turnos futuros
+    (aparece no bloco "Tool tips" sempre que a tool for carregada). Grave
+    APENAS uma limitação não-óbvia e DURÁVEL que você descobriu USANDO a tool
+    nesta conversa: modo de falha ("falha com payload > 5MB"), requisito de
+    ordem ("chame X antes de Y, senão retorna vazio"), armadilha de parâmetro.
+    `tool` é o nome completo ('servidor__tool', ex.: 'desktop-commander__start_process');
+    `tip` é UMA frase imperativa e GERAL — não o caso específico desta conversa.
+    NÃO use para: fatos do usuário/tarefa (memory_write_batch), preferência ou
+    ranking entre tools (a seleção é automática), ou o que a description já diz.
+    Se a tool já atingiu o limite de dicas, remova a mais fraca antes (tool_tip_remove)."""
+    if not tool.strip():
+        return "Erro: `tool` vazia."
+    if not tip.strip():
+        return "Erro: `tip` vazia."
+    try:
+        data = await _memory_api_request("POST", "/tools/tips", {
+            "tool": tool.strip(),
+            "tip": tip.strip(),
+        })
+    except MemoryToolError as e:
+        return f"Erro ao gravar dica: {e.detail}"
+    except Exception as e:
+        log.exception("tool_tip_add falhou")
+        return f"Erro ao gravar dica: {e}"
+    if data.get("status") == "updated":
+        log.info(f"[tips] '{tool}' dica #{data.get('tip_id')} atualizada (refinamento)")
+        return (f"Dica existente atualizada (#{data.get('tip_id')}) — "
+                f"{data.get('tips_count')} dica(s) ativa(s) para '{tool}'.")
+    log.info(f"[tips] '{tool}' dica #{data.get('tip_id')} gravada")
+    return (f"Dica gravada (#{data.get('tip_id')}) — "
+            f"{data.get('tips_count')} dica(s) ativa(s) para '{tool}'.")
+
+
+@mcp.tool()
+async def tool_tip_remove(tool: str, tip_id: int) -> str:
+    """Retira (retrata) uma dica sua sobre uma tool — use quando a dica provou
+    estar errada, desatualizada, ou quando você precisa de espaço para uma
+    dica melhor. `tool` é o nome completo ('servidor__tool') e `tip_id` é o id
+    mostrado no bloco "Tool tips" do system prompt (ex.: [#3] → 3)."""
+    if not tool.strip():
+        return "Erro: `tool` vazia."
+    try:
+        data = await _memory_api_request("DELETE", f"/tools/tips/{int(tip_id)}?tool={tool.strip()}")
+    except MemoryToolError as e:
+        return f"Erro ao remover dica: {e.detail}"
+    except Exception as e:
+        log.exception("tool_tip_remove falhou")
+        return f"Erro ao remover dica: {e}"
+    log.info(f"[tips] '{tool}' dica #{tip_id} retratada")
+    return f"Dica #{tip_id} de '{tool}' removida."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
