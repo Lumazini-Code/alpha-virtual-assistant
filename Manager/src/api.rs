@@ -95,15 +95,6 @@ pub fn memory_url() -> String {
         .unwrap_or_else(|| format!("http://{}:3000", bind_host()))
 }
 
-/// URL do visualizador de grafo (:8777) — link do painel e health check.
-pub fn graph_url() -> String {
-    std::env::var("AVA_GRAPH_URL")
-        .ok()
-        .map(|url| url.trim().trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| format!("http://{}:8777", bind_host()))
-}
-
 pub async fn serve(
     state: SharedState,
     ui_tx: tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
@@ -158,8 +149,13 @@ pub async fn serve(
         .route("/", get(get_webui))
         .route("/index.html", get(get_webui))
         .route("/favicon.ico", get(get_favicon))
+        .route("/assets/alpha-icon.svg", get(get_alpha_icon))
         .route("/stats", get(get_stats))
         .route("/graph/status", get(get_graph_status))
+        .route("/graph/snapshot", get(get_graph_snapshot))
+        .route("/graph/events", get(get_graph_events))
+        .route("/graph/replay", get(get_graph_replay))
+        .route("/assets/vis-network.min.js", get(get_vis_network))
         .route("/docker/logs", get(get_docker_logs))
         .route("/orch", any(proxy_orchestrator))
         .route("/orch/{*path}", any(proxy_orchestrator))
@@ -563,13 +559,31 @@ async fn get_webui(State(state): State<SharedState>) -> Response {
     response
 }
 
-/// Ícone do app — evita o 401 do fallback do router MCP no /favicon.ico.
+/// Favicon: usa o PNG (mesmo desenho do alpha.ico, mas com o canal alfa
+/// preservado pelo encoder — o .ico tem a variante 32bpp transparente e
+/// navegadores escolhem justamente ela).
 async fn get_favicon() -> Response {
     const ICON: &[u8] = include_bytes!("../assets/icon.png");
     let mut response = Response::new(Body::from(ICON));
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
+}
+
+/// Versão branca do `resource/Alpha Icon.svg`. O CSS do WebUI inverte para
+/// preto no tema claro (`--icf`), então o mesmo asset serve nos dois temas.
+async fn get_alpha_icon() -> Response {
+    const ICON: &[u8] = include_bytes!("../assets/alpha-icon-white.svg");
+    let mut response = Response::new(Body::from(ICON));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+    );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=86400"),
@@ -589,27 +603,114 @@ async fn get_stats() -> Response {
     }
 }
 
-/// O grafo (:8777) é um app separado no host/container. O front só precisa
-/// saber se está no ar para mostrar o link; um TCP connect resolve sem
-/// depender de CORS.
-async fn get_graph_status() -> Response {
-    let url = graph_url();
-    let online = match reqwest::Url::parse(&url) {
-        Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or("127.0.0.1");
-            let port = parsed.port_or_known_default().unwrap_or(80);
-            matches!(
-                tokio::time::timeout(
-                    Duration::from_millis(500),
-                    tokio::net::TcpStream::connect((host, port)),
-                )
-                .await,
-                Ok(Ok(_))
+/// Estado do worker do grafo (não sobe o worker).
+async fn get_graph_status(State(state): State<SharedState>) -> Response {
+    Json(state.graph.status().await).into_response()
+}
+
+/// Snapshot completo do grafo. Sobe o worker via docker exec se preciso.
+async fn get_graph_snapshot(State(state): State<SharedState>) -> Response {
+    match state.graph.snapshot().await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+/// SSE do grafo embutido. O primeiro frame é o snapshot (mesmo em
+/// reconexões); depois vêm graph_delta/activation/scope_switch.
+async fn get_graph_events(State(state): State<SharedState>) -> Response {
+    // Assina antes de esperar o snapshot para não perder deltas do boot.
+    let mut receiver = state.graph.subscribe();
+    let snapshot = match state.graph.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error })),
             )
+                .into_response()
         }
-        Err(_) => false,
     };
-    Json(serde_json::json!({ "online": online, "url": url })).into_response()
+    let initial = format!(
+        "data: {}\n\n",
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into())
+    );
+
+    let stream = async_stream::stream! {
+        yield Ok::<String, std::io::Error>(initial);
+        loop {
+            tokio::select! {
+                event = receiver.recv() => match event {
+                    Ok(line) => {
+                        let down = line.contains("\"worker_down\"");
+                        yield Ok(format!("data: {line}\n\n"));
+                        if down {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("graph SSE: cliente atrasado ({skipped} eventos) — reconectar");
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    yield Ok(": keepalive\n\n".to_string());
+                }
+            }
+        }
+    };
+
+    let mut response = Response::new(Body::from_stream(stream));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayQuery {
+    n: Option<usize>,
+}
+
+/// Replay dos activation_log.jsonl (root + projetos), direto do bind mount.
+async fn get_graph_replay(
+    State(state): State<SharedState>,
+    Query(query): Query<ReplayQuery>,
+) -> Response {
+    let n = query.n.unwrap_or(50);
+    let root = state.project_root.clone();
+    match tokio::task::spawn_blocking(move || crate::graph::replay(&root, n)).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("falha no replay: {error}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Biblioteca vis-network vendorizada — o grafo é renderizado no próprio
+/// documento, sem CDN e sem página externa.
+async fn get_vis_network() -> Response {
+    const JS: &[u8] = include_bytes!("../assets/vis-network.min.js");
+    let mut response = Response::new(Body::from(JS));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]

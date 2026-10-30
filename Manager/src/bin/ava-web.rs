@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -59,7 +61,22 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // Nome fixo do app/janela no Linux: o GTK deriva o WM_CLASS (X11) e o
+    // app_id (Wayland) dele. Sem isso o valor é "ava-web"/"Ava-web" e a barra
+    // de tarefas não casa com alpha-ai.desktop — cai no ícone genérico.
+    #[cfg(target_os = "linux")]
+    {
+        glib::set_prgname(Some("alpha-ai"));
+        glib::set_application_name("Alpha AI");
+    }
+
     let event_loop = EventLoopBuilder::<ControlEvent>::with_user_event().build();
+    // Depois do GTK inicializado (pelo event loop) e antes da janela nascer:
+    // `prgname` define a parte "instance" do WM_CLASS (alpha-ai) e o GTK
+    // capitaliza a parte "class" (Alpha-ai). Fixamos a class em minúsculas
+    // para casar exatamente com StartupWMClass=alpha-ai no .desktop.
+    #[cfg(target_os = "linux")]
+    gtk::gdk::set_program_class("alpha-ai");
     let proxy = event_loop.create_proxy();
 
     let icon = load_icon();
@@ -68,7 +85,9 @@ fn main() -> anyhow::Result<()> {
         .with_inner_size(LogicalSize::new(1280.0, 860.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0))
         .with_resizable(true)
-        .with_visible(true)
+        // Nasce oculta e só aparece depois do WebView: evita uma janela
+        // vazia piscando enquanto o GTK realiza a janela.
+        .with_visible(false)
         .with_window_icon(icon)
         .build(&event_loop)
         .context("falha ao criar a janela nativa")?;
@@ -100,7 +119,6 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     let _webview = {
-        use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
         let vbox = window
             .default_vbox()
@@ -111,6 +129,8 @@ fn main() -> anyhow::Result<()> {
     };
     #[cfg(not(target_os = "linux"))]
     let _webview = builder.build(&window).context("falha ao criar WebView2")?;
+
+    window.set_visible(true);
 
     // Só começa a aceitar focus/quit depois que a janela existe.
     app_ipc::spawn_listener(listener, move |command| {
@@ -226,7 +246,12 @@ fn install_logging(root: &Path) {
 
 fn load_icon() -> Option<Icon> {
     const ICON_BYTES: &[u8] = include_bytes!("../../assets/icon.png");
-    let image = image::load_from_memory(ICON_BYTES).ok()?.into_rgba8();
+    let image = image::load_from_memory(ICON_BYTES)
+        .map_err(|e| tracing::warn!("ícone inválido em assets/icon.png: {e}"))
+        .ok()?
+        .into_rgba8();
     let (width, height) = image.dimensions();
-    Icon::from_rgba(image.into_raw(), width, height).ok()
+    Icon::from_rgba(image.into_raw(), width, height)
+        .map_err(|e| tracing::warn!("ícone rejeitado por assets/icon.png: {e}"))
+        .ok()
 }

@@ -675,21 +675,19 @@ if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
 
 # -- 5b''. Perfil de recursos (RAM) --------------------------------------------
 # Escreve as flags de consumo no Modules\.env. Economico (default): TTS
-# (~470MB), visualizador de grafo (~80MB) e voz do host (~600MB) desligados —
+# (~470MB) e voz do host (~600MB) desligados —
 # tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
 # AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
 # pergunta seguinte o reergue sozinho.
-$ans = Read-Host 'Perfil de recursos? [1]=Economico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS+grafo, ~1.4GB) [1/2, default 1]'
+$ans = Read-Host 'Perfil de recursos? [1]=Economico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS, ~1.3GB) [1/2, default 1]'
 if ($ans -match '^[2]') {
   Set-EnvVar 'AVA_TTS_ENABLED' '1'
-  Set-EnvVar 'AVA_GRAPH_UI' '1'
   Set-EnvVar 'AVA_VOICE' '1'
-  Write-Ok 'Perfil completo: voz + TTS + visualizador de grafo ligados.'
+  Write-Ok 'Perfil completo: voz + TTS ligados.'
 } else {
   Set-EnvVar 'AVA_TTS_ENABLED' '0'
-  Set-EnvVar 'AVA_GRAPH_UI' '0'
   Set-EnvVar 'AVA_VOICE' '0'
-  Write-Ok 'Perfil economico: TTS, visualizador de grafo e voz desligados (ligue flags em Modules\.env quando quiser).'
+  Write-Ok 'Perfil economico: TTS e voz desligados (ligue flags em Modules\.env quando quiser).'
 }
 Set-EnvVar 'AVA_DOCKER_IDLE_MINUTES' '15'
 Write-Ok 'Docker dorme apos 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15).'

@@ -22,7 +22,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 /// Porta padrão do canal de controle. Fora das faixas já usadas pelo
-/// ambiente (9000/9001, 9100 do transcribe, 9222 do Chrome, 8777 do grafo).
+/// ambiente (9000/9001, 9100 do transcribe, 9222 do Chrome).
 pub const DEFAULT_CONTROL_PORT: u16 = 9123;
 
 /// Endereço do canal: sempre loopback, com override por env (útil em dev

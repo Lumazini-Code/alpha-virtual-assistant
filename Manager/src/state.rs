@@ -196,6 +196,8 @@ pub struct AppState {
     /// Diretório raiz do projeto (onde ficam docker-compose.yml, o binário
     /// do MCP manager, etc.) — cwd dos processos supervisionados.
     pub project_root: PathBuf,
+    /// Grafo embutido (worker Python no container) — consumido pelo WebUI.
+    pub graph: Arc<crate::graph::GraphService>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -390,6 +392,7 @@ pub fn new_shared_state() -> SharedState {
             binary: transcript_binary,
         })),
         docker_start_script: find_docker_start_script(),
+        graph: Arc::new(crate::graph::GraphService::new(project_root.clone())),
         project_root,
     })
 }

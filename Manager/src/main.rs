@@ -28,6 +28,7 @@ mod app_ipc;
 mod app_launcher;
 mod chat;
 mod docker_logs;
+mod graph;
 mod idle_watcher;
 mod mcp_server;
 mod platform;
@@ -302,11 +303,15 @@ fn main() -> anyhow::Result<()> {
     // Roda até a UI fechar de verdade (menu "Sair" do tray → quit_requested
     // → close permitido → run_native retorna → processo encerra e a thread
     // do tray morre junto).
-    let result = run_ui(shared_state, rt_handle, cmd_rx);
+    let graph = shared_state.graph.clone();
+    let result = run_ui(shared_state, rt_handle.clone(), cmd_rx);
 
     // O ava-web é outro processo: pede para ele fechar junto com o tray
     // (fechar a janela do app sozinha NÃO encerra o tray).
     app_launcher::request_quit();
+
+    // Encerra o docker exec do grafo antes de o runtime cair.
+    rt_handle.block_on(graph.shutdown());
 
     result
 }
@@ -399,15 +404,19 @@ fn run_ui(
     // de automação do fluxo de close sem depender do clique no tray).
     let start_visible = std::env::var("AVA_TRAY_START_VISIBLE").is_ok();
     tracing::debug!("run_ui: start_visible={start_visible}");
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([360.0, 480.0])
+        .with_resizable(true)
+        .with_title("AVA — Gerenciador de Processos")
+        // nasce oculta: só aparece quando o usuário pede via tray
+        .with_visible(start_visible)
+        // não aparece na barra de tarefas (o ícone fica só na tray)
+        .with_taskbar(false);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 480.0])
-            .with_resizable(true)
-            .with_title("AVA — Gerenciador de Processos")
-            // nasce oculta: só aparece quando o usuário pede via tray
-            .with_visible(start_visible)
-            // não aparece na barra de tarefas (o ícone fica só na tray)
-            .with_taskbar(false),
+        viewport,
         ..Default::default()
     };
 
@@ -424,6 +433,19 @@ fn run_ui(
 fn find_frame_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2)
         .position(|w| w == b"\n\n")
+}
+
+/// Ícone da janela eframe (Windows taskbar/alt-tab e Linux WM). Mesmo PNG
+/// do tray; o eframe usa o padrão "e" quando não recebe nenhum.
+fn load_window_icon() -> Option<egui::IconData> {
+    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+    let image = image::load_from_memory(ICON_BYTES).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
 
 fn load_tray_icon() -> tray_icon::Icon {

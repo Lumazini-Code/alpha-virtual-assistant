@@ -26,7 +26,7 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 │  │  memory_api.py :3000     memória (SQLite+LanceDB+grafo)│               │  │
 │  │  TTS.py :3004            fala (Supertonic, streaming) │                │  │
 │  │  onnxManager.py :2002    embeddings E5 + reranker ONNX │                │  │
-│  │  graph_activation.py :8777  visualização do grafo (SSE)│               │  │
+│  │  graph_activation.py       worker do grafo (stdio, on-demand)│          │  │
 │  └────────────────────────────────────────────────────────┘                │
 │    │ :9001 no host (tray API + rotas MCP no MESMO listener)                     │
 │    ▼                                                                        │
@@ -102,7 +102,7 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - **Card de identidade da Alpha (`GET/PATCH /identity`)**: card singleton com quem a própria assistente é (nome, descrição, papéis/valores, infos extras), **semeado no boot** a partir de `resource/persona.json` e ligado à sua **memória de identidade LT** — no viewer vira o nó ★ dourado `a{id}` com aresta `identity_memory`; editado pelo alpha-mcp (`memory_identity_*`).
 - **RAG de arquivos locais (`indexed-file`)**: cadastro com hash SHA-256 (reindexa só o que mudou), chunking 500/100 com posição (`char_start/end`) e leitura em 3 modos — arquivo inteiro por path, chunks daquele arquivo ranqueados pela query, ou busca semântica global.
 - **Planos persistidos** (`/plans/*`) com CRUD pela TUI e pelo `plan_recorder`.
-- Visualização **em tempo real** do grafo em `graph_activation.py` (:8777): polling de diff do SQLite (~1 s) com nós de memória, **tools como hexágonos** (`t{id}`) e **planos como diamantes** (`p{id}`); arestas nascendo, sendo reforçadas e podadas por decay ao vivo.
+- Visualização **em tempo real** do grafo **embutida no WebUI do Manager**: `graph_activation.py` roda como worker headless (stdio, sob demanda) e o `vis-network` renderiza no próprio documento; nós de memória, **tools como hexágonos** (`t{id}`) e **planos como diamantes** (`p{id}`), com arestas nascendo/reforçadas/podadas ao vivo.
 
 ### Visão (vision.py) — desligada por padrão
 O pipeline completo (**Depth Anything V2** → clusterização por camadas → **EdgeSAM** → crops → **DINOv3** → consulta ao dicionário visual, mais **YuNet** + **EdgeFace** para rostos, tudo ONNX/CPU) existe e funciona, mas **não sobe por default**: a forma como foi projetado para ser usado (agente totalmente autônomo com visão constante) ainda não é suportada. Com `VISION_OBJECTS_ENABLED=0` (default), `start.sh` não inicia vision.py, a tool `vision_objects` não é oferecida e as imagens vão embutidas direto no contexto do modelo principal. Com a flag em `1`, o fluxo antigo volta (face recognition + segmentação → crops → resposta do modelo multimodal).
@@ -155,7 +155,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 
 ```
 ├── orchestrator.py          # Engine de tool-calling (FastAPI/SSE, :9000) + Conversation Hub
-├── graph_activation.py      # Visualizador do grafo hebbiano em tempo real (SSE, :8777)
+├── graph_activation.py      # Worker headless do grafo hebbiano (JSON via stdio; render no WebUI)
 ├── Modules/
 │   ├── LLM.py               # Cliente OpenRouter + prompts + memory-watch (:4003)
 │   ├── TTS.py               # Supertonic streaming (:3004)
@@ -194,7 +194,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 | TTS.py | container | 3004 | Síntese e playback de fala (Supertonic) — **opt-in** (`AVA_TTS_ENABLED=1`) |
 | LLM.py | container | 4003 | Inferência (OpenRouter) — mesclado no processo do orchestrator (`AVA_MERGED_SERVICES=1`) |
 | onnxManager.py | container | 2002 | E5 embeddings + rerank (API única ONNX) |
-| graph_activation.py | container | 8777 | Grafo em tempo real (SSE, diff polling) — **opt-in** (`AVA_GRAPH_UI=1`) |
+| graph_activation.py | container | — | Worker do grafo (stdio, sob demanda via `docker exec`); renderização embutida no WebUI |
 | **mcp_manager (Rust)** | **host (embutido no tray)** | 9001 | Registro + execução de servidores MCP (mesmo listener da API do tray) |
 | **transcript (C++)** | **host** | 9100 | `/health` + `/speaker/embed` (voz contínua, VAD/ASR/CAM++) |
 | searxng | container | 8081 | Meta-busca (loopback) — on-demand (`WEB_STACK_ON_DEMAND=1`: sobe na 1ª busca, dorme após 5 min) |
@@ -268,9 +268,8 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
 | `AVA_DOCKER_IDLE_MINUTES` | tray | 15 | Minutos de inatividade antes do `docker down` (a pergunta seguinte reergue o stack sozinho) |
 | `AVA_TTS_ENABLED` | `start.sh` | `0` | Liga o serviço de TTS (Supertonic, ~470 MB/worker na RAM). Desligado = fala não sintetiza |
-| `AVA_GRAPH_UI` | orchestrator/start.sh | `0` | Liga o visualizador do grafo (:8777, ~80 MB) — dentro do processo do orchestrator no modo mesclado |
 | `AVA_VOICE` | tray | `0` | Liga o pipeline de voz no host (wake word + ASR, ~600 MB). Desligado = transcript não sobe no auto-init; `POST /transcript/start` sobe à mão |
-| `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) e grafo (:8777) mesclados no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
+| `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) mesclado no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |

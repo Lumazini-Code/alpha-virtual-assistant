@@ -4603,11 +4603,13 @@ async def delete_project(slug: str):
 
 
 # ── Serviços mesclados (AVA_MERGED_SERVICES, default 1) ──────────────────────
-# LLM (:4003, proxy puro do OpenRouter) e o visualizador do grafo (:8777)
-# rodam em THREADS deste processo — um único interpreter Python. Cada serviço
-# FastAPI pago a parte custa ~60-100MB de interpreter+libs; mesclar economiza
-# isso SEM mudar o contrato: as portas continuam existindo nos mesmos
-# endereços (TUI/tray/healthchecks não mudam nada).
+# LLM (:4003, proxy puro do OpenRouter) roda em THREAD deste processo — um
+# único interpreter Python. Cada serviço FastAPI pago a parte custa
+# ~60-100MB de interpreter+libs; mesclar economiza isso SEM mudar o contrato:
+# a porta continua existindo no mesmo endereço (TUI/tray/healthchecks não
+# mudam nada).
+# O grafo NÃO sobe mais aqui: o WebUI embutido do Manager sobe o worker
+# graph_activation.py sob demanda via `docker exec` (stdio, sem porta).
 # start.sh só sobe os standalone quando AVA_MERGED_SERVICES=0.
 # Falha ao carregar serviço mesclado → saída 78 (EX_CONFIG): o restart_on_fail
 # do start.sh NÃO reinicia em loop config quebrada (mesma convenção do
@@ -4670,24 +4672,6 @@ def _start_merged_services() -> None:
         daemon=True, name="uvicorn-llm",
     ).start()
 
-    # ── Visualizador do grafo (:8777) — opt-in AVA_GRAPH_UI (default 0) ──
-    if os.getenv("AVA_GRAPH_UI", "0").strip().lower() in ("1", "true", "yes", "on"):
-        try:
-            import graph_activation as _ga
-        except Exception as e:
-            _fatal_merged(
-                f"[merged] falha ao importar graph_activation.py ({type(e).__name__}: {e}) — "
-                f"para isolar, rode com AVA_MERGED_SERVICES=0."
-            )
-        # argv=["--memory-api"]: mesmo contrato do standalone no start.sh —
-        # publica o badge do escopo ativo (lê GET /status da memory API).
-        threading.Thread(
-            target=_ga.main, kwargs={"argv": ["--memory-api"]},
-            daemon=True, name="graph-activation",
-        ).start()
-        log.info("[merged] Graph UI ativo em :8777 (AVA_GRAPH_UI=1)")
-    else:
-        log.info("[merged] Graph UI desligado (AVA_GRAPH_UI=0) — economia de ~80MB")
 
 
 if __name__ == "__main__":

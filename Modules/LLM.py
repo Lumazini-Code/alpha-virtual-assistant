@@ -102,7 +102,7 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip(
 LLM_API_KEY  = (
     os.getenv("LLM_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
 )
-LLM_MODEL    = os.getenv("LLM_MODEL", "z-ai/glm-5.3-flash:floor")
+LLM_MODEL    = os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017")
 
 # Host do provider — decide se API key é exigida (local: nunca é) e alimenta
 # o /health (llm_key: "ok" | "not-required" | "missing"). LLM_PROVIDER_LOCAL=1

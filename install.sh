@@ -637,24 +637,22 @@ fi
 
 # ── 5b-1. Perfil de recursos (RAM) ───────────────────────────────────────────
 # Escreve as flags de consumo no Modules/.env. Econômico (default): TTS
-# (~470MB), visualizador de grafo (~80MB) e voz do host (~600MB) desligados —
+# (~470MB) e voz do host (~600MB) desligados —
 # tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
 # AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
 # pergunta seguinte o reergue sozinho.
-printf 'Perfil de recursos? [1]=Econômico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS+grafo, ~1.4GB) [1/2, default 1] '
+printf 'Perfil de recursos? [1]=Econômico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS, ~1.3GB) [1/2, default 1] '
 read -r ans || ans=""
 case "$ans" in
   2)
     set_env_var AVA_TTS_ENABLED 1
-    set_env_var AVA_GRAPH_UI 1
     set_env_var AVA_VOICE 1
-    ok "Perfil completo: voz + TTS + visualizador de grafo ligados."
+    ok "Perfil completo: voz + TTS ligados."
     ;;
   *)
     set_env_var AVA_TTS_ENABLED 0
-    set_env_var AVA_GRAPH_UI 0
     set_env_var AVA_VOICE 0
-    ok "Perfil econômico: TTS, visualizador de grafo e voz desligados (ligue as flags em Modules/.env quando quiser)."
+    ok "Perfil econômico: TTS e voz desligados (ligue as flags em Modules/.env quando quiser)."
     ;;
 esac
 set_env_var AVA_DOCKER_IDLE_MINUTES 15
@@ -1170,7 +1168,33 @@ case ":$PATH:" in
     ;;
 esac
 
-# ── 8. Auto-start do tray ─────────────────────────────────────────────────────
+# ── 8. Ícone + entrada de aplicativo + auto-start do tray ─────────────────────
+# O ava-web define WM_CLASS/app_id "alpha-ai" (ava-web.rs). O .desktop precisa
+# ter o mesmo nome/StartupWMClass para a barra de tarefas achar o ícone; caso
+# contrário o shell mostra o ícone genérico.
+ICON_DIR="$HOME/.local/share/icons/hicolor/512x512/apps"
+APPS_DIR="$HOME/.local/share/applications"
+mkdir -p "$ICON_DIR" "$APPS_DIR"
+install -Dm644 "$INSTALL_DIR/Manager/assets/icon.png" "$ICON_DIR/alpha-ai.png"
+
+cat > "$APPS_DIR/alpha-ai.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Alpha AI
+Comment=Interface web do Alpha AI (WebView nativa)
+Icon=alpha-ai
+Exec="$INSTALL_DIR/Manager/ava-web"
+Terminal=false
+StartupNotify=true
+StartupWMClass=alpha-ai
+Categories=Utility;
+EOF
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+ok "Aplicativo registrado: $APPS_DIR/alpha-ai.desktop"
+
 AUTOSTART_DIR="$HOME/.config/autostart"
 mkdir -p "$AUTOSTART_DIR"
 cat > "$AUTOSTART_DIR/alpha-ai-tray.desktop" <<EOF
@@ -1178,7 +1202,8 @@ cat > "$AUTOSTART_DIR/alpha-ai-tray.desktop" <<EOF
 Type=Application
 Name=Alpha AI Tray
 Comment=Gerenciador Docker do Alpha AI (bandeja do sistema)
-Exec=$INSTALL_DIR/Manager/ava-tray
+Icon=alpha-ai
+Exec="$INSTALL_DIR/Manager/ava-tray"
 Terminal=false
 StartupNotify=false
 X-GNOME-Autostart-enabled=true

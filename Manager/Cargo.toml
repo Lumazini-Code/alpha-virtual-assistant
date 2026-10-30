@@ -36,6 +36,10 @@ required-features = ["webapp"]
 gtk = "0.18"
 glib = "0.18"
 
+[build-dependencies]
+# Ícone do .exe (Explorer/taskbar) no target Windows; ignorado no Linux.
+winresource = "0.1"
+
 [dependencies]
 # ── Janela nativa com WebView (binário ava-web) ────────────────────────────
 # wry = motor do WebView do sistema (WebKitGTK no Linux, WebView2 no
@@ -87,6 +91,9 @@ tray-icon = "0.14"
 
 # ── Loop de eventos nativo (necessário para o tray-icon funcionar) ─────────
 winit = "0.29"
+
+# ── SSE do grafo embutido ───────────────────────────────────────────────────
+async-stream = "0.3"
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 tracing = "0.1"
