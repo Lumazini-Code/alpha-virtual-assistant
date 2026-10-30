@@ -65,8 +65,15 @@ except ImportError:
 #   - intfloat/multilingual-e5-base   (278M, dim 768, int8 ≈ 280MB)
 #   - Alibaba-NLP/gte-multilingual-base (305M, dim 768)
 #   - BAAI/bge-m3 (568M, dim 1024) — só em máquina boa
-EMBED_MODEL_PATH   = os.getenv("ONNX_EMBED_MODEL_PATH",  "./Models/multilingual-e5-small/multilingual-e5-small.onnx")
-EMBED_TOKENIZER    = os.getenv("ONNX_EMBED_TOKENIZER", "./Models/multilingual-e5-small/tokenizer.json")
+# ── Base de modelos — resolvida relativa a ESTE arquivo, não ao CWD ──────────
+# No start.sh antigo funcionava porque fazia `cd /app/Modules` antes de subir
+# o onnxManager. No launcher unificado (CWD=/app) o "./Models/..." resolveria
+# para /app/Models (inexistente). Path(__file__).parent = /app/Modules nos
+# dois modos — o container monta Models/ dentro de Modules/ por volume.
+_MODELS_BASE = Path(__file__).resolve().parent / "Models"
+
+EMBED_MODEL_PATH   = os.getenv("ONNX_EMBED_MODEL_PATH",  str(_MODELS_BASE / "multilingual-e5-small/multilingual-e5-small.onnx"))
+EMBED_TOKENIZER    = os.getenv("ONNX_EMBED_TOKENIZER", str(_MODELS_BASE / "multilingual-e5-small/tokenizer.json"))
 EMBED_MAX_LENGTH   = max(32, int(os.getenv("ONNX_EMBED_MAX_LENGTH", "128")))
 EMBED_DIM          = int(os.getenv("ONNX_EMBED_DIM", "384"))
 EMBED_THREADS      = max(1, int(os.getenv("ONNX_EMBED_THREADS", "2")))
@@ -85,8 +92,8 @@ EMBED_MAX_BATCH    = max(8, int(os.getenv("ONNX_EMBED_MAX_BATCH", "64")))
 ONNX_EMBED_AUTO_QUANTIZE = os.getenv("ONNX_EMBED_AUTO_QUANTIZE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Reranker model (ms-marco-MiniLM-L-6-v2)
-RERANK_MODEL_PATH  = "./Models/ms-marco-MiniLM-L-6-v2/ms-marco-MiniLM-L-6-v2.onnx"
-RERANK_TOKENIZER   = "./Models/ms-marco-MiniLM-L-6-v2/tokenizer.json"
+RERANK_MODEL_PATH  = str(_MODELS_BASE / "ms-marco-MiniLM-L-6-v2/ms-marco-MiniLM-L-6-v2.onnx")
+RERANK_TOKENIZER   = str(_MODELS_BASE / "ms-marco-MiniLM-L-6-v2/tokenizer.json")
 RERANK_MAX_LENGTH  = 512
 RERANK_THREADS     = max(1, int(os.getenv("ONNX_RERANK_THREADS", "2")))
 RERANK_MAX_BATCH   = max(8, int(os.getenv("ONNX_RERANK_MAX_BATCH", "32")))
@@ -259,24 +266,147 @@ def _malloc_trim_watchdog(interval_s: float = 60.0) -> None:
     threading.Thread(target=_loop, daemon=True, name="malloc-trim").start()
 
 
+def _write_skip_marker(marker: Path, reason: str) -> None:
+    """Escreve o marker de desativação int8. Falha em escrever (ex.: disco
+    cheio) NÃO é fatal — o serviço funciona sem quantização de qualquer forma."""
+    try:
+        marker.write_text(f"int8 desativado em {time.strftime('%Y-%m-%d %H:%M')}: {reason}\n")
+    except Exception:
+        pass
+
+
+def _int8_cache_paths(src: Path) -> tuple[Path, Path]:
+    """Caminhos do cache int8 (`<nome>_int8.onnx`) e do marker de desativação
+    (`<nome>_int8.skip`) derivados do modelo original."""
+    int8 = src.with_name(f"{src.stem}_int8.onnx")
+    return int8, int8.with_name(f"{src.stem}_int8.skip")
+
+
+def _fp16_to_fp32(src: Path, dst: Path) -> Optional[bool]:
+    """Converte initializers FLOAT16 de um modelo ONNX para fp32 (gráfico
+    principal, sem subgrafos If/Loop). Retorna True se converteu (dst criado),
+    False se o modelo não tinha fp16 (nada a fazer) e None se não foi possível
+    (pacote `onnx` ausente).
+
+    Por que existe: o e5-small vem do HF com initializers FLOAT16 ("fp32
+    disfarçado"). O ORT-CPU converte fp16→fp32 na carga de qualquer forma (os
+    pesos acabam em fp32 na RAM), mas o quantize_dynamic EXIGE pesos fp32 —
+    quantizar direto no arquivo fp16 produz um modelo inválido (DequantizeLinear
+    com escala fp16 → INVALID_GRAPH na carga) e o cache quebrado derruba o
+    serviço em todo boot (rc=78). A conversão é cacheada em `<nome>_fp32.onnx`.
+    Validado no e5-small: 149 initializers fp16 → int8 de 112MB, cosine 0.9907
+    vs fp32. Pico de RAM na 1ª execução (~1GB, one-time): protobuf + arrays fp32.
+    """
+    try:
+        import onnx
+        from onnx import TensorProto, numpy_helper
+    except ImportError:
+        return None
+
+    model = onnx.load(str(src))
+    g = model.graph
+
+    def _to_fp32(t) -> int:
+        if t.data_type == TensorProto.FLOAT16:
+            arr = numpy_helper.to_array(t).astype(np.float32)
+            t.data_type = TensorProto.FLOAT
+            t.raw_data = arr.tobytes()
+            return 1
+        return 0
+
+    n_init = sum(_to_fp32(t) for t in g.initializer)
+    if n_init == 0:
+        return False
+    for sp in g.sparse_initializer:
+        _to_fp32(sp.values)
+    # Cast(to=fp16) → Cast(to=fp32): com os pesos em fp32, todo o grafo computa
+    # em fp32 (inclusive o Cast do attention_mask int64→fp16, que continua
+    # existindo — só muda o tipo de destino).
+    for node in g.node:
+        if node.op_type == "Cast" and node.attribute and node.attribute[0].i == TensorProto.FLOAT16:
+            node.attribute[0].i = TensorProto.FLOAT
+    for vi in list(g.input) + list(g.output) + list(g.value_info):
+        tt = vi.type.tensor_type
+        if tt.elem_type == TensorProto.FLOAT16:
+            tt.elem_type = TensorProto.FLOAT
+    # Escrita atômica: um save interrompido deixaria um fp32_conv corrupto que
+    # seria reutilizado como quant_src em todo boot (o cache quebrado nunca
+    # se auto-corrige). tmp + rename garante que dst só existe se completo.
+    tmp = dst.with_name(dst.name + ".tmp")
+    onnx.save(model, str(tmp))
+    tmp.replace(dst)
+    return True
+
+
 def _ensure_quantized(fp32_path: str) -> tuple[str, bool]:
     """Retorna (caminho_a_usar, usou_int8). Quantiza int8 na 1ª execução e
-    cacheia ao lado do fp32 (`<nome>_int8.onnx`). Mesmo padrão do vision.py."""
+    cacheia ao lado do fp32 (`<nome>_int8.onnx`). Mesmo padrão do vision.py.
+
+    O modelo pode ser fp16 disfarçado (e5-small: 149 initializers FLOAT16):
+    nesse caso a conversão fp16→fp32 (`<nome>_fp32.onnx`, cacheada) roda antes
+    da quantização — ver _fp16_to_fp32. Se o int8 re-quantizado também não
+    carregar, o EmbeddingModel cria o marker `<nome>_int8.skip` para desativar
+    o retry a cada boot."""
     if not ONNX_EMBED_AUTO_QUANTIZE:
         return fp32_path, False
     p = Path(fp32_path)
     if p.suffix != ".onnx" or "int8" in p.stem.lower():
         return fp32_path, False
-    int8_path = p.with_name(f"{p.stem}_int8.onnx")
+    int8_path, skip_marker = _int8_cache_paths(p)
     if int8_path.exists():
         return str(int8_path), True
+    if skip_marker.exists():
+        log.info(f"Quantização int8 desativada ({skip_marker.name}) — usando modelo sem quantizar")
+        return fp32_path, False
+
+    # Cache int8 exige gravar ao lado do modelo (Models/ é montado :ro no
+    # container — quantização roda só no host, ou gerando o cache lá). Sem
+    # permissão de escrita, nem carregue o modelo: o boot com o dir ro pagaria
+    # o custo de carregar 225MB de protobuf só para falhar no save.
+    if not os.access(p.parent, os.W_OK):
+        log.warning(f"Sem permissão de escrita em {p.parent} — quantização int8 pulada. "
+                    "Gere o cache no host (rode o serviço uma vez com o diretório de modelos gravável) "
+                    "para o container usar int8 via mount ro.")
+        return fp32_path, False
+
+    # fp16 disfarçado → fp32 de verdade (pré-requisito do quantize_dynamic).
+    fp32_conv = p.with_name(f"{p.stem}_fp32.onnx")
+    quant_src = fp32_path
+    if fp32_conv.exists():
+        log.info(f"Usando conversão fp16→fp32 cacheada: {fp32_conv.name}")
+        quant_src = str(fp32_conv)
+    else:
+        try:
+            conv = _fp16_to_fp32(p, fp32_conv)
+        except Exception as e:
+            # Ex.: modelo corrupto, disco cheio. Sem marker o boot seguinte
+            # recarregaria 225MB de protobuf só para falhar de novo.
+            log.warning(f"Conversão fp16→fp32 falhou ({e}) — usando modelo sem quantizar. "
+                        f"Apague {skip_marker.name} p/ reativar.")
+            _write_skip_marker(skip_marker, f"conversão fp16→fp32 falhou ({e})")
+            return fp32_path, False
+        if conv is None:
+            log.warning("pacote `onnx` indisponível — não é possível converter fp16→fp32; "
+                        "quantização pulada (quantizar o arquivo fp16 produziria um modelo inválido)")
+            return fp32_path, False
+        if conv is True:
+            log.info(f"Modelo fp16 → fp32: {fp32_conv.name} ({fp32_conv.stat().st_size // (1024*1024)} MB)")
+            quant_src = str(fp32_conv)
+        # conv is False: modelo genuinamente fp32 — quantiza o original direto.
+
     try:
-        log.info(f"Quantizando embedding model int8 (uma única vez): {p.name} → {int8_path.name}")
-        quantize_dynamic(fp32_path, str(int8_path), weight_type=QuantType.QInt8)
+        log.info(f"Quantizando embedding model int8 (uma única vez): {Path(quant_src).name} → {int8_path.name}")
+        quantize_dynamic(quant_src, str(int8_path), weight_type=QuantType.QInt8)
         log.info(f"Modelo int8 salvo: {int8_path} ({int8_path.stat().st_size // (1024*1024)} MB)")
         return str(int8_path), True
     except Exception as e:
-        log.warning(f"Falha ao quantizar ({e}) — usando fp32")
+        # Marker: sem ele, um modelo cuja quantização falha SEMPRE (bug, arquivo
+        # corrupto) re-quantizaria em todo boot. Custo: uma falha transitória
+        # (ex.: disco cheio) exige apagar o marker manualmente p/ reativar.
+        log.warning(f"Falha ao quantizar ({e}) — criando {skip_marker.name} e usando modelo sem quantizar. "
+                    f"Apague {skip_marker.name} p/ reativar.")
+        int8_path.unlink(missing_ok=True)
+        _write_skip_marker(skip_marker, f"quantização falhou ({e})")
         return fp32_path, False
 
 
@@ -289,8 +419,41 @@ class EmbeddingModel:
         opts = _memory_opts(EMBED_THREADS, 1)
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        # Int8 com fallback: a sessão int8 pode falhar em runtime (arquivo
+        # corrupto no disco, quantização gerou grafo inválido). Tentar:
+        # 1) int8 cacheado; 2) re-quantizar a partir do original; 3) modelo
+        # original + marker de desativação para não repetir o loop a cada boot.
+        base_path = model_path
         model_path, used_int8 = _ensure_quantized(model_path)
-        self._session   = ort.InferenceSession(model_path, opts, providers=providers)
+        try:
+            self._session = ort.InferenceSession(model_path, opts, providers=providers)
+        except Exception as e:
+            if not used_int8:
+                # Nem int8 havia: o modelo original não carrega — fatal (rc=78).
+                raise
+            log.warning(f"Sessão int8 falhou ({e}) — re-quantizando a partir do modelo original")
+            _int8_path, skip_marker = _int8_cache_paths(Path(base_path))
+            _int8_path.unlink(missing_ok=True)
+            retry_path, retry_int8 = _ensure_quantized(base_path)
+            if retry_int8:
+                try:
+                    self._session = ort.InferenceSession(retry_path, opts, providers=providers)
+                    model_path, used_int8 = retry_path, True
+                except Exception as e2:
+                    log.warning(f"Re-quantização também falhou ({e2}) — criando {skip_marker.name} "
+                                f"e usando modelo sem quantizar. Apague {skip_marker.name} p/ reativar.")
+                    # int8 re-quantizado também não carrega: não deixá-lo no
+                    # disco, senão o próximo boot o tenta ANTES do marker.
+                    Path(retry_path).unlink(missing_ok=True)
+                    _write_skip_marker(skip_marker, f"sessão int8 falhou mesmo após re-quantização ({e2})")
+                    self._session = ort.InferenceSession(base_path, opts, providers=providers)
+                    model_path, used_int8 = base_path, False
+            else:
+                # Marker já existe (skip branch), ou a re-quantização falhou com
+                # exceção (o _ensure_quantized criou o marker). Só carregar o original.
+                self._session = ort.InferenceSession(base_path, opts, providers=providers)
+                model_path, used_int8 = base_path, False
         self._tokenizer = TokenizerWrapper(tokenizer_path, EMBED_MAX_LENGTH)
         self._provider  = self._session.get_providers()[0]
 
@@ -490,6 +653,15 @@ state = AppState()
 # sem isso um modelo corrompido gerava crash-loop eterno (restart a cada 5s).
 EXIT_CONFIG = 78
 
+# ── Modo unificado (launcher.py — AVA_UNIFIED=1) ─────────────────────────────
+# No processo único, os._exit aqui mataria o orchestrator/memory junto. Com a
+# flag de ambiente, _fatal_exit levanta SystemExit e marca _UNIFIED_FATAL —
+# o canal pelo qual o launcher distingue 78 (fica fora, SEM restart) de crash
+# comum (restart em 5s). Necessário porque o uvicorn engole SystemExit de
+# lifespan (testado: captura BaseException no main() do LifespanOn e sai com
+# SystemExit(3) DELE) — a flag é o único canal confiável.
+_UNIFIED_FATAL = False
+
 # Piso de tamanho de um .onnx válido — e5-small/MiniLM têm dezenas de MB.
 # Arquivo truncado (download/zip interrompido) fica bem abaixo disso.
 MIN_MODEL_BYTES = 10 * 1024 * 1024
@@ -504,13 +676,20 @@ _FATAL_FIX_HINT = (
 def _fatal_exit(msg: str) -> None:
     """Erro de startup irrecuperável: loga acionável e sai com EX_CONFIG.
     os._exit garante o código no container (o uvicorn captura exceções de
-    lifespan e sairia com o código DELE, mascarando o 78)."""
+    lifespan e sairia com o código DELE, mascarando o 78).
+    No modo unificado (launcher.py) os._exit mataria o processo único inteiro:
+    levanta SystemExit + marca _UNIFIED_FATAL (canal p/ o launcher — ver
+    comentário em EXIT_CONFIG acima)."""
     for h in log.handlers:
         try:
             h.flush()
         except Exception:
             pass
     log.error(msg)
+    if os.environ.get("AVA_UNIFIED", "0") == "1":
+        global _UNIFIED_FATAL
+        _UNIFIED_FATAL = True
+        raise SystemExit(EXIT_CONFIG)
     os._exit(EXIT_CONFIG)
 
 

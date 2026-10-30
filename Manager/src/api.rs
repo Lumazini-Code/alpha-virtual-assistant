@@ -32,8 +32,19 @@
 //!                            AUTO-iniciado quando o container carrega.
 //!   POST /transcript/stop  -> encerra o transcript de voz
 //!   GET  /transcript/status -> estado do transcript + liveness por pid
+//!
+//! ── MCP manager EMBUTIDO ──────────────────────────────────────────────────
+//! O mcp_manager (antigo binário standalone :4008) é agora um serviço interno
+//! (crate::mcp_server): suas rotas (/health, /servers, /skills, /tools, ...)
+//! são MERGED no MESMO listener :9001 abaixo. O auth middleware do mcp fica
+//! no router dele (as rotas próprias do tray continuam sem auth). Consumidores:
+//!   - orchestrator.py (MCP_MANAGER_URL → http://127.9.12.22:9001)
+//!   - install.sh (registro de servers MCP via :9001)
+//!   - GET /mcp/status (tray): reporta "embutido" — o /mcp/start do
+//!     install.sh vira no-op idempotente.
 
-use crate::mcp_manager;
+use std::sync::Arc;
+
 use crate::process_manager;
 use crate::state::SharedState;
 use crate::transcript;
@@ -51,6 +62,48 @@ pub async fn serve(
     state: SharedState,
     ui_tx: tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
 ) -> anyhow::Result<()> {
+    // ── Env: Modules/.env → processo ─────────────────────────────────────
+    // Antes, o supervisor injetava env no binário mcp_manager filho; agora
+    // o MCP é embutido — então o PRÓPRIO processo carrega o Modules/.env
+    // no ambiente (uma vez, no boot, BEFORE o init do mcp_server). Isso
+    // alimenta: auth middleware (AVA_INTERNAL_TOKEN), MEMORY_API_URL do
+    // Config e o env herdado pelos servidores MCP stdio spawnados
+    // (PLAYWRIGHT_MCP_EXTENSION_TOKEN etc.). Vars já presentes no processo
+    // têm prioridade (o shell do usuário pode sobrescrever).
+    load_env_file(&state.project_root.join("Modules").join(".env"));
+
+    // ── MCP manager EMBUTIDO ────────────────────────────────────────────────
+    // Boot do serviço interno (abre o registry SQLite, watchdog da memory).
+    // Falha de init (banco corrompido, etc.) NÃO derruba a API do tray: as
+    // rotas MCP ficam fora e o log registra — o tray continua gerenciando
+    // docker/transcript. (Antes: o binário standalone morria e o tray
+    // re-espawnava em 30s; o equivalente aqui é o restart do tray inteiro.)
+    let mcp_state: Option<Arc<crate::mcp_server::AppState>> =
+        match crate::mcp_server::init(&state.project_root).await {
+            Ok(st) => {
+                let mut mcp = state.mcp.lock().await;
+                mcp.status = crate::state::McpStatus::Running;
+                Some(st)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "MCP manager embutido NÃO subiu (rotas MCP fora do ar): {e:#}"
+                );
+                let mut mcp = state.mcp.lock().await;
+                mcp.status = crate::state::McpStatus::Crashed;
+                None
+            }
+        };
+    // Guarda o handle da runtime no estado: /mcp/stop e o auto-stop do
+    // container precisam dele para derrubar as sessões MCP (shutdown_all).
+    if let Some(ref st) = mcp_state {
+        let _ = state.mcp_server.set(st.clone());
+    }
+    let mcp_router = match mcp_state {
+        Some(st) => crate::mcp_server::app(st),
+        None => axum::Router::new(),
+    };
+
     let app = Router::new()
         .route("/status", get(get_status))
         .route("/docker/start", post(post_docker_start))
@@ -68,6 +121,7 @@ pub async fn serve(
         // janela do tray direto na tela de chat. Fire-and-forget.
         .route("/ui/chat-open", post(post_ui_chat_open))
         .with_state(state)
+        .merge(mcp_router)
         // Sender da UI para o /ui/chat-open (não vai no AppState — o canal
         // nasce no main e é clonado aqui; Extension evita mudar o AppState).
         .layer(axum::Extension(ui_tx));
@@ -79,6 +133,47 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Carrega `KEY=VALUE` do Modules/.env no processo (sem sobrescrever vars
+/// já setadas). Parser minimalista: ignora linhas vazias/comentário,
+/// reconhece `export KEY=...` e remove aspas duplas/simples.
+///
+/// Fonte única: install.sh grava os tokens aqui (chmod 600) — o tray
+/// pre-standalone lidos no boot. Erros de leitura não derrubam a API
+/// (o fail-open do auth middleware cobre: sem token, aceita a menos que
+/// AVA_REQUIRE_AUTH=1).
+fn load_env_file(path: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut loaded = 0usize;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut value = value.trim().to_string();
+        if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+        // Vars process env têm prioridade (sobrescrita manual deliberada).
+        if std::env::var_os(key).is_none() {
+            unsafe { std::env::set_var(key, &value) };
+            loaded += 1;
+        }
+    }
+    tracing::info!("Modules/.env: {loaded} variável(eis) carregada(s) no ambiente.");
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -215,8 +310,13 @@ async fn get_browser_status(State(state): State<SharedState>) -> impl IntoRespon
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// MCP manager (HOST) — ativação + supervisão do executável standalone
+// MCP manager — agora EMBUTIDO no tray (sem binário standalone)
 // ════════════════════════════════════════════════════════════════════════
+// O antigo supervisor (Manager/src/mcp_manager.rs) foi removido: o serviço
+// roda dentro do processo do tray (mcp_server.rs). Os endpoints /mcp/* do
+// tray existem por compatibilidade — install.sh chama /mcp/start no boot e a
+// UI do tray mostra o estado. Start é no-op idempotente; stop derruba as
+// sessões MCP vivas (keepers + subprocessos stdio) e o watchdog da memory.
 
 #[derive(Serialize)]
 struct McpStatusResponse {
@@ -224,49 +324,66 @@ struct McpStatusResponse {
     /// | "Crash — reiniciando..."
     status: String,
     pid: Option<u32>,
-    /// Executável encontrado na raiz do projeto (ou AVA_MCP_MANAGER_BIN)?
+    /// O mcp_manager é embutido: sempre "instalado".
     installed: bool,
-    /// GET /health (:4008) respondeu 2xx agora?
+    /// Enquanto ESTE handler responde, o processo (que serve o /health do
+    /// MCP no mesmo listener) está vivo — liveness auto-evidente.
     healthy: bool,
     binary: String,
 }
 
 async fn post_mcp_start(State(state): State<SharedState>) -> impl IntoResponse {
-    match mcp_manager::start(&state).await {
-        Ok(()) => Json(SimpleResponse {
-            ok: true,
-            message: "MCP manager iniciado.".into(),
-        }),
-        Err(e) => Json(SimpleResponse {
+    let was_crashed = {
+        let mcp = state.mcp.lock().await;
+        mcp.status == crate::state::McpStatus::Crashed
+    };
+    // No-op idempotente: o serviço é o próprio processo. Se um init anterior
+    // falhou (Crashed), a "re-ativação" real é o restart do tray inteiro.
+    if was_crashed {
+        Json(SimpleResponse {
             ok: false,
-            message: e.to_string(),
-        }),
+            message: "MCP manager embutido não subiu no boot — reinicie o tray para \
+                      tentar de novo (restart do processo inteiro)."
+                .into(),
+        })
+    } else {
+        tracing::info!("POST /mcp/start — no-op (MCP manager embutido, sempre ativo)");
+        Json(SimpleResponse {
+            ok: true,
+            message: "MCP manager embutido no tray — sempre ativo (nada a iniciar).".into(),
+        })
     }
 }
 
 async fn post_mcp_stop(State(state): State<SharedState>) -> impl IntoResponse {
-    match mcp_manager::stop(&state).await {
-        Ok(()) => Json(SimpleResponse {
+    // Encerra as sessões MCP vivas (sessões stdio + keeper tasks) e o
+    // watchdog da memory — o equivalente graceful do SIGTERM que o tray
+    // mandava ao binário standalone. O serviço em si permanece ativo (é o
+    // próprio processo): /health e rotas continuam respondendo.
+    let mcp_state = state.mcp_server.get().cloned();
+    let mut mcp = state.mcp.lock().await;
+    let Some(mcp_state) = mcp_state else {
+        return Json(SimpleResponse {
             ok: true,
-            message: "MCP manager encerrado.".into(),
-        }),
-        Err(e) => Json(SimpleResponse {
-            ok: false,
-            message: e.to_string(),
-        }),
-    }
+            message: "MCP manager não subiu no boot — nada a encerrar.".into(),
+        });
+    };
+    crate::mcp_server::shutdown_all(&mcp_state).await;
+    mcp.status = crate::state::McpStatus::Stopped;
+    Json(SimpleResponse {
+        ok: true,
+        message: "Sessões MCP encerradas (serviço embutido permanece ativo).".into(),
+    })
 }
 
 async fn get_mcp_status(State(state): State<SharedState>) -> impl IntoResponse {
-    let (status, pid, installed, healthy) = mcp_manager::mcp_snapshot(&state).await;
-    let binary = { state.mcp.lock().await.binary.display().to_string() };
-
+    let mcp = state.mcp.lock().await;
     Json(McpStatusResponse {
-        status: status.label().to_string(),
-        pid,
-        installed,
-        healthy,
-        binary,
+        status: mcp.status.label().to_string(),
+        pid: None,
+        installed: true,
+        healthy: true,
+        binary: "embutido no tray (mcp_server.rs)".into(),
     })
 }
 

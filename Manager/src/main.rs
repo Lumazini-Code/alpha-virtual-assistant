@@ -26,7 +26,7 @@
 mod api;
 mod chat;
 mod idle_watcher;
-mod mcp_manager;
+mod mcp_server;
 mod platform;
 mod process_manager;
 mod state;
@@ -160,19 +160,9 @@ fn main() -> anyhow::Result<()> {
     // Isso permite que a aplicação "se conecte" a instâncias do
     // docker que foram iniciadas anteriormente.
     rt_handle.block_on(process_manager::discover_running_processes(&shared_state));
-    // MCP manager (host, placeholder): descoberta em TASK BACKGROUND —
-    // NUNCA block_on na main thread. Um health check pendurado aqui não
-    // pode atrasar a subida da API/tray/janela (defaults do estado até a
-    // descoberta completar: NotInstalled/Stopped).
-    {
-        let state = shared_state.clone();
-        rt.spawn(async move {
-            mcp_manager::discover(&state).await;
-        });
-    }
 
-    // Transcript (voz, host): descoberta em background pelo mesmo motivo —
-    // o liveness é só um pid check, mas nada aqui pode atrasar a tray.
+    // Transcript (voz, host): descoberta em background — nada aqui pode
+    // atrasar a subida da tray (o liveness é só um pid check).
     {
         let state = shared_state.clone();
         rt.spawn(async move {
@@ -213,8 +203,8 @@ fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 process_manager::health_check_docker(&state).await;
-                // MCP manager (host): Running sem /health → Crashed → respawn.
-                mcp_manager::health_check(&state).await;
+                // MCP manager: embutido no processo (mcp_server.rs) — sem
+                // health check externo (não há processo para "perder").
                 // Transcript (host): Running sem pid → Crashed → respawn
                 // (com o container de pé).
                 transcript::health_check(&state).await;

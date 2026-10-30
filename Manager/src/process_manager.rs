@@ -17,7 +17,6 @@
 //! O docker continua sendo chamado via subprocess, exatamente como no
 //! script original (docker-start.bat / docker-start.sh).
 
-use crate::mcp_manager;
 use crate::platform::NoWindow;
 use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
 use crate::transcript;
@@ -386,9 +385,18 @@ fn spawn_auto_start_host_services(state: &SharedState) {
                  Ligue a voz com AVA_VOICE=1 em Modules/.env (ou POST /transcript/start)."
             );
         }
-        match mcp_manager::start(&state).await {
-            Ok(()) => tracing::info!("Auto-init: MCP manager ativo."),
-            Err(e) => tracing::warn!("Auto-init: MCP manager não subiu: {e:#}"),
+        // ── MCP manager ─────────────────────────────────────────────────
+        // EMBUTIDO no processo do tray (crate::mcp_server — ex-binário
+        // standalone): o init acontece no boot da API (api::serve), não
+        // aqui. Só registramos o estado Running/Crashed do init.
+        match state.mcp_server.get() {
+            Some(_) => {
+                let mut m = state.mcp.lock().await;
+                if m.status == McpStatus::Stopped {
+                    m.status = McpStatus::Running;
+                }
+            }
+            None => tracing::warn!("Auto-init: MCP manager embutido não subiu no boot (ver log da API)."),
         }
     });
 }
@@ -448,18 +456,20 @@ fn spawn_auto_stop_host_services(state: &SharedState) {
             }
         }
 
-        // MCP manager: mesma regra.
+        // MCP manager EMBUTIDO: mesma regra — derruba as sessões MCP vivas
+        // (keepers + subprocessos stdio) e o watchdog da memory. O serviço
+        // em si continua ativo (é o próprio processo do tray); /health e as
+        // rotas continuam respondendo.
         let mcp_stop = {
             let m = state.mcp.lock().await;
-            matches!(
-                m.status,
-                McpStatus::Running | McpStatus::Starting | McpStatus::Crashed
-            )
+            matches!(m.status, McpStatus::Running | McpStatus::Crashed)
         };
         if mcp_stop {
-            match mcp_manager::stop(&state).await {
-                Ok(()) => tracing::info!("Auto-stop: MCP manager encerrado."),
-                Err(e) => tracing::warn!("Auto-stop: MCP manager não parou: {e:#}"),
+            if let Some(mcp_state) = state.mcp_server.get() {
+                crate::mcp_server::shutdown_all(mcp_state).await;
+                let mut m = state.mcp.lock().await;
+                m.status = McpStatus::Stopped;
+                tracing::info!("Auto-stop: sessões MCP encerradas.");
             }
         }
     });

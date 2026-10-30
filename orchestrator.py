@@ -53,10 +53,11 @@ Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
 TTS NÃO é uma tool do modelo — o sistema dispara TTS automaticamente sobre a
 resposta final (igual antes), o modelo nunca decide chamar TTS.
 
-Tools via MCP (descoberta em duas etapas — ver Modules/mcp_manager.py):
-  Quaisquer servidores MCP que o usuário registrar via API REST no
-  mcp_manager (porta 4008 — registro, sync e EXECUÇÃO ficam todos lá; este
-  orchestrator é só um cliente REST dele). Cada tool é indexada no grafo
+Tools via MCP (descoberta em duas etapas — ver Manager/src/mcp_server.rs):
+  Quaisquer servidores MCP que o usuário registre via API REST no
+  mcp_manager (embutido no tray, porta 9001 — registro, sync e EXECUÇÃO
+  ficam todos lá; este orchestrator é só um cliente REST dele). Cada tool
+  é indexada no grafo
   de tools (ToolsDB, via memory_api) para a SELEÇÃO. O loop primeiro
   escolhe os servidores relevantes pelo GRAFO de tools (kNN + PPR no
   co-uso, via /skills/select — barato, sem conectar em nada) e SÓ ENTÃO
@@ -77,7 +78,8 @@ Integra os microserviços AVA que continuam como acesso HTTP direto:
   - TTS             (port 3004)  — text-to-speech (Supertonic) — SISTEMA, não tool
   - LLM Chat        (port 4003)  — conversational inference (OpenRouter)
   - Vision / VQA    (port 4002)  — image understanding (tool nativa)
-  - MCP Manager     (port 4008)  — registro + executor de servidores MCP
+  - MCP Manager     (port 9001)  — registro + executor de servidores MCP
+    (EMBUTIDO no tray — mcp_server.rs; não é mais um processo standalone)
 Process manager (port 9001) segue controlando o ambiente Docker.
 """
 from __future__ import annotations
@@ -106,8 +108,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 import regex as re
-# MCP é consumido VIA mcp_manager (REST, porta 4008) — este processo nunca
-# spawna servidores MCP nem segura sessões; o manager é o único executante.
+# MCP é consumido VIA mcp_manager (REST) — este processo nunca
+# spawna servidores MCP nem segura sessões; o manager é o único executante
+# (embutido no tray do host, servido na MESMA porta :9001 da API do tray).
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -143,11 +146,12 @@ TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://127.9.12.22:9100
 VISION_OBJECTS_ENABLED = os.getenv("VISION_OBJECTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 DEEP_SEARCH_URL      = "http://127.9.12.22:4005"
 ALPHA_CODE_URL       = "http://127.9.12.22:4006"
-# mcp_manager.py — registro REST + executor de servidores MCP (stdio/http).
-# É o ÚNICO processo que spawna servidores MCP e mantém sessões; este
+# mcp_manager (em Manager/src/mcp_server.rs) — registro REST + executor de
+# servidores MCP (stdio/http). É o ÚNICO executor que spawna servidores MCP
+# e mantém sessões (embutido no processo do tray); este
 # orchestrator fala com ele via REST na descoberta em duas etapas (ver
 # MCP via mcp_manager, abaixo, e _select_skills/_load_mcp_tools).
-MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://127.9.12.22:4008")
+MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://127.9.12.22:9001")
 # Teto default de execução para tools MCP — o EXECUTOR_TIMEOUTS não tem
 # entradas por tool MCP (nomes dinâmicos `servidor__tool`), então toda tool
 # externa que não tiver override usa este valor (também enviado ao manager,
@@ -290,7 +294,8 @@ PLANS_MAX_STEPS_SERVER = 50
 # ══════════════════════════════════════════════════════════════════════════════
 # O registry não é mais um dict hardcoded (MCPSkill/MCP_SKILLS) — os
 # servidores são cadastrados pelo USUÁRIO via API REST no mcp_manager
-# (porta 4008), que também é o único EXECUTANTE (spawns stdio, sessões,
+# (mesma porta :9001 do tray no host — a API do tray e as rotas MCP são o
+# MESMO listener), que também é o único EXECUTANTE (spawns stdio, sessões,
 # proxy de call_tool). Este processo só fala REST com o manager:
 #
 # Etapa 1 (_select_skills): o grafo de tools (ToolsDB, na memory_api)
@@ -4615,6 +4620,11 @@ def _fatal_merged(msg: str) -> None:
         except Exception:
             pass
     log.critical(msg)
+    if os.environ.get("AVA_UNIFIED", "0") == "1":
+        # Modo unificado (launcher.py): aqui (fora de lifespan) SystemExit
+        # PROPAGA de verdade — o launcher captura e mantém os demais serviços
+        # de pé (mesmo contrato rc=78 do restart_on_fail).
+        raise SystemExit(78)
     os._exit(78)
 
 

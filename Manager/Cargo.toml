@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 # Em release, otimiza para tamanho/velocidade e remove símbolos de debug.
+# Sem panic="abort": o mcp_manager EMBUTIDO (mcp_server.rs) roda em tasks do
+# mesmo runtime — abort mataria o tray inteiro num panic do MCP. Com unwind,
+# um panic numa task é capturado pelo tokio (handler morre, conexão cai,
+# servidor e tray continuam) — isolamento equivalente ao respawn de processo
+# que a supervisão externa fazia.
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
-panic = "abort"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
@@ -19,18 +23,29 @@ glib = "0.18"
 tokio = { version = "1", features = ["full"] }
 
 # ── Servidor REST ──────────────────────────────────────────────────────────
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+# 0.8: mesma versão do módulo MCP embutido (mcp_server.rs). O tray serve a
+# API :9001 + todas as rotas do MCP manager no MESMO listener (unificação de
+# portas — o mcp_manager standalone não existe mais).
+axum = "0.8"
 
-# ── Cliente HTTP (health check do MCP manager em localhost:4008) ───────────
-# default-features off: sem TLS (só falamos http com o manager local).
-# "json": .json(&body) do turno de chat (POST /execute no orchestrator).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# ── Cliente HTTP (POST /execute no orchestrator, health da memory_api,
+# sessões MCP streamable-http do mcp_server) ────────────────────────────────
+# rustls-tls: o mcp_server conecta em servidores MCP http externos (https).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # ── Serialização JSON ──────────────────────────────────────────────────────
+# preserve_order: schemas de tools MCP chegam/parte na ordem original (o
+# mcp_server embutido depende disso).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# ── MCP manager EMBUTIDO (mcp_server.rs) ───────────────────────────────────
+rusqlite = { version = "0.32", features = ["bundled"] }
+indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+which = "6"
+process-wrap = { version = "8.2", features = ["tokio1"] }
+rmcp = { version = "0.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # ── GUI (janela imediata, leve, multiplataforma) ───────────────────────────
 eframe = { version = "0.28", default-features = false, features = [

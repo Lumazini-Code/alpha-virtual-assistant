@@ -15,11 +15,11 @@ services:
   ava:
     ports:
       # Serviços DO CONTAINER expostos ao host (TUI/process manager).
-      # NUNCA publicar 9001 (tray), 9222 (Chrome CDP) nem 4008 (mcp_manager)
-      # — são serviços do HOST: publicar faz o proxy do Docker Desktop
-      # capturar a porta e sombrear o serviço local (TUI recebia "socket
-      # closed" no tray), e na 4008 o publish colide com o bind do
-      # mcp_manager nativo (roda NO HOST, supervisionado pelo tray).
+      # NUNCA publicar 9001 (tray + mcp_manager embutido) nem 9222
+      # (Chrome CDP) — são serviços do HOST: publicar faz o proxy do Docker
+      # Desktop capturar a porta e sombrear o serviço local (TUI recebia
+      # "socket closed" no tray), e a 9001 colide com o bind do tray no
+      # host (mesma listener serve as rotas MCP).
       # Prefixo 127.9.12.22: em TODAS as portas — sem ele o Docker Desktop
       # publica em 0.0.0.0 e a LAN inteira alcança os serviços (Plano 1 — T9).
       - "127.9.12.22:3000:3000"
@@ -35,8 +35,9 @@ services:
       - "127.9.12.22:3005:3005"
       - "127.9.12.22:2001:2001"
 
-    # Container → serviços do host (tray :9001, Chrome CDP :9222,
-    # transcribe :9100, mcp_manager :4008). No Windows/WSL2 `localhost`
+    # Container → serviços do host (tray :9001 — que também serve as rotas
+    # MCP embutidas, Chrome CDP :9222, transcribe :9100). No Windows/WSL2
+    # `localhost`
     # dentro do container NÃO é o host — as URLs abaixo apontam os clientes
     # do container para os serviços no HOST via host.docker.internal (o
     # Docker Desktop ponteia pro loopback do host; na rota WSL, os relays
@@ -49,9 +50,9 @@ services:
       PULSE_SERVER: "unix:/run/user/1000/pulse/native"
       PULSE_RUNTIME_PATH: "/run/user/1000/pulse"
       PROCESS_MANAGER_URL: "http://host.docker.internal:9001"
-      # mcp_manager (Rust) roda NO HOST (spawnado pelo tray) — o default do
-      # orchestrator (127.9.12.22:4008) apontaria para o próprio container.
-      MCP_MANAGER_URL: "http://host.docker.internal:4008"
+      # mcp_manager (EMBUTIDO no tray do host) — o default do orchestrator
+      # (127.9.12.22:9001) apontaria para o próprio container.
+      MCP_MANAGER_URL: "http://host.docker.internal:9001"
       # Embedding on-demand (cadastro de voz): o transcribe (main.cpp) roda
       # NO HOST (microfone) — dentro do container "localhost" não é o host.
       # Mesmo tratamento do PROCESS_MANAGER_URL (extra_hosts já tem o gateway).

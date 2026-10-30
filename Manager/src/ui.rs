@@ -23,7 +23,7 @@
 //! de contexto do tray ("Sair"), que envia UiCommand::Quit pelo canal
 //! mpsc (a thread do tray é dona do ícone; ver main.rs).
 
-use crate::mcp_manager;
+use crate::state;
 use crate::process_manager;
 use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
 use crate::transcript;
@@ -72,7 +72,6 @@ pub struct TrayApp {
     // via try_lock para não travar a thread de UI).
     docker_status: ProcStatus,
     mcp_status: McpStatus,
-    mcp_installed: bool,
     transcript_status: TranscriptStatus,
     transcript_installed: bool,
 
@@ -113,7 +112,6 @@ impl TrayApp {
             quit_requested: false,
             docker_status: ProcStatus::Stopped,
             mcp_status: McpStatus::NotInstalled,
-            mcp_installed: false,
             transcript_status: TranscriptStatus::NotInstalled,
             transcript_installed: false,
             feedback: None,
@@ -134,7 +132,6 @@ impl TrayApp {
         }
         if let Ok(mcp) = self.state.mcp.try_lock() {
             self.mcp_status = mcp.status.clone();
-            self.mcp_installed = mcp.binary.exists();
         }
         if let Ok(t) = self.state.transcript.try_lock() {
             self.transcript_status = t.status.clone();
@@ -600,25 +597,25 @@ impl TrayApp {
                 let running = self.mcp_status == McpStatus::Running;
 
                 if ui
-                    .add_enabled(self.mcp_installed && !running, egui::Button::new("Ligar"))
+                    .add_enabled(!running, egui::Button::new("Ligar"))
                     .clicked()
                 {
                     self.spawn_start_mcp();
                 }
 
                 if ui
-                    .add_enabled(self.mcp_installed && running, egui::Button::new("Desligar"))
+                    .add_enabled(running, egui::Button::new("Desligar"))
                     .clicked()
                 {
                     self.spawn_stop_mcp();
                 }
             });
 
-            if !self.mcp_installed {
+            if self.mcp_status == McpStatus::Crashed {
                 ui.label(
                     egui::RichText::new(
-                        "executável não encontrado — coloque mcp_manager (port Rust) \
-                         na raiz do projeto ou defina AVA_MCP_MANAGER_BIN",
+                        "MCP manager embutido não subiu no boot — reinicie o tray \
+                         para tentar de novo",
                     )
                     .weak()
                     .small(),
@@ -714,9 +711,14 @@ impl TrayApp {
     fn spawn_start_mcp(&self) {
         let state = self.state.clone();
         self.rt.spawn(async move {
-            match mcp_manager::start(&state).await {
-                Ok(()) => tracing::info!("MCP manager iniciado (UI do tray)."),
-                Err(e) => tracing::error!("Erro ao iniciar MCP manager: {e:#}"),
+            // Embutido: se o init do boot OK, marcar Running; se falhou
+            // (Crashed), avisar — a re-subida real é o restart do tray.
+            let m = state.mcp.lock().await;
+            match m.status {
+                state::McpStatus::Crashed => {
+                    tracing::warn!("MCP manager embutido não subiu no boot — reinicie o tray.");
+                }
+                _ => tracing::info!("MCP manager embutido — sempre ativo (nada a iniciar)."),
             }
         });
     }
@@ -724,8 +726,15 @@ impl TrayApp {
     fn spawn_stop_mcp(&self) {
         let state = self.state.clone();
         self.rt.spawn(async move {
-            if let Err(e) = mcp_manager::stop(&state).await {
-                tracing::error!("Erro ao parar MCP manager: {e:#}");
+            // Derruba as sessões MCP vivas (keepers + subprocessos stdio) —
+            // o serviço embutido em si permanece no processo do tray.
+            match state.mcp_server.get() {
+                Some(mcp_state) => {
+                    crate::mcp_server::shutdown_all(mcp_state).await;
+                    let mut m = state.mcp.lock().await;
+                    m.status = state::McpStatus::Stopped;
+                }
+                None => tracing::warn!("MCP manager não subiu no boot — nada a encerrar."),
             }
         });
     }
@@ -766,7 +775,6 @@ fn mcp_status_dot(ui: &mut egui::Ui, status: &McpStatus) {
     let color = match status {
         McpStatus::Running => egui::Color32::from_rgb(90, 200, 100),
         McpStatus::Stopped | McpStatus::NotInstalled => egui::Color32::from_rgb(150, 150, 150),
-        McpStatus::Starting | McpStatus::Stopping => egui::Color32::from_rgb(230, 180, 60),
         McpStatus::Crashed => egui::Color32::from_rgb(224, 80, 60),
     };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());

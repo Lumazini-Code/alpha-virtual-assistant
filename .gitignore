@@ -56,8 +56,6 @@ Modules/.playwright-mcp
 
 resource/Alpha icon.xcf
 
-Modules/mcp_manager/target
-
 Modules/mcp_manager/db/
 
 .graphifyignore

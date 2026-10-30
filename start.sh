@@ -92,7 +92,19 @@ restart_on_fail() {
 echo "  • Orchestrator..."
 # CORREÇÃO: agora protegido por restart_on_fail como todo o resto —
 # antes, se caísse uma vez, nunca mais voltava.
-restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
+# ── Modo unificado (AVA_SINGLE_PROCESS, default 1) ───────────────────────────
+# launcher.py roda orchestrator (:9000) + memory (:3000) + onnx (:2002) +
+# LLM (:4003)/grafo (:8777) em THREADS de um único processo — uma só cópia de
+# interpreter+libs (~200-300MB a menos), portas/contratos idênticos. TTS e
+# Vision seguem como processos standalone nos blocos abaixo (nativos pesados —
+# segfault neles não derruba o resto). Fallback: AVA_SINGLE_PROCESS=0 devolve
+# o comportamento antigo (um processo por serviço).
+if [ "${AVA_SINGLE_PROCESS:-1}" = "1" ]; then
+    echo "  • Modo unificado (AVA_SINGLE_PROCESS=1): launcher único p/ todos os serviços"
+    restart_on_fail "AVA unified" "python3 /app/launcher.py" &
+else
+    restart_on_fail "Orchestrator" "python3 /app/orchestrator.py" &
+fi
 sleep 1
 
 # ── Modo mesclado (AVA_MERGED_SERVICES, default 1) ───────────────────────────
@@ -123,7 +135,12 @@ sleep 1
 cd /app/Modules
 
 echo "  • onnx Manager..."
-restart_on_fail "onnx Manager" "python3 onnxManager.py" &
+# No modo unificado (:2002) sobe dentro do launcher (thread) — ver AVA_SINGLE_PROCESS
+if [ "${AVA_SINGLE_PROCESS:-1}" = "1" ]; then
+    echo "    (mesclado no launcher — AVA_SINGLE_PROCESS=1)"
+else
+    restart_on_fail "onnx Manager" "python3 onnxManager.py" &
+fi
 
 # Deep Search removido — busca web agora é um servidor MCP próprio
 # (mcp_servers/alpha-mcp, serviço alpha-mcp no docker-compose).
@@ -158,7 +175,12 @@ fi
 
 
 echo "  • Memory Server..."
-restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
+# No modo unificado (:3000) sobe dentro do launcher (thread) — ver AVA_SINGLE_PROCESS
+if [ "${AVA_SINGLE_PROCESS:-1}" = "1" ]; then
+    echo "    (mesclada no launcher — AVA_SINGLE_PROCESS=1)"
+else
+    restart_on_fail "Memory Server" "cd '$MEMORY_API_CWD' && python3 memory_api.py" &
+fi
 
 
 echo "✓ Todos os serviços iniciados"

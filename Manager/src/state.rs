@@ -87,20 +87,15 @@ impl Default for BrowserState {
     }
 }
 
-/// Porta padrão do MCP manager no host (a mesma que ele serve dentro do
-/// container hoje — :4008).
-pub const MCP_MANAGER_DEFAULT_PORT: u16 = 4008;
-
-/// Status do MCP manager. Difere do ProcStatus por ter `NotInstalled`
-/// (binário do executável Rust ainda não existe — placeholder inerte) e
-/// `Crashed` (estava Running e o health check o perdeu).
+/// Status do MCP manager EMBUTIDO. O serviço roda dentro do próprio
+/// processo do tray (crate::mcp_server): sem processo externo, os únicos
+/// estados possíveis referem-se ao init no boot e ao /mcp/stop.
+/// `NotInstalled` é mantido como estado inicial inerte padrão (Default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpStatus {
     NotInstalled,
     Stopped,
-    Starting,
     Running,
-    Stopping,
     Crashed,
 }
 
@@ -109,36 +104,28 @@ impl McpStatus {
         match self {
             McpStatus::NotInstalled => "não instalado",
             McpStatus::Stopped => "Inativo",
-            McpStatus::Starting => "Iniciando...",
             McpStatus::Running => "Ativo",
-            McpStatus::Stopping => "Encerrando...",
-            McpStatus::Crashed => "Crash — reiniciando...",
+            McpStatus::Crashed => "Crash — não subiu no boot",
         }
     }
 }
 
-/// Estado do MCP manager no HOST. A intenção: os servidores MCP (stdio e
-/// http) passam a rodar NO computador do usuário (acesso real ao
-/// filesystem, npx/node/uvx do host, Chrome de depuração, etc.) — o
-/// mcp_manager.py atual mora no container e vai ser portado para um
-/// executável Rust standalone supervisionado aqui.
+/// Estado do MCP manager EMBUTIDO. O serviço roda DENTRO do processo do
+/// tray (crate::mcp_server — ex-binário standalone :4008): sem binário
+/// externo, sem pid, sem health check externo. O campo `status` só reporta
+/// o resultado do init no boot (Running / Crashed) e o efeito do /mcp/stop
+/// (sessões MCP encerradas). Os servidores MCP (stdio e http) rodam no
+/// computador do usuário com acesso real ao filesystem/npx/node — igual ao
+/// standalone, agora sem processo extra.
 #[derive(Debug, Clone)]
 pub struct McpManagerState {
     pub status: McpStatus,
-    pub pid: Option<u32>,
-    /// Caminho do executável (vazio = não encontrado).
-    pub binary: PathBuf,
-    /// URL de health check (GET /health — o manager responde 200 {"status":"ok"}).
-    pub health_url: String,
 }
 
 impl Default for McpManagerState {
     fn default() -> Self {
         Self {
             status: McpStatus::NotInstalled,
-            pid: None,
-            binary: PathBuf::new(),
-            health_url: format!("http://127.9.12.22:{MCP_MANAGER_DEFAULT_PORT}/health"),
         }
     }
 }
@@ -195,10 +182,13 @@ impl Default for TranscriptState {
 pub struct AppState {
     pub docker: Arc<TokioMutex<DockerState>>,
     pub browser: Arc<TokioMutex<BrowserState>>,
-    /// MCP manager: processo do HOST supervisionado pelo tray (o mcp_manager
-    /// vira um executável standalone Rust; enquanto ele não existe, o estado
-    /// fica em NotInstalled e nada é spawnado).
+    /// MCP manager EMBUTIDO: estado do serviço + o handle da sua runtime
+    /// (Some após o init bem-sucedido — /mcp/stop derruba as sessões dele).
     pub mcp: Arc<TokioMutex<McpManagerState>>,
+    /// Runtime do mcp_server embutido — Some se o init do boot foi OK
+    /// (OnceLock porque o SharedState é Arc: o set acontece UMA vez, no
+    /// boot da API; leitores (/mcp/stop, auto-stop, UI) consultam depois).
+    pub mcp_server: std::sync::OnceLock<Arc<crate::mcp_server::AppState>>,
     /// Transcript (voz): processo do HOST supervisionado pelo tray —
     /// auto-iniciado junto com o container (same lifecycle do mcp).
     pub transcript: Arc<TokioMutex<TranscriptState>>,
@@ -252,79 +242,6 @@ fn find_docker_start_script() -> PathBuf {
     tracing::warn!(
         "Nenhum script docker-start encontrado, usando fallback: {}",
         fallback.display()
-    );
-    fallback
-}
-
-/// ✅ Detecta o binário do MCP manager (executável Rust standalone no HOST).
-///
-/// Ordem de resolução:
-///   1. env AVA_MCP_MANAGER_BIN — caminho explícito (absoluto ou relativo
-///      à raiz do projeto);
-///   2. `mcp_manager` (Linux) / `mcp_manager.exe` (Windows) na RAIZ do
-///      projeto — mesmo lugar do docker-compose.yml (nome default que o
-///      build do port Rust deve produzir);
-///   3. `mcp-manager` idem (nome com hífen também é aceito).
-///
-/// Não encontrado → retorno vazio: o tray mantém o estado NotInstalled e
-/// a supervisão fica INERTE (start responde "não instalado", health check
-/// não faz nada). Nenhum crash, nenhum spawn fantasma.
-fn find_mcp_manager_binary() -> PathBuf {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
-
-    if let Some(env_path) = std::env::var_os("AVA_MCP_MANAGER_BIN") {
-        let p = PathBuf::from(env_path);
-        let p = if p.is_absolute() {
-            p
-        } else {
-            let root = exe_dir
-                .clone()
-                .map(|d| d.join("..").canonicalize().unwrap_or(d))
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            root.join(p)
-        };
-        tracing::info!("MCP manager (env AVA_MCP_MANAGER_BIN): {}", p.display());
-        return p;
-    }
-
-    let names: &[&str] = if cfg!(windows) {
-        &["mcp_manager.exe", "mcp-manager.exe"]
-    } else {
-        &["mcp_manager", "mcp-manager"]
-    };
-
-    // Diretórios candidatos, em ordem:
-    //   1. exe_dir/.. — layout INSTALADO (ex.: <projeto>/bin/ava-tray → raiz)
-    //   2. exe_dir/../.. — layout de BUILD do cargo (Manager/target/debug →
-    //      raiz do projeto, que é onde docker-compose.yml e o binário do
-    //      port vivem durante o desenvolvimento)
-    //   3. exe_dir — exe e binário lado a lado
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(d) = &exe_dir {
-        dirs.push(d.join("..").canonicalize().unwrap_or_else(|_| d.clone()));
-        dirs.push(d.join("../..").canonicalize().unwrap_or_else(|_| d.clone()));
-        dirs.push(d.clone());
-    }
-    dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    for dir in &dirs {
-        for name in names {
-            let p = dir.join(name);
-            if p.exists() {
-                tracing::info!("Binário MCP manager encontrado: {}", p.display());
-                return p;
-            }
-        }
-    }
-
-    // Não existe — placeholder default (o /mcp/status avisa "não instalado")
-    let fallback = dirs[0].join(names[0]);
-    tracing::info!(
-        "Binário MCP manager não encontrado (procurado: {:?} em {:?}) — supervisão inerte até o port Rust existir.",
-        names,
-        dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>()
     );
     fallback
 }
@@ -405,6 +322,40 @@ fn find_transcript_binary() -> PathBuf {
     fallback
 }
 
+/// ✅ Resolve a RAIZ do projeto (onde ficam docker-compose.yml, Modules/, o
+/// banco do MCP manager etc.).
+///
+/// Layouts suportados, em ordem:
+///   1. INSTALADO — exe dentro do projeto (ex.: <raiz>/ava-tray ou
+///      <raiz>/bin/ava-tray → 1 ou 2 níveis acima);
+///   2. DEV (cargo) — <raiz>/Manager/target/{debug,release}/ava-tray → 3
+///      níveis acima.
+///
+/// O teste é Contents-Based (docker-compose.yml existe), não conta de
+/// nível fixa. Fallback: exe_dir (comportamento inerte como antes).
+fn find_project_root(exe_dir: &std::path::Path) -> PathBuf {
+    let dir_ok = |d: &std::path::Path| d.join("docker-compose.yml").is_file();
+    let mut candidate = exe_dir.to_path_buf();
+    for _ in 0..3 {
+        candidate = match candidate.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
+        if dir_ok(&candidate) {
+            return candidate.canonicalize().unwrap_or(candidate);
+        }
+    }
+    // Sem docker-compose.yml nenhum nível acima — mantém o comportamento
+    // antigo (exe_dir/..) para o caso de layout de zip temporário do dev.
+    let fallback = exe_dir.join("..");
+    tracing::warn!(
+        "docker-compose.yml não encontrado em até 3 níveis acima do exe — \
+         project_root fallback: {}",
+        fallback.display()
+    );
+    fallback
+}
+
 pub fn new_shared_state() -> SharedState {
     tracing::info!(
         "Diretório do executável: {}",
@@ -419,30 +370,16 @@ pub fn new_shared_state() -> SharedState {
         .ok()
         .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let project_root = exe_dir.join("..").canonicalize().unwrap_or_else(|_| exe_dir.clone());
-    let mcp_binary = find_mcp_manager_binary();
+    let project_root = find_project_root(&exe_dir);
     let transcript_binary = find_transcript_binary();
-
-    // Health check aponta para a porta do manager no HOST (env
-    // AVA_MCP_MANAGER_URL sobrescreve — ex.: porta diferente no port).
-    let mcp_port = std::env::var("AVA_MCP_MANAGER_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .unwrap_or(MCP_MANAGER_DEFAULT_PORT);
 
     Arc::new(AppState {
         docker: Arc::new(TokioMutex::new(DockerState::default())),
         browser: Arc::new(TokioMutex::new(BrowserState::default())),
         mcp: Arc::new(TokioMutex::new(McpManagerState {
-            status: if mcp_binary.exists() {
-                McpStatus::Stopped
-            } else {
-                McpStatus::NotInstalled
-            },
-            pid: None,
-            binary: mcp_binary,
-            health_url: format!("http://127.9.12.22:{mcp_port}/health"),
+            status: McpStatus::Stopped,
         })),
+        mcp_server: std::sync::OnceLock::new(),
         transcript: Arc::new(TokioMutex::new(TranscriptState {
             status: if transcript_binary.exists() {
                 TranscriptStatus::Stopped

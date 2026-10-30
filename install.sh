@@ -776,11 +776,12 @@ else
 fi
 
 # ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
-# Cadastra o @playwright/mcp no mcp_manager (:4008) logo após o `up` do stack.
+# Cadastra o @playwright/mcp no mcp_manager (embutido no tray, :9001) logo
+# após o `up` do stack.
 # O POST /servers é upsert idempotente e o /sync tem no-op por doc_hash —
 # seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
 # retenta; se falhar de vez, só avisa (não aborta a instalação).
-MCP_MANAGER_URL="http://127.9.12.22:4008"
+MCP_MANAGER_URL="http://127.9.12.22:9001"
 
 register_playwright_mcp() {
   # O env do registro é autocontido (o mcp_manager mescla server.env sobre o
@@ -1002,7 +1003,8 @@ register_desktop_commander_mcp() {
 
 
 # ── 5d. Manager (ava-tray) — API REST em :9001 ───────────────────────────────
-# O Manager sobe/derruba o stack Docker e supervisiona o mcp_manager do host.
+# O Manager sobe/derruba o stack Docker e serve o mcp_manager embutido
+# (mesmo processo/listener :9001).
 # O instalador o inicia primeiro e pede o start do Docker pela API dele.
 MANAGER_URL="http://127.9.12.22:9001"
 
@@ -1056,7 +1058,7 @@ docker_up_via_manager() {
   return 1
 }
 
-# O mcp_manager (:4008) roda no host, supervisionado pelo Manager.
+# O mcp_manager é EMBUTIDO no Manager (processo único, mesma porta :9001).
 ensure_mcp_manager() {
   manager_up || { warn "Manager indisponível — não consegui garantir o mcp_manager."; return 1; }
   local out i
@@ -1199,7 +1201,7 @@ ok "Instalação concluída ($INSTALL_DIR)"
 info "Comandos úteis:"
 info "  alpha-ai                          # abre a TUI"
 info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
-info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log) e do mcp_manager (mcp_manager.log)"
+info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log — inclui o MCP manager embutido)"
 info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
 
 if [ "$NO_LAUNCH" -eq 0 ] && [ -t 0 ]; then

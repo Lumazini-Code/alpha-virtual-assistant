@@ -15,6 +15,11 @@
 //! mcp_manager — Controle de servidores MCP: registro (REST) + executor.
 //! =====================================================================
 //!
+//! EMBUTIDO no tray (Manager): este módulo era o binário standalone
+//! `mcp_manager` (:4008) — agora é um serviço interno do processo único
+//! do tray, servido no MESMO listener da API :9001 (rotas merged em
+//! api.rs). O binário standalone não existe mais.
+//!
 //! Port 1:1 do `mcp_manager.py`. A lógica, as rotas, as mensagens, o schema
 //! SQLite (ava_mcp_servers.db) e os formatos JSON são os mesmos do original.
 //!
@@ -25,7 +30,7 @@
 //! plataformas, ambiente herdado por plataforma, sem janela de console no
 //! Windows, grupo de processos no Unix).
 //!
-//! Rotas:
+//! Rotas (todas em :9001, com o auth middleware embutido — /health exempt):
 //!   GET    /health
 //!   POST   /servers                      (registrar/atualizar servidor)
 //!   POST   /servers/install              (instalação assistida de MCP npm)
@@ -40,8 +45,10 @@
 //!   POST   /skills/select                (etapa 1b: seleção via grafo de tools)
 //!   GET    /tools                        (todas as tools conhecidas)
 //!
-//! Porta 4008 (env MCP_MANAGER_PORT). Memory em MEMORY_API_URL (default
-//! http://localhost:3000).
+//! Memory em MEMORY_API_URL (default http://127.9.12.22:3000). O env que
+//! antes era injetado pelo supervisor (AVA_INTERNAL_TOKEN, MEMORY_API_URL,
+//! PLAYWRIGHT_MCP_EXTENSION_TOKEN) é herdado do processo do tray — que lê
+//! Modules/.env no boot (mesma fonte de sempre).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -88,7 +95,6 @@ static SERVER_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").unwrap());
 
 struct Config {
-    port: u16,
     memory_api_url: String,
     db_dir: PathBuf,
     db_path: PathBuf,
@@ -103,77 +109,18 @@ fn env_parse<T: FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// Abre logs/<name> em append, com base no diretório do executável — a
-/// MESMA regra do Config::from_env para o db_dir (o binário vive na raiz do
-/// projeto). None se não der: o log segue só no stderr e nada aqui pode
-/// derrubar o boot por causa de telemetria.
-fn open_log_file(name: &str) -> Option<std::fs::File> {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
-    let dir = base.join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(name))
-        .ok()
-}
-
-/// Logging duplo: stderr + logs/mcp_manager.log (append, ANSI off).
-///
-/// O arquivo é obrigatório, não luxo: o tray lança este binário com
-/// stdout/stderr redirecionados (ou null) — sem arquivo próprio, a causa de
-/// uma morte se perdia para sempre (incidente de 26/10: o manager morreu
-/// ~2 min após o boot e o stderr registrado era vazio, porque ia para
-/// Stdio::null). Com o arquivo, qualquer modo de lançamento (spawn do
-/// tray, manual, debug) produz o mesmo log.
-fn install_logging(max_level: tracing::Level) {
-    use tracing_subscriber::filter::LevelFilter;
-    use tracing_subscriber::layer::{Layer as _, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let level = LevelFilter::from(max_level);
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_filter(level);
-    let file_layer = open_log_file("mcp_manager.log").map(|file| {
-        tracing_subscriber::fmt::layer()
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(std::sync::Arc::new(file))
-            .with_filter(level)
-    });
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(file_layer)
-        .init();
-}
-
-/// Panics também vão para o arquivo: o hook roda ANTES do unwind — se o
-/// processo morrer em seguida, a mensagem e a backtrace já estão em disco.
-fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        tracing::error!("PANIC: {info}\n{backtrace}");
-        default_hook(info);
-    }));
-}
-
 impl Config {
-    fn from_env() -> Self {
+    fn from_env(project_root: &std::path::Path) -> Self {
         // Banco local do manager (registry de servidores + cache de
-        // tools/schemas). Equivalente ao `Path(__file__).parent / "db"`
-        // do Python: relativo ao diretório do executável.
-        let base = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let db_dir = base.join("Modules").join("mcp_manager").join("db");
+        // tools/schemas). Mesmo path do binário standalone: <raiz>/Modules/
+        // mcp_manager/db/ — o registry atual NÃO migra: installs existentes
+        // continuam com os servers registrados.
+        let db_dir = project_root
+            .join("Modules")
+            .join("mcp_manager")
+            .join("db");
         let db_path = db_dir.join("ava_mcp_servers.db");
         Config {
-            port: env_parse("MCP_MANAGER_PORT", 4008u16),
             memory_api_url: std::env::var("MEMORY_API_URL")
                 .unwrap_or_else(|_| "http://127.9.12.22:3000".to_string()),
             db_dir,
@@ -497,7 +444,7 @@ struct Runtime {
     memory_watchdog_task: Option<JoinHandle<()>>,
 }
 
-struct AppState {
+pub struct AppState {
     cfg: Config,
     // Escritas no SQLite serializadas por um lock explícito (db_lock).
     db: Mutex<Connection>,
@@ -2336,10 +2283,9 @@ async fn server_call(
 // Application / Lifespan
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn app(state: Arc<AppState>) -> Router {
+pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/status", get(health))
         .route("/servers", post(register_server).get(list_servers))
         .route("/servers/install", post(install_server))
         .route("/servers/{name}", get(get_server).delete(delete_server))
@@ -2357,13 +2303,14 @@ fn app(state: Arc<AppState>) -> Router {
 
 /// Middleware de auth interna (Plano 1 — T3/T5).
 /// Exige `Authorization: Bearer <AVA_INTERNAL_TOKEN>` em todas as rotas
-/// exceto `/health` e `/status` (healthchecks do compose dependem).
+/// exceto `/health` (healthchecks). O middleware só aplica às rotas MCP
+/// deste router — as rotas próprias do tray (:9001 /status, /docker/*, ...)
+/// NÃO passam por aqui (routers são merged com suas layers próprias).
 /// Fail-open quando AVA_INTERNAL_TOKEN ausente, a menos que AVA_REQUIRE_AUTH=1.
 async fn auth_middleware(req: Request, next: Next) -> Response {
     let path = req.uri().path();
     // Isentar healthcheck e docs
     if path == "/health"
-        || path == "/status"
         || path == "/docs"
         || path == "/openapi.json"
         || path.starts_with("/docs/")
@@ -2391,7 +2338,6 @@ async fn auth_middleware(req: Request, next: Next) -> Response {
 
     if let Some(supplied) = auth.strip_prefix("Bearer ") {
         // comparação em tempo constante para evitar timing attack
-        use std::sync::atomic::{AtomicBool, Ordering};
         // Não vamos fazer fancy crypto aqui; comparação de strings com
         // len igual é suficiente para o caso de uso (token de 32 bytes).
         if supplied.len() == token.len()
@@ -2409,24 +2355,6 @@ async fn auth_middleware(req: Request, next: Next) -> Response {
     (StatusCode::UNAUTHORIZED, body).into_response()
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            s.recv().await;
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
-
 async fn wait_all(events: Vec<Event>) {
     let mut handles = Vec::new();
     for ev in events {
@@ -2437,22 +2365,17 @@ async fn wait_all(events: Vec<Event>) {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let debug_on = std::env::var("AVA_DEBUG").map(|v| !v.is_empty()).unwrap_or(false);
-    let max_level = if debug_on { tracing::Level::DEBUG } else { tracing::Level::INFO };
-    install_panic_hook();
-    install_logging(max_level);
-
-    let cfg = Config::from_env();
+/// Boot do MCP manager EMBUTIDO — o corpo do antigo `main()` sem o logging
+/// próprio (o tray já instala subscriber+panic hook), sem o bind/serve (as
+/// rotas são merged no listener :9001 da API) e sem o shutdown (agora é
+/// `shutdown_all`, chamado pelo /mcp/stop). Erros retornam — o tray decide
+/// (API sobe sem as rotas MCP; as demais funcionalidades seguem).
+pub async fn init(project_root: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+    let cfg = Config::from_env(project_root);
     info!("Iniciando MCP Manager (registro + executor de servidores MCP)...");
-    let db = match open_db(&cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Falha ao abrir o banco {}: {e}", cfg.db_path.display());
-            std::process::exit(1);
-        }
-    };
+    let db = open_db(&cfg).map_err(|e| {
+        anyhow::anyhow!("Falha ao abrir o banco {}: {e}", cfg.db_path.display())
+    })?;
     // ── Auth interna (Plano 1): o cliente HTTP de memória carrega o
     // AVA_INTERNAL_TOKEN como header padrão — sem isso TODA chamada ao
     // memory_api (/tools/select, /write/batch, ...) volta 401 e o seletor
@@ -2476,7 +2399,6 @@ async fn main() {
     let memory = memory_builder
         .build()
         .expect("falha ao criar cliente HTTP");
-    let port = cfg.port;
     let st = Arc::new(AppState {
         cfg,
         db: Mutex::new(db),
@@ -2511,32 +2433,18 @@ async fn main() {
         .map(|rows| rows.into_iter().map(|r| r.name).collect())
         .unwrap_or_default();
     info!(
-        "MCP Manager pronto — {} servidor(es) registrado(s): {}",
+        "MCP Manager pronto (embutido no tray :9001) — {} servidor(es) registrado(s): {}",
         st.db_count_servers().unwrap_or(0),
         py_list(&names)
     );
+    Ok(st)
+}
 
-    let bind_host = std::env::var("AVA_BIND_HOST")
-        .ok()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "127.9.12.22".to_string());
-    let listener = match tokio::net::TcpListener::bind((bind_host.as_str(), port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("Falha ao abrir {bind_host}:{port}: {e}");
-            std::process::exit(1);
-        }
-    };
-    info!("Escutando em http://{bind_host}:{port}");
-    if let Err(e) = axum::serve(listener, app(st.clone()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        tracing::error!("Servidor HTTP terminou com erro: {e}");
-    }
-
-    // ── shutdown (pós-yield do lifespan) ──
+/// Shutdown do MCP manager embutido — a seção de shutdown do antigo `main()`
+/// (antes rodava no SIGTERM do binário standalone). Chamado por /mcp/stop e
+/// pelo auto-stop do container: aborta o watchdog, derruba sessões MCP vivas
+/// e espera os keepers fecharem os subprocessos stdio.
+pub async fn shutdown_all(st: &Arc<AppState>) {
     // Watchdog antes do mais: pode estar no meio de um sync (spawn stdio).
     let wd = st.rt().memory_watchdog_task.take();
     if let Some(h) = wd {
@@ -2556,7 +2464,7 @@ async fn main() {
         set
     };
     for name in &names {
-        drop_session(&st, name);
+        drop_session(st, name);
     }
     let dones: Vec<Event> = st.rt().keeper_tasks.values().map(|k| k.done.clone()).collect();
     if !dones.is_empty() {
