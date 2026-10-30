@@ -24,12 +24,16 @@
 //! próprio loop de eventos e conversa com a UI via canal mpsc.
 
 mod api;
+mod app_ipc;
+mod app_launcher;
 mod chat;
+mod docker_logs;
 mod idle_watcher;
 mod mcp_server;
 mod platform;
 mod process_manager;
 mod state;
+mod stats;
 mod transcript;
 mod ui;
 
@@ -37,7 +41,7 @@ use eframe::egui;
 use state::new_shared_state;
 use tokio::sync::mpsc;
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIconBuilder, TrayIconEvent,
 };
 
@@ -298,7 +302,13 @@ fn main() -> anyhow::Result<()> {
     // Roda até a UI fechar de verdade (menu "Sair" do tray → quit_requested
     // → close permitido → run_native retorna → processo encerra e a thread
     // do tray morre junto).
-    run_ui(shared_state, rt_handle, cmd_rx)
+    let result = run_ui(shared_state, rt_handle, cmd_rx);
+
+    // O ava-web é outro processo: pede para ele fechar junto com o tray
+    // (fechar a janela do app sozinha NÃO encerra o tray).
+    app_launcher::request_quit();
+
+    result
 }
 
 /// Tray no Linux: init + loop GTK na thread do tray. O loop roda pra
@@ -328,11 +338,17 @@ fn run_tray(tx: mpsc::UnboundedSender<UiCommand>) {
 /// guardado vivo: no Windows/Linux o ícone some se o objeto for dropado.
 fn build_tray(tx: mpsc::UnboundedSender<UiCommand>) -> TrayIconData {
     let menu = Menu::new();
-    let open_item = MenuItem::new("Abrir", true, None);
+    // "Abrir aplicativo" = WebUI nativa (ava-web); "Status" = janela egui
+    // antiga de status/chat. Separador antes de Sair para não misturar.
+    let app_item = MenuItem::new("Abrir aplicativo", true, None);
+    let open_item = MenuItem::new("Status", true, None);
     let quit_item = MenuItem::new("Sair", true, None);
+    menu.append(&app_item).ok();
     menu.append(&open_item).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&quit_item).ok();
 
+    let app_id = app_item.id().clone();
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
 
@@ -357,7 +373,9 @@ fn build_tray(tx: mpsc::UnboundedSender<UiCommand>) -> TrayIconData {
     {
         let tx = tx;
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if event.id == open_id {
+            if event.id == app_id {
+                app_launcher::open_or_focus();
+            } else if event.id == open_id {
                 let _ = tx.send(UiCommand::Show);
             } else if event.id == quit_id {
                 let _ = tx.send(UiCommand::Quit);

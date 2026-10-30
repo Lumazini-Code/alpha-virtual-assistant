@@ -19,6 +19,10 @@ services:
       - ./resource:/app/resource
       - ./Modules:/app/Modules
       - ./orchestrator.py:/app/orchestrator.py
+      # start.sh chama "python3 /app/launcher.py" no modo unificado. A imagem
+      # NÃO copia o código (só requirements.txt) — todo .py da raiz precisa
+      # de bind mount explícito, como os demais abaixo.
+      - ./launcher.py:/app/launcher.py
       - ./scraping_client.py:/app/scraping_client.py
       - ava-cache:/root/.cache
       - ava-logs:/app/logs

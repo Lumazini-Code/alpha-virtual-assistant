@@ -14,11 +14,37 @@ opt-level = 3
 lto = true
 strip = true
 
+# Binários:
+#   ava-tray — bandeja + API :9001 (sempre).
+#   ava-web  — janela nativa com WebView (só com --features webapp). É um
+#              processo separado de propósito: o eframe/winit do tray já é
+#              dono da main thread, e GTK/WebKit no mesmo processo brigaria
+#              pelos event loops.
+[features]
+webapp = ["dep:wry", "dep:tao", "dep:webbrowser"]
+
+[[bin]]
+name = "ava-tray"
+path = "src/main.rs"
+
+[[bin]]
+name = "ava-web"
+path = "src/bin/ava-web.rs"
+required-features = ["webapp"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
 
 [dependencies]
+# ── Janela nativa com WebView (binário ava-web) ────────────────────────────
+# wry = motor do WebView do sistema (WebKitGTK no Linux, WebView2 no
+# Windows). tao = janela/event loop próprio, separado do winit do eframe.
+wry = { version = "0.57", optional = true }
+tao = { version = "0.37", optional = true }
+# Links do chat abrem no navegador padrão, nunca numa segunda WebView.
+webbrowser = { version = "1", optional = true }
+
 # ── Runtime assíncrono (compartilhado entre API REST e watchers) ─────────────
 tokio = { version = "1", features = ["full"] }
 
@@ -31,7 +57,8 @@ axum = "0.8"
 # ── Cliente HTTP (POST /execute no orchestrator, health da memory_api,
 # sessões MCP streamable-http do mcp_server) ────────────────────────────────
 # rustls-tls: o mcp_server conecta em servidores MCP http externos (https).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# stream: o proxy /orch do WebUI repassa SSE (/conversation/stream) sem buffer.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # ── Serialização JSON ──────────────────────────────────────────────────────
 # preserve_order: schemas de tools MCP chegam/parte na ordem original (o
@@ -69,3 +96,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 anyhow = "1"
 chrono = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# CPU/RAM/GPU do host para o painel de status do WebUI (mesmo dado que a
+# TUI antiga lia via systeminformation).
+sysinfo = { version = "0.40", default-features = false, features = ["system", "gpu"] }

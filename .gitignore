@@ -25,6 +25,10 @@ Manager/build/**
 Manager/incremental/**
 Manager/.fingerprint/**
 Manager/ava-tray
+Manager/ava-tray.exe
+Manager/ava-web
+Manager/ava-web.exe
+Manager/WebView2Loader.dll
 
 .opencode
 

@@ -121,7 +121,7 @@ as_root() {
 }
 
 # 1a. curl e unzip (necessários para baixar/instalar o resto)
-for cmd in curl unzip; do
+for cmd in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     info "'$cmd' não encontrado — instalando..."
     [ -n "$PKG" ] || die "'$cmd' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
@@ -134,7 +134,7 @@ for cmd in curl unzip; do
     command -v "$cmd" >/dev/null 2>&1 || die "Falha ao instalar '$cmd'. Instale-o manualmente e rode novamente."
   fi
 done
-ok "curl e unzip disponíveis."
+ok "Dependências disponíveis disponíveis."
 
 # 1b. Docker Engine (+ compose v2) — instala automaticamente se ausente
 # Testa o daemon: direto (usuário já no grupo docker) ou via sg (grupo
@@ -305,7 +305,7 @@ unzip -oq "$TMP_DIR/alpha-ai.zip" -d "$INSTALL_DIR"
 
 cd "$INSTALL_DIR"
 
-chmod +x tui/alpha-ai Manager/ava-tray docker-start.sh 2>/dev/null || true
+chmod +x tui/alpha-ai Manager/ava-tray Manager/ava-web docker-start.sh 2>/dev/null || true
 ok "Arquivos extraídos."
 
 # ── 3a. Rebind dos containers (reinstalação sobre stack rodando) ──────────────

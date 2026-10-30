@@ -44,19 +44,65 @@
 //!     install.sh vira no-op idempotente.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::process_manager;
 use crate::state::SharedState;
 use crate::transcript;
 use axum::{
-    extract::State,
-    response::{IntoResponse, Json},
-    routing::{get, post},
+    body::{to_bytes, Body},
+    extract::{Query, Request, State},
+    http::{
+        header,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+        HeaderName, HeaderValue, StatusCode,
+    },
+    response::{IntoResponse, Json, Response},
+    routing::{any, get, post},
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const API_PORT: u16 = 9001;
+
+/// Host de bind da API/WebUI. Mesma resolução usada pelo serve(): env
+/// (carregada de Modules/.env) → default 127.9.12.22 (loopback dedicado).
+pub fn bind_host() -> String {
+    std::env::var("AVA_BIND_HOST")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "127.9.12.22".to_string())
+}
+
+/// URL que a janela nativa (`ava-web`) deve carregar. 0.0.0.0/:: não são
+/// endereços de destino válidos para o WebView: normaliza para loopback.
+pub fn base_url() -> String {
+    let host = bind_host();
+    let host = match host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    };
+    format!("http://{host}:{API_PORT}")
+}
+
+/// URL da API de memória (:3000) — planos, pessoas/vozes.
+pub fn memory_url() -> String {
+    std::env::var("AVA_MEMORY_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| format!("http://{}:3000", bind_host()))
+}
+
+/// URL do visualizador de grafo (:8777) — link do painel e health check.
+pub fn graph_url() -> String {
+    std::env::var("AVA_GRAPH_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| format!("http://{}:8777", bind_host()))
+}
 
 pub async fn serve(
     state: SharedState,
@@ -105,6 +151,22 @@ pub async fn serve(
     };
 
     let app = Router::new()
+        // ── WebUI local (janela ava-web) ───────────────────────────────────
+        // Servida pela MESMA origem da API: sem CORS para /status,
+        // /docker/*, etc. O front ainda fala com o orchestrator via
+        // /orch/* (proxy abaixo), que injeta o token interno no servidor.
+        .route("/", get(get_webui))
+        .route("/index.html", get(get_webui))
+        .route("/favicon.ico", get(get_favicon))
+        .route("/stats", get(get_stats))
+        .route("/graph/status", get(get_graph_status))
+        .route("/docker/logs", get(get_docker_logs))
+        .route("/orch", any(proxy_orchestrator))
+        .route("/orch/{*path}", any(proxy_orchestrator))
+        .route("/memory", any(proxy_memory))
+        .route("/memory/{*path}", any(proxy_memory))
+        .route("/mcpapi", any(proxy_mcp))
+        .route("/mcpapi/{*path}", any(proxy_mcp))
         .route("/status", get(get_status))
         .route("/docker/start", post(post_docker_start))
         .route("/docker/stop", post(post_docker_stop))
@@ -126,8 +188,7 @@ pub async fn serve(
         // nasce no main e é clonado aqui; Extension evita mudar o AppState).
         .layer(axum::Extension(ui_tx));
 
-    let bind_host = std::env::var("AVA_BIND_HOST").unwrap_or_else(|_| "127.9.12.22".to_string());
-    let addr = format!("{bind_host}:{API_PORT}");
+    let addr = format!("{}:{API_PORT}", bind_host());
     tracing::info!("API REST escutando em http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -467,4 +528,233 @@ async fn post_ui_chat_open(
         ok: true,
         message: "chat-open enviado".into(),
     })
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// WebUI local — página + proxy do orchestrator
+// ════════════════════════════════════════════════════════════════════════
+
+/// Serve o `Manager/index.html`. Lê do disco a cada request (editar o HTML
+/// e recarregar a janela já mostra a mudança, sem recompilar); se o
+/// arquivo não existir no layout de instalação, usa a cópia embutida no
+/// binário.
+async fn get_webui(State(state): State<SharedState>) -> Response {
+    let path = state.project_root.join("Manager").join("index.html");
+    let html = match tokio::fs::read_to_string(&path).await {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::debug!(
+                "webui: {} indisponível ({e}) — usando index.html embutido",
+                path.display()
+            );
+            include_str!("../index.html").to_string()
+        }
+    };
+
+    let mut response = html.into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Dev local: sem cache, o reload da WebView sempre pega o arquivo atual.
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Ícone do app — evita o 401 do fallback do router MCP no /favicon.ico.
+async fn get_favicon() -> Response {
+    const ICON: &[u8] = include_bytes!("../assets/icon.png");
+    let mut response = Response::new(Body::from(ICON));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
+}
+
+/// CPU/RAM/GPU do host para o painel de status do WebUI.
+async fn get_stats() -> Response {
+    match tokio::task::spawn_blocking(crate::stats::collect).await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("falha ao coletar stats: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// O grafo (:8777) é um app separado no host/container. O front só precisa
+/// saber se está no ar para mostrar o link; um TCP connect resolve sem
+/// depender de CORS.
+async fn get_graph_status() -> Response {
+    let url = graph_url();
+    let online = match reqwest::Url::parse(&url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("127.0.0.1");
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    tokio::net::TcpStream::connect((host, port)),
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        }
+        Err(_) => false,
+    };
+    Json(serde_json::json!({ "online": online, "url": url })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+}
+
+/// Snapshot das últimas linhas do container (painel Ctrl+D do WebUI).
+async fn get_docker_logs(Query(query): Query<LogsQuery>) -> Response {
+    let logs = crate::docker_logs::tail(query.tail.unwrap_or(200)).await;
+    Json(logs).into_response()
+}
+
+/// Proxy same-origin do front (`/orch/*`) para o orchestrator.
+///
+/// Evita CORS e mantém o AVA_INTERNAL_TOKEN fora do JavaScript: o
+/// navegador fala só com :9001, e este handler injeta o Bearer no
+/// servidor. Suporta streaming (SSE do /conversation/stream) — o corpo
+/// do upstream é repassado como stream, sem buffer.
+async fn proxy_orchestrator(State(state): State<SharedState>, req: Request) -> Response {
+    let base = crate::chat::orchestrator_url(&state).await;
+    proxy_upstream(state, req, "/orch", base).await
+}
+
+/// Proxy same-origin da API de memória (:3000): planos, pessoas/vozes.
+async fn proxy_memory(State(state): State<SharedState>, req: Request) -> Response {
+    proxy_upstream(state, req, "/memory", memory_url()).await
+}
+
+/// Proxy same-origin das rotas do MCP manager EMBUTIDO. O front chama
+/// `/mcpapi/servers`; este handler reescreve para `/servers` no MESMO
+/// listener :9001 e injeta o Bearer — as rotas MCP continuam protegidas.
+async fn proxy_mcp(State(state): State<SharedState>, req: Request) -> Response {
+    proxy_upstream(state, req, "/mcpapi", base_url()).await
+}
+
+async fn proxy_upstream(state: SharedState, req: Request, prefix: &str, base: String) -> Response {
+    let uri = req.uri().clone();
+    let suffix = uri.path().strip_prefix(prefix).unwrap_or(uri.path());
+    let suffix = if suffix.is_empty() { "/" } else { suffix };
+    let upstream = match uri.query() {
+        Some(query) => format!("{base}{suffix}?{query}"),
+        None => format!("{base}{suffix}"),
+    };
+
+    let (parts, body) = req.into_parts();
+    let body = match to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(e) => return proxy_error(StatusCode::BAD_REQUEST, format!("corpo inválido: {e}")),
+    };
+
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in parts.headers.iter() {
+        if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) else {
+            continue;
+        };
+        headers.append(name, value);
+    }
+
+    // O front não recebe o token interno; quem fala com o orchestrator é o
+    // Manager. Se o cliente já mandou um Authorization (settings do app),
+    // respeita — útil para apontar para outro orchestrator.
+    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+        if let Ok(token) = crate::chat::auth_header(&state).await {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&token) {
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+        }
+    }
+
+    let upstream_response = match proxy_client()
+        .request(method, &upstream)
+        .headers(headers)
+        .body(reqwest::Body::from(body))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!("proxy /orch: falha ao conectar em {upstream}: {e}");
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                format!("orchestrator indisponível: {e}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream_response.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_headers = upstream_response.headers().clone();
+    let mut response = Response::new(Body::from_stream(upstream_response.bytes_stream()));
+    *response.status_mut() = status;
+
+    let out_headers = response.headers_mut();
+    for (name, value) in upstream_headers.iter() {
+        if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_str().as_bytes()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) else {
+            continue;
+        };
+        out_headers.append(name, value);
+    }
+
+    response
+}
+
+/// Client do proxy: connect timeout curto (orchestrator é local), sem
+/// timeout total — o SSE fica aberto enquanto a janela existir.
+fn proxy_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn proxy_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+    )
 }

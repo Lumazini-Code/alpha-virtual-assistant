@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alpha AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f7f6f3;--sf:#fff;--sb:#efede8;--ink:#1f1e1d;--mu:#77736c;--ln:#e4e1da;--ac:#1243e4;--acs:#e8edfc;--am:#b97a00;--gr:#2f8f5f;--rd:#cf4a14;--sh:0 1px 2px rgba(20,18,14,.06),0 6px 24px rgba(20,18,14,.06);color-scheme:light}
+:root[data-t=dark]{--bg:#1c1c1b;--sf:#262625;--sb:#171716;--ink:#ecebe7;--mu:#9a968e;--ln:#363634;--ac:#7c9aff;--acs:#252d4a;--am:#e4a012;--gr:#4caf7d;--rd:#ef6a3a;--sh:0 1px 2px #0006,0 8px 28px #0005;color-scheme:dark}
+@media(prefers-color-scheme:dark){:root:not([data-t=light]){--bg:#1c1c1b;--sf:#262625;--sb:#171716;--ink:#ecebe7;--mu:#9a968e;--ln:#363634;--ac:#7c9aff;--acs:#252d4a;--am:#e4a012;--gr:#4caf7d;--rd:#ef6a3a;--sh:0 1px 2px #0006,0 8px 28px #0005;color-scheme:dark}}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 Geist,system-ui,sans-serif;display:flex;overflow:hidden}
+button,input,select,textarea{font:inherit;color:inherit}button{cursor:pointer;background:none;border:0}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+aside{width:264px;background:var(--sb);border-right:1px solid var(--ln);display:flex;flex-direction:column;padding:14px 10px;gap:6px;transition:margin .2s;flex:none}
+body.nosb aside{margin-left:-264px}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 10px;font-weight:600;font-size:16px}
+.logo{width:26px;height:26px;border-radius:8px;background:var(--ac);color:#fff;display:grid;place-items:center;font:500 16px Newsreader,serif;flex:none}
+.nb{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;font-weight:500;width:100%;text-align:left}
+.nb:hover,.pj:hover{background:var(--ln)}
+.nb.pri{background:var(--sf);border:1px solid var(--ln)}
+.lbl{display:flex;justify-content:space-between;align-items:center;color:var(--mu);font-size:13px;padding:12px 10px 4px}
+.lbl button{width:24px;height:24px;border-radius:6px;font-size:18px;line-height:1;color:var(--mu)}.lbl button:hover{background:var(--ln)}
+#pjs{flex:1;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.pj{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:10px;text-align:left;width:100%}
+.pj.on{background:var(--sf);box-shadow:inset 0 0 0 1px var(--ln);font-weight:500}
+.pj .dot{width:7px;height:7px;border-radius:50%;background:var(--ln);flex:none}.pj.on .dot{background:var(--ac)}
+.pj .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pj .x{opacity:0;color:var(--mu);padding:0 4px}.pj:hover .x{opacity:1}.pj .x:hover{color:var(--rd)}
+#np{margin:2px 4px 6px;padding:7px 10px;border:1px solid var(--ln);border-radius:10px;background:var(--sf);width:calc(100% - 8px);display:none}
+.hint{color:var(--mu);font-size:12.5px;padding:2px 10px}
+.foot{border-top:1px solid var(--ln);padding-top:8px;display:flex;flex-direction:column;gap:2px}
+.st{display:flex;align-items:center;gap:8px;color:var(--mu);font-size:13px;padding:4px 10px}
+.st i{width:8px;height:8px;border-radius:50%;background:var(--ln)}.st i.ok{background:var(--gr)}.st i.wa{background:var(--am)}.st i.er{background:var(--rd)}
+main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
+header{display:flex;align-items:center;gap:8px;padding:10px 16px;min-height:52px}
+.ib{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;color:var(--mu)}.ib:hover{background:var(--ln);color:var(--ink)}
+.badge{font-size:13px;padding:3px 10px;border-radius:99px;background:var(--acs);color:var(--ac);display:none}
+.sp{flex:1}
+.mode{display:flex;border:1px solid var(--ln);border-radius:99px;padding:2px;background:var(--sf);font-size:13px}
+.mode button{padding:3px 12px;border-radius:99px;color:var(--mu)}.mode button.on{background:var(--ink);color:var(--bg)}
+#chat{flex:1;overflow:auto;scroll-behavior:smooth}
+.col{max-width:760px;margin:0 auto;padding:8px 20px 24px}
+.m{display:flex;gap:12px;margin:22px 0}.m.u{justify-content:flex-end;margin:18px 0}
+.bub{background:var(--sb);border:1px solid var(--ln);padding:9px 14px;border-radius:18px 18px 4px 18px;max-width:82%;white-space:pre-wrap;word-break:break-word}
+.chip{display:inline-block;font-size:12.5px;color:var(--mu);margin-bottom:4px}
+.av{width:26px;height:26px;border-radius:8px;background:var(--ac);color:#fff;display:grid;place-items:center;font:500 16px Newsreader,serif;flex:none;margin-top:2px}
+.body{flex:1;min-width:0}
+.txt{font:17px/1.65 Newsreader,Georgia,serif}.txt p{margin:0 0 .7em}.txt h2,.txt h3,.txt h4,.txt h5{font:600 1.05em Geist,sans-serif;margin:1.2em 0 .4em}
+.txt h2{font-size:1.25em}.txt ul,.txt ol{padding-left:1.4em;margin:0 0 .8em}.txt li{margin:.2em 0}
+.txt code{font:500 .82em 'JetBrains Mono',monospace;background:var(--sb);border:1px solid var(--ln);padding:1px 5px;border-radius:5px}
+.txt blockquote{margin:0 0 .8em;padding-left:14px;border-left:3px solid var(--ln);color:var(--mu)}.txt a{color:var(--ac)}
+.cbw{margin:.4em 0 1em;border:1px solid var(--ln);border-radius:12px;overflow:hidden;background:var(--sf)}
+.cb{display:flex;justify-content:space-between;align-items:center;padding:5px 12px;background:var(--sb);font:12.5px Geist,sans-serif;color:var(--mu)}
+.cb button{color:var(--mu);padding:2px 6px;border-radius:6px}.cb button:hover{background:var(--ln)}
+.txt pre{margin:0;padding:12px 14px;overflow:auto}.txt pre code{background:none;border:0;padding:0;font-size:13px;line-height:1.55}
+.think,.steps{border:1px solid var(--ln);border-radius:12px;margin:0 0 12px;background:var(--sf);font-size:13.5px;overflow:hidden}
+.think button{display:flex;justify-content:space-between;width:100%;padding:8px 12px;color:var(--mu);text-align:left}.think button span{color:var(--ac)}
+.think p{margin:0;padding:0 12px 10px;color:var(--mu);font-style:italic;white-space:pre-wrap;word-break:break-word}
+.sh{padding:8px 12px;color:var(--am);font-weight:500;border-bottom:1px solid var(--ln)}
+.sr{display:flex;gap:9px;padding:6px 12px;align-items:baseline}.sr+.sr{border-top:1px dashed var(--ln)}
+.sr .ic{width:14px;text-align:center;flex:none}.sr small{display:block;color:var(--mu);font:12px 'JetBrains Mono',monospace;word-break:break-all}
+.sr.running .ic{color:var(--am);animation:p 1s infinite}.sr.done .ic{color:var(--gr)}.sr.error .ic,.err{color:var(--rd)}.sr.pending .ic{color:var(--mu)}
+@keyframes p{50%{opacity:.3}}
+.err{font-size:14px;margin-top:6px}
+.dots i{display:inline-block;width:6px;height:6px;margin-right:4px;border-radius:50%;background:var(--mu);animation:p 1s infinite}.dots i:nth-child(2){animation-delay:.15s}.dots i:nth-child(3){animation-delay:.3s}
+.caret::after{content:"";display:inline-block;width:7px;height:1em;background:var(--ac);margin-left:2px;vertical-align:-2px;animation:p 1s infinite}
+#hero{text-align:center;margin:12vh 0 22px}
+#hero h1{font:400 38px/1.15 Newsreader,serif;margin:14px 0 6px;letter-spacing:-.01em}#hero p{margin:0;color:var(--mu)}
+#hero .logo{width:44px;height:44px;font-size:26px;border-radius:13px}
+.hint2{color:var(--mu);font-size:13px;margin-top:16px}
+kbd{font:12px 'JetBrains Mono',monospace;border:1px solid var(--ln);border-bottom-width:2px;border-radius:5px;padding:0 5px;background:var(--sf)}
+#cm{padding:0 20px 16px}
+.box{max-width:760px;margin:0 auto;background:var(--sf);border:1px solid var(--ln);border-radius:22px;box-shadow:var(--sh);padding:10px 12px 8px;transition:border-color .15s}
+.box:focus-within{border-color:var(--ac)}body.code .box:focus-within{border-color:var(--am)}
+textarea{width:100%;border:0;outline:0;background:none;resize:none;max-height:220px;padding:4px 4px 6px;line-height:1.5}
+body.code textarea{font-family:'JetBrains Mono',monospace;font-size:14px}
+.bar{display:flex;align-items:center;gap:6px}
+.go{width:34px;height:34px;border-radius:50%;background:var(--ink);color:var(--bg);display:grid;place-items:center}.go:disabled{opacity:.3;cursor:default}.go.stop{background:var(--rd);color:#fff}
+#att{display:none;margin:0 0 6px}#att span{display:inline-flex;gap:8px;align-items:center;background:var(--sb);border:1px solid var(--ln);border-radius:10px;padding:3px 6px 3px 10px;font-size:13px}
+#att button{color:var(--mu)}
+.tag{font-size:12.5px;color:var(--am);display:none}body.code .tag{display:inline}
+.drop::after{content:"Solte o arquivo para anexar";position:absolute;inset:8px;border:2px dashed var(--ac);border-radius:18px;background:color-mix(in srgb,var(--bg) 88%,transparent);display:grid;place-items:center;color:var(--ac);font-weight:500;z-index:5}
+/* status de recursos (CPU/RAM/GPU) — espelha o StatusPanel da TUI */
+.metrics{display:flex;flex-direction:column;gap:5px;padding:2px 10px 8px;color:var(--mu);font-size:12px}
+.metric{display:grid;grid-template-columns:32px 1fr auto;align-items:center;gap:7px}
+.metric b{font-weight:500;font-size:11.5px;color:var(--mu);min-width:38px;text-align:right}
+.mbar{height:4px;background:var(--ln);border-radius:99px;overflow:hidden}
+.mbar i{display:block;height:100%;width:0;background:var(--gr);border-radius:99px;transition:width .35s,background .35s}
+.metric.wa .mbar i{background:var(--am)}
+.metric.er .mbar i{background:var(--rd)}
+a.nb{text-decoration:none;color:var(--ink)}
+#ograph.off{opacity:.55;color:var(--mu)}
+/* listas de planos/servidores/pessoas dentro das configurações */
+.list{display:flex;flex-direction:column;gap:6px;margin:2px 0 6px}
+.item{border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg)}
+.item .nm{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13.5px}
+.item .sub{color:var(--mu);font-size:12.5px;margin-top:2px}
+.item input[type=text],.item textarea{width:100%;margin-top:6px;border:1px solid var(--ln);border-radius:8px;padding:6px 8px;background:var(--sf)}
+.item textarea{min-height:52px;resize:vertical}
+.item .acts{display:flex;gap:6px;justify-content:flex-end;margin-top:6px}
+.item .acts button{border:1px solid var(--ln);border-radius:8px;padding:4px 9px;font-size:12.5px;color:var(--mu)}
+.item .acts button:hover{color:var(--ink);background:var(--ln)}
+.item .acts button.danger{color:var(--rd)}
+.item>summary{cursor:pointer;list-style:none}
+.item>summary::-webkit-details-marker{display:none}
+.item>summary::before{content:"▸";color:var(--mu);display:inline-block;width:14px}
+.item[open]>summary::before{content:"▾"}
+.dh .meta{font-size:12.5px;color:var(--mu);font-weight:400;margin-left:auto;margin-right:8px}
+details.add{border:1px solid var(--ln);border-radius:10px;padding:8px 10px;margin:6px 0 10px;background:var(--bg)}
+details.add summary{cursor:pointer;font-size:13px;color:var(--mu)}
+details.add .addbody{padding-top:8px}
+details.add label{margin-top:8px}
+.empty{color:var(--mu);font-size:13px;padding:4px 0}
+.logs pre{margin:8px 0;background:#141413;color:#d9d7d1;border-radius:10px;padding:12px;max-height:58vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.45 'JetBrains Mono',monospace}
+.logs .meta{display:flex;gap:10px;align-items:center;color:var(--mu);font-size:12.5px}
+dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:var(--ink);padding:0;width:min(560px,94vw);box-shadow:var(--sh)}dialog::backdrop{background:#0006}
+.dh{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--ln);font-weight:600}
+.db{padding:6px 20px 20px;max-height:70vh;overflow:auto}
+.db h3{font-size:13px;color:var(--mu);font-weight:500;margin:18px 0 6px}
+.db label{display:block;font-size:13.5px;margin:10px 0 3px}
+.db input[type=text],.db input[type=password],.db select,.db textarea{width:100%;border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg)}
+.db textarea{min-height:90px;resize:vertical}
+.row{display:flex;align-items:center;gap:10px;justify-content:space-between;margin:10px 0}.row small{display:block;color:var(--mu)}
+.btn{background:var(--ink);color:var(--bg);border-radius:10px;padding:7px 14px;font-weight:500;margin-top:8px}
+.note{font-size:13px;color:var(--mu);margin-top:8px;min-height:1.2em}
+@media(max-width:760px){aside{position:fixed;inset:0 auto 0 0;z-index:9;margin-left:-264px}body:not(.nosb) aside{margin-left:0;box-shadow:var(--sh)}body.nosb aside{margin-left:-264px}#hero h1{font-size:30px}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand"><span class="logo">α</span>Alpha AI</div>
+  <button class="nb pri" id="nw">＋ Nova conversa</button>
+  <div class="lbl">Projetos <button id="addp" title="Criar projeto (Ctrl+P)">+</button></div>
+  <input id="np" type="text" placeholder="Nome do projeto, Enter cria" aria-label="Nome do projeto">
+  <div id="pjs"></div>
+  <div class="hint">Cada projeto tem sua própria memória; ativar mescla com a memória geral.</div>
+  <div class="foot">
+    <div class="metrics" id="metrics" aria-label="Recursos do sistema">
+      <div class="metric" id="m-cpu"><span>CPU</span><div class="mbar"><i id="bcpu"></i></div><b id="tcpu">–</b></div>
+      <div class="metric" id="m-ram"><span>RAM</span><div class="mbar"><i id="bram"></i></div><b id="tram">–</b></div>
+      <div class="metric" id="m-gpu"><span>GPU</span><div class="mbar"><i id="bgpu"></i></div><b id="tgpu">–</b></div>
+    </div>
+    <div class="st"><i id="sd"></i><span id="sdt">docker: verificando…</span></div>
+    <a class="nb off" id="ograph" href="#" target="_blank" rel="noopener">🔗 Grafo de memória</a>
+    <button class="nb" id="olog">▤ Logs do Docker</button>
+    <button class="nb" id="oset">⚙ Configurações</button>
+  </div>
+</aside>
+<main>
+  <header>
+    <button class="ib" id="tsb" title="Barra lateral" aria-label="Alternar barra lateral">☰</button>
+    <span class="badge" id="bdg"></span>
+    <span class="sp"></span>
+    <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Código</button></div>
+    <button class="ib" id="thm" title="Tema" aria-label="Alternar tema">◐</button>
+  </header>
+  <div id="chat"><div class="col">
+    <div id="hero"><span class="logo">α</span><h1>Como posso ajudar?</h1><p>Any model. Every tool. Zero limits.</p>
+      <div class="hint2"><kbd>Ctrl</kbd>+<kbd>K</kbd> modo código · <kbd>Ctrl</kbd>+<kbd>E</kbd> pensamento · <kbd>Ctrl</kbd>+<kbd>D</kbd> logs · <kbd>Ctrl</kbd>+<kbd>P</kbd> projetos · <kbd>Ctrl</kbd>+<kbd>S</kbd> ajustes</div></div>
+    <div id="ms"></div>
+  </div></div>
+  <div id="cm"><div class="box">
+    <div id="att"></div>
+    <textarea id="in" rows="1" placeholder="Digite sua mensagem, ou arraste um arquivo aqui" aria-label="Mensagem"></textarea>
+    <div class="bar">
+      <button class="ib" id="clip" title="Anexar arquivo" aria-label="Anexar arquivo">📎</button>
+      <span class="tag">modo código</span><span class="sp"></span>
+      <button class="go" id="go" aria-label="Enviar" disabled>↑</button>
+    </div>
+    <input type="file" id="fi" hidden>
+  </div></div>
+</main>
+
+<dialog id="ds">
+  <div class="dh">Configurações <button class="ib" id="cs" aria-label="Fechar">✕</button></div>
+  <div class="db">
+    <h3>Conexão</h3>
+    <label for="c-orch">Orchestrator (URL direta :9000 ou proxy /orch)</label><input type="text" id="c-orch">
+    <label for="c-api">Process manager (porta 9001)</label><input type="text" id="c-api">
+    <label for="c-tok">Token interno (opcional — o proxy /orch já injeta)</label><input type="password" id="c-tok" autocomplete="off">
+    <div class="row"><div>Modo demonstração<small>Simula respostas sem backend</small></div><input type="checkbox" id="c-demo"></div>
+    <h3>Assistente</h3>
+    <label for="c-per">Persona (system prompt)</label><textarea id="c-per"></textarea>
+    <button class="btn" id="sp">Salvar persona</button>
+    <label for="c-eff">Esforço de pensamento</label>
+    <select id="c-eff"><option value="auto">Automático</option><option value="none">Nenhum</option><option value="low">Baixo</option><option value="medium">Médio</option><option value="high">Alto</option></select>
+    <div class="row"><div>Memory Watch<small>Vigia de confiança do LLM</small></div><input type="checkbox" id="c-w"></div>
+    <div class="note" id="sn"></div>
+    <h3>Planos</h3>
+    <div id="plans" class="list"><div class="empty">Abra as configurações para carregar.</div></div>
+    <div class="note">Para gravar um plano novo use o <code>scripts/plan_recorder.py</code> (CLI/TUI) — a gravação interage com o navegador e não roda dentro do WebUI.</div>
+    <h3>Servidores MCP</h3>
+    <div id="mcps" class="list"><div class="empty">Abra as configurações para carregar.</div></div>
+    <details class="add" id="mcp-add">
+      <summary>＋ Adicionar servidor MCP</summary>
+      <div class="addbody">
+        <label for="mcp-kind">Tipo</label>
+        <select id="mcp-kind">
+          <option value="npm">Pacote npm (npx -y)</option>
+          <option value="http">Servidor externo (URL http)</option>
+          <option value="stdio">Comando local (stdio)</option>
+        </select>
+        <label for="mcp-target" id="mcp-target-label">Pacote npm</label>
+        <input type="text" id="mcp-target" placeholder="@modelcontextprotocol/server-filesystem">
+        <div id="mcp-args-wrap" style="display:none">
+          <label for="mcp-args">Argumentos do comando</label>
+          <input type="text" id="mcp-args" placeholder="--flag valor">
+        </div>
+        <label for="mcp-name">Nome (opcional; vazio deriva do pacote/URL/comando)</label>
+        <input type="text" id="mcp-name" placeholder="meu-servidor">
+        <label for="mcp-sum">Descrição / skill summary (opcional)</label>
+        <input type="text" id="mcp-sum" placeholder="o que este servidor faz">
+        <button class="btn" id="mcp-add-btn">Adicionar servidor</button>
+        <div class="note" id="mcp-note"></div>
+      </div>
+    </details>
+    <h3>Pessoas e vozes</h3>
+    <div id="voices" class="list"><div class="empty">Abra as configurações para carregar.</div></div>
+    <details class="add" id="v-add">
+      <summary>＋ Cadastrar pessoa (grava ~5s de microfone)</summary>
+      <div class="addbody">
+        <label for="v-name">Nome</label>
+        <input type="text" id="v-name" placeholder="Ex.: Felipe">
+        <label for="v-desc">Descrição</label>
+        <input type="text" id="v-desc" placeholder="Opcional — vínculo com a memória de longo prazo">
+        <button class="btn" id="v-rec">● Gravar 5s e cadastrar</button>
+        <div class="note" id="v-note"></div>
+      </div>
+    </details>
+    <h3>Aparência</h3>
+    <select id="c-th" aria-label="Tema"><option value="auto">Seguir o sistema</option><option value="light">Claro</option><option value="dark">Escuro</option></select>
+  </div>
+</dialog>
+
+<dialog id="dl">
+  <div class="dh">Logs do Docker <span class="meta" id="dlmeta"></span><button class="ib" id="cl" aria-label="Fechar">✕</button></div>
+  <div class="db logs">
+    <pre id="dll">carregando…</pre>
+    <div class="note">Polling a cada 2s · container <code>ava</code> (override: AVA_CONTAINER_NAME).</div>
+  </div>
+</dialog>
+
+<script>
+const $=s=>document.querySelector(s);
+const S={ms:[],busy:false,code:false,sid:null,att:null,ctl:null,full:false,act:'general',pjs:[],plans:[],mcps:[],voices:[]};
+/* Servido pelo Manager (:9001) => tudo same-origin: a API é location.origin
+   e o orchestrator passa pelo proxy /orch (que injeta o token no servidor).
+   Aberto como arquivo (file://) mantém as URLs absolutas antigas. */
+const sameOrigin=location.protocol==='http:'||location.protocol==='https:';
+let cfg={
+  orch:sameOrigin?location.origin+'/orch':'http://127.9.12.22:9000',
+  api:sameOrigin?location.origin:'http://127.9.12.22:9001',
+  token:'',demo:false,theme:'auto'};
+try{Object.assign(cfg,JSON.parse(localStorage.getItem('ava-web')||'{}'))}catch{}
+/* Migração: localStorage de uma sessão anterior pode ter os defaults
+   absolutos. Só reescreve se ainda forem exatamente os defaults — configs
+   customizadas pelo usuário são preservadas. */
+if(sameOrigin&&cfg.api==='http://127.9.12.22:9001')cfg.api=location.origin;
+if(sameOrigin&&cfg.orch==='http://127.9.12.22:9000')cfg.orch=location.origin+'/orch';
+const keep=()=>{try{localStorage.setItem('ava-web',JSON.stringify(cfg))}catch{}};
+const H=(h={})=>cfg.token?{...h,Authorization:'Bearer '+cfg.token}:h;
+/* Bases same-origin servidas pelo Manager. Em file:// não há proxy, então
+   mem/mcp caem nas portas antigas (podem falhar por CORS — o app nativo
+   sempre é servido por HTTP em :9001). */
+const BASE={
+  orch:()=>cfg.orch,
+  api:()=>cfg.api,
+  mem:()=>sameOrigin?location.origin+'/memory':'http://127.9.12.22:3000',
+  mcp:()=>sameOrigin?location.origin+'/mcpapi':'http://127.9.12.22:9001'
+};
+async function jf(base,path,method='GET',body){
+  const root=BASE[base]?BASE[base]():base;
+  const r=await fetch(root+path,{method,headers:H(body?{'Content-Type':'application/json'}:{}),body:body&&JSON.stringify(body)});
+  if(!r.ok){let m='HTTP '+r.status;try{const j=await r.json();m=j.error||j.detail||m}catch{}throw new Error(m)}
+  return r.status===204?{}:r.json().catch(()=>({}));
+}
+
+/* ---------- SSE (mesmo formato de _sse() no orchestrator) ---------- */
+async function*sse(body){
+  const rd=body.getReader(),dec=new TextDecoder();let b='';
+  const fr=k=>{let ev='message';const d=[];for(const l of k.split('\n')){if(l.startsWith('event:'))ev=l.slice(6).trim();else if(l.startsWith('data:'))d.push(l.slice(5).replace(/^ /,''))}return d.length?{event:ev,raw:d.join('\n')}:null};
+  for(;;){const{done,value}=await rd.read();if(done)break;b+=dec.decode(value,{stream:true}).replace(/\r\n/g,'\n');
+    let i;while((i=b.indexOf('\n\n'))>=0){const f=fr(b.slice(0,i));b=b.slice(i+2);if(f)yield f}}
+  if(b.trim()){const f=fr(b);if(f)yield f}
+}
+const pj=r=>{try{return JSON.parse(r)}catch{return r}};
+function frame(m,{event:e,raw}){
+  const d=pj(raw),o=d&&typeof d==='object'?d:null;
+  const plan=dyn=>m.plan||(m.plan={dyn,steps:[]});
+  if(e==='meta'&&o?.session_id)S.sid=o.session_id;
+  else if(e==='plan'&&o)m.plan={dyn:false,steps:(o.steps||[]).map(s=>({n:+(s.step??s.id)||0,ex:String(s.executor??s.name??''),act:String(s.action??''),st:'pending'}))};
+  else if(e==='tool_call'&&o){const p=plan(true),n=+o.step||0;if(!p.steps.some(s=>s.n===n))p.steps.push({n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'})}
+  else if(e==='step_start'&&o){const p=plan(true);let s=p.steps.find(x=>x.n===+o.step);if(!s)p.steps.push(s={n:+o.step,ex:o.executor});s.act=o.action;s.st='running'}
+  else if(e==='step_done'&&o&&m.plan){const s=m.plan.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}
+  else if(e==='reasoning')m.reason=(m.reason||'')+raw;
+  else if(e==='delta')m.text+=raw;
+  else if(e==='error'){m.err=o?o.error:raw;m.streaming=false}
+  else if(e==='done'){m.streaming=false;if(o?.final_response)m.text=o.final_response}
+  /* audio_start / audio / audio_end / result: ignorados nesta versão */
+}
+async function*demo(q){
+  const w=t=>new Promise(r=>setTimeout(r,t)),f=(event,x)=>({event,raw:typeof x==='string'?x:JSON.stringify(x)});
+  yield f('meta',{session_id:'demo'});
+  for(const t of 'Vou checar a memória do projeto antes de responder.'.split(' ')){yield f('reasoning',t+' ');await w(40)}
+  yield f('tool_call',{step:1,tool:'memory.read',arguments:{query:q}});await w(700);yield f('step_done',{step:1,success:true,latency_ms:683});
+  const txt=`Modo demonstração: nenhum backend foi chamado.\n\n## Você disse\n> ${q}\n\n- Respostas chegam por **SSE** em \`delta\`\n- O pensamento aparece no bloco acima\n\n\`\`\`python\nprint("olá, AVA")\n\`\`\``;
+  for(const t of txt.split(/(?<=\s)/)){yield f('delta',t);await w(22)}
+  yield f('done',{});
+}
+
+/* ---------- Markdown ---------- */
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const inl=s=>esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+function md(src){
+  const bl=[];
+  src=src.replace(/```([\w+-]*)\n?([\s\S]*?)(?:```|$)/g,(_,l,c)=>{bl.push(`<div class="cbw"><div class="cb"><span>${esc(l||'código')}</span><button data-copy>Copiar</button></div><pre><code>${esc(c.replace(/\n$/,''))}</code></pre></div>`);return`\n@@${bl.length-1}@@\n`});
+  let out='',list=null;const end=()=>{if(list){out+=`</${list}>`;list=null}};
+  for(const ln of src.split('\n')){let m;
+    if(m=ln.match(/^@@(\d+)@@$/)){end();out+=bl[m[1]]}
+    else if(m=ln.match(/^(#{1,6})\s+(.*)/)){end();const n=Math.min(m[1].length+1,5);out+=`<h${n}>${inl(m[2])}</h${n}>`}
+    else if(m=ln.match(/^\s*([-*+]|\d+\.)\s+(.*)/)){const t=/\d/.test(m[1])?'ol':'ul';if(list!==t){end();out+=`<${t}>`;list=t}out+=`<li>${inl(m[2])}</li>`}
+    else if(m=ln.match(/^>\s?(.*)/)){end();out+=`<blockquote>${inl(m[1])}</blockquote>`}
+    else if(!ln.trim())end();
+    else{end();out+=`<p>${inl(ln)}</p>`}
+  }
+  end();return out;
+}
+
+/* ---------- Renderização ---------- */
+const ICON={running:'●',done:'✓',error:'✕',pending:'○'};
+function html(m){
+  if(m.role==='u')return`<div class="m u"><div class="bub">${m.att?`<div class="chip">📎 ${esc(m.att)}</div>`:''}${esc(m.text)}</div></div>`;
+  let h='<div class="m a"><span class="av">α</span><div class="body">';
+  if(m.reason){const R=160,c=!S.full&&m.reason.length>R;
+    h+=`<div class="think"><button data-think><b style="font-weight:500">Pensamento · ${m.reason.length} caracteres</b><span>${c?'expandir':'recolher'}</span></button><p>${esc(c?'… '+m.reason.slice(-R):m.reason)}</p></div>`}
+  if(m.plan)h+=`<div class="steps"><div class="sh">${m.plan.dyn?'Ferramentas':'Plano'} · ${m.plan.steps.length} passo(s)</div>`+m.plan.steps.map(s=>
+    `<div class="sr ${s.st}"><span class="ic">${ICON[s.st]}</span><div><b style="font-weight:500">${esc(s.ex||'passo '+s.n)}</b>${s.ms!=null?` <span style="color:var(--mu)">${Math.round(s.ms)} ms</span>`:''}${s.er?` <span class="err">${esc(s.er)}</span>`:''}${s.st!=='done'&&s.act?`<small>${esc(s.act.slice(0,90))}</small>`:''}</div></div>`).join('')+'</div>';
+  h+=`<div class="txt${m.streaming&&m.text?' caret':''}">${md(m.text)}${m.streaming&&!m.text&&!m.reason&&!m.plan?'<span class="dots"><i></i><i></i><i></i></span>':''}</div>`;
+  if(m.err)h+=`<div class="err">⚠ ${esc(m.err)}</div>`;
+  return h+'</div></div>';
+}
+let raf=0;
+function draw(all){
+  $('#hero').style.display=S.ms.length?'none':'';
+  const box=$('#ms');
+  if(all||box.children.length!==S.ms.length){box.innerHTML=S.ms.map(html).join('')}
+  else if(S.ms.length){const l=box.lastElementChild;l.outerHTML=html(S.ms.at(-1))}
+  if(!raf)raf=requestAnimationFrame(()=>{raf=0;const c=$('#chat');if(c.scrollHeight-c.scrollTop-c.clientHeight<160||all)c.scrollTop=c.scrollHeight});
+}
+function ui(){
+  $('#go').className='go'+(S.busy?' stop':'');$('#go').textContent=S.busy?'■':'↑';$('#go').setAttribute('aria-label',S.busy?'Parar':'Enviar');
+  $('#go').disabled=!S.busy&&!$('#in').value.trim();
+  document.body.classList.toggle('code',S.code);$('#m0').classList.toggle('on',!S.code);$('#m1').classList.toggle('on',S.code);
+  const b=$('#bdg');b.style.display=S.act!=='general'?'inline-block':'none';b.textContent='◆ '+S.act;
+  $('#att').style.display=S.att?'block':'none';
+  $('#att').innerHTML=S.att?`<span>${S.att.kind==='image'?'🖼':'📄'} ${esc(S.att.name)}<button data-rmatt aria-label="Remover anexo">✕</button></span>`:'';
+}
+
+/* ---------- Envio ---------- */
+async function send(text){
+  text=text.trim();if(!text||S.busy)return;
+  const c=text.toLowerCase();
+  if(c==='/attach')return $('#fi').click();
+  if(c==='/settings')return openSet();
+  if(c==='/projects'){document.body.classList.remove('nosb');return $('#addp').focus()}
+  if(c==='/clear')return clear();
+  const att=S.att;S.att=null;
+  const u={role:'u',text,att:att?.name},a={role:'a',text:'',streaming:true};
+  S.ms.push(u,a);S.busy=true;$('#in').value='';fit();ui();draw(true);
+  S.ctl=new AbortController();
+  if(!cfg.demo)fetch(cfg.api+'/docker/start',{method:'POST',headers:H()}).catch(()=>{});
+  const body=S.code
+    ?{task:text,session_id:S.sid,project_dir:null,max_steps:25,temperature:.3,model_override:null,stream:true}
+    :{input:text,session_id:S.sid,voice:'M1',lang:'pt',tts:false,tts_output:'client',image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,search_pdfs:false,stream:true};
+  if(att?.kind==='image'&&S.code)a.err='Imagem ignorada: o modo código (/code) não suporta imagens.';
+  try{
+    let it;
+    if(cfg.demo)it=demo(text);
+    else{
+      const r=await fetch(cfg.orch+(S.code?'/code':'/execute'),{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify(body),signal:S.ctl.signal});
+      if(!r.ok||!r.body)throw new Error('HTTP '+r.status);
+      it=sse(r.body);
+    }
+    for await(const f of it){if(S.ctl.signal.aborted)break;frame(a,f);draw()}
+  }catch(e){if(e.name!=='AbortError')a.err=`Orchestrator offline — ${cfg.orch} (${e.message})`}
+  a.streaming=false;S.busy=false;S.ctl=null;draw();ui();
+}
+function clear(){S.ctl?.abort();S.ms=[];S.sid=null;S.busy=false;draw(true);ui()}
+
+/* ---------- Anexos (imagem → base64, texto → document_content) ---------- */
+const TXT=/\.(txt|md|markdown|json|ya?ml|toml|ini|cfg|conf|html?|css|csv|xml|sql|sh|py|js|ts|tsx|jsx|rs|go|java|kt|swift|c|h|cc|cpp|hpp|rb|php|lua|r|scala|dart)$/i;
+function attach(f){
+  if(!f)return;const rd=new FileReader();
+  if(f.type.startsWith('image/')){rd.onload=()=>{S.att={kind:'image',name:f.name,data:String(rd.result).split(',')[1]};ui()};rd.readAsDataURL(f)}
+  else if(f.type.startsWith('text/')||TXT.test(f.name)){rd.onload=()=>{S.att={kind:'doc',name:f.name,data:String(rd.result)};ui()};rd.readAsText(f)}
+  else{const a=S.ms.at(-1);toast(`Tipo não suportado no navegador: ${f.name} (PDF/DOCX exigem o backend)`)}
+}
+function toast(t){const n=$('#sdt');const o=n.textContent;n.textContent=t;setTimeout(()=>n.textContent=o,4000)}
+
+/* ---------- Projetos (escopos de memória) ---------- */
+async function loadProj(){
+  const box=$('#pjs');
+  try{
+    const d=await jf('orch','/projects');S.act=d.active||'general';S.pjs=d.projects||[];
+    box.innerHTML=[{slug:'general',name:'Geral'},...S.pjs].map(p=>`<div class="pj${p.slug===S.act?' on':''}" role="button" tabindex="0" data-slug="${esc(p.slug)}"><span class="dot"></span><span class="nm">${esc(p.name||p.slug)}</span>${p.slug!=='general'?'<button class="x" data-del title="Apagar projeto" aria-label="Apagar projeto">✕</button>':''}</div>`).join('');
+  }catch(e){box.innerHTML=`<div class="hint">${cfg.demo?'Projetos indisponíveis no modo demonstração.':'Orchestrator offline: '+esc(e.message)}</div>`;S.act='general'}
+  ui();
+}
+async function pact(slug){try{slug==='general'?await jf('orch','/projects/deactivate','POST'):await jf('orch','/projects/'+encodeURIComponent(slug)+'/activate','POST')}catch(e){toast(e.message)}loadProj()}
+async function pdel(slug){
+  if(!confirm(`Apagar "${slug}"? Isso remove TODA a memória do projeto (irreversível).`))return;
+  try{await jf('orch','/projects/'+encodeURIComponent(slug),'DELETE')}catch(e){toast(e.message)}loadProj();
+}
+async function pnew(name){try{await jf('orch','/projects','POST',{name})}catch(e){toast(e.message)}loadProj()}
+
+/* ---------- Status do process manager ---------- */
+async function poll(){
+  const i=$('#sd'),t=$('#sdt');
+  if(cfg.demo){i.className='wa';t.textContent='modo demonstração';return}
+  try{const s=await jf('api','/status'),st=String(s.docker?.status||'?'),l=st.toLowerCase();
+    i.className=/run|ativo|ok/.test(l)?'ok':/start|inici/.test(l)?'wa':/err/.test(l)?'er':'';t.textContent='docker '+st}
+  catch{i.className='er';t.textContent='process manager offline'}
+}
+
+/* ---------- Recursos do host (CPU/RAM/GPU) ---------- */
+function setBar(row,bar,text,pct,label,title){
+  const r=$('#'+row),b=$('#'+bar),t=$('#'+text);
+  const p=Math.max(0,Math.min(100,Number(pct)||0));
+  r.classList.toggle('wa',p>=60&&p<85);r.classList.toggle('er',p>=85);
+  b.style.width=p+'%';t.textContent=label;t.title=title||'';
+}
+async function loadStats(){
+  if(cfg.demo){setBar('m-cpu','bcpu','tcpu',0,'demo');setBar('m-ram','bram','tram',0,'demo');setBar('m-gpu','bgpu','tgpu',0,'N/A');return}
+  try{
+    const s=await jf('api','/stats');
+    setBar('m-cpu','bcpu','tcpu',s.cpu_pct,Math.round(s.cpu_pct)+'%',`CPU ${s.cpu_pct.toFixed(1)}%`);
+    setBar('m-ram','bram','tram',s.ram_pct,`${s.ram_used_gb.toFixed(1)}/${s.ram_total_gb.toFixed(1)}G`,`RAM ${s.ram_pct.toFixed(1)}%`);
+    const g=s.gpu||{};
+    if(g.has_gpu){
+      const vram=g.vram_total_mb>0?(g.vram_used_mb/g.vram_total_mb)*100:0;
+      setBar('m-gpu','bgpu','tgpu',g.gpu_pct,`${Math.round(g.gpu_pct)}%`,
+        `GPU ${g.vendor} · uso ${g.gpu_pct.toFixed(1)}% · VRAM ${(g.vram_used_mb/1024).toFixed(1)}/${(g.vram_total_mb/1024).toFixed(1)}GB (${Math.round(vram)}%)`);
+    }else setBar('m-gpu','bgpu','tgpu',0,'N/A','GPU não detectada');
+  }catch{
+    setBar('m-cpu','bcpu','tcpu',0,'—');setBar('m-ram','bram','tram',0,'—');setBar('m-gpu','bgpu','tgpu',0,'—');
+  }
+}
+
+/* ---------- Grafo Hebbiano (:8777) ---------- */
+async function pollGraph(){
+  const a=$('#ograph');
+  try{
+    const s=await jf('api','/graph/status');
+    a.href=s.url;a.classList.toggle('off',!s.online);
+    a.textContent=s.online?'🔗 Grafo de memória':'🔗 Grafo offline';
+    a.title=s.online?'Abrir o visualizador do grafo no navegador':'AVA_GRAPH_UI=1 em Modules/.env sobe o :8777';
+  }catch{
+    a.href=`http://${location.hostname}:8777`;a.classList.add('off');
+    a.textContent='🔗 Grafo offline';a.title='process manager offline';
+  }
+}
+
+/* ---------- Logs do Docker (Ctrl+D) ---------- */
+let logTimer=null;
+async function refreshLogs(){
+  const pre=$('#dll'),meta=$('#dlmeta');
+  try{
+    const r=await jf('api','/docker/logs?tail=200');
+    const lines=Array.isArray(r.lines)?r.lines:[];
+    pre.textContent=lines.length?lines.join('\n'):'(sem linhas)';
+    if(r.error)pre.textContent+=`\n\n[${r.error}]`;
+    meta.textContent=`${r.container||'ava'} · ${lines.length} linha(s)`;
+    const near=pre.scrollHeight-pre.scrollTop-pre.clientHeight<90;
+    if(near)pre.scrollTop=pre.scrollHeight;
+  }catch(e){pre.textContent='Falha ao ler os logs: '+e.message;meta.textContent=''}
+}
+function openLogs(){
+  $('#dl').showModal();refreshLogs();
+  if(logTimer)clearInterval(logTimer);
+  logTimer=setInterval(refreshLogs,2000);
+}
+function closeLogs(){if(logTimer){clearInterval(logTimer);logTimer=null}$('#dl').close()}
+
+/* ---------- Planos (memory :3000) ---------- */
+function renderPlans(){
+  const box=$('#plans');
+  if(!S.plans.length){box.innerHTML='<div class="empty">Nenhum plano ainda — grave pelo plan_recorder.py.</div>';return}
+  box.innerHTML=S.plans.map(p=>`<details class="item" data-id="${p.plan_id}">
+    <summary><span class="nm"><b>${esc(p.name)}</b><span class="sub">v${p.version} · ${(p.steps||[]).length} passo(s)${p.scope?' · '+esc(p.scope):''}</span></span></summary>
+    <input type="text" class="p-name" value="${esc(p.name)}" aria-label="Nome do plano">
+    <textarea class="p-desc" aria-label="Descrição do plano">${esc(p.description||'')}</textarea>
+    <div class="acts"><button data-psave>Salvar</button><button class="danger" data-pdel>Apagar</button></div>
+  </details>`).join('');
+}
+async function loadPlans(){
+  const box=$('#plans');box.innerHTML='<div class="empty">Carregando planos…</div>';
+  try{const d=await jf('mem','/plans/list','POST',{});S.plans=d.plans||[];renderPlans()}
+  catch(e){S.plans=[];box.innerHTML=`<div class="empty">Planos indisponíveis: ${esc(e.message)}</div>`}
+}
+
+/* ---------- Servidores MCP (MCP manager embutido) ---------- */
+const NATIVE_MCP=new Set(['playwright','playwright-mcp','alpha-mcp']);
+const validMcpName=n=>/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(n)&&!n.includes('__');
+function mcpNameFromUrl(url){
+  const rest=url.replace(/^https?:\/\//i,'');
+  const authority=(rest.split(/[/?#]/,1)[0]||'').trim().toLowerCase();
+  return authority.replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-+|-+$/g,'');
+}
+function mcpNameFromCommand(command){
+  const base=(command.trim().split(/[\\/]/).pop()||'').toLowerCase();
+  return base.replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-+|-+$/g,'');
+}
+function splitArgsText(text){
+  const out=[];const re=/"([^"]*)"|'([^']*)'|(\S+)/g;let m;
+  while((m=re.exec(text))!==null)out.push(m[1]??m[2]??m[3]??'');
+  return out;
+}
+function renderMcps(){
+  const box=$('#mcps');
+  if(!S.mcps.length){box.innerHTML='<div class="empty">Nenhum servidor MCP adicionado.</div>';return}
+  box.innerHTML=S.mcps.map(s=>`<div class="item" data-name="${esc(s.name)}">
+    <div class="nm"><b>${esc(s.name)}</b><span class="sub">${esc(s.transport||'?')} · ${Number(s.tools)||0} tool(s)${s.enabled===false?' · desabilitado':''}</span></div>
+    <div class="acts"><button class="danger" data-mdel>Remover</button></div>
+  </div>`).join('');
+}
+async function loadMcps(){
+  const box=$('#mcps');box.innerHTML='<div class="empty">Carregando servidores MCP…</div>';
+  try{
+    const d=await jf('mcp','/servers');
+    S.mcps=(d.servers||[]).filter(s=>!NATIVE_MCP.has(s.name));
+    renderMcps();
+  }catch(e){S.mcps=[];box.innerHTML=`<div class="empty">MCP manager indisponível: ${esc(e.message)}</div>`}
+}
+
+/* ---------- Pessoas / vozes (memory :3000 + orchestrator) ---------- */
+function renderVoices(){
+  const box=$('#voices');
+  if(!S.voices.length){box.innerHTML='<div class="empty">Nenhuma pessoa cadastrada.</div>';return}
+  box.innerHTML=S.voices.map(v=>`<div class="item" data-id="${v.person_id}">
+    <div class="nm"><b>${esc(v.person_name)}</b><span class="sub">${Number(v.examples_count)||0} exemplo(s)</span></div>
+    <div class="sub">${esc(v.description||'sem descrição')}</div>
+    <input type="text" class="v-desc-input" value="${esc(v.description||'')}" placeholder="Descrição da pessoa" aria-label="Descrição de ${esc(v.person_name)}">
+    <div class="acts"><button data-vsave>Salvar descrição</button><button class="danger" data-vdel>Remover</button></div>
+  </div>`).join('');
+}
+async function loadVoices(){
+  const box=$('#voices');box.innerHTML='<div class="empty">Carregando pessoas…</div>';
+  try{const d=await jf('mem','/voice-dict/list');S.voices=d.people||d.voices||[];renderVoices()}
+  catch(e){S.voices=[];box.innerHTML=`<div class="empty">Pessoas indisponíveis: ${esc(e.message)}</div>`}
+}
+/** Grava N segundos no microfone e devolve PCM s16le mono 16kHz em base64
+ * (mesmo contrato do arecord/ffmpeg da TUI, mas direto da WebView). */
+async function recordPcm(seconds){
+  if(!navigator.mediaDevices?.getUserMedia)throw new Error('microfone indisponível neste WebView');
+  const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC){stream.getTracks().forEach(t=>t.stop());throw new Error('Web Audio indisponível')}
+  const ctx=new AC();
+  try{
+    await ctx.resume?.();
+    const src=ctx.createMediaStreamSource(stream);
+    const proc=ctx.createScriptProcessor?ctx.createScriptProcessor(4096,1,1):ctx.createJavaScriptNode(4096,1,1);
+    const chunks=[];
+    proc.onaudioprocess=e=>chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    const mute=ctx.createGain();mute.gain.value=0;
+    src.connect(proc);proc.connect(mute);mute.connect(ctx.destination);
+    await new Promise(r=>setTimeout(r,seconds*1000));
+    src.disconnect();proc.disconnect();mute.disconnect();
+    const rate=ctx.sampleRate;
+    let total=0;for(const c of chunks)total+=c.length;
+    if(!total)throw new Error('nenhum áudio capturado');
+    const flat=new Float32Array(total);let off=0;
+    for(const c of chunks){flat.set(c,off);off+=c.length}
+    const outLen=Math.max(1,Math.floor(total*16000/rate));
+    const pcm=new Int16Array(outLen);
+    for(let i=0;i<outLen;i++){
+      const pos=i*rate/16000,j=Math.floor(pos),f=pos-j;
+      let s=(flat[j]||0)*(1-f)+(flat[j+1]||0)*f;
+      s=Math.max(-1,Math.min(1,s));
+      pcm[i]=s*0x7fff;
+    }
+    const bytes=new Uint8Array(pcm.buffer);let bin='';const CH=0x8000;
+    for(let i=0;i<bytes.length;i+=CH)bin+=String.fromCharCode(...bytes.subarray(i,i+CH));
+    return btoa(bin);
+  }finally{
+    stream.getTracks().forEach(t=>t.stop());
+    try{await ctx.close()}catch{}
+  }
+}
+
+/* ---------- Configurações ---------- */
+const note=t=>$('#sn').textContent=t;
+async function openSet(){
+  $('#c-orch').value=cfg.orch;$('#c-api').value=cfg.api;$('#c-tok').value=cfg.token;$('#c-demo').checked=cfg.demo;$('#c-th').value=cfg.theme;
+  $('#ds').showModal();note('');
+  if(cfg.demo){
+    $('#plans').innerHTML='<div class="empty">Indisponível no modo demonstração.</div>';
+    $('#mcps').innerHTML='<div class="empty">Indisponível no modo demonstração.</div>';
+    $('#voices').innerHTML='<div class="empty">Indisponível no modo demonstração.</div>';
+    return;
+  }
+  const r=await Promise.allSettled([jf('orch','/persona'),jf('orch','/settings/reasoning-effort'),jf('orch','/settings/watch-confidence')]);
+  if(r[0].value)$('#c-per').value=r[0].value.persona||'';
+  if(r[1].value)$('#c-eff').value=r[1].value.effort||'auto';
+  if(r[2].value)$('#c-w').checked=!!r[2].value.enabled;
+  if(r.every(x=>x.status==='rejected'))note('Não foi possível ler as preferências: orchestrator offline.');
+  void loadPlans();void loadMcps();void loadVoices();
+}
+function theme(){const t=cfg.theme;t==='auto'?document.documentElement.removeAttribute('data-t'):document.documentElement.dataset.t=t}
+for(const [id,k] of [['c-orch','orch'],['c-api','api'],['c-tok','token']])$('#'+id).oninput=e=>{cfg[k]=e.target.value.trim().replace(/\/$/,'');keep()};
+$('#c-demo').onchange=e=>{cfg.demo=e.target.checked;keep();poll();loadProj()};
+$('#c-th').onchange=e=>{cfg.theme=e.target.value;keep();theme()};
+$('#sp').onclick=async()=>{try{await jf('orch','/persona','PUT',{persona:$('#c-per').value});note('Persona salva. Vale a partir do próximo turno.')}catch(e){note('Falha: '+e.message)}};
+$('#c-eff').onchange=async e=>{try{await jf('orch','/settings/reasoning-effort','PUT',{effort:e.target.value==='auto'?null:e.target.value});note('Esforço atualizado.')}catch(x){note('Falha: '+x.message)}};
+$('#c-w').onchange=async e=>{try{await jf('orch','/settings/watch-confidence','PUT',{enabled:e.target.checked});note('Memory Watch '+(e.target.checked?'ligado':'desligado')+'.')}catch(x){note('Falha: '+x.message)}};
+$('#cs').onclick=()=>{$('#ds').close();loadProj();poll()};
+
+/* ---------- Ações: planos / MCP / pessoas ---------- */
+$('#plans').onclick=async e=>{
+  const row=e.target.closest('details.item');if(!row)return;
+  const id=Number(row.dataset.id);
+  if(e.target.closest('[data-psave]')){
+    const name=row.querySelector('.p-name').value.trim();
+    const description=row.querySelector('.p-desc').value;
+    if(!name)return toast('O nome do plano não pode ficar vazio.');
+    try{
+      await jf('mem','/plans/update','PATCH',{plan_id:id,new_name:name,description});
+      toast('Plano salvo.');loadPlans();
+    }catch(err){toast('Falha ao salvar plano: '+err.message)}
+  }else if(e.target.closest('[data-pdel]')){
+    const name=row.querySelector('.p-name').value.trim();
+    if(!confirm(`Apagar o plano "${name}"?`))return;
+    try{await jf('mem','/plans/delete','DELETE',{plan_id:id});toast('Plano apagado.');loadPlans()}
+    catch(err){toast('Falha ao apagar plano: '+err.message)}
+  }
+};
+
+function syncMcpForm(){
+  const kind=$('#mcp-kind').value;
+  $('#mcp-args-wrap').style.display=kind==='stdio'?'block':'none';
+  $('#mcp-target-label').textContent=kind==='npm'?'Pacote npm':kind==='http'?'URL do servidor (http/https)':'Comando do executável';
+  $('#mcp-target').placeholder=kind==='npm'?'@modelcontextprotocol/server-filesystem':kind==='http'?'http://localhost:4010/mcp':'python';
+}
+$('#mcp-kind').onchange=syncMcpForm;syncMcpForm();
+
+$('#mcps').onclick=async e=>{
+  const row=e.target.closest('[data-name]');if(!row||!e.target.closest('[data-mdel]'))return;
+  const name=row.dataset.name;
+  if(!confirm(`Remover o servidor MCP "${name}" e as tools dele do grafo?`))return;
+  try{await jf('mcp','/servers/'+encodeURIComponent(name),'DELETE');toast(`${name} removido.`);loadMcps()}
+  catch(err){toast('Falha ao remover MCP: '+err.message)}
+};
+
+$('#mcp-add-btn').onclick=async()=>{
+  const kind=$('#mcp-kind').value,target=$('#mcp-target').value.trim();
+  const summary=$('#mcp-sum').value.trim(),nameInput=$('#mcp-name').value.trim();
+  const out=$('#mcp-note');out.textContent='';
+  if(!target){out.textContent='Informe o pacote/URL/comando.';return}
+  const btn=$('#mcp-add-btn');btn.disabled=true;
+  try{
+    if(kind==='npm'){
+      const res=await jf('mcp','/servers/install','POST',{package:target,...(nameInput?{name:nameInput}:{}),...(summary?{skill_summary:summary}:{})});
+      out.textContent=`✓ ${res.name||target} instalado/sincronizado.`;
+    }else{
+      const name=nameInput||(kind==='http'?mcpNameFromUrl(target):mcpNameFromCommand(target));
+      if(!validMcpName(name))throw new Error("nome inválido — use letras, números, '-' ou '_' (sem '__')");
+      const body={name,transport:kind,...(kind==='http'?{url:target}:{command:target,args:splitArgsText($('#mcp-args').value)}),...(summary?{skill_summary:summary}:{})};
+      await jf('mcp','/servers','POST',body);
+      try{await jf('mcp','/servers/'+encodeURIComponent(name)+'/sync','POST');out.textContent=`✓ ${name} registrado e sincronizado.`}
+      catch(err){out.textContent=`✓ ${name} registrado — sync falhou: ${err.message}`}
+    }
+    $('#mcp-target').value='';$('#mcp-args').value='';$('#mcp-name').value='';$('#mcp-sum').value='';
+    loadMcps();
+  }catch(err){out.textContent='✗ '+err.message}
+  finally{btn.disabled=false}
+};
+
+$('#voices').onclick=async e=>{
+  const row=e.target.closest('[data-id]');if(!row)return;
+  const id=Number(row.dataset.id);
+  if(e.target.closest('[data-vsave]')){
+    try{await jf('mem','/voice-dict/'+id,'PATCH',{description:row.querySelector('.v-desc-input').value});toast('Descrição salva.');loadVoices()}
+    catch(err){toast('Falha ao salvar pessoa: '+err.message)}
+  }else if(e.target.closest('[data-vdel]')){
+    const name=row.querySelector('b')?.textContent||`#${id}`;
+    if(!confirm(`Remover "${name}" e todos os embeddings de voz (DB + FAISS)?`))return;
+    try{await jf('mem','/voice-dict/'+id,'DELETE');toast(`${name} removida.`);loadVoices()}
+    catch(err){toast('Falha ao remover pessoa: '+err.message)}
+  }
+};
+
+$('#v-rec').onclick=async()=>{
+  const btn=$('#v-rec'),noteEl=$('#v-note');
+  const name=$('#v-name').value.trim(),description=$('#v-desc').value.trim();
+  if(!name){noteEl.textContent='Informe o nome da pessoa.';return}
+  if(btn.disabled)return;
+  btn.disabled=true;noteEl.textContent='Abrindo microfone…';
+  let left=5;btn.textContent=`● Gravando… ${left}s`;
+  const timer=setInterval(()=>{left--;btn.textContent=`● Gravando… ${Math.max(0,left)}s`},1000);
+  try{
+    const audio=await recordPcm(5);
+    noteEl.textContent='Enviando embedding…';
+    const r=await jf('orch','/voice/register','POST',{person_name:name,description,audio_b64:audio,sample_rate:16000});
+    noteEl.textContent=`✓ embedding gravado (id ${r.embedding_id??'?'}) — ${r.new_person?'pessoa nova':'exemplo adicional'}${r.memory_id?` · memória #${r.memory_id}`:''}`;
+    $('#v-name').value='';$('#v-desc').value='';
+    loadVoices();
+  }catch(err){noteEl.textContent='✗ '+(err.name==='NotAllowedError'?'permissão de microfone negada':err.message)}
+  finally{clearInterval(timer);btn.disabled=false;btn.textContent='● Gravar 5s e cadastrar'}
+};
+
+/* ---------- Logs do Docker / polling ---------- */
+$('#olog').onclick=openLogs;
+$('#cl').onclick=closeLogs;
+$('#dl').addEventListener('close',()=>{if(logTimer){clearInterval(logTimer);logTimer=null}});
+loadStats();pollGraph();
+setInterval(()=>{if(!document.hidden)loadStats()},2000);
+setInterval(()=>{if(!document.hidden)pollGraph()},10000);
+
+/* ---------- Eventos ---------- */
+const inp=$('#in');
+function fit(){inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,220)+'px'}
+inp.oninput=()=>{fit();ui()};
+inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send(inp.value)}};
+inp.onpaste=e=>{const f=[...e.clipboardData.files][0];if(f){e.preventDefault();attach(f)}};
+$('#go').onclick=()=>S.busy?S.ctl?.abort():send(inp.value);
+$('#clip').onclick=()=>$('#fi').click();
+$('#fi').onchange=e=>{attach(e.target.files[0]);e.target.value=''};
+$('#nw').onclick=clear;$('#oset').onclick=openSet;
+$('#tsb').onclick=()=>document.body.classList.toggle('nosb');
+$('#m0').onclick=()=>{S.code=false;ui()};$('#m1').onclick=()=>{S.code=true;ui()};
+$('#thm').onclick=()=>{const d=getComputedStyle(document.body).colorScheme==='dark';cfg.theme=d?'light':'dark';keep();theme()};
+$('#addp').onclick=()=>{const n=$('#np');n.style.display='block';n.focus()};
+$('#np').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim()){pnew(e.target.value.trim());e.target.value='';e.target.style.display='none'}if(e.key==='Escape')e.target.style.display='none'};
+$('#pjs').onclick=e=>{const p=e.target.closest('.pj');if(!p)return;e.target.closest('[data-del]')?pdel(p.dataset.slug):pact(p.dataset.slug)};
+$('#pjs').onkeydown=e=>{if(e.key==='Enter'&&e.target.classList.contains('pj'))pact(e.target.dataset.slug)};
+$('#chat').onclick=e=>{
+  if(e.target.closest('[data-think]')){S.full=!S.full;draw(true)}
+  const c=e.target.closest('[data-copy]');
+  if(c){navigator.clipboard?.writeText(c.closest('.cbw').querySelector('code').textContent);c.textContent='Copiado';setTimeout(()=>c.textContent='Copiar',1500)}
+};
+$('#att').onclick=e=>{if(e.target.closest('[data-rmatt]')){S.att=null;ui()}};
+let dc=0;const mn=$('main');
+mn.ondragenter=e=>{e.preventDefault();dc++;mn.classList.add('drop')};
+mn.ondragleave=()=>{if(--dc<=0){dc=0;mn.classList.remove('drop')}};
+mn.ondragover=e=>e.preventDefault();
+mn.ondrop=e=>{e.preventDefault();dc=0;mn.classList.remove('drop');attach(e.dataTransfer.files[0])};
+document.addEventListener('keydown',e=>{
+  if(!(e.ctrlKey||e.metaKey))return;const k=e.key.toLowerCase();
+  const m={k:()=>{S.code=!S.code;ui()},e:()=>{S.full=!S.full;draw(true)},d:()=>{$('#dl').open?closeLogs():openLogs()},s:openSet,p:()=>{document.body.classList.remove('nosb');$('#addp').click()},l:clear};
+  if(m[k]){e.preventDefault();m[k]()}
+});
+
+theme();ui();draw(true);loadProj();poll();setInterval(()=>{if(!document.hidden)poll()},5000);
+if(innerWidth<=760)document.body.classList.add('nosb');
+</script>
+</body>
+</html>
