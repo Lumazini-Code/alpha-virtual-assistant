@@ -767,6 +767,15 @@ install_patched_playwright_extension_linux() {
     return 1
   fi
 
+  # Se o Chrome já removeu/blocklistou o ID, o external extension não
+  # reinstala nem com CRX novo. Só é seguro editar o Preferences com o
+  # Chrome fechado — o script recusa e o aviso fica para o final.
+  if [ -f "$INSTALL_DIR/scripts/clear_playwright_extension_blocklist.py" ]; then
+    python3 "$INSTALL_DIR/scripts/clear_playwright_extension_blocklist.py" \
+      --id "$ext_id" >/dev/null 2>&1 || \
+      warn "Bloqueio de external extension não pôde ser limpo agora (Chrome aberto?)."
+  fi
+
   set_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN "$ext_token"
   set_env_var PLAYWRIGHT_MCP_EXTENSION_ID "$ext_id"
   PLAYWRIGHT_PATCHED=1
@@ -1376,6 +1385,10 @@ info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
 info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log — inclui o MCP manager embutido)"
 info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
 
+if [ "$PLAYWRIGHT_PATCHED" -eq 1 ]; then
+  info "Se a extensão não aparecer em chrome://extensions, feche o Chrome e rode:"
+  info "  python3 $INSTALL_DIR/scripts/clear_playwright_extension_blocklist.py"
+fi
 if [ "$PLAYWRIGHT_PATCHED" -eq 1 ] && [ "$PLAYWRIGHT_CHROME_WAS_RUNNING" -eq 1 ]; then
   warn "A extensão Playwright patcheada só é carregada quando o Chrome reiniciar."
   warn "Feche e reabra o Chrome; depois sincronize as tools do Playwright:"
