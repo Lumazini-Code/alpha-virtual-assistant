@@ -35,6 +35,13 @@ required-features = ["webapp"]
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
+# Linux: o diálogo de pasta usa GTK direto na thread principal do tao/WebKit.
+# NÃO usar rfd/gtk3 aqui: ele inicializa GTK numa thread própria, o que
+# conflita com o GTK já inicializado pelo tao e derruba o processo.
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# Windows/macOS: backend nativo do rfd, sem xdg-portal/async-std.
+rfd = { version = "0.15", default-features = false }
 
 [build-dependencies]
 # Ícone do .exe (Explorer/taskbar) no target Windows; ignorado no Linux.

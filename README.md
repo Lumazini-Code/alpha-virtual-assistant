@@ -2,22 +2,22 @@
 
 > **Any model. Every tool. Zero limits.**
 
-Assistente de IA pessoal: uma TUI reativa em Node/Bun, um Manager em Rust na bandeja do sistema (com chat widget ativado por wake word), um backend Python de microserviços orquestrado via Docker, um **mcp_manager standalone em Rust** e um **pipeline de voz em C++** — ambos rodando no host sob supervisão do tray. Inferência via **OpenRouter** (qualquer modelo), memória de longo prazo em **grafo hebbiano**, **voz** (wake word + ASR streaming + identificação de falante + TTS streaming), **busca web** como servidor MCP próprio e **tools MCP extensíveis** em runtime.
+Assistente de IA pessoal: uma **WebUI nativa** em Rust/WebKit (`Manager/ava-web`) com TUI opcional em Node/Bun, um Manager em Rust na bandeja do sistema (com chat widget ativado por wake word), um backend Python de microserviços orquestrado via Docker, um **mcp_manager embutido no tray** e um **pipeline de voz em C++** — ambos rodando no host sob supervisão do tray. Inferência via **OpenRouter** (qualquer modelo), memória de longo prazo em **grafo hebbiano**, **voz** (wake word + ASR streaming + identificação de falante + TTS streaming), **busca web** como servidor MCP próprio e **tools MCP extensíveis** em runtime.
 
 ---
 
 ## Arquitetura
 
-O sistema é dividido entre o **container Docker** (serviços Python sem acesso a microfone/Chrome/servidores MCP stdio) e o **host** (TUI, tray, mcp_manager Rust e pipeline de voz C++ — coisas que precisam de microfone, navegador e execução real na máquina do usuário).
+O sistema é dividido entre o **container Docker** (serviços Python sem acesso a microfone/Chrome/servidores MCP stdio) e o **host** (WebUI nativa `ava-web`, tray, mcp_manager Rust embutido e pipeline de voz C++ — coisas que precisam de microfone, navegador, filesystem e execução real na máquina do usuário). A TUI em Ink continua disponível como interface opcional.
 
 ```
 ┌──────────────────────────────── HOST ────────────────────────────────────────┐
 │                                                                              │
-│  TUI (TypeScript/Ink, binário standalone via Bun)   Manager Rust (ava-tray)  │
-│  comando: alpha-ai                                  tray + UI egui + chat    │
-│    │  POST :9001/docker/start (a cada pergunta)     widget; REST API :9001   │
-│    │  POST :9000/execute (SSE, por turno)           /docker /browser /mcp    │
-│    │                                                /status                  │
+│  WebUI nativa (Manager/ava-web, WebKitGTK/WebView2)  Manager Rust (ava-tray)│
+│  comando: alpha-ai (chat, grafo, CWD dos MCPs)       tray + API REST :9001   │
+│  TUI opcional (TypeScript/Ink, build Bun)            /docker /browser /mcp   │
+│    │  POST :9001/docker/start (a cada pergunta)      /fs/cwd /status         │
+│    │  POST :9000/execute (SSE, por turno, cwd opcional)                      │
 │    │  + Bearer AVA_INTERNAL_TOKEN em tudo                                    │
 │    ▼                                                     │                   │
 │  ┌────────────── Container "ava" (Python, FastAPI) ──────┼────────────────┐  │
@@ -47,12 +47,12 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 
 ### Fluxo de uma pergunta (texto)
 
-1. **Entrada**: a TUI ou o **chat widget do Manager** envia o turno ao orchestrator: `POST :9000/execute` (SSE), com `source` (`"tui"` / `"chat"`) e Bearer token interno.
+1. **Entrada**: a **WebUI nativa (`ava-web`)**, a TUI opcional ou o chat da bandeja envia o turno ao orchestrator: `POST :9000/execute` (SSE), com `source` (`"tui"` / `"chat"`) e Bearer token interno. A WebUI envia também `cwd` — a pasta de trabalho escolhida para o projeto ativo, usada pelos MCPs stdio daquele turno.
 2. **Pré-loop**: o orchestrator garante a sessão de memória, consome o cache de contexto de voz (se houver embedding de falante pré-ingestado) e faz o recall inicial de memórias.
 3. **Inferência**: o histórico + tools vão ao **LLM.py** (:4003), que chama o OpenRouter com function-calling nativo.
 4. **Tools**: o loop resolve as chamadas em duas frentes:
    - **Nativas** (`list_plans`, `run_plan`, `memory_search`, `vision_objects` quando habilitada) — registradas direto no orchestrator;
-   - **MCP** — descoberta em duas etapas via mcp_manager :9001 (grafo de co-uso escolhe os servidores → carrega as tools reais → executa via REST). Antes de tools de browser, o orchestrator pede o Chrome ao tray (que o abre apenas se não estiver aberto).
+   - **MCP** — descoberta em duas etapas via mcp_manager :9001 (grafo de co-uso escolhe os servidores → carrega as tools reais → executa via REST). O `cwd` do turno vai junto na chamada; o tray valida o caminho no host e spawna/respawna o servidor stdio nele. Antes de tools de browser, o orchestrator pede o Chrome ao tray (que o abre apenas se não estiver aberto).
 5. **Memória**: leituras/escritas no **grafo hebbiano** (memory_api :3000) durante o loop — recall, correção e extração de novas memórias.
 6. **Resposta final**: o texto encerra o turno (não existe tool "finish") e dispara **TTS automático** quando o cliente pediu áudio. Todos os eventos (delta, tool_call, done) são espelhados no **Conversation Hub** (`GET /conversation/stream`, SSE), que alimenta o chat widget do Manager em tempo real.
 
@@ -62,7 +62,7 @@ O sistema é dividido entre o **container Docker** (serviços Python sem acesso 
 2. A **wake word** ("Alpha", via sherpa-onnx KeywordSpotter) é detectada; com `WAKE_GATE_ASR=true` o ASR só abre depois dela — o áudio acumulado da frase (incluindo a wake word) é reenviado ao ASR de uma vez. Frases sem wake word não gastam nenhuma inferência.
 3. O ASR streaming (nemotron 0.6B GGUF, cache-aware com lookahead) transcreve o comando; a wake word **abre o chat widget do Manager**.
 4. O **speaker embedding CAM++ (192 dims)** é enviado ao orchestrator via `POST /voice/ingest` — fora do caminho crítico do turno. O orchestrator pré-busca a memória de voz (kNN no `voice_dict`) e injeta no próximo `/execute` com custo 0 ms.
-5. Cadastro de voz: pela TUI (Settings → Vozes), o microfone é gravado N segundos (`arecord`/`parec`/`ffmpeg`, Linux) e o embedding é gerado via `POST /voice/register` → `POST /speaker/embed` (:9100) → gravado no `voice_dict` (memory :3000).
+5. Cadastro de voz: pela WebUI/TUI (Configurações → Vozes), o microfone é gravado N segundos (`arecord`/`parec`/`ffmpeg`, Linux) e o embedding é gerado via `POST /voice/register` → `POST /speaker/embed` (:9100) → gravado no `voice_dict` (memory :3000).
 6. A resposta final dispara **TTS automático** (Supertonic :3004) quando habilitado — o modelo nunca chama TTS.
 
 O único jeito de encerrar o turno é **responder em texto puro** — não existe tool de "finish".
@@ -80,7 +80,7 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - **Memory-watch**: monitor de correção de memória — se a nova resposta contradiz uma memória usada, classifica (confirmação/complementação/correção) e reescreve o prefill da retomada.
 - **Extração pós-resposta** de memórias de longo prazo, forçada por JSON schema.
 - **Conversation Hub**: SSE com todos os eventos dos turnos (`/conversation/stream`) + catch-up por id (`/conversation/recent`) — reconexão do chat widget do Manager sem perder eventos.
-- **Persona editável em runtime**: `GET/PUT /persona` no orchestrator — a 1ª linha do system prompt vive em `resource/persona.json` e é trocada pela TUI (Settings → Persona) sem restart (a cláusula de tools é sempre anexada pelo orchestrator).
+- **Persona editável em runtime**: `GET/PUT /persona` no orchestrator — a 1ª linha do system prompt vive em `resource/persona.json` e é trocada pela WebUI/TUI (Configurações → Persona) sem restart (a cláusula de tools é sempre anexada pelo orchestrator).
 
 ### Agent Skills (SKILL.md) — playbooks no padrão skills.sh
 - Skills no padrão **Agent Skills** (o mesmo do CLI `skills` do npm: `npx skills add owner/repo`) são lidas **direto do disco** (mounts ro no container — `npx skills` roda no host, o container enxerga na hora). Os dois instaladores já fazem a instalação automática: etapa 3b instala o pacote hyperframes (`npx --yes skills add heygen-com/hyperframes -a universal -y` — `-a universal` grava só em `.agents/skills` (store canônico, sem linkar em `.claude`/`.cursor`/etc), `-y` pula os prompts, re-run é idempotente e falha (rede) é aviso, não morte) e a etapa 3c instala o **OfficeCLI** (`npm install -g @officecli/officecli`, prefix do usuário; no Linux com node de apt/pacman usa `as_root`) + a skill `officecli` baixada de `officecli.ai/SKILL.md` direto para o store (temp + `mv` — SKILL.md truncado não entra no índice). Duas origens instaladas pelo usuário + uma criada em runtime, mesma mecânica:
@@ -97,11 +97,11 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - Curto prazo (SQLite) + longo prazo (LanceDB vetorial) + **grafo de memórias e tools** com arestas que se **reforçam por co-uso e co-ativação** (regra hebbiana), com auto-link na escrita e decay podando o que esquece.
 - Busca semântica com **E5 multilingual** (ONNX, onnxManager :2002) + **rerank cross-encoder** (ms-marco MiniLM) + **Personalized PageRank** com spread de ativação + MMR (inibição lateral).
 - **Grafo de tools (ToolsDB)**: cada tool MCP tem um snippet (o "skill.md" dela); o selector de servidores usa kNN + PPR no grafo de co-uso para escolher **quais** servidores carregar por rodada (economia de contexto com servidores de 20+ tools), com **cota de 4 tools por servidor** (um servidor grande não monopoliza o kNN), **exemplos de uso aprendidos** pós-turno (a query vira vetor "learned") e **self-heal** de vetores perdidos (re-embeda pelo doc_hash).
-- **Dicionários sensoriais** integrados: `visual_dict` (significado de objetos), `face_dict` (rostos) e `voice_dict` (vozes cadastradas pela TUI) — embeddings consultados por kNN, texto pesquisável pela leitura normal de memória.
+- **Dicionários sensoriais** integrados: `visual_dict` (significado de objetos), `face_dict` (rostos) e `voice_dict` (vozes cadastradas pela WebUI/TUI) — embeddings consultados por kNN, texto pesquisável pela leitura normal de memória.
 - **Cards de pessoa (`people-card`)**: unificam rostos + vozes em um card textual (descrição, likes, religião, infos extras) com **memória de identidade** no grafo (nó estável que ancora as arestas) — criados/editados pelo alpha-mcp (`memory_people_card_*`) e lidos como memória normal.
 - **Card de identidade da Alpha (`GET/PATCH /identity`)**: card singleton com quem a própria assistente é (nome, descrição, papéis/valores, infos extras), **semeado no boot** a partir de `resource/persona.json` e ligado à sua **memória de identidade LT** — no viewer vira o nó ★ dourado `a{id}` com aresta `identity_memory`; editado pelo alpha-mcp (`memory_identity_*`).
 - **RAG de arquivos locais (`indexed-file`)**: cadastro com hash SHA-256 (reindexa só o que mudou), chunking 500/100 com posição (`char_start/end`) e leitura em 3 modos — arquivo inteiro por path, chunks daquele arquivo ranqueados pela query, ou busca semântica global.
-- **Planos persistidos** (`/plans/*`) com CRUD pela TUI e pelo `plan_recorder`.
+- **Planos persistidos** (`/plans/*`) com CRUD pela WebUI/TUI e pelo `plan_recorder`.
 - Visualização **em tempo real** do grafo **embutida no WebUI do Manager**: `graph_activation.py` roda como worker headless (stdio, sob demanda) e o `vis-network` renderiza no próprio documento; nós de memória, **tools como hexágonos** (`t{id}`) e **planos como diamantes** (`p{id}`), com arestas nascendo/reforçadas/podadas ao vivo.
 
 ### Visão (vision.py) — desligada por padrão
@@ -112,32 +112,40 @@ O pipeline completo (**Depth Anything V2** → clusterização por camadas → *
 - **Pipeline C++ no host** (transcribe): wake word + ASR streaming + speaker verification, com gate de ASR por wake word (nenhuma inferência gasta sem comando). Supervisionado pelo tray como um processo do host (liveness por pid, restart-on-fail).
 - **Identificação de falante**: embeddings CAM++ pré-ingestados injetam "quem está falando" no turno — o assistente sabe diferenciar usuários cadastrados no `voice_dict`.
 - **TTS** (Supertonic, :3004): pipeline estilo Piper (worker pool, fila de texto, heap de áudio ordenado, miniaudio 40 ms): `/speak`, `/stream` (síntese paralela por sentença em ordem), `/cancel`. Disparado automaticamente sobre a resposta final; o modelo nunca decide chamar TTS.
-- **Cadastro de vozes pela TUI** (Settings → Vozes): gravação local de microfone, edição de descrição, listagem — tudo via `voice_dict` na memory API.
+- **Cadastro de vozes pela WebUI/TUI** (Configurações → Vozes): gravação local de microfone, edição de descrição, listagem — tudo via `voice_dict` na memory API.
 
 ### Busca web (alpha-mcp)
-O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/alpha-mcp`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — falando direto com a memory API. E as tools de **criação duradoura** falam com o **orchestrator** (:9000, Bearer interno): `project_create` (cria e **ATIVA** um escopo de memória próprio — memórias LT, grafo e planos isolados; mesmo fluxo da TUI: criou → entrou) + `project_list`; `skill_create` (cria skill SKILL.md em `.agents/skills-created/` com re-sync do índice na hora — ver **Agent Skills**) + `skill_list` (catálogo completo).
+O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/alpha-mcp`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — falando direto com a memory API. E as tools de **criação duradoura** falam com o **orchestrator** (:9000, Bearer interno): `project_create` (cria e **ATIVA** um escopo de memória próprio — memórias LT, grafo e planos isolados; mesmo fluxo da WebUI/TUI: criou → entrou) + `project_list`; `skill_create` (cria skill SKILL.md em `.agents/skills-created/` com re-sync do índice na hora — ver **Agent Skills**) + `skill_list` (catálogo completo).
 
 ### Tools MCP (extensibilidade)
 - **mcp_manager reescrito em Rust e EMBUTIDO no tray** (`Manager/src/mcp_server.rs`) rodando **NO HOST**, fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome do usuário). Suas rotas são servidas no MESMO listener da API do tray (:9001) — não existe mais binário standalone nem processo supervisionado.
 - O orchestrator é **cliente REST** dele: registro, sync, listagem de tools e **execução** (`/servers/{name}/call`) ficam todos lá; este processo nunca spawna servidores MCP nem segura sessões.
-- Servidores são registrados/sincronizados/removidos **em runtime** — inclusive pela **TUI** (instalação assistida de servidores remotos, comandos locais pip/uv e endpoints localhost), sem reiniciar nada.
+- **CWD por turno**: a WebUI envia `cwd` no `/execute`; o orchestrator repassa o valor em cada `/servers/{name}/call`. O tray valida o caminho no host (o orchestrator roda no container e não enxerga o filesystem do host) e aplica `current_dir` no spawn do servidor **stdio**. Sem seleção, o padrão é a pasta base do usuário (`HOME`/`USERPROFILE`). Trocar de pasta derruba e respawna a sessão stdio daquele servidor; servidores **http** ignoram o CWD.
+- A pasta escolhida **persiste por projeto** em `cache/webui_cwd.json` (chave = slug do projeto ativo) e é restaurada entre sessões. Os endpoints `GET/PUT/DELETE /fs/cwd` do tray gerenciam esse estado e só aceitam conexões loopback.
+- Servidores são registrados/sincronizados/removidos **em runtime** — inclusive pela **WebUI** e pela **TUI opcional** (instalação assistida de servidores remotos, comandos locais pip/uv e endpoints localhost), sem reiniciar nada.
 - **Playwright MCP** pré-configurado com `--extension`: conecta ao **Chrome real do usuário** via extensão "Playwright MCP Bridge" (instalada no perfil padrão). O orchestrator pede o Chrome ao tray, que o abre **apenas se ele não estiver aberto** — em modo normal, sem CDP nem cópia de perfil — e **o Chrome fica aberto** após as ações (processo detached do host, sobrevive ao docker). Suas sessões/logins do Chrome valendo. A autenticação da extensão é automática: o token `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (`Modules/.env`) é injetado pelo tray no mcp_manager e herdado pelo servidor MCP — sem diálogo de aprovação por conexão.
 - **Windows**: URLs de servidores http cadastradas como `localhost:PORTA` são reescritas para `host.docker.internal` no momento da conexão (porta e path preservados).
 
 ### Manager Rust (ava-tray)
 - Ícone na **bandeja do sistema** (GTK/Linux, tray nativo no Windows) + janela de status (egui) com start/stop do docker, status do mcp_manager e do transcript.
-- **Chat widget**: abre com a wake word "Alpha" (detectada pelo pipeline de voz) ou manualmente; envia turnos escritos ao orchestrator (`source="chat"`, sem TTS — a fala é papel da TUI/voz) e consome o Conversation Hub (SSE) para renderizar a resposta em tempo real.
-- API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager), `/transcript/*` (start/stop/status do pipeline de voz) e `POST /ui/chat-open` (wake word do transcribe → abre o chat widget).
+- **Chat widget**: abre com a wake word "Alpha" (detectada pelo pipeline de voz) ou manualmente; envia turnos escritos ao orchestrator (`source="chat"`, sem TTS — a fala é papel da WebUI/TUI/voz) e consome o Conversation Hub (SSE) para renderizar a resposta em tempo real.
+- API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager), `/transcript/*` (start/stop/status do pipeline de voz), `/fs/cwd` (GET/PUT/DELETE do CWD por projeto, loopback-only) e `POST /ui/chat-open` (wake word do transcribe → abre o chat widget).
 - **Supervisão de processos do host**: transcript (:9100) — discover → spawn → health check periódico → restart-on-fail. (O mcp_manager não é mais um processo: é embutido no tray.) Variáveis de auth/config lidas do `Modules/.env`.
 - **Timer de inatividade**: `docker down` após 45 min sem perguntas (configurável via `AVA_DOCKER_IDLE_MINUTES`).
 - **Chrome do usuário** sob demanda: aberto em **modo normal** (perfil padrão, sem `--remote-debugging-port`) apenas **se o Chrome não estiver aberto** — spawn detached, sem cópia de perfil e sem cache `chrome-profile-cdp`.
 
-### TUI (terminal, Ink/React)
+### WebUI (Manager/ava-web)
+- Janela nativa com WebView (`ava-web`) carregando o WebUI servido pelo tray em `:9001`: chat com streaming SSE, grafo hebbiano embutido, projetos e configurações (servidores MCP, vozes, planos, Docker).
+- **Seletor de pasta de trabalho dos MCPs**: o botão `📁`/chip de pasta abre o **diálogo nativo do sistema** (GTK na thread principal no Linux; `rfd` nativo no Windows/macOS). A escolha é enviada no `cwd` de cada `/execute`.
+- O CWD é **por projeto ativo** e persistido entre sessões em `cache/webui_cwd.json`. Ao trocar de projeto, a pasta salva daquele projeto é restaurada; sem pasta configurada, usa a base do usuário (`~`/`C:\Users\%USERNAME%`).
+- A seleção nativa existe apenas dentro do `ava-web`; não há fallback de navegador de pastas em HTML.
+
+### TUI (terminal, Ink/React) — opcional
 - Chat com streaming SSE, planos de execução (CoT) renderizados, timeline de tool calls e linha de status dos processos.
 - Painel de **status** (CPU/RAM/GPU via systeminformation), painel de **logs do Docker** ao vivo (`Ctrl+D`), painel de **settings** (`Ctrl+S` ou `/settings`) com gestão de **servidores MCP** (instalação assistida npm/http/stdio e remoção), **vozes** (cadastro por microfone, edição de descrição e remoção), **planos** (lista/edição versionada) e **persona** editável, links para o grafo.
 - Comando `/image <caminho>` para anexar imagens à conversa (vão direto ao modelo multimodal).
 - **Autenticação interna**: toda requisição leva `Authorization: Bearer <AVA_INTERNAL_TOKEN>` (token do `Modules/.env` gerado pelo install.sh; nunca logado).
-- **Binário standalone** (~80 MB, cross-compile Bun) — não exige Node no usuário.
+- **Binário standalone** (~80 MB, cross-compile Bun) — não exige Node no usuário. O instalador atual aponta `alpha-ai` para o WebUI; a TUI fica disponível no release em `tui/alpha-ai`.
 
 ---
 
@@ -173,9 +181,9 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   │   └── linux/ windows/  #   builds por plataforma
 │   └── Models/              # Pesos ONNX/GGUF (gitignored; via Models.zip)
 ├── mcp_servers/alpha-mcp/   # alpha-mcp (SearXNG→BM25→Crawl4AI, :4010)
-├── Manager/                 # ava-tray (Rust: axum + eframe + tray-icon, :9001)
+├── Manager/                 # ava-tray (Rust: axum + eframe + tray-icon, :9001) + ava-web (WebUI nativa)
 │   └── src/                 #   api, chat (widget), transcript, mcp_manager, idle_watcher…
-├── src/                     # TUI (TypeScript/Ink; build Bun)
+├── src/                     # TUI opcional (TypeScript/Ink; build Bun)
 │   └── lib/                 #   auth (Bearer), voiceRecorder, voices, mcpServers, plans…
 ├── resource/                # ícones, settings do SearXNG, config alpha-mcp
 ├── docker-compose.yml       # stack base (+ overrides .linux/.windows)
@@ -212,7 +220,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - Docker Engine + plugin compose v2; arquitetura **x86_64**.
 - ~2,5 GB livres além do Docker (pesos extraídos) e internet no primeiro boot (build + download do Supertonic no HF).
 - Áudio e GPU são **opcionais** — tudo roda em CPU (ONNX Runtime). Otimizações de memória já embutidas (`MALLOC_ARENA_MAX`, threads limitados do ONNX/Supertonic): o stack rodou de ~4,5 GB para ~1,4 GB — e, com o **perfil econômico** do instalador (default), fica em **~500 MB** sem voz (LLM + grafo mesclados no processo do orchestrator, TTS/graph UI/voz desligados, web stack on-demand). Voz ligada: ~1,1 GB.
-- Para voz: microfone + `arecord`/`parec`/`ffmpeg` no Linux (gravação de voz na TUI ainda não suportada no Windows — o pipeline C++ de voz contínua tem build para ambas as plataformas). A voz é **opt-in**: `AVA_VOICE=1` em `Modules/.env` (o tray pulando o transcript economiza ~600 MB de RAM no host; `POST /transcript/start` sobe manualmente sem reiniciar nada).
+- Para voz: microfone + `arecord`/`parec`/`ffmpeg` no Linux (gravação de voz pela WebUI/TUI ainda não suportada no Windows — o pipeline C++ de voz contínua tem build para ambas as plataformas). A voz é **opt-in**: `AVA_VOICE=1` em `Modules/.env` (o tray pulando o transcript economiza ~600 MB de RAM no host; `POST /transcript/start` sobe manualmente sem reiniciar nada).
 
 ## Instalação
 
@@ -227,7 +235,7 @@ curl -fsSL -o /tmp/alpha-install.sh \
 curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\install.bat"
 ```
 
-O instalador pede o provider de inferência (`LLM_BASE_URL` — Enter = OpenRouter; `LLM_API_KEY` só se o provider não for local) e gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles.
+O instalador pede o provider de inferência (`LLM_BASE_URL` — Enter = OpenRouter; `LLM_API_KEY` só se o provider não for local) e gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles. No Linux ele cria o comando `alpha-ai` apontando para `Manager/ava-web`; no Windows, um wrapper `alpha-ai.cmd` que abre `Manager\ava-web.exe`.
 
 **Modo teste (antes do release oficial)**: com a env var `ALPHA_RELEASE_ZIP` apontando para um zip local, o instalador pula o GitHub inteiro e instala desse zip — mesmo fluxo, mesma validação:
 
@@ -243,9 +251,9 @@ $env:ALPHA_RELEASE_ZIP = 'C:\caminho\alpha-ai-windows.zip'; .\install.ps1
 ## Uso
 
 ```bash
-alpha-ai          # abre a TUI
+alpha-ai          # abre a WebUI nativa (Manager/ava-web)
 ```
-Digite a pergunta no terminal (o ambiente sobe sozinho sob demanda). Ou simplesmente **fale "Alpha"** — o pipeline de voz detecta a wake word, transcreve o comando e abre o chat widget do Manager. `/image <caminho>` anexa uma imagem; `?`/painéis para status, logs do Docker, settings (servidores MCP, vozes) e o grafo.
+Digite a pergunta no chat da WebUI (o ambiente sobe sozinho sob demanda) e use o botão `📁` para escolher a pasta de trabalho dos MCPs do projeto ativo. Ou simplesmente **fale "Alpha"** — o pipeline de voz detecta a wake word, transcreve o comando e abre o chat do Manager. Configurações, servidores MCP, vozes, planos, logs do Docker e o grafo ficam no próprio WebUI. A TUI opcional continua acessível em `tui/alpha-ai` (com `/image` e painéis de terminal).
 
 Logs e manutenção:
 ```bash
@@ -279,9 +287,11 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `VISION_OBJECTS_ENABLED` | orchestrator | `0` | Liga o fluxo vision_objects (sobe vision.py à parte) |
 | `MCP_CALL_TIMEOUT` | orchestrator | 180 s | Teto de execução de tools MCP sem override |
 | `AVA_LOCALHOST_REWRITE` | compose (Windows) | `host.docker.internal` | Reescrita de URLs localhost de servidores MCP http |
-| `AVA_API_BASE` / `AVA_ORCHESTRATOR_URL` | TUI / Manager | :9001 / :9000 | Endpoints dos componentes |
+| `AVA_API_BASE` / `AVA_ORCHESTRATOR_URL` | WebUI / TUI / Manager | :9001 / :9000 | Endpoints dos componentes |
 | `AVA_TTS_OUTPUT` | TUI | `client` | Onde a fala toca: `client` (a TUI toca no host via pacat/aplay/ffplay) ou `device` (container, via PulseAudio) |
 | `ONNX_PROVIDERS` | compose | `CPUExecutionProvider` | Provedores do ONNX Runtime |
+
+**CWD dos MCPs stdio**: não é variável de ambiente — é escolhido pela WebUI (`📁`) e persistido por projeto em `cache/webui_cwd.json`. Sem seleção, o padrão é a pasta base do usuário (`HOME`/`USERPROFILE`). A troca de pasta respawna o servidor stdio na próxima chamada; servidores `http` não são afetados. O tray expõe `GET/PUT/DELETE /fs/cwd` (loopback-only) para ler/gravar esse estado.
 
 ### Providers de inferência (OpenAI-compatible)
 
@@ -317,8 +327,8 @@ sem código). Qualquer API que implemente `POST /v1/chat/completions` serve:
 
 ## Roadmap
 
-- [ ] Empacotar o release automatizado (CI com build do `ava-tray` + `mcp_manager` + binários da TUI)
-- [ ] Gravação de voz no Windows pela TUI (dshow exige nome de device localizado)
+- [ ] Empacotar o release automatizado (CI com build do `ava-tray` + `ava-web` + TUI opcional)
+- [ ] Gravação de voz no Windows pela WebUI/TUI (dshow exige nome de device localizado)
 - [ ] Modo "agente autônomo" com visão constante (reabilitar vision.py por padrão)
 - [ ] Autoupdate do `install.sh` (diff entre releases)
 - [ ] Suporte a GPU via ONNX Runtime (CUDA/ROCm) além de CPU
@@ -330,7 +340,7 @@ sem código). Qualquer API que implemente `POST /v1/chat/completions` serve:
 | Orquestração | Python 3.11, FastAPI, httpx, SSE |
 | IA/ML | OpenRouter (LLM), ONNX Runtime (E5, ms-marco, DINOv3, EdgeSAM, Depth Anything V2, YuNet, EdgeFace, nemotron-ASR, sherpa-onnx KWS, CAM++), Supertonic (TTS), LanceDB, SQLite |
 | Voz | C++ (miniaudio, ten-vad, sherpa-onnx, GGUF streaming) — host |
-| Tools | MCP (mcp_manager próprio em Rust, standalone no host), Playwright MCP (extensão), SearXNG + Valkey + Crawl4AI + docker-socket-proxy |
-| Manager | Rust, axum, tokio, eframe/egui, tray-icon |
-| TUI | TypeScript, Ink/React, Bun (single-binary cross-compile) |
+| Tools | MCP (mcp_manager próprio em Rust, **embutido no tray**, com CWD por turno/projeto), Playwright MCP (extensão), SearXNG + Valkey + Crawl4AI + docker-socket-proxy |
+| Manager / WebUI | Rust, axum, tokio, eframe/egui, tray-icon; `ava-web` com WebKitGTK/WebView2 |
+| TUI (opcional) | TypeScript, Ink/React, Bun (single-binary cross-compile) |
 | Infra | Docker Compose (base + overrides Linux/Windows) |

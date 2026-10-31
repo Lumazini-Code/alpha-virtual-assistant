@@ -82,6 +82,8 @@ kbd{font:12px 'JetBrains Mono',monospace;border:1px solid var(--ln);border-botto
 .box:focus-within{border-color:var(--ac)}
 textarea{width:100%;border:0;outline:0;background:none;resize:none;max-height:220px;padding:4px 4px 6px;line-height:1.5}
 .bar{display:flex;align-items:center;gap:6px}
+.cwdlbl{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mu);font-size:12px;cursor:pointer;padding:3px 7px;border-radius:8px}
+.cwdlbl:hover{background:var(--ln);color:var(--ink)}
 .go{width:34px;height:34px;border-radius:50%;background:var(--ink);color:var(--bg);display:grid;place-items:center}.go:disabled{opacity:.3;cursor:default}.go.stop{background:var(--rd);color:#fff}
 #att{display:none;margin:0 0 6px}#att span{display:inline-flex;gap:8px;align-items:center;background:var(--sb);border:1px solid var(--ln);border-radius:10px;padding:3px 6px 3px 10px;font-size:13px}
 #att button{color:var(--mu)}
@@ -335,6 +337,8 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     <textarea id="in" rows="1" placeholder="Digite sua mensagem, ou arraste um arquivo aqui" aria-label="Mensagem"></textarea>
     <div class="bar">
       <button class="ib" id="clip" title="Anexar arquivo" aria-label="Anexar arquivo">📎</button>
+      <button class="ib" id="cwd" title="Escolher pasta de trabalho dos MCPs" aria-label="Escolher pasta de trabalho dos MCPs">📁</button>
+      <span class="cwdlbl" id="cwdlabel" role="button" tabindex="0" title="Pasta de trabalho dos MCPs">pasta base (~)</span>
       <span class="sp"></span>
       <button class="go" id="go" aria-label="Enviar" disabled>↑</button>
     </div>
@@ -413,7 +417,7 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 
 <script>
 const $=s=>document.querySelector(s);
-const S={ms:[],busy:false,view:'chat',sid:null,att:null,ctl:null,full:false,act:'general',pjs:[],plans:[],mcps:[],voices:[]};
+const S={ms:[],busy:false,view:'chat',sid:null,att:null,ctl:null,full:false,act:'general',cwd:null,pjs:[],plans:[],mcps:[],voices:[]};
 /* Servido pelo Manager (:9001) => tudo same-origin: a API é location.origin
    e o orchestrator passa pelo proxy /orch (que injeta o token no servidor).
    Aberto como arquivo (file://) mantém as URLs absolutas antigas. */
@@ -525,7 +529,38 @@ function ui(){
   const b=$('#bdg');b.style.display=S.act!=='general'?'inline-block':'none';b.textContent='◆ '+S.act;
   $('#att').style.display=S.att?'block':'none';
   $('#att').innerHTML=S.att?`<span>${S.att.kind==='image'?'🖼':'📄'} ${esc(S.att.name)}<button data-rmatt aria-label="Remover anexo">✕</button></span>`:'';
+  const cw=$('#cwdlabel');
+  if(cw){
+    cw.textContent=(S.cwd?String(S.cwd).replace(/[\\/]+$/,'').split(/[\\/]/).pop()||S.cwd:'pasta base (~)');
+    cw.title=S.cwd||'Pasta base do usuário (~)';
+  }
 }
+
+/* ---------- CWD por projeto (WebUI → tray → MCPs stdio) ---------- */
+async function loadCwd(){
+  try{
+    const d=await jf('api','/fs/cwd?project='+encodeURIComponent(S.act||'general'));
+    S.cwd=d.cwd||null;
+  }catch(e){S.cwd=null}
+  ui();
+}
+function pickCwd(){
+  // Diálogo nativo de pasta dentro da janela ava-web (wry IPC).
+  if(window.ipc&&typeof window.ipc.postMessage==='function'){
+    window.ipc.postMessage(JSON.stringify({type:'pickFolder'}));
+    return;
+  }
+  toast('A escolha de pasta está disponível na janela nativa do Alpha AI.');
+}
+window.__cwdPicked=async function(path){
+  if(!path)return;
+  try{
+    const d=await jf('api','/fs/cwd','PUT',{project:S.act||'general',cwd:path});
+    S.cwd=d.cwd||null;
+    ui();
+    toast('Pasta de trabalho: '+S.cwd);
+  }catch(e){toast('Falha ao salvar a pasta: '+e.message)}
+};
 
 function setView(view){
   S.view=view;
@@ -546,7 +581,7 @@ async function send(text){
   S.ms.push(u,a);S.busy=true;$('#in').value='';fit();ui();draw(true);
   S.ctl=new AbortController();
   if(!cfg.demo)fetch(cfg.api+'/docker/start',{method:'POST',headers:H()}).catch(()=>{});
-  const body={input:text,session_id:S.sid,voice:'M1',lang:'pt',tts:false,tts_output:'client',image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,search_pdfs:false,stream:true};
+  const body={input:text,session_id:S.sid,voice:'M1',lang:'pt',tts:false,tts_output:'client',image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,search_pdfs:false,stream:true,cwd:S.cwd||null};
   try{
     let it;
     if(cfg.demo)it=demo(text);
@@ -579,8 +614,9 @@ async function loadProj(){
     box.innerHTML=[{slug:'general',name:'Geral'},...S.pjs].map(p=>`<div class="pj${p.slug===S.act?' on':''}" role="button" tabindex="0" data-slug="${esc(p.slug)}"><span class="dot"></span><span class="nm">${esc(p.name||p.slug)}</span>${p.slug!=='general'?'<button class="x" data-del title="Apagar projeto" aria-label="Apagar projeto">✕</button>':''}</div>`).join('');
   }catch(e){box.innerHTML=`<div class="hint">${cfg.demo?'Projetos indisponíveis no modo demonstração.':'Orchestrator offline: '+esc(e.message)}</div>`;S.act='general'}
   ui();
+  await loadCwd();
 }
-async function pact(slug){try{slug==='general'?await jf('orch','/projects/deactivate','POST'):await jf('orch','/projects/'+encodeURIComponent(slug)+'/activate','POST')}catch(e){toast(e.message)}loadProj()}
+async function pact(slug){try{slug==='general'?await jf('orch','/projects/deactivate','POST'):await jf('orch','/projects/'+encodeURIComponent(slug)+'/activate','POST')}catch(e){toast(e.message)}await loadProj()}
 async function pdel(slug){
   if(!confirm(`Apagar "${slug}"? Isso remove TODA a memória do projeto (irreversível).`))return;
   try{await jf('orch','/projects/'+encodeURIComponent(slug),'DELETE')}catch(e){toast(e.message)}loadProj();
@@ -884,6 +920,9 @@ inp.onpaste=e=>{const f=[...e.clipboardData.files][0];if(f){e.preventDefault();a
 $('#go').onclick=()=>S.busy?S.ctl?.abort():send(inp.value);
 $('#clip').onclick=()=>$('#fi').click();
 $('#fi').onchange=e=>{attach(e.target.files[0]);e.target.value=''};
+$('#cwd').onclick=pickCwd;
+$('#cwdlabel').onclick=pickCwd;
+$('#cwdlabel').onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pickCwd()}};
 $('#nw').onclick=clear;$('#oset').onclick=openSet;
 $('#tsb').onclick=()=>document.body.classList.toggle('nosb');
 $('#m0').onclick=()=>setView('chat');$('#m1').onclick=()=>setView('graph');

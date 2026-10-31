@@ -42,6 +42,9 @@ use wry::{WebContext, WebViewBuilder};
 enum ControlEvent {
     Focus,
     Quit,
+    /// IPC da página (`window.ipc.postMessage`) pediu o diálogo nativo de
+    /// seleção de pasta para o CWD dos MCPs.
+    PickFolder,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,6 +81,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     gtk::gdk::set_program_class("alpha-ai");
     let proxy = event_loop.create_proxy();
+    let proxy_ipc = proxy.clone();
 
     let icon = load_icon();
     let window = WindowBuilder::new()
@@ -115,10 +119,25 @@ fn main() -> anyhow::Result<()> {
                 wry::PageLoadEvent::Finished => "finished",
             };
             tracing::info!("webui: load {state} {url}");
+        })
+        // A WebUI só pode abrir o diálogo NATIVO de pasta dentro do ava-web.
+        // O caminho absoluto é devolvido por evaluate_script no event loop
+        // (`window.__cwdPicked`), que então persiste via /fs/cwd no tray.
+        .with_ipc_handler(move |request| {
+            let wants_folder = serde_json::from_str::<serde_json::Value>(request.body().trim())
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .map(|kind| kind == "pickFolder")
+                .unwrap_or(false);
+            if wants_folder {
+                if let Err(e) = proxy_ipc.send_event(ControlEvent::PickFolder) {
+                    tracing::warn!("ipc pickFolder: event loop indisponível: {e}");
+                }
+            }
         });
 
     #[cfg(target_os = "linux")]
-    let _webview = {
+    let webview = {
         use wry::WebViewBuilderExtUnix;
         let vbox = window
             .default_vbox()
@@ -128,7 +147,7 @@ fn main() -> anyhow::Result<()> {
             .context("falha ao criar WebKitGTK")?
     };
     #[cfg(not(target_os = "linux"))]
-    let _webview = builder.build(&window).context("falha ao criar WebView2")?;
+    let webview = builder.build(&window).context("falha ao criar WebView2")?;
 
     window.set_visible(true);
 
@@ -156,6 +175,23 @@ fn main() -> anyhow::Result<()> {
                 window.set_minimized(false);
                 window.set_visible(true);
                 window.set_focus();
+            }
+            Event::UserEvent(ControlEvent::PickFolder) => {
+                // Diálogo NATIVO de pasta (mesmo tipo do anexo), SEMPRE na
+                // main thread — GTK/COM não são thread-safe.
+                let picked = pick_folder_native();
+                let js = match picked {
+                    Some(path) => {
+                        let path = path.to_string_lossy().into_owned();
+                        let json =
+                            serde_json::to_string(&path).unwrap_or_else(|_| "null".to_string());
+                        format!("window.__cwdPicked && window.__cwdPicked({json});")
+                    }
+                    None => "window.__cwdPicked && window.__cwdPicked(null);".to_string(),
+                };
+                if let Err(e) = webview.evaluate_script(&js) {
+                    tracing::warn!("pickFolder: evaluate_script falhou: {e}");
+                }
             }
             _ => {}
         }
@@ -213,6 +249,57 @@ fn project_root() -> PathBuf {
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Pasta base do usuário para o diálogo abrir nela.
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
+/// Seletor nativo de pasta.
+///
+/// Linux: GTK direto na thread principal (a mesma que o tao/WebKitGTK já
+/// inicializou). NÃO usar o backend gtk3 do rfd aqui: ele sobe uma thread
+/// GTK própria e chama gtk_init_check de novo — GTK não é thread-safe e o
+/// processo inteiro cai.
+#[cfg(target_os = "linux")]
+fn pick_folder_native() -> Option<PathBuf> {
+    use gtk::prelude::*;
+
+    let _ = gtk::init();
+    let dialog = gtk::FileChooserDialog::with_buttons(
+        Some("Escolher pasta de trabalho dos MCPs"),
+        None::<&gtk::Window>,
+        gtk::FileChooserAction::SelectFolder,
+        &[
+            ("Cancelar", gtk::ResponseType::Cancel),
+            ("Selecionar", gtk::ResponseType::Accept),
+        ],
+    );
+    if let Some(home) = user_home() {
+        dialog.set_current_folder(home);
+    }
+    let response = dialog.run();
+    let picked = if response == gtk::ResponseType::Accept {
+        dialog.filename()
+    } else {
+        None
+    };
+    unsafe { dialog.destroy() };
+    picked
+}
+
+/// Windows/macOS: diálogo nativo do rfd (COM/Cocoa), na main thread.
+#[cfg(not(target_os = "linux"))]
+fn pick_folder_native() -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Escolher pasta de trabalho dos MCPs");
+    if let Some(home) = user_home() {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder()
 }
 
 fn install_logging(root: &Path) {

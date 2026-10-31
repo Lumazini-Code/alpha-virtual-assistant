@@ -51,7 +51,7 @@
 //! Modules/.env no boot (mesma fonte de sempre).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -100,6 +100,23 @@ struct Config {
     db_path: PathBuf,
     connect_timeout: f64,
     unhealthy_ttl_s: f64,
+    /// CWD padrão dos servidores MCP stdio quando a chamada não traz um.
+    /// É a pasta base do usuário (HOME/USERPROFILE), não a raiz do projeto.
+    default_cwd: PathBuf,
+}
+
+/// Pasta base do usuário para o host atual (Linux/macOS: HOME,
+/// Windows: USERPROFILE). Fallback: raiz do projeto.
+fn user_home_dir(project_root: &FsPath) -> PathBuf {
+    let candidate = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+    candidate
+        .as_deref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or(candidate)
+        .unwrap_or_else(|| project_root.to_path_buf())
 }
 
 fn env_parse<T: FromStr>(name: &str, default: T) -> T {
@@ -129,6 +146,9 @@ impl Config {
             // Servidor cuja conexão/call falhou fica fora da /skills/select por
             // este tempo. Servidores always_on nunca são excluídos por isso.
             unhealthy_ttl_s: env_parse("MCP_UNHEALTHY_TTL_S", 300.0f64),
+            // Sem CWD explícito na chamada, os MCPs stdio rodam na pasta base
+            // do usuário (pedido do WebUI). Servidores http ignoram.
+            default_cwd: user_home_dir(project_root),
         }
     }
 }
@@ -357,6 +377,9 @@ struct ServerCallRequest {
     /// Teto de execução da tool (segundos); 0 < timeout <= 3600.
     #[serde(default = "d_call_timeout")]
     timeout: f64,
+    /// CWD por turno (WebUI). Só vale para stdio; ausente = default_cwd.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +451,9 @@ struct Runtime {
     // Sessões MCP vivas por servidor. Spawn LAZY (só conecta na primeira
     // chamada/sync/test). O dono real do subprocesso é o keeper task.
     sessions: IndexMap<String, Peer<RoleClient>>,
+    // CWD com que cada sessão stdio foi spawnada. Se uma chamada pedir outro
+    // CWD, a sessão é derrubada e respawnada (o CWD do processo é imutável).
+    session_cwd: HashMap<String, PathBuf>,
     // Uma lock por servidor pra evitar spawn duplicado em chamadas concorrentes.
     connect_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     // Geração por servidor: incrementada a cada drop_session. Um connect em voo
@@ -1229,10 +1255,14 @@ fn build_stdio_command(
     command: &str,
     args: &[String],
     env: &IndexMap<String, String>,
+    cwd: &FsPath,
 ) -> process_wrap::tokio::TokioCommandWrap {
     let resolved = resolve_executable(command);
     let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args);
+    // CWD explícito: não depende do cwd herdado do tray (que pode ser
+    // project_root, home, ou um diretório órfão após reinstalação).
+    cmd.current_dir(cwd);
     // env = {**default_environment(), **server.env}
     let mut merged = default_environment();
     for (k, v) in env {
@@ -1288,6 +1318,7 @@ fn drop_session(st: &AppState, name: &str) {
     let mut rt = st.rt();
     *rt.gens.entry(name.to_string()).or_insert(0) += 1;
     rt.sessions.shift_remove(name);
+    rt.session_cwd.remove(name);
     rt.connect_locks.remove(name);
     if let Some(ev) = rt.stop_events.remove(name) {
         ev.set();
@@ -1300,6 +1331,10 @@ fn drop_session(st: &AppState, name: &str) {
 struct KeeperGuard {
     st: Arc<AppState>,
     name: String,
+    /// Geração da sessão dona deste keeper. Se um drop_session/respawn
+    /// incrementou a geração, este keeper é velho e NÃO pode remover a sessão
+    /// nova que já ocupa o mesmo nome.
+    generation: u64,
     done: Event,
     popped: bool,
 }
@@ -1311,7 +1346,13 @@ impl KeeperGuard {
         }
         self.popped = true;
         let mut rt = self.st.rt();
+        let current_gen = rt.gens.get(&self.name).copied().unwrap_or(0);
+        if current_gen != self.generation {
+            // Outro keeper (geração mais nova) já é o dono do nome.
+            return;
+        }
         rt.sessions.shift_remove(&self.name);
+        rt.session_cwd.remove(&self.name);
         rt.keeper_tasks.remove(&self.name);
         rt.stop_events.remove(&self.name);
     }
@@ -1334,6 +1375,7 @@ async fn session_keeper(
     st: Arc<AppState>,
     name: String,
     row: ServerRow,
+    cwd: PathBuf,
     ready: Event,
     err: Arc<Mutex<Vec<String>>>,
     stop: Event,
@@ -1360,14 +1402,31 @@ async fn session_keeper(
                 .ok_or_else(|| "RuntimeError: transport='stdio' sem command configurado".to_string())?;
             let args = resolve_cdp_endpoint(&parse_args(&row.args_json));
             let env = parse_env(&row.env_json);
-            info!("MCP[{name}]: spawn stdio `{} {}`", command, args.join(" "));
-            let transport = TokioChildProcess::new(build_stdio_command(&command, &args, &env))
-                .map_err(|e| format!("OSError: {e}"))?;
+            info!(
+                "MCP[{name}]: spawn stdio `{} {}` (cwd={})",
+                command,
+                args.join(" "),
+                cwd.display()
+            );
+            let transport =
+                TokioChildProcess::new(build_stdio_command(&command, &args, &env, &cwd))
+                    .map_err(|e| format!("OSError: {e}"))?;
             ().serve(transport)
                 .await
                 .map_err(|e| format!("ClientInitializeError: {e}"))?
         };
-        st.rt().sessions.insert(name.clone(), svc.peer().clone());
+        // Um drop_session pode ter acontecido durante o handshake (ex.: o
+        // usuário trocou de CWD). Não deixa esta sessão velha sobrescrever a
+        // nova que já ocupa o mesmo nome.
+        let current_gen = st.rt().gens.get(&name).copied().unwrap_or(0);
+        if current_gen != guard.generation {
+            return Err("RuntimeError: geração mudou durante o connect — sessão descartada".to_string());
+        }
+        {
+            let mut rt = st.rt();
+            rt.sessions.insert(name.clone(), svc.peer().clone());
+            rt.session_cwd.insert(name.clone(), cwd.clone());
+        }
         service = Some(svc);
         ready.set();
         stop.wait().await; // subprocesso vivo até drop/shutdown
@@ -1389,6 +1448,39 @@ async fn session_keeper(
     // `guard` dropado aqui → done.set()
 }
 
+/// Resolve o CWD de uma chamada de tool. O caminho vem do WebUI (host) e é
+/// validado AQUI, no tray — o orchestrator roda no container e não enxerga o
+/// filesystem do host. Relativo resolve contra o default; ausente usa o
+/// default (pasta base do usuário).
+fn resolve_call_cwd(st: &AppState, requested: Option<&str>) -> Result<PathBuf, ApiError> {
+    let default = st.cfg.default_cwd.clone();
+    let raw = requested.map(str::trim).filter(|p| !p.is_empty());
+    let candidate = match raw {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                default.join(path)
+            }
+        }
+        None => default,
+    };
+    let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
+        http_err(
+            422,
+            format!("cwd inválido '{}': {e}", candidate.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(http_err(
+            422,
+            format!("cwd '{}' não é um diretório", canonical.display()),
+        ));
+    }
+    Ok(canonical)
+}
+
 /// Retorna a sessão do servidor, conectando (spawn) na primeira vez — via
 /// keeper task próprio. O handshake inteiro tem teto de CONNECT_TIMEOUT:
 /// servidor que não fala MCP não pode pendurar o handler (e com ele a
@@ -1396,12 +1488,27 @@ async fn session_keeper(
 async fn get_session(
     st: &Arc<AppState>,
     name: &str,
+    cwd: &FsPath,
     allow_disabled: bool,
 ) -> Result<Peer<RoleClient>, ApiError> {
-    let generation = st.rt().gens.get(name).copied().unwrap_or(0);
     let existing = st.rt().sessions.get(name).cloned();
     if let Some(s) = existing {
-        return Ok(s);
+        let same_cwd = st
+            .rt()
+            .session_cwd
+            .get(name)
+            .map(|current| current == cwd)
+            .unwrap_or(false);
+        if same_cwd {
+            return Ok(s);
+        }
+        // CWD mudou entre turnos: o processo stdio não muda de diretório.
+        // Derruba e respawna abaixo.
+        info!(
+            "MCP[{name}]: CWD mudou para {} — respawnando sessão stdio",
+            cwd.display()
+        );
+        drop_session(st, name);
     }
     let row = st
         .db_get_server(name)?
@@ -1419,15 +1526,28 @@ async fn get_session(
     let _held = lock.lock().await;
     let existing = st.rt().sessions.get(name).cloned();
     if let Some(s) = existing {
-        // outro request venceu a corrida
-        return Ok(s);
+        // Outro request venceu a corrida. Só reutiliza se o CWD bater.
+        let same_cwd = st
+            .rt()
+            .session_cwd
+            .get(name)
+            .map(|current| current == cwd)
+            .unwrap_or(false);
+        if same_cwd {
+            return Ok(s);
+        }
+        drop_session(st, name);
     }
+    // Geração DEPOIS de qualquer eviction acima: é ela que o keeper guarda
+    // para não remover uma sessão nova num respawn por mudança de CWD.
+    let generation = st.rt().gens.get(name).copied().unwrap_or(0);
     let t0 = Instant::now();
     let (ready, stop, done) = (Event::new(), Event::new(), Event::new());
     let err: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let guard = KeeperGuard {
         st: st.clone(),
         name: name.to_string(),
+        generation,
         done: done.clone(),
         popped: false,
     };
@@ -1438,6 +1558,7 @@ async fn get_session(
             st.clone(),
             name.to_string(),
             row,
+            cwd.to_path_buf(),
             ready.clone(),
             err.clone(),
             stop.clone(),
@@ -1724,7 +1845,8 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
     let row = st
         .db_get_server(name)?
         .ok_or_else(|| http_err(404, format!("Servidor MCP '{name}' não registrado")))?;
-    let session = get_session(st, name, true).await?;
+    let default_cwd = st.cfg.default_cwd.clone();
+    let session = get_session(st, name, &default_cwd, true).await?;
     let result = match list_tools_with_timeout(&session).await {
         Ok(r) => r,
         Err((label, msg)) => {
@@ -1859,7 +1981,8 @@ async fn test_server(State(st): State<Arc<AppState>>, Path(name): Path<String>) 
     if st.db_get_server(&name)?.is_none() {
         return Err(http_err(404, format!("Servidor MCP '{name}' não registrado")));
     }
-    let session = get_session(&st, &name, true).await?;
+    let default_cwd = st.cfg.default_cwd.clone();
+    let session = get_session(&st, &name, &default_cwd, true).await?;
     let result = match list_tools_with_timeout(&session).await {
         Ok(r) => r,
         Err((label, msg)) => {
@@ -2222,7 +2345,18 @@ async fn server_call(
     if !(req.timeout > 0.0 && req.timeout <= 3600.0) {
         return Err(http_err(422, "timeout: deve estar entre 0 (exclusivo) e 3600"));
     }
-    let session = get_session(&st, &name, false).await?;
+    // CWD só se aplica a processos stdio. Servidores http já estão rodando em
+    // outro processo: não faz sentido (nem deve) respawná-los quando o usuário
+    // troca de pasta no WebUI.
+    let row = st
+        .db_get_server(&name)?
+        .ok_or_else(|| http_err(404, format!("Servidor MCP '{name}' não registrado")))?;
+    let cwd = if row.transport == "stdio" {
+        resolve_call_cwd(&st, req.cwd.as_deref())?
+    } else {
+        st.cfg.default_cwd.clone()
+    };
+    let session = get_session(&st, &name, &cwd, false).await?;
     let call = session.call_tool(CallToolRequestParam {
         name: req.tool.clone().into(),
         arguments: Some(req.arguments.clone()),
@@ -2372,7 +2506,10 @@ async fn wait_all(events: Vec<Event>) {
 /// (API sobe sem as rotas MCP; as demais funcionalidades seguem).
 pub async fn init(project_root: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
     let cfg = Config::from_env(project_root);
-    info!("Iniciando MCP Manager (registro + executor de servidores MCP)...");
+    info!(
+        "Iniciando MCP Manager (registro + executor de servidores MCP) — CWD padrão stdio: {}",
+        cfg.default_cwd.display()
+    );
     let db = open_db(&cfg).map_err(|e| {
         anyhow::anyhow!("Falha ao abrir o banco {}: {e}", cfg.db_path.display())
     })?;

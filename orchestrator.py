@@ -639,6 +639,10 @@ async def _mirror_conversation(hub: ConversationHub, name: str, data: Any) -> No
 class ExecuteRequest(BaseModel):
     input:         str = Field(..., max_length=200_000)
     session_id:    Optional[str]  = None
+    # CWD dos servidores MCP stdio para ESTE turno (escolhido no WebUI).
+    # O orchestrator roda no container e não enxerga o filesystem do host:
+    # o valor é opaco aqui e validado pelo mcp_manager (tray, no host).
+    cwd:           Optional[str]  = Field(None, max_length=4096)
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
@@ -1557,6 +1561,9 @@ _WRITE_HINT = "Use this when the user asks you to remember/record/save something
 # só quem realmente precisa de contexto conversacional (vision_objects)
 # lê isso. Setado pelo loop principal logo antes de cada `executor(...)`.
 _CURRENT_HISTORY: ContextVar[list[dict]] = ContextVar("_current_history", default=[])
+# CWD do turno corrente — lido por executores MCP auxiliares (planos/macros)
+# que não recebem o ExecuteRequest inteiro. Setado no /execute.
+_CURRENT_MCP_CWD: ContextVar[Optional[str]] = ContextVar("_current_mcp_cwd", default=None)
 
 
 def _sanitize_history_for_submodel(history: list[dict]) -> list[dict]:
@@ -1848,9 +1855,11 @@ def _plan_check_domain(url: str) -> Optional[str]:
 async def _plan_mcp_call(tool: str, arguments: dict) -> Any:
     """Chama uma tool do Playwright MCP via mcp_manager e devolve o resultado
     textual. Levanta em qualquer falha (o chamador decide o que fazer)."""
+    cwd = _CURRENT_MCP_CWD.get()
     r = await state.mcp_client.post(
         f"/servers/{PLAN_PLAYWRIGHT_SERVER}/call",
-        json={"tool": tool, "arguments": arguments, "timeout": MCP_CALL_TIMEOUT},
+        json={"tool": tool, "arguments": arguments, "timeout": MCP_CALL_TIMEOUT,
+              **({"cwd": cwd} if cwd else {})},
     )
     r.raise_for_status()
     data = r.json()
@@ -3545,7 +3554,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                         state.mcp_client.post(
                             f"/servers/{server}/call",
                             json={"tool": mcp_tool_name, "arguments": args,
-                                  "timeout": mcp_timeout},
+                                  "timeout": mcp_timeout,
+                                  **({"cwd": req.cwd} if req.cwd else {})},
                         ),
                         timeout=mcp_timeout + 10.0,
                     )
@@ -3653,6 +3663,9 @@ async def _execute_stream_generator(req: ExecuteRequest):
     t0 = time.perf_counter()
     eid = str(uuid.uuid4())
     sid = req.session_id or str(uuid.uuid4())
+    # Propaga o CWD do turno para os executores MCP auxiliares (planos/macros)
+    # via ContextVar — o tool loop normal repassa req.cwd explicitamente.
+    _CURRENT_MCP_CWD.set(req.cwd)
     log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
     # Espelho no Conversation Hub: `meta` inclui a pergunta (o chat do Manager
@@ -3663,10 +3676,11 @@ async def _execute_stream_generator(req: ExecuteRequest):
     await _mirror_conversation(CONVERSATION_HUB, "meta", {
         "execution_id": eid, "session_id": sid,
         "input": req.input, "source": req.source or "tui", "tts": req.tts,
+        "cwd": req.cwd,
     })
     yield _sse("meta", {"execution_id": eid, "session_id": sid,
                         "input": req.input, "source": req.source or "tui",
-                        "tts": req.tts})
+                        "tts": req.tts, "cwd": req.cwd})
 
     events_queue: asyncio.Queue = asyncio.Queue(
         maxsize=int(os.environ.get("AVA_EVENTS_QUEUE_MAX", "2000"))

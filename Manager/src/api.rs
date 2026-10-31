@@ -43,6 +43,9 @@
 //!   - GET /mcp/status (tray): reporta "embutido" — o /mcp/start do
 //!     install.sh vira no-op idempotente.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +54,7 @@ use crate::state::SharedState;
 use crate::transcript;
 use axum::{
     body::{to_bytes, Body},
-    extract::{Query, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{
         header,
         header::{CACHE_CONTROL, CONTENT_TYPE},
@@ -175,6 +178,12 @@ pub async fn serve(
         .route("/transcript/start", post(post_transcript_start))
         .route("/transcript/stop", post(post_transcript_stop))
         .route("/transcript/status", get(get_transcript_status))
+        // CWD escolhido na WebUI, persistido POR PROJETO (slug). Loopback-only:
+        // expõe caminhos do host, então não pode ficar aberto na LAN.
+        .route(
+            "/fs/cwd",
+            get(get_fs_cwd).put(put_fs_cwd).delete(delete_fs_cwd),
+        )
         // Chamado pelo transcribe (C++) na deteção da wake word: abre a
         // janela do tray direto na tela de chat. Fire-and-forget.
         .route("/ui/chat-open", post(post_ui_chat_open))
@@ -188,7 +197,12 @@ pub async fn serve(
     tracing::info!("API REST escutando em http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    // ConnectInfo é necessário para o guard loopback do /fs/cwd.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -268,6 +282,111 @@ struct BrowserStatusResponse {
     running: bool,
     /// PID rastreado — Some só se o Chrome foi aberto pelo próprio tray.
     pid: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct FsCwdResponse {
+    project: String,
+    /// Caminho persistido para o projeto; None = usa o default (home).
+    cwd: Option<String>,
+    /// Pasta base do usuário no host.
+    default: String,
+}
+
+#[derive(Deserialize)]
+struct FsCwdQuery {
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FsCwdUpdate {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Guard das rotas que expõem caminhos do host. Só aceita loopback.
+fn require_loopback(addr: SocketAddr) -> Result<(), Response> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "rota disponível apenas para conexões loopback"
+        })),
+    )
+        .into_response())
+}
+
+fn normalize_project(raw: Option<&str>) -> Result<String, Response> {
+    let project = raw.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("general");
+    let valid = project.len() <= 64
+        && project
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .unwrap_or(false)
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "project slug inválido" })),
+        )
+            .into_response());
+    }
+    Ok(project.to_string())
+}
+
+fn host_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn cwd_store_path(state: &SharedState) -> PathBuf {
+    state.project_root.join("cache").join("webui_cwd.json")
+}
+
+fn read_cwd_store(state: &SharedState) -> HashMap<String, String> {
+    let path = cwd_store_path(state);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<HashMap<String, String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_cwd_store(state: &SharedState, store: &HashMap<String, String>) -> Result<(), String> {
+    let path = cwd_store_path(state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("criar {}: {e}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(store).map_err(|e| format!("serializar: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("gravar {}: {e}", path.display()))
+}
+
+fn validate_host_cwd(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("cwd vazio".into());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err("cwd deve ser um caminho absoluto".into());
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("cwd não existe ou não é acessível: {e}"))?;
+    if !canonical.is_dir() {
+        return Err("cwd não é um diretório".into());
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -364,6 +483,106 @@ async fn get_browser_status(State(state): State<SharedState>) -> impl IntoRespon
     let (running, pid) = process_manager::browser_status(&state).await;
 
     Json(BrowserStatusResponse { running, pid })
+}
+
+// ── CWD da WebUI, persistido por projeto ────────────────────────────────────
+
+async fn get_fs_cwd(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<FsCwdQuery>,
+) -> Response {
+    if let Err(resp) = require_loopback(addr) {
+        return resp;
+    }
+    let project = match normalize_project(query.project.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let store = read_cwd_store(&state);
+    let cwd = store.get(&project).and_then(|raw| validate_host_cwd(raw).ok());
+    Json(FsCwdResponse {
+        project,
+        cwd,
+        default: host_home_dir().to_string_lossy().into_owned(),
+    })
+    .into_response()
+}
+
+async fn put_fs_cwd(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<FsCwdUpdate>,
+) -> Response {
+    if let Err(resp) = require_loopback(addr) {
+        return resp;
+    }
+    let project = match normalize_project(body.project.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let mut store = read_cwd_store(&state);
+    let cwd = match body.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(raw) => match validate_host_cwd(raw) {
+            Ok(path) => {
+                store.insert(project.clone(), path.clone());
+                Some(path)
+            }
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": err })),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            store.remove(&project);
+            None
+        }
+    };
+    if let Err(err) = write_cwd_store(&state, &store) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response();
+    }
+    Json(FsCwdResponse {
+        project,
+        cwd,
+        default: host_home_dir().to_string_lossy().into_owned(),
+    })
+    .into_response()
+}
+
+async fn delete_fs_cwd(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<FsCwdQuery>,
+) -> Response {
+    if let Err(resp) = require_loopback(addr) {
+        return resp;
+    }
+    let project = match normalize_project(query.project.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let mut store = read_cwd_store(&state);
+    store.remove(&project);
+    if let Err(err) = write_cwd_store(&state, &store) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response();
+    }
+    Json(FsCwdResponse {
+        project,
+        cwd: None,
+        default: host_home_dir().to_string_lossy().into_owned(),
+    })
+    .into_response()
 }
 
 // ════════════════════════════════════════════════════════════════════════
