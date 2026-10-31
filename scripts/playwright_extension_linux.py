@@ -179,12 +179,16 @@ def main() -> int:
         ppe.patch_auth_token(auth.read_text(encoding="utf-8"), token),
         encoding="utf-8",
     )
+    ppe.apply_branding(SRC)
 
     manifest_path = SRC / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     # O CRX terá a NOSSA chave. A key da Microsoft aqui definiria outro ID
     # para a versão unpacked e não pode assinar este CRX.
     manifest.pop("key", None)
+    # Sem update_url da Web Store: senão o Chrome valida a cópia contra a
+    # assinatura da loja e marca DISABLE_CORRUPTED.
+    manifest.pop("update_url", None)
     version = next_version(str(manifest.get("version", "0.4.0")))
     manifest["version"] = version
     manifest_path.write_text(

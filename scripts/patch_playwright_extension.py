@@ -47,6 +47,14 @@ import sys
 from pathlib import Path
 
 EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
+BRAND_NAME = "Alpha AI Browser Bridge"
+BRAND_SHORT_NAME = "Alpha Bridge"
+BRAND_DESCRIPTION = (
+    "Conecta o Alpha AI ao Chrome para automação de abas, "
+    "com acesso à aba ativa e às sessões reais do usuário."
+)
+BRAND_ACTION_TITLE = "Alpha AI Browser Bridge"
+BRAND_ICONS = Path(__file__).resolve().parent.parent / "resource" / "playwright-extension-icons"
 if os.name == "nt":
     DEST = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "alpha-ai" / "playwright-extension"
 else:
@@ -221,6 +229,60 @@ def patch_background(text: str) -> str:
     return text
 
 
+def apply_branding(ext_dir: Path) -> None:
+    """Aplica nome/ícones/títulos da Alpha à cópia da extensão."""
+    manifest_path = ext_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["name"] = BRAND_NAME
+    manifest["short_name"] = BRAND_SHORT_NAME
+    manifest["description"] = BRAND_DESCRIPTION
+    action = manifest.setdefault("action", {})
+    action["default_title"] = BRAND_ACTION_TITLE
+    manifest_path.write_text(
+        json.dumps(manifest, indent=3, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    if BRAND_ICONS.is_dir():
+        icons = ext_dir / "icons"
+        icons.mkdir(exist_ok=True)
+        for size in (16, 32, 48, 128):
+            source = BRAND_ICONS / f"icon-{size}.png"
+            if source.is_file():
+                shutil.copy2(source, icons / f"icon-{size}.png")
+
+    for name in ("status.html", "connect.html"):
+        page = ext_dir / name
+        if not page.is_file():
+            continue
+        text = page.read_text(encoding="utf-8")
+        text = re.sub(
+            r"<title>.*?</title>",
+            f"<title>{BRAND_NAME}</title>",
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        page.write_text(text, encoding="utf-8")
+
+    replacements = {
+        "Playwright Extension": BRAND_NAME,
+        "the Playwright Extension": f"the {BRAND_NAME}",
+        "Playwright extension only": "Alpha AI extension only",
+        "Playwright group": "Alpha AI group",
+        "Playwright client": "Alpha AI client",
+        "Playwright CLI or MCP server": "Alpha AI MCP server",
+    }
+    for relative in ("lib/ui/connect.js", "lib/ui/status.js"):
+        page = ext_dir / relative
+        if not page.is_file():
+            continue
+        text = page.read_text(encoding="utf-8")
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        page.write_text(text, encoding="utf-8")
+
+
 def patch_auth_token(text: str, token: str) -> str:
     """Fixa o token da extensão para o valor gerado pelo instalador.
 
@@ -278,6 +340,21 @@ def main() -> int:
     # Metadados de verificação da versão da Web Store não valem para a cópia
     # patcheada; mantê-los faria o Chrome marcar a extensão como corrompida.
     shutil.rmtree(args.out / "_metadata", ignore_errors=True)
+    apply_branding(args.out)
+
+    # O update_url da Web Store faz o Chrome validar a cópia patcheada contra
+    # a assinatura da loja e marcá-la como DISABLE_CORRUPTED. Fora da loja,
+    # ele não deve existir (a key é mantida no Windows para preservar o ID).
+    manifest_path = args.out / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("update_url", None)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=3, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        raise SystemExit(f"patch: falha ao ajustar manifest.json: {exc}")
 
     background = args.out / "lib" / "background.mjs"
     patched = patch_background(background.read_text(encoding="utf-8"))
