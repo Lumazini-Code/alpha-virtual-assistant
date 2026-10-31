@@ -693,11 +693,11 @@ Set-EnvVar 'AVA_DOCKER_IDLE_MINUTES' '15'
 Write-Ok 'Docker dorme apos 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15).'
 
 # -- 5b. Registro do Playwright MCP (dependencia direta do sistema) -----------
-# Cadastra o @playwright/mcp no mcp_manager (:4008) logo apos o `up` do stack.
+# Cadastra o @playwright/mcp no mcp_manager (:9001) logo apos o `up` do stack.
 # O POST /servers e upsert idempotente e o /sync tem no-op por doc_hash -
 # seguro re-executar. Tolerante a falha: se o manager ainda estiver bootando,
 # retenta; se falhar de vez, so avisa (nao aborta a instalacao).
-$McpManagerUrl = 'http://127.9.12.22:4008'
+$McpManagerUrl = 'http://127.9.12.22:9001'
 
 function Register-PlaywrightMcp {
   # O env do registro e autocontido (o mcp_manager mescla server.env sobre o
@@ -935,7 +935,7 @@ function Start-DockerViaManager {
   }
 }
 
-# O mcp_manager (:4008) roda no host, supervisionado pelo Manager.
+# O mcp_manager (:9001) roda embutido no Manager, no host.
 function Ensure-McpManager {
   if (-not (Test-ManagerUp)) { Write-Warn2 'Manager indisponivel - nao consegui garantir o mcp_manager.'; return $false }
   try {
@@ -968,7 +968,7 @@ function Ensure-McpManager {
 #                socat 0.0.0.0:PORTA -> GW_WSL:PORTA      (servicos do HOST)
 #   (2) Windows: portproxy 127.9.12.22:PORTA -> IP_VM:PORTA  (host -> containers)
 #   (3) Windows: portproxy GW_WSL:9001/9222/9100 -> loopback (containers -> host)
-# A porta 4008 fica FORA: o mcp_manager roda no HOST e publicar a porta colidiria.
+# A porta 9001 fica FORA: o mcp_manager roda no HOST e publicar a porta colidiria.
 # Rota A (Docker Desktop) nao precisa de nada disso: ele publica no loopback do
 # Windows e host.docker.internal ja aponta para o host.
 if ($script:UseWSLDocker) {
@@ -1260,6 +1260,35 @@ Write-Info '  alpha-ai                          # abre o WebUI (Manager\ava-web.
 Write-Info '  Manager\ava-web.exe               # mesma janela, caminho direto'
 Write-Info "  $script:LogsHint   # logs do backend"
 Write-Info "  $InstallDir\logs    # logs do tray (ava-tray.log) e do mcp_manager (mcp_manager.log)"
+
+# -- 9b. Patch OPCIONAL da extensao Playwright (Windows e manual) --------------
+# O Chrome no Windows nao aceita instalar um CRX local automaticamente nem
+# --load-extension (removido no Chrome 137). O patch fica documentado aqui:
+# a extensao patcheada (aba ativa real, sem tab group) e carregada como
+# "unpacked" uma unica vez, pelo usuario.
+Write-Host ''
+Write-Info '--- Patch opcional da extensao Playwright (aba ativa / sem tab group) ---'
+Write-Info 'O @playwright/mcp ja funciona com a extensao da Chrome Web Store.'
+Write-Info 'Para controlar a ULTIMA ABA ATIVA real (e nao abrir uma aba nova), faca:'
+Write-Info ''
+Write-Info '  1. Gere a copia patcheada da extensao (requer Python 3 no host):'
+Write-Info ('       python "' + $InstallDir + '\scripts\patch_playwright_extension.py"')
+Write-Info '     Saida: $env:LOCALAPPDATA\alpha-ai\playwright-extension'
+Write-Info ''
+Write-Info '  2. Abra chrome://extensions, ative o Developer mode,'
+Write-Info '     REMOVA a "Playwright Extension" da Chrome Web Store e clique em'
+Write-Info '     "Load unpacked" na pasta acima.'
+Write-Info ''
+Write-Info '  3. Abra chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status.html'
+Write-Info '     e copie o token para PLAYWRIGHT_MCP_EXTENSION_TOKEN em Modules\.env.'
+Write-Info '     (Ou rode novamente: install.ps1 -SkipBuild -NoLaunch, que extrai o token.)'
+Write-Info ''
+Write-Info '  4. Reinicie o ava-tray e execute o sync do Playwright:'
+Write-Info '       curl -X POST http://127.9.12.22:9001/servers/playwright/sync -H "Authorization: Bearer <AVA_INTERNAL_TOKEN>"'
+Write-Info ''
+Write-Info 'O patch NAO e instalado automaticamente no Windows: o Chrome bloqueia'
+Write-Info 'CRX local/registro externo fora da Chrome Web Store. No Linux o install.sh'
+Write-Info 'faz esse fluxo sozinho via external extension + CRX proprio.'
 
 if (-not $NoLaunch) {
   $LaunchExe = Join-Path $InstallDir 'Manager\ava-web.exe'

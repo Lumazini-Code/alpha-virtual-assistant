@@ -77,6 +77,9 @@ Uso: install.sh [opções]
 Env:
   ALPHA_RELEASE_ZIP=ARQUIVO.zip  Usa um zip local em vez do release do GitHub
                                  (modo teste antes do release oficial)
+  AVA_PLAYWRIGHT_PATCHED_EXTENSION=0
+                                 Não instala a extensão Playwright patcheada
+                                 (usa a extensão da Chrome Web Store)
 EOF
   exit 0
 }
@@ -458,6 +461,17 @@ set_env_var() {
   chmod 600 "$ENV_FILE"
 }
 
+# Remove uma variável do .env (usado no fallback do patch do Playwright)
+unset_env_var() {
+  local k="$1" tmp
+  [ -f "$ENV_FILE" ] || return 0
+  tmp="$(mktemp)"
+  grep -vE "^${k}=" "$ENV_FILE" > "$tmp" || true
+  cat "$tmp" > "$ENV_FILE"
+  rm -f "$tmp"
+  chmod 600 "$ENV_FILE"
+}
+
 existing_key() {
   # Aceita a key nova (LLM_API_KEY) ou a de instalações antigas (OPENROUTER_API_KEY)
   [ -f "$ENV_FILE" ] && grep -qE '^(LLM_API_KEY|OPENROUTER_API_KEY)=.+' "$ENV_FILE" 2>/dev/null
@@ -681,17 +695,96 @@ esac
 set_env_var AVA_DOCKER_IDLE_MINUTES 15
 ok "Docker dorme após 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15)."
 
-# ── 5b-2. Token da extensão do Playwright (PLAYWRIGHT_MCP_EXTENSION_TOKEN) ───
-# O @playwright/mcp roda com --extension e pareia com a extensão oficial do
-# Chrome via este token. O token NÃO é gerado pelo instalador: a própria
-# extensão o cria (base64url de 32 bytes) e persiste em localStorage
-# ('auth-token') na origem chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm
-# quando a página status.html é aberta. Extraímos o valor do LevelDB de
-# Local Storage do perfil do navegador. Se a extensão ainda não estiver
-# instalada, a extração é refeita na etapa 5c, após abrir a Chrome Web Store.
+# ── 5b-2. Extensão do Playwright + token ─────────────────────────────────────
+# @playwright/mcp roda com --extension. No Linux, o instalador agora empacota
+# uma cópia PATCHED da extensão (aba ativa real, sem tab group) e a instala
+# como external extension: um CRX próprio em /opt/google/chrome/extensions.
+# Como não temos a chave da Microsoft, o CRX tem um ID novo; o wrapper de
+# NODE_OPTIONS faz o Playwright MCP aceitar esse ID sem forkar o pacote.
+# Fallback (AVA_PLAYWRIGHT_PATCHED_EXTENSION=0 ou falha): extensão da loja,
+# com token extraído do localStorage como antes.
 
 PLAYWRIGHT_EXTENSION_URL="https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm"
 PLAYWRIGHT_EXTENSION_STATUS_URL="chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status.html"
+
+PLAYWRIGHT_PATCHED=0
+PLAYWRIGHT_CHROME_WAS_RUNNING=0
+PLAYWRIGHT_EXTENSION_SHARE="$HOME/.local/share/alpha-ai"
+PLAYWRIGHT_EXTENSION_WRAPPER="$PLAYWRIGHT_EXTENSION_SHARE/playwright_extension_id_wrapper.cjs"
+PLAYWRIGHT_EXTENSION_ID_FILE="$PLAYWRIGHT_EXTENSION_SHARE/playwright-extension-id"
+PLAYWRIGHT_EXTENSION_TOKEN_FILE="$PLAYWRIGHT_EXTENSION_SHARE/playwright-extension-token"
+PLAYWRIGHT_EXTENSION_EXTERNAL_JSON="$PLAYWRIGHT_EXTENSION_SHARE/playwright-extension-external.json"
+
+install_patched_playwright_extension_linux() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  local chrome="${AVA_CHROME_PATH:-}" c ext_id ext_token ext_dir
+  if [ -z "$chrome" ]; then
+    for c in google-chrome google-chrome-stable chromium chromium-browser; do
+      if command -v "$c" >/dev/null 2>&1; then chrome="$c"; break; fi
+    done
+  fi
+  if [ -z "$chrome" ]; then
+    warn "Chrome/Chromium não encontrado — patch da extensão Playwright ignorado."
+    return 1
+  fi
+  [ -f "$INSTALL_DIR/scripts/playwright_extension_linux.py" ] || return 1
+
+  if pgrep -x chrome >/dev/null 2>&1 || pgrep -x chromium >/dev/null 2>&1; then
+    PLAYWRIGHT_CHROME_WAS_RUNNING=1
+  fi
+  mkdir -p "$PLAYWRIGHT_EXTENSION_SHARE"
+  install -Dm644 "$INSTALL_DIR/scripts/playwright_extension_id_wrapper.cjs" \
+    "$PLAYWRIGHT_EXTENSION_WRAPPER"
+
+  info "Empacotando extensão Playwright patcheada (CRX/ID/token próprios)..."
+  if ! AVA_CHROME_PATH="$chrome" python3 \
+      "$INSTALL_DIR/scripts/playwright_extension_linux.py"; then
+    warn "Falha ao empacotar a extensão patcheada — usando a extensão da loja."
+    return 1
+  fi
+
+  ext_id="$(cat "$PLAYWRIGHT_EXTENSION_ID_FILE" 2>/dev/null || true)"
+  ext_token="$(cat "$PLAYWRIGHT_EXTENSION_TOKEN_FILE" 2>/dev/null || true)"
+  if [ -z "$ext_id" ] || [ -z "$ext_token" ]; then
+    warn "Extensão patcheada sem ID/token — usando a extensão da loja."
+    return 1
+  fi
+
+  if [ -d /opt/google/chrome ]; then
+    ext_dir="/opt/google/chrome/extensions"
+  elif [ -d /usr/share/google-chrome ]; then
+    ext_dir="/usr/share/google-chrome/extensions"
+  else
+    ext_dir="/opt/google/chrome/extensions"
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    install -Dm644 "$PLAYWRIGHT_EXTENSION_EXTERNAL_JSON" "$ext_dir/$ext_id.json" || return 1
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo install -Dm644 "$PLAYWRIGHT_EXTENSION_EXTERNAL_JSON" "$ext_dir/$ext_id.json" || return 1
+  else
+    warn "Sem root/sudo para gravar $ext_dir — usando a extensão da loja."
+    return 1
+  fi
+
+  set_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN "$ext_token"
+  set_env_var PLAYWRIGHT_MCP_EXTENSION_ID "$ext_id"
+  PLAYWRIGHT_PATCHED=1
+  ok "Extensão Playwright patcheada instalada como external extension (ID $ext_id)."
+  warn "Se o Chrome já estava aberto, feche e reabra para carregar a extensão externa."
+  return 0
+}
+
+if [ "${AVA_PLAYWRIGHT_PATCHED_EXTENSION:-1}" != "0" ]; then
+  if ! install_patched_playwright_extension_linux; then
+    # Fallback limpo: sem ID próprio e sem token do CRX patcheado.
+    unset_env_var PLAYWRIGHT_MCP_EXTENSION_ID
+    unset_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN
+  fi
+else
+  unset_env_var PLAYWRIGHT_MCP_EXTENSION_ID
+  unset_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN
+fi
 
 # Procura o 'auth-token' da extensão no LevelDB de Local Storage dos perfis
 # dos navegadores Chromium instalados e imprime o token (43 chars base64url).
@@ -769,6 +862,7 @@ open_url() {
   fi
 }
 
+if [ "$PLAYWRIGHT_PATCHED" -eq 0 ]; then
 if ! grep -qE '^PLAYWRIGHT_MCP_EXTENSION_TOKEN=.+' "$ENV_FILE" 2>/dev/null; then
   info "Procurando token da extensão Playwright no perfil do navegador..."
   if token="$(extract_playwright_token)"; then
@@ -795,6 +889,7 @@ else
     fi
   fi
 fi
+fi
 
 # ── 5c. Registro do Playwright MCP (dependência direta do sistema) ────────────
 # Cadastra o @playwright/mcp no mcp_manager (embutido no tray, :9001) logo
@@ -815,12 +910,24 @@ register_playwright_mcp() {
   #     versionMismatch); forçar 2 mantém o par testado com a extensão 0.4.x
   #     da loja mesmo se o @playwright/mcp@latest subir o default do relay
   #     (o env é lido pelo relay no spawn: process.env.PLAYWRIGHT_EXTENSION_PROTOCOL).
-  local payload token
+  local payload token ext_id wrapper env_json
   token="$(get_env_var PLAYWRIGHT_MCP_EXTENSION_TOKEN)"
-  local env_json='{"DISPLAY": ":0", "PLAYWRIGHT_EXTENSION_PROTOCOL": "2"}'
-  if [ -n "$token" ]; then
-    env_json="$(printf '{"DISPLAY": ":0", "PLAYWRIGHT_EXTENSION_PROTOCOL": "2", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "%s"}' "$token")"
-  fi
+  ext_id="$(get_env_var PLAYWRIGHT_MCP_EXTENSION_ID)"
+  wrapper="$PLAYWRIGHT_EXTENSION_WRAPPER"
+  [ -f "$wrapper" ] || ext_id=""
+  # JSON via python: token/caminho podem ter caracteres que o printf quebraria.
+  env_json="$(python3 - "$token" "$ext_id" "$wrapper" <<'PY'
+import json, sys
+token, ext_id, wrapper = sys.argv[1:4]
+env = {"DISPLAY": ":0", "PLAYWRIGHT_EXTENSION_PROTOCOL": "2"}
+if token:
+    env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = token
+if ext_id:
+    env["PLAYWRIGHT_MCP_EXTENSION_ID"] = ext_id
+    env["NODE_OPTIONS"] = '--require="' + wrapper + '"'
+print(json.dumps(env))
+PY
+)"
   payload="$(printf '{
   "name": "playwright",
   "skill_summary": "Automação de navegador (navegar, clicar, extrair conteúdo)",
@@ -1268,6 +1375,12 @@ info "  $INSTALL_DIR/Manager/ava-web      # mesma janela, caminho direto"
 info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
 info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log — inclui o MCP manager embutido)"
 info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
+
+if [ "$PLAYWRIGHT_PATCHED" -eq 1 ] && [ "$PLAYWRIGHT_CHROME_WAS_RUNNING" -eq 1 ]; then
+  warn "A extensão Playwright patcheada só é carregada quando o Chrome reiniciar."
+  warn "Feche e reabra o Chrome; depois sincronize as tools do Playwright:"
+  info "  curl -X POST $MCP_MANAGER_URL/servers/playwright/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
+fi
 
 if [ "$NO_LAUNCH" -eq 0 ] && [ -t 0 ]; then
   info "Abrindo o WebUI..."

@@ -124,6 +124,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - A pasta escolhida **persiste por projeto** em `cache/webui_cwd.json` (chave = slug do projeto ativo) e é restaurada entre sessões. Os endpoints `GET/PUT/DELETE /fs/cwd` do tray gerenciam esse estado e só aceitam conexões loopback.
 - Servidores são registrados/sincronizados/removidos **em runtime** — inclusive pela **WebUI** e pela **TUI opcional** (instalação assistida de servidores remotos, comandos locais pip/uv e endpoints localhost), sem reiniciar nada.
 - **Playwright MCP** pré-configurado com `--extension`: conecta ao **Chrome real do usuário** via extensão "Playwright MCP Bridge" (instalada no perfil padrão). O orchestrator pede o Chrome ao tray, que o abre **apenas se ele não estiver aberto** — em modo normal, sem CDP nem cópia de perfil — e **o Chrome fica aberto** após as ações (processo detached do host, sobrevive ao docker). Suas sessões/logins do Chrome valendo. A autenticação da extensão é automática: o token `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (`Modules/.env`) é injetado pelo tray no mcp_manager e herdado pelo servidor MCP — sem diálogo de aprovação por conexão.
+- **Aba ativa vs. tab group**: por padrão, o auto-connect com token ancora o MCP na aba do `connect.html` e a extensão oficial isola as abas controladas no grupo `Playwright`. No **Linux**, o `install.sh` empacota e instala automaticamente uma cópia patcheada como **external extension** (CRX próprio, novo ID, token fixo) e usa um wrapper `NODE_OPTIONS` para o Playwright MCP aceitar o novo ID — a aba controlada passa a ser a última aba ativa real e não há tab group. Use `AVA_PLAYWRIGHT_PATCHED_EXTENSION=0` para voltar à extensão da loja. No **Windows**, o `install.ps1` imprime o passo a passo do patch manual (`python scripts\patch_playwright_extension.py` + *Load unpacked*), porque o Chrome não aceita CRX local/registro externo fora da Web Store. Sem o patch, a alternativa é remover o token do MCP e escolher a aba manualmente em **“Allow & select”** no `connect.html`.
 - **Windows**: URLs de servidores http cadastradas como `localhost:PORTA` são reescritas para `host.docker.internal` no momento da conexão (porta e path preservados).
 
 ### Manager Rust (ava-tray)
@@ -189,7 +190,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 ├── docker-compose.yml       # stack base (+ overrides .linux/.windows)
 ├── start.sh                 # supervisor do container (restart-on-fail por serviço)
 ├── install.sh / install.bat # instaladores (baixam o release, geram tokens, models)
-└── scripts/                 # patch-cfonts (build TUI), plan_recorder (gravação de planos)
+└── scripts/                 # patch-cfonts (TUI), plan_recorder, patch/empacotamento da extensão Playwright
 ```
 
 ## Serviços e portas
@@ -281,6 +282,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
+| `AVA_PLAYWRIGHT_PATCHED_EXTENSION` | `install.sh` | `1` | Linux: empacota/instala a extensão Playwright patcheada (aba ativa, sem tab group) como external CRX. `0` usa a extensão da Chrome Web Store |
 | `AVA_CDP_SERVERS` | orchestrator | `playwright` | Servidores MCP que usam o Chrome do host |
 | `MCP_MANAGER_URL` | orchestrator | `localhost:9001` | Onde o mcp_manager está (embutido no tray) |
 | `TRANSCRIBE_HTTP_URL` | orchestrator | `localhost:9100` | Mini HTTP do transcript (host) p/ `/speaker/embed` |
