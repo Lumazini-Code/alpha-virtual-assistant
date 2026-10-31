@@ -33,9 +33,9 @@
 #      start do Docker (POST /docker/start) + garante o mcp_manager (/mcp/start);
 #      registra os MCPs e espera o /status do orchestrator responder
 #      (sem GUI/Manager: cai para docker-start.sh up -d)
-#   7. Symlink do comando `alpha-ai` em ~/.local/bin
+#   7. Symlink do comando `alpha-ai` em ~/.local/bin -> Manager/ava-web
 #   8. Auto-start do ava-tray via XDG autostart (+ inicia agora se ainda não estiver no ar)
-#   9. Inicia a TUI (se o terminal for interativo)
+#   9. Inicia o WebUI (Manager/ava-web) se o terminal for interativo
 #
 # Reinstalação é idempotente: sobrescreve arquivos, preserva Modules/.env com
 # chave válida e `up -d` não derruba containers já sadios.
@@ -71,7 +71,7 @@ Uso: install.sh [opções]
   --install-dir DIR   Pasta de instalação (padrão: $DEFAULT_INSTALL_DIR)
   --keep-models-zip   Não apaga Modules/Models.zip após extrair
   --skip-build        Pula o build/up do Docker (útil para reinstalar)
-  --no-launch         Não abre a TUI ao final
+  --no-launch         Não abre o WebUI ao final
   -h, --help          Esta ajuda
 
 Env:
@@ -120,21 +120,44 @@ as_root() {
   fi
 }
 
-# 1a. curl e unzip (necessários para baixar/instalar o resto)
-for cmd in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    info "'$cmd' não encontrado — instalando..."
-    [ -n "$PKG" ] || die "'$cmd' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
+# 1a. Dependências do host. curl/unzip são comandos; os pacotes "-dev" são
+# bibliotecas e NÃO existem como comando — testá-los com `command -v` fazia o
+# instalador tentar reinstalá-los para sempre e morrer mesmo com tudo
+# instalado. O teste correto é pkg-config (ou o header, sem pkg-config).
+dep_ok() {
+  case "$1" in
+    libwebkit2gtk-4.1-dev)
+      if command -v pkg-config >/dev/null 2>&1; then
+        pkg-config --exists webkit2gtk-4.1
+      else
+        [ -f /usr/include/webkitgtk-4.1/webkit2/webkit2.h ]
+      fi
+      ;;
+    libsoup-3.0-dev)
+      if command -v pkg-config >/dev/null 2>&1; then
+        pkg-config --exists libsoup-3.0
+      else
+        [ -f /usr/include/libsoup-3.0/libsoup/soup.h ]
+      fi
+      ;;
+    *) command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+for dep in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev; do
+  if ! dep_ok "$dep"; then
+    info "'$dep' não encontrado — instalando..."
+    [ -n "$PKG" ] || die "'$dep' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
     case "$PKG" in
-      apt-get) as_root apt-get update -qq && as_root apt-get install -y -qq "$cmd" ;;
-      dnf|dnf5) as_root "$PKG" install -y "$cmd" ;;
-      yum)      as_root yum install -y "$cmd" ;;
-      pacman)   as_root pacman -S --noconfirm --needed "$cmd" ;;
+      apt-get) as_root apt-get update -qq && as_root apt-get install -y -qq "$dep" ;;
+      dnf|dnf5) as_root "$PKG" install -y "$dep" ;;
+      yum)      as_root yum install -y "$dep" ;;
+      pacman)   as_root pacman -S --noconfirm --needed "$dep" ;;
     esac
-    command -v "$cmd" >/dev/null 2>&1 || die "Falha ao instalar '$cmd'. Instale-o manualmente e rode novamente."
+    dep_ok "$dep" || die "Falha ao instalar '$dep'. Instale-o manualmente e rode novamente."
   fi
 done
-ok "Dependências disponíveis disponíveis."
+ok "Dependências do host disponíveis."
 
 # 1b. Docker Engine (+ compose v2) — instala automaticamente se ausente
 # Testa o daemon: direto (usuário já no grupo docker) ou via sg (grupo
@@ -305,7 +328,7 @@ unzip -oq "$TMP_DIR/alpha-ai.zip" -d "$INSTALL_DIR"
 
 cd "$INSTALL_DIR"
 
-chmod +x tui/alpha-ai Manager/ava-tray Manager/ava-web docker-start.sh 2>/dev/null || true
+chmod +x Manager/ava-tray Manager/ava-web docker-start.sh 2>/dev/null || true
 ok "Arquivos extraídos."
 
 # ── 3a. Rebind dos containers (reinstalação sobre stack rodando) ──────────────
@@ -1145,9 +1168,10 @@ else
 fi
 
 # ── 7. Comando do terminal ────────────────────────────────────────────────────
+# `alpha-ai` abre o WebUI nativo (Manager/ava-web), não mais a TUI antiga.
 mkdir -p "$HOME/.local/bin"
-ln -sf "$INSTALL_DIR/tui/alpha-ai" "$HOME/.local/bin/alpha-ai"
-ok "Comando instalado: alpha-ai -> $INSTALL_DIR/tui/alpha-ai"
+ln -sf "$INSTALL_DIR/Manager/ava-web" "$HOME/.local/bin/alpha-ai"
+ok "Comando instalado: alpha-ai -> $INSTALL_DIR/Manager/ava-web"
 
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
@@ -1174,15 +1198,32 @@ esac
 # contrário o shell mostra o ícone genérico.
 ICON_DIR="$HOME/.local/share/icons/hicolor/512x512/apps"
 APPS_DIR="$HOME/.local/share/applications"
+HICOLOR_DIR="$HOME/.local/share/icons/hicolor"
 mkdir -p "$ICON_DIR" "$APPS_DIR"
-install -Dm644 "$INSTALL_DIR/Manager/assets/icon.png" "$ICON_DIR/alpha-ai.png"
+# alpha-ai-taskbar.png é o mesmo glifo com 5% de margem em cada lado: o PNG
+# original preenche 100% do canvas e fica maior que os outros ícones do dock.
+install -Dm644 "$INSTALL_DIR/Manager/assets/alpha-ai-taskbar.png" "$ICON_DIR/alpha-ai.png"
 
+# O StIconTheme do GNOME Shell só observa o mtime da RAIZ do tema (hicolor),
+# não dos subdiretórios como 512x512/apps. Instalar o PNG ali não invalida o
+# cache do processo atual do Shell, que continua caindo no ícone genérico. O
+# index.theme (ausente no hicolor do usuário) permite gerar o icon-theme.cache
+# e o touch final garante a mudança de mtime mesmo se o cache não for gerado.
+if [ ! -f "$HICOLOR_DIR/index.theme" ] && [ -f /usr/share/icons/hicolor/index.theme ]; then
+  install -Dm644 /usr/share/icons/hicolor/index.theme "$HICOLOR_DIR/index.theme"
+fi
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f "$HICOLOR_DIR" >/dev/null 2>&1 || true
+touch "$HICOLOR_DIR"
+
+# Icon= com caminho absoluto: o Shell carrega o PNG como GFileIcon e não passa
+# pelo cache de temas acima. O nome temático continua instalado para os menus.
 cat > "$APPS_DIR/alpha-ai.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Alpha AI
 Comment=Interface web do Alpha AI (WebView nativa)
-Icon=alpha-ai
+Icon=$ICON_DIR/alpha-ai.png
 Exec="$INSTALL_DIR/Manager/ava-web"
 Terminal=false
 StartupNotify=true
@@ -1191,8 +1232,6 @@ Categories=Utility;
 EOF
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 \
-  && gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 ok "Aplicativo registrado: $APPS_DIR/alpha-ai.desktop"
 
 AUTOSTART_DIR="$HOME/.config/autostart"
@@ -1202,7 +1241,7 @@ cat > "$AUTOSTART_DIR/alpha-ai-tray.desktop" <<EOF
 Type=Application
 Name=Alpha AI Tray
 Comment=Gerenciador Docker do Alpha AI (bandeja do sistema)
-Icon=alpha-ai
+Icon=$ICON_DIR/alpha-ai.png
 Exec="$INSTALL_DIR/Manager/ava-tray"
 Terminal=false
 StartupNotify=false
@@ -1224,12 +1263,13 @@ fi
 echo
 ok "Instalação concluída ($INSTALL_DIR)"
 info "Comandos úteis:"
-info "  alpha-ai                          # abre a TUI"
+info "  alpha-ai                          # abre o WebUI (Manager/ava-web)"
+info "  $INSTALL_DIR/Manager/ava-web      # mesma janela, caminho direto"
 info "  $INSTALL_DIR/docker-start.sh logs -f ava   # logs do backend"
 info "  $INSTALL_DIR/logs/                       # logs do tray (ava-tray.log — inclui o MCP manager embutido)"
 info "  $INSTALL_DIR/uninstall.sh         # desinstalação"
 
 if [ "$NO_LAUNCH" -eq 0 ] && [ -t 0 ]; then
-  info "Abrindo a TUI..."
+  info "Abrindo o WebUI..."
   exec "$HOME/.local/bin/alpha-ai"
 fi

@@ -17,9 +17,9 @@
 #   6. Build; inicia o Manager (ava-tray.exe, API :9001), pede a ele o start do
 #      Docker (POST /docker/start) e garante o mcp_manager (/mcp/start); registra
 #      os MCPs e espera o /status responder (falha do Manager: compose up -d direto)
-#   7. Adiciona tui\ ao PATH do usuario (comando `alpha-ai`)
+#   7. Adiciona Manager\ ao PATH + wrapper `alpha-ai.cmd` -> ava-web.exe
 #   8. Auto-start do ava-tray.exe via HKCU\...\Run (+ inicia agora)
-#   9. Inicia a TUI
+#   9. Inicia o WebUI (Manager\ava-web.exe)
 #
 # Uso: powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 [-InstallDir DIR] [-SkipBuild] [-NoLaunch]
 # Env: $env:ALPHA_RELEASE_ZIP = 'caminho.zip' -> usa zip local em vez do
@@ -1209,15 +1209,28 @@ if (-not $SkipBuild) {
 }
 
 # -- 7. PATH do usuario --------------------------------------------------------
-$TuiDir = Join-Path $InstallDir 'tui'
-$UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (-not $UserPath) { $UserPath = '' }
-if ($UserPath -notlike "*$TuiDir*") {
-  $NewPath = if ($UserPath) { "$UserPath;$TuiDir" } else { $TuiDir }
-  [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
-  Write-Ok "Comando instalado: alpha-ai (em $TuiDir). Reabra o terminal para valer."
+# `alpha-ai` abre o WebUI nativo (Manager\ava-web.exe), nao mais a TUI antiga.
+$ManagerDir = Join-Path $InstallDir 'Manager'
+$WebExe = Join-Path $ManagerDir 'ava-web.exe'
+if (Test-Path $WebExe) {
+  # O .cmd fica ao lado do ava-web.exe; %~dp0 resolve o caminho com espacos.
+  $Cmd = Join-Path $ManagerDir 'alpha-ai.cmd'
+  Set-Content -Path $Cmd -Encoding ASCII -Value '@echo off', 'start "" "%~dp0ava-web.exe" %*'
+
+  $TuiDir = Join-Path $InstallDir 'tui'
+  $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $UserPath) { $UserPath = '' }
+  $Parts = @($UserPath -split ';' | Where-Object { $_ -and $_ -ne $TuiDir })
+  if ($Parts -notcontains $ManagerDir) { $Parts += $ManagerDir }
+  $NewPath = ($Parts -join ';')
+  if ($NewPath -ne $UserPath) {
+    [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
+    Write-Ok "Comando instalado: alpha-ai -> $WebExe. Reabra o terminal para valer."
+  } else {
+    Write-Ok "Comando alpha-ai ja no PATH ($ManagerDir)."
+  }
 } else {
-  Write-Ok "Comando alpha-ai ja no PATH."
+  Write-Warn2 "ava-web.exe nao encontrado em $WebExe - comando alpha-ai nao instalado."
 }
 
 # -- 8. Auto-start do tray -----------------------------------------------------
@@ -1243,11 +1256,17 @@ if (Test-Path $TrayExe) {
 Write-Host ''
 Write-Ok "Instalacao concluida ($InstallDir)"
 Write-Info 'Comandos uteis:'
-Write-Info '  alpha-ai                          # abre a TUI (novo terminal)'
+Write-Info '  alpha-ai                          # abre o WebUI (Manager\ava-web.exe)'
+Write-Info '  Manager\ava-web.exe               # mesma janela, caminho direto'
 Write-Info "  $script:LogsHint   # logs do backend"
 Write-Info "  $InstallDir\logs    # logs do tray (ava-tray.log) e do mcp_manager (mcp_manager.log)"
 
 if (-not $NoLaunch) {
-  Write-Info 'Abrindo a TUI...'
-  Start-Process -FilePath (Join-Path $TuiDir 'alpha-ai.exe')
+  $LaunchExe = Join-Path $InstallDir 'Manager\ava-web.exe'
+  if (Test-Path $LaunchExe) {
+    Write-Info 'Abrindo o WebUI...'
+    Start-Process -FilePath $LaunchExe -WorkingDirectory $InstallDir
+  } else {
+    Write-Warn2 "ava-web.exe nao encontrado em $LaunchExe - WebUI nao iniciado."
+  }
 }
