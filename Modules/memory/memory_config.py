@@ -340,6 +340,13 @@ SKILLS_TOP_K            = 3      # skills "primary" por seleção — mais que i
 # skills irrelevantes. Recalibrar se trocar o modelo de embed.
 SKILLS_MIN_SCORE        = 0.79   # cosine mínimo p/ uma skill entrar como primary
 SKILLS_FALLBACK_TOP_K   = 5      # teto em modo low-confidence (sem threshold)
+SKILLS_FALLBACK_MIN_SCORE = 0.55 # piso aplicado também no modo low-confidence —
+                                 # evita injetar skills irrelevantes quando o
+                                 # top-1 já está abaixo do sinal de ruído
+# Novos limites do lado do orchestrator (seleção + hint).
+AGENT_SKILLS_MIN_SCORE  = 0.79   # espelho do SKILLS_MIN_SCORE (env AVA_SKILLS_MIN_SCORE)
+AGENT_SKILLS_FALLBACK_MIN_OVERLAP = 0.20  # overlap mínimo no fallback lexical
+AGENT_SKILLS_AUDIT_MIN_TURNS = 20  # turnos mínimos p/ listar skills nunca selecionadas
 
 # ── NEW: busca por grafo nos dicionários (rosto/objeto/voz) ───────────────────
 DICT_GRAPH_MAX_RELATED = 3

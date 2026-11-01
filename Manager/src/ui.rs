@@ -57,6 +57,8 @@ pub struct ChatMessage {
     pub in_progress: bool,
     /// true para a tool que está sendo chamada no momento (sem step_done).
     pub tool_pending: bool,
+    /// ID da tool call para casar step_done em execução paralela.
+    pub tool_call_id: Option<String>,
 }
 
 pub struct TrayApp {
@@ -197,6 +199,7 @@ impl TrayApp {
                         text: input.to_string(),
                         in_progress: false,
                         tool_pending: false,
+                        tool_call_id: None,
                     });
                     // Bolha da resposta entra vazia e em progresso.
                     self.chat_history.push(ChatMessage {
@@ -204,6 +207,7 @@ impl TrayApp {
                         text: String::new(),
                         in_progress: true,
                         tool_pending: false,
+                        tool_call_id: None,
                     });
                     self.chat_running = true;
                 }
@@ -239,6 +243,7 @@ impl TrayApp {
                                 text: piece.to_string(),
                                 in_progress: true,
                                 tool_pending: false,
+                                tool_call_id: None,
                             });
                         }
                         None => {}
@@ -255,32 +260,71 @@ impl TrayApp {
                             msg.in_progress = false;
                         }
                     }
+                    let tool_call_id = ev.data.get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
                     self.chat_history.push(ChatMessage {
                         role: ChatRole::Tool,
                         text: format!("chamando {tool}…"),
                         in_progress: true,
                         tool_pending: true,
+                        tool_call_id,
                     });
                 }
             }
+            "skill_loaded" => {
+                // Skills selecionadas para este turno — mostra na UI qual
+                // playbook está ativo. Como o ChatRole não tem um tipo
+                // específico para skill, registramos como uma linha de
+                // sistema (Tool com tool_pending=false para não casar com
+                // step_done).
+                if let Some(skills) = ev.data.get("skills").and_then(|v| v.as_array()) {
+                    let names: Vec<&str> = skills
+                        .iter()
+                        .filter_map(|s| s.get("name").and_then(|n| n.as_str()))
+                        .collect();
+                    if !names.is_empty() {
+                        let msg = format!("🛠 Skills carregadas: {}", names.join(", "));
+                        tracing::info!("{}", msg);
+                        self.chat_history.push(ChatMessage {
+                            role: ChatRole::Tool,
+                            text: msg,
+                            in_progress: false,
+                            tool_pending: false,
+                            tool_call_id: None,
+                        });
+                    }
+                }
+            }
             "step_done" => {
-                // Fecha a tool pendente mais recente com sucesso/falha.
+                // Fecha a tool pendente com sucesso/falha. Em execução paralela,
+                // casa pelo tool_call_id; sem id (evento antigo/serial), cai na
+                // heurística de "primeira tool pendente de trás para frente".
                 let success = ev
                     .data
                     .get("success")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                for msg in self.chat_history.iter_mut().rev() {
-                    if msg.role == ChatRole::Tool && msg.tool_pending {
-                        msg.tool_pending = false;
-                        msg.in_progress = false;
-                        msg.text = format!(
-                            "{} {}",
-                            if success { "✓" } else { "✗" },
-                            msg.text.trim_end_matches('…').trim()
-                        );
-                        break;
-                    }
+                let tool_call_id = ev
+                    .data
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str);
+                let target = self.chat_history.iter_mut().rev().find(|m| {
+                    m.role == ChatRole::Tool
+                        && m.tool_pending
+                        && match tool_call_id {
+                            Some(id) => m.tool_call_id.as_deref() == Some(id),
+                            None => true,
+                        }
+                });
+                if let Some(msg) = target {
+                    msg.tool_pending = false;
+                    msg.in_progress = false;
+                    msg.text = format!(
+                        "{} {}",
+                        if success { "✓" } else { "✗" },
+                        msg.text.trim_end_matches('…').trim()
+                    );
                 }
             }
             "done" => {
@@ -306,6 +350,7 @@ impl TrayApp {
                                 text: final_response.to_string(),
                                 in_progress: false,
                                 tool_pending: false,
+                                tool_call_id: None,
                             });
                         }
                         None => {}
@@ -315,6 +360,34 @@ impl TrayApp {
                     msg.in_progress = false;
                 }
                 self.chat_running = false;
+            }
+            "stream_warning" => {
+                // Truncamento do stream (drop-oldest na fila do orchestrator):
+                // o cliente precisa saber que parte da resposta não chegou.
+                let dropped = ev
+                    .data
+                    .get("dropped_events")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let warning = format!(
+                    "\n\n⚠ parte da resposta foi truncada ({dropped} eventos descartados)"
+                );
+                if let Some(a) = self
+                    .chat_history
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == ChatRole::Assistant && m.in_progress)
+                {
+                    a.text.push_str(&warning);
+                } else {
+                    self.chat_history.push(ChatMessage {
+                        role: ChatRole::Assistant,
+                        text: warning.trim_start().to_string(),
+                        in_progress: false,
+                        tool_pending: false,
+                        tool_call_id: None,
+                    });
+                }
             }
             "error" => {
                 let err_text = ev
@@ -338,6 +411,7 @@ impl TrayApp {
                         text: format!("✗ erro: {err_text}"),
                         in_progress: false,
                         tool_pending: false,
+                        tool_call_id: None,
                     });
                 }
                 self.chat_running = false;
@@ -440,6 +514,7 @@ impl TrayApp {
                 text: text.clone(),
                 in_progress: false,
                 tool_pending: false,
+                tool_call_id: None,
             });
             // Bolha da Alpha entra vazia e em progresso (tokens chegam em deltas).
             self.chat_history.push(ChatMessage {
@@ -447,6 +522,7 @@ impl TrayApp {
                 text: String::new(),
                 in_progress: true,
                 tool_pending: false,
+                tool_call_id: None,
             });
             self.chat_running = true;
 

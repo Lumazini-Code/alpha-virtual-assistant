@@ -93,7 +93,9 @@ import os
 import queue
 import re
 import time
+import unicodedata
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -157,6 +159,19 @@ MCP_MANAGER_URL      = os.getenv("MCP_MANAGER_URL", "http://127.9.12.22:9001")
 # externa que não tiver override usa este valor (também enviado ao manager,
 # que repassa ao call_tool do SDK).
 MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
+# ── Teto de tools por rodada ──────────────────────────────────────────────────
+# O schema é enviado inteiro ao modelo a cada turno. Servidores always-on +
+# seleção do grafo podem somar dezenas de tools; acima do teto a escolha do
+# modelo degrada (e o payload cresce). O cap prioriza always-on → grafo → resto
+# e é aplicado DEPOIS do _load_mcp_tools (schema real já carregado).
+MCP_MAX_TOOLS_PER_TURN = int(os.getenv("AVA_MCP_MAX_TOOLS_PER_TURN", "40"))
+# Allowlist opcional de tools MCP que PODEM rodar em paralelo. Vazia = usa a
+# heurística conservadora por nome (read-only/idempotente). Nomes completos
+# (`servidor__tool`) separados por vírgula; a allowlist FORÇA safe.
+MCP_PARALLEL_SAFE_ALLOWLIST = {
+    s.strip() for s in os.getenv("AVA_MCP_PARALLEL_SAFE_TOOLS", "").split(",")
+    if s.strip()
+}
 # ── Servidores MCP always-on ──────────────────────────────────────────────────
 # Servidores MCP cujas tools devem estar SEMPRE disponíveis ao modelo, sem
 # passar pelo seletor semântico (/skills/select) — união com o resultado do
@@ -165,7 +180,7 @@ MCP_CALL_TIMEOUT     = float(os.getenv("MCP_CALL_TIMEOUT", "180.0"))
 # offline não é injetado. Env para override sem tocar em código.
 ALWAYS_ON_MCP_SERVERS = {
     s.strip() for s in os.getenv(
-        "AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp,desktop-commander"
+        "AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp"
     ).split(",") if s.strip()
 }
 # desktop-commander SEMPRE-on (26/10): é o EXECUTOR do agente (shell/arquivos/
@@ -247,6 +262,10 @@ ALWAYS_ON_AGENT_SKILLS = {
     s.strip() for s in os.getenv("AVA_ALWAYS_ON_AGENT_SKILLS", "").split(",") if s.strip()
 }
 AGENT_SKILLS_TOP_K   = int(os.getenv("AVA_SKILLS_TOP_K", "3"))
+AGENT_SKILLS_MIN_SCORE = float(os.getenv("AVA_SKILLS_MIN_SCORE", "0.79"))
+AGENT_SKILLS_FALLBACK_MIN_OVERLAP = float(os.getenv("AVA_SKILLS_FALLBACK_MIN_OVERLAP", "0.20"))
+AGENT_SKILLS_AUDIT_MIN_TURNS = int(os.getenv("AVA_SKILLS_AUDIT_MIN_TURNS", "20"))
+AGENT_SKILLS_FALLBACK_TOP_K = int(os.getenv("AVA_SKILLS_FALLBACK_TOP_K", "5"))
 SKILL_BODY_MAX_CHARS = int(os.getenv("AVA_SKILL_BODY_MAX_CHARS", "64000"))
 SKILL_FILE_MAX_CHARS = int(os.getenv("AVA_SKILL_FILE_MAX_CHARS", "32000"))
 # Skills cujo playbook referencia MCP tools POR NOME — só são anunciadas no
@@ -256,7 +275,15 @@ SKILL_FILE_MAX_CHARS = int(os.getenv("AVA_SKILL_FILE_MAX_CHARS", "32000"))
 # projects-and-skills (prompts.txt), e o condicionamento sobreviveu como gate
 # de VISIBILIDADE da skill — nunca anunciar tool que não está disponível.
 MCP_GATED_AGENT_SKILLS: dict[str, set[str]] = {
-    "projects-and-skills": {"project_create", "skill_create"},
+    "projects-and-skills": {"project_create", "project_list", "skill_create", "skill_list"},
+}
+# Análogo ao MCP, para skills cujo playbook depende de tools NATIVAS do
+# registry TOOLS (list_plans/run_plan/use_skill/skill_file). Se o schema
+# nativo mudar e a tool sumir, a skill deixa de ser anunciada — o hint nunca
+# aponta para uma tool que o modelo não recebe. use_skill é gate GLOBAL do
+# bloco de skills: sem ele nenhum playbook pode ser carregado.
+NATIVE_GATED_AGENT_SKILLS: dict[str, set[str]] = {
+    "browser-plans": {"list_plans", "run_plan"},
 }
 # Gerenciador de processos (Rust/axum) que sobe/derruba o ambiente Docker.
 # Env: no Windows o container precisa alcançar o tray NO HOST —
@@ -338,11 +365,111 @@ DEFAULT_MIN_SCORE = 0.30
 ORCH_RECALL_TOP_K       = int(os.getenv("ORCH_RECALL_TOP_K", "6"))
 ORCH_RECALL_TOP_K_FINAL = int(os.getenv("ORCH_RECALL_TOP_K_FINAL", "5"))
 ORCH_RECALL_MAX_CHARS   = int(os.getenv("ORCH_RECALL_MAX_CHARS", "3000"))
+# ── Orçamento dos blocos DINÂMICOS do system prompt (tail, pós-prefixo ──────
+# estático). ORCH_RECALL_MAX_CHARS já limita o recall de memória; estes tetos
+# impedem que planos + dicas + skills inflem o prompt num turno cheio. O corte
+# acontece só no bloco dinâmico — o prefixo cacheável nunca é tocado. Valores
+# generosos por default, ajustáveis por env.
+PLANS_HINT_MAX_CHARS    = int(os.getenv("PLANS_HINT_MAX_CHARS", "600"))
+TOOL_TIPS_MAX_CHARS     = int(os.getenv("TOOL_TIPS_MAX_CHARS", "1200"))
+SKILLS_HINT_MAX_CHARS   = int(os.getenv("SKILLS_HINT_MAX_CHARS", "1500"))
 ORCH_ST_PAIRS           = int(os.getenv("ORCH_ST_PAIRS", "5"))
 ORCH_ST_MAX_CHARS       = int(os.getenv("ORCH_ST_MAX_CHARS", "2400"))
 # Teto do par cru gravado no ST (cabeça + cauda com marcador). Mantém o recall
 # da sessão inteira dentro do orçamento ORCH_ST_MAX_CHARS.
 ST_SAVE_MAX_CHARS       = int(os.getenv("ST_SAVE_MAX_CHARS", "2000"))
+
+# Marcador ÚNICO de corte semântico — reutilizado no ST salvo e no bloco final.
+ST_OMIT_MARKER          = "\n[…trecho omitido…]\n"
+
+# Metadados de confiança/recência injetados no bloco de recall. O modelo precisa
+# distinguir fato sólido de memória fraca/antiga — sem isso, fatos conflitantes
+# ficam indistinguíveis.
+RECALL_CONF_HIGH        = float(os.getenv("RECALL_CONF_HIGH", "0.75"))
+RECALL_CONF_MEDIUM      = float(os.getenv("RECALL_CONF_MEDIUM", "0.45"))
+
+# Query de recall contextual: inputs curtos/deíticos ("faz isso", "e agora?")
+# ganham os últimos turnos do cache para não errar o alvo semântico.
+RECALL_QUERY_RECENT_PAIRS = int(os.getenv("RECALL_QUERY_RECENT_PAIRS", "2"))
+RECALL_QUERY_MAX_CHARS    = int(os.getenv("RECALL_QUERY_MAX_CHARS", "800"))
+RECENT_TURNS_MAX_SESSIONS = int(os.getenv("RECENT_TURNS_MAX_SESSIONS", "128"))
+RECENT_TURNS_MAX_PAIRS    = int(os.getenv("RECENT_TURNS_MAX_PAIRS", "3"))
+
+
+def _age_label(ts: Optional[float]) -> str:
+    """Idade legível de um timestamp Unix (para metadados de Tool Tips)."""
+    if not ts:
+        return "nunca"
+    delta = max(0.0, time.time() - float(ts))
+    if delta < 3600:
+        return f"{int(delta // 60)}min"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    return f"{int(delta // 86400)}d"
+
+
+def _truncate_block(text: str, max_chars: int, label: str) -> str:
+    """Corta um bloco DINÂMICO do prompt no último espaço/linha antes do teto e
+    anexa um marcador explícito. Nunca corta no meio de uma palavra; nunca
+    levanta exceção (teto <= 0 ou texto curto devolve o texto intacto)."""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = f"\n… [truncated: {label}]"
+    budget = max_chars - len(marker)
+    if budget <= 0:
+        return text[:max_chars]
+    head = text[:budget]
+    cut = head.rfind("\n")
+    if cut < budget // 2:
+        cut = head.rfind(" ")
+    if cut <= 0:
+        cut = budget
+    return head[:cut].rstrip() + marker
+
+
+# ── Métricas operacionais (agregadas, leves) ────────────────────────────────
+# Contadores em memória, resetados a cada restart. O /status expõe um snapshot
+# para que regressões agregadas (fallback de skills/tools, drops de fila,
+# falhas de memória) não fiquem só em log.warning.
+_METRICS: dict[str, Any] = {
+    "turns_total": 0,
+    "turns_degraded": 0,
+    "degraded": {
+        "skill_selector_fallback": 0,
+        "mcp_manager_offline": 0,
+        "mcp_server_load_failures": 0,
+        "agent_skills_unavailable": 0,
+    },
+    "tool_failures_by_category": {},
+    "unknown_tool_calls": 0,
+    "invalid_json_calls": 0,
+    "queue_drops": 0,
+    "memory_save_failures": 0,
+    "memory_extraction_failures": 0,
+    "force_finish_calls": 0,
+}
+
+
+def _metric_inc(name: str, key: Optional[str] = None, n: int = 1) -> None:
+    """Incrementa um contador global. Nunca levanta (métricas não derrubam o turno)."""
+    try:
+        if key is None:
+            _METRICS[name] = int(_METRICS.get(name, 0)) + n
+        else:
+            bucket = _METRICS.get(name)
+            if not isinstance(bucket, dict):
+                bucket = _METRICS[name] = {}
+            bucket[key] = int(bucket.get(key, 0)) + n
+    except Exception:
+        pass
+
+
+def _metric_snapshot() -> dict[str, Any]:
+    """Cópia rasa e serializável das métricas (para /status e eventos)."""
+    snap: dict[str, Any] = {}
+    for k, v in _METRICS.items():
+        snap[k] = dict(v) if isinstance(v, dict) else v
+    return snap
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. Respond naturally and briefly. No reasoning needed.",
@@ -692,6 +819,7 @@ class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
     result: Optional[Any] = None; error: Optional[str] = None
     retries: int = 0; latency_ms: float = 0.0
+    tool_call_id: Optional[str] = None
 
 class ExecuteResponse(BaseModel):
     execution_id: str; input: str; session_id: str; final_response: str
@@ -888,6 +1016,9 @@ async def lifespan(app: FastAPI):
     # (best-effort — memory offline não bloqueia o boot; o retry acontece
     # no próximo turno via assinatura do scan).
     await _ensure_agent_skills_index(force=True)
+    # NEW (Tool Tips): registra as tools NATIVAS no ToolsDB para o
+    # tool_tip_add aceitá-las e o bloco "Tool tips" incluí-las.
+    await _ensure_native_tools_index(force=True)
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
@@ -943,6 +1074,73 @@ def _result_to_text(res) -> str:
                 lines.append(f"[{idx + 1}] {str(item)[:280]}")
         return ("\n".join(lines))[:MAX_CONTEXT_CHARS]
     return str(res)[:MAX_CONTEXT_CHARS]
+
+
+def _parse_tool_args(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Valida os argumentos de um tool_call antes de executar qualquer coisa.
+
+    Devolve (args, erro). Só um JSON OBJECT é aceito: lista/escalar/None viram
+    erro — nunca `{}` silencioso. Vazio/None é o único caso legítimo de `{}`
+    (tool sem parâmetros). O erro é devolvido ao modelo como role="tool" para
+    ele corrigir a chamada na próxima rodada, em vez de repetir o mesmo
+    payload inválido sem saber o motivo."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}, None
+    if isinstance(raw, dict):
+        return raw, None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        return None, f"invalid JSON: {e}"
+    if not isinstance(parsed, dict):
+        return None, f"arguments must be a JSON object, got {type(parsed).__name__}"
+    return parsed, None
+
+
+def _categorize_error(exc: BaseException) -> tuple[str, str]:
+    """Classifica uma falha de tool em categoria acionável + hint curto.
+
+    O modelo escolhe o retry certo a partir do prefixo (TIMEOUT, AUTH,
+    NOT_FOUND, BAD_ARGS, RATE_LIMIT, UNAVAILABLE) em vez de repetir cegamente
+    a mesma chamada. O detalhe bruto continua no texto, depois do prefixo."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "TIMEOUT", "The call timed out. Reduce scope or try one simpler approach; do not repeat the same call."
+    if isinstance(exc, httpx.TimeoutException):
+        return "TIMEOUT", "The call timed out. Reduce scope or try one simpler approach; do not repeat the same call."
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return "AUTH", "Authentication or authorization failed. Do not repeat; tell the user that credentials or permissions need to be fixed."
+        if code in (404, 410):
+            return "NOT_FOUND", "The requested resource was not found. Check the name, path, or id; do not repeat with the same arguments."
+        if code in (400, 422):
+            return "BAD_ARGS", "The arguments were rejected as invalid. Correct them to match the tool schema."
+        if code == 429:
+            return "RATE_LIMIT", "Rate limited. Wait or reduce request frequency; do not retry immediately."
+        if code >= 500:
+            return "UNAVAILABLE", "The service is unavailable. Try once more later or use a different approach."
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, ConnectionError)):
+        return "UNAVAILABLE", "The service is unreachable. Try once more later or use a different approach."
+    text = str(exc).lower()
+    if "timeout" in text or "timed out" in text:
+        return "TIMEOUT", "The call timed out. Reduce scope or try one simpler approach; do not repeat the same call."
+    if "unauthorized" in text or "forbidden" in text or "auth" in text:
+        return "AUTH", "Authentication or authorization failed. Do not repeat; tell the user that credentials or permissions need to be fixed."
+    if "not found" in text or "does not exist" in text:
+        return "NOT_FOUND", "The requested resource was not found. Check the name, path, or id; do not repeat with the same arguments."
+    if "invalid" in text or "bad request" in text or "validation" in text:
+        return "BAD_ARGS", "The arguments were rejected as invalid. Correct them to match the tool schema."
+    if "rate limit" in text or "429" in text:
+        return "RATE_LIMIT", "Rate limited. Wait or reduce request frequency; do not retry immediately."
+    return "UNAVAILABLE", "The tool call failed due to an unexpected error. Try a different approach or report the issue."
+
+
+def _format_tool_error(category: str, detail: str, hint: Optional[str] = None) -> str:
+    """Formata o erro de tool com prefixo acionável para o modelo."""
+    msg = f"ERROR[{category}]: {detail}"
+    if hint:
+        msg += f" Hint: {hint}"
+    return msg
 
 
 async def _fire_tts(text, req):
@@ -1116,6 +1314,88 @@ def _spawn(coro) -> asyncio.Task:
     return t
 
 
+# ── Falhas de memória por sessão (nota no próximo turno) ─────────────────────
+# _save_turn e a extração pós-turno são fire-and-forget: sem um sinal
+# persistente, a perda de conhecimento fica invisível. Guardamos flags por
+# sessão com TTL curto; _run_tool_loop consome e injeta um aviso no próximo
+# system prompt. Limite duro de entradas evita crescimento sem fim.
+_MEMORY_FAILURES: dict[str, dict[str, Any]] = {}
+_MEMORY_FAILURES_TTL_S = 24 * 60 * 60
+_MEMORY_FAILURES_MAX = 200
+
+
+def _prune_memory_failures() -> None:
+    now = time.time()
+    for sid in list(_MEMORY_FAILURES):
+        item = _MEMORY_FAILURES.get(sid) or {}
+        if now - float(item.get("at") or 0) > _MEMORY_FAILURES_TTL_S:
+            _MEMORY_FAILURES.pop(sid, None)
+    while len(_MEMORY_FAILURES) > _MEMORY_FAILURES_MAX:
+        _MEMORY_FAILURES.pop(next(iter(_MEMORY_FAILURES)), None)
+
+
+def _note_memory_failure(sid: str, kind: str, reason: str) -> None:
+    """Registra falha de gravação/extração de memória para ESTA sessão."""
+    try:
+        _prune_memory_failures()
+        item = _MEMORY_FAILURES.get(sid) or {"save_failed": False, "extract_failed": False}
+        item["at"] = time.time()
+        if kind == "save":
+            item["save_failed"] = True
+        elif kind == "extract":
+            item["extract_failed"] = True
+        # Mantém o motivo mais recente; se ambos falharem, concatena os dois.
+        old = str(item.get("reason") or "").strip()
+        new = f"{kind}: {reason}".strip()
+        item["reason"] = f"{old} | {new}" if old and new not in old else new
+        _MEMORY_FAILURES[sid] = item
+    except Exception:
+        pass
+
+
+def _clear_memory_failure(sid: str, kind: str) -> None:
+    """Remove a flag daquela falha quando o serviço voltou a funcionar."""
+    try:
+        item = _MEMORY_FAILURES.get(sid)
+        if not item:
+            return
+        if kind == "save":
+            item["save_failed"] = False
+        elif kind == "extract":
+            item["extract_failed"] = False
+        if not item.get("save_failed") and not item.get("extract_failed"):
+            _MEMORY_FAILURES.pop(sid, None)
+    except Exception:
+        pass
+
+
+def _consume_memory_warning(sid: str) -> str:
+    """Consome (uma vez) o aviso de memória do turno anterior desta sessão."""
+    try:
+        _prune_memory_failures()
+        item = _MEMORY_FAILURES.pop(sid, None)
+        if not item:
+            return ""
+        parts: list[str] = []
+        if item.get("save_failed"):
+            parts.append("the raw turn was not saved to short-term history")
+        if item.get("extract_failed"):
+            parts.append("post-turn memory extraction failed")
+        if not parts:
+            return ""
+        reason = str(item.get("reason") or "").strip()
+        detail = f" ({reason})" if reason else ""
+        return (
+            "<memory_warning>The previous turn's memory was not saved: "
+            + "; ".join(parts)
+            + detail
+            + ". Do not assume it is in long-term memory; if the user references "
+            "it, restate or ask instead of pretending to remember.</memory_warning>"
+        )
+    except Exception:
+        return ""
+
+
 async def _save_turn(u, a, sid):
     """Grava o par cru (user, assistant) no ST da sessão. É o ÚNICO histórico
     de conversa que o próximo turno recebe (via /read-short-term) — se falhar,
@@ -1130,16 +1410,17 @@ async def _save_turn(u, a, sid):
     # próximo passo — onde fica o 'quer que eu gere?'). O recall do ST tem
     # orçamento de ORCH_ST_MAX_CHARS (2400) p/ a SESSÃO INTEIRA; um turno
     # gigante sozinho já o estoura e a sanitizer descartaria os demais.
-    def _clip(t: str) -> str:
-        if len(t) <= ST_SAVE_MAX_CHARS:
-            return t
-        return t[:ST_SAVE_MAX_CHARS - 400] + "\n[…trecho omitido…]\n" + t[-400:]
+    u, a = _clip_with_marker(u, ST_SAVE_MAX_CHARS), _clip_with_marker(a, ST_SAVE_MAX_CHARS)
 
-    u, a = _clip(u), _clip(a)
+    # Cache de turnos recentes p/ enriquecer a query de recall do PRÓXIMO turno.
+    # Independe do /write-short-term ter aceitado o par (dedup etc.): o turno
+    # aconteceu e serve de contexto conversacional.
+    _remember_turn(sid, u, a)
     payload = {
         "session_id": sid,
         "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
     }
+    last_error = ""
     for attempt in (1, 2):
         try:
             r = await _memory_request("POST", "/write-short-term", payload)
@@ -1147,18 +1428,26 @@ async def _save_turn(u, a, sid):
             reason = str(r.get("reason") or "?") if isinstance(r, dict) else str(r)
             if stored:
                 log.info(f"[save_turn] ST gravado (session={sid[:8]})")
-            elif reason.startswith("duplicate_semantic"):
+                _clear_memory_failure(sid, "save")
+                return True
+            if reason.startswith("duplicate_semantic"):
                 log.info(f"[save_turn] ST recusado por dedup ({reason}) — "
                          "resumo episódico já cobre o turno")
-            else:
-                log.warning(f"[save_turn] ST NÃO gravado (reason={reason}) — "
-                            f"session={sid[:8]} — turno seguinte nasce sem histórico!")
-            return
+                _clear_memory_failure(sid, "save")
+                return True
+            last_error = f"short-term save rejected: {reason}"
+            log.warning(f"[save_turn] ST NÃO gravado (reason={reason}) — "
+                        f"session={sid[:8]} — turno seguinte nasce sem histórico!")
+            break
         except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
             log.warning(f"[save_turn] write-short-term falhou (tentativa {attempt}/2): "
                         f"{type(e).__name__}: {e}")
             if attempt == 1:
                 await asyncio.sleep(1.0)
+    _metric_inc("memory_save_failures")
+    _note_memory_failure(sid, "save", last_error or "unknown failure")
+    return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Recall de memória pré-loop (A) — LT semântico + ST cru, em paralelo
@@ -1216,6 +1505,167 @@ def _norm_st_fragments(text: str) -> list[str]:
     return frags
 
 
+def _clip_with_marker(text: str, max_chars: int, tail_chars: int = 400) -> str:
+    """Corta texto mantendo cabeça + cauda e um marcador explícito de omissão.
+    Corta em fronteira de linha/espaço quando possível — nunca no meio de uma
+    palavra se houver quebra próxima ao limite. Nunca levanta exceção."""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    # Orçamento minúsculo (menor que o marcador): ainda sinaliza o corte.
+    if max_chars <= len(ST_OMIT_MARKER):
+        return text[:max_chars] + "…"
+    # Garante que o marcador caiba, reduzindo a cauda se necessário.
+    tail_chars = min(tail_chars, max(0, max_chars - len(ST_OMIT_MARKER) - 1))
+    head_budget = max(0, max_chars - tail_chars - len(ST_OMIT_MARKER))
+    if head_budget <= 0:
+        return text[:max(0, max_chars - len(ST_OMIT_MARKER))] + ST_OMIT_MARKER
+    head = text[:head_budget]
+    cut = head.rfind("\n")
+    if cut < head_budget // 2:
+        cut = head.rfind(" ")
+    if cut <= 0:
+        cut = head_budget
+    head = head[:cut].rstrip()
+    tail = text[-tail_chars:].lstrip()
+    return f"{head}{ST_OMIT_MARKER}{tail}"
+
+
+def _norm_dedup_text(text: str) -> str:
+    """Normalização conservadora p/ dedup: lowercase, sem prefixo [role],
+    espaços colapsados e pontuação final removida."""
+    t = re.sub(r"^\[(?:user|assistant)\]\s*", "", (text or "").strip(), flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t.rstrip(" .,;:!?")
+
+
+def _age_label(created_at: Any, now: Optional[float] = None) -> str:
+    """Idade compacta de uma memória ('3d', '12h', 'new'); '' se desconhecida."""
+    try:
+        ts = float(created_at or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    delta = max(0.0, (now if now is not None else time.time()) - ts)
+    if delta < 3600:
+        return "new"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    return f"{int(delta // 86400)}d"
+
+
+def _confidence_label(confidence: Any) -> str:
+    """Confiança qualitativa a partir do score numérico do MemoryEntry."""
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return ""
+    if c <= 0:
+        return ""
+    if c >= RECALL_CONF_HIGH:
+        return "high"
+    if c >= RECALL_CONF_MEDIUM:
+        return "medium"
+    return "low"
+
+
+def _memory_meta(m: dict, now: Optional[float] = None) -> str:
+    """Metadados compactos de uma memória: confidence, age e relevance.
+    Omite campos ausentes/zero. Retorna '' quando não há nada a mostrar."""
+    parts: list[str] = []
+    conf = _confidence_label(m.get("confidence"))
+    if conf:
+        parts.append(f"confidence: {conf}")
+    age = _age_label(m.get("created_at"), now)
+    if age:
+        parts.append(f"age: {age}")
+    try:
+        score = float(m.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score > 0:
+        parts.append(f"relevance: {score:.2f}")
+    return " · ".join(parts)
+
+
+def _memory_line(m: dict, weak: bool = False, now: Optional[float] = None) -> str:
+    """Bullet de memória com metadados; `weak` marca evidência indireta."""
+    text = (m.get("text") or m.get("content") or "").strip()
+    meta = _memory_meta(m, now)
+    if weak:
+        meta = (meta + " · weak evidence" if meta else "weak evidence")
+    return f"- {text}" + (f" [{meta}]" if meta else "")
+
+
+def _known_recall_fragments(read_res: Optional[dict],
+                            st_turns: Optional[list[dict]] = None) -> list[str]:
+    """Fragmentos normalizados do recall + ST, usados p/ dedup do bloco de voz."""
+    frags: list[str] = []
+    for m in (read_res or {}).get("results") or []:
+        n = _norm_dedup_text(m.get("text") or m.get("content") or "")
+        if n:
+            frags.append(n)
+    for t in st_turns or []:
+        n = _norm_dedup_text(t.get("content") or "")
+        if n:
+            frags.append(n)
+    return frags
+
+
+# Cache LRU dos últimos turnos por sessão — usado SÓ para enriquecer a query
+# de recall em inputs curtos/deíticos. O histórico canônico continua sendo o
+# /read-short-term; este cache é best-effort e nunca bloqueia o turno.
+_RECENT_TURNS: "OrderedDict[str, list[dict]]" = OrderedDict()
+
+
+def _remember_turn(sid: str, user_text: str, assistant_text: str) -> None:
+    """Registra o par do turno para a próxima query de recall. Best-effort:
+    nunca levanta. Limitado por sessão e por número de sessões (LRU)."""
+    try:
+        if not sid:
+            return
+        def _one(role: str, text: str) -> dict:
+            return {"role": role, "content": _clip_with_marker(text or "", 400, 120)}
+        turns = _RECENT_TURNS.get(sid) or []
+        turns.extend([_one("user", user_text), _one("assistant", assistant_text)])
+        _RECENT_TURNS[sid] = turns[-2 * RECENT_TURNS_MAX_PAIRS:]
+        _RECENT_TURNS.move_to_end(sid)
+        while len(_RECENT_TURNS) > RECENT_TURNS_MAX_SESSIONS:
+            _RECENT_TURNS.popitem(last=False)
+    except Exception:
+        pass
+
+
+def _build_recall_query(user_input: str, sid: str) -> str:
+    """Expande a query de recall quando o input é curto ou deítico, usando os
+    últimos turnos do cache. Input longo/normal fica inalterado para não
+    diluir a busca semântica."""
+    raw = (user_input or "").strip()
+    if not raw:
+        return raw
+    low = raw.lower()
+    deictic = (
+        "isso", "isto", "aquilo", "e agora", "continua", "continuar",
+        "de novo", "faz", "fazer", "same", "this", "that", "do it",
+        "now what", "continue", "again",
+    )
+    words = re.findall(r"[\wÀ-ÿ'-]+", raw)
+    is_short = len(words) <= 8
+    has_deictic = any(d in low for d in deictic)
+    if not (is_short or has_deictic):
+        return raw
+    turns = _RECENT_TURNS.get(sid) or []
+    if not turns:
+        return raw
+    recent = [(t.get("content") or "").strip()
+              for t in turns[-(2 * RECALL_QUERY_RECENT_PAIRS):]]
+    recent = [r for r in recent if r]
+    if not recent:
+        return raw
+    query = raw + "\n\nRecent conversation:\n" + "\n".join(recent)
+    return _clip_with_marker(query, RECALL_QUERY_MAX_CHARS, 200)
+
+
 def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]] = None) -> str:
     """Formata os resultados do /read como bloco de contexto type-aware.
 
@@ -1233,56 +1683,88 @@ def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]
     if not read_res:
         return ""
     results = read_res.get("results") or []
+    now = time.time()
 
     recent_blob = ""
     if st_turns:
         recent_blob = " ".join(
-            (t.get("content") or "").lower() for t in st_turns if t.get("content")
+            _norm_dedup_text(t.get("content") or "") for t in st_turns if t.get("content")
         )
 
     lt_primary: list[str] = []
-    lt_related: list[str] = []
+    lt_related_items: list[tuple[str, dict]] = []
     references: list[str] = []
+    primary_norms: list[str] = []
+    seen: set[str] = set()
+
     for m in results:
         text = (m.get("text") or m.get("content") or "").strip()
         if not text:
+            continue
+        norm = _norm_dedup_text(text)
+        if not norm or norm in seen:
             continue
         mtype = m.get("memory_type") or "long_term"
         match = m.get("match_type") or "primary"
         if mtype in ("knowledge", "indexed_file"):
             src = m.get("file_name") or m.get("source")
-            references.append(text + (f" (source: {src})" if src else ""))
+            line = text + (f" (source: {src})" if src else "")
+            meta = _memory_meta(m, now)
+            references.append(f"- {line}" + (f" [{meta}]" if meta else ""))
+            seen.add(norm)
         elif mtype == "short_term":
             if recent_blob and any(
                 f in recent_blob for f in _norm_st_fragments(text) if len(f) >= 12
             ):
                 continue
-            lt_primary.append(text)
+            seen.add(norm)
+            primary_norms.append(norm)
+            lt_primary.append(_memory_line(m, now=now))
         elif match == "related":
-            lt_related.append(text)
+            lt_related_items.append((norm, m))
         else:
-            lt_primary.append(text)
+            seen.add(norm)
+            primary_norms.append(norm)
+            lt_primary.append(_memory_line(m, now=now))
+
+    # Dedup de "related" contra os fatos primários (e entre si): o grafo às
+    # vezes devolve o mesmo fato já presente como hit direto. Evidência
+    # indireta duplicada é só token desperdiçado.
+    lt_related: list[str] = []
+    for norm, m in lt_related_items:
+        if norm in seen:
+            continue
+        if any(
+            len(norm) >= 20 and len(pn) >= 20 and (norm in pn or pn in norm)
+            for pn in primary_norms
+        ):
+            continue
+        seen.add(norm)
+        lt_related.append(_memory_line(m, weak=True, now=now))
 
     sections: list[str] = []
     if lt_primary:
         sections.append("Known facts and episodes (long-term memory):\n"
-                        + "\n".join(f"- {t}" for t in lt_primary))
+                        + "\n".join(lt_primary))
     if lt_related:
-        sections.append("Graph associations (indirect context — may be relevant):\n"
-                        + "\n".join(f"- {t}" for t in lt_related))
+        sections.append("Graph associations (weak evidence — indirect links; verify before relying):\n"
+                        + "\n".join(lt_related))
     if references:
         sections.append("Reference material (knowledge base / indexed files):\n"
-                        + "\n".join(f"- {t}" for t in references))
+                        + "\n".join(references))
     return "\n\n".join(sections)
 
 
-def _sanitize_st_turns(turns: list[dict], max_chars: int) -> list[dict]:
+def _sanitize_st_turns(turns: list[dict], max_chars: int) -> tuple[list[dict], bool]:
     """Turnos crus do /read-short-term → mensagens user/assistant alternadas
     e válidas para a alternância estrita do chat template:
       * descarta roles desconhecidos e conteúdos vazios;
       * mescla mensagens consecutivas do MESMO role (grupos episódicos do ST
         só têm assistant, o que quebraria user/assistant/user);
-      * corta as MAIS ANTIGAS até caber no orçamento de chars.
+      * corta as MAIS ANTIGAS até caber no orçamento de chars;
+      * se um único turno ainda estourar, corta com marcador explícito
+        (nunca corta silenciosamente no meio de uma frase).
+    Retorna (turnos_saneados, houve_descarte).
     """
     cleaned: list[dict] = []
     for t in turns:
@@ -1294,9 +1776,21 @@ def _sanitize_st_turns(turns: list[dict], max_chars: int) -> list[dict]:
             cleaned[-1]["content"] += "\n" + content
         else:
             cleaned.append({"role": role, "content": content})
+
+    dropped = False
     while len(cleaned) > 1 and sum(len(m["content"]) for m in cleaned) > max_chars:
         cleaned.pop(0)
-    return cleaned
+        dropped = True
+
+    # Caso extremo: um único turno maior que o orçamento inteiro. Corta com
+    # o marcador padrão para o modelo saber que houve omissão.
+    if cleaned and sum(len(m["content"]) for m in cleaned) > max_chars:
+        for m in cleaned:
+            if len(m["content"]) > max_chars:
+                m["content"] = _clip_with_marker(m["content"], max_chars, 200)
+                dropped = True
+
+    return cleaned, dropped
 
 
 def _plan_match_score(user_input: str, plan: dict) -> float:
@@ -1416,9 +1910,15 @@ def _consume_voice_context(sid: str) -> Optional[dict]:
     return res
 
 
-def _format_voice_context_block(voice_res: Optional[dict]) -> str:
+def _format_voice_context_block(voice_res: Optional[dict],
+                                exclude_frags: Optional[list[str]] = None) -> str:
     """VoiceDictReadResponse → bloco de contexto p/ o system prompt.
-    Em inglês (língua do system prompt do tool loop). Retorna "" se vazio."""
+    Em inglês (língua do system prompt do tool loop). Retorna "" se vazio.
+
+    `exclude_frags`: fragmentos normalizados já presentes no recall/ST. As
+    memórias associadas ao falante que duplicam esses fatos são omitidas —
+    evita o mesmo fato aparecer duas vezes (voz + LT). A identidade do falante
+    NUNCA é filtrada."""
     if not voice_res:
         return ""
     candidates = voice_res.get("results") or []
@@ -1435,9 +1935,23 @@ def _format_voice_context_block(voice_res: Optional[dict]) -> str:
     for c in candidates[1:3]:
         lines.append(f"- Other candidate: \"{c.get('person_name')}\""
                      f" (score {c.get('score', 0):.2f}): {c.get('description') or 'no description'}")
+    exclude = [f for f in (exclude_frags or []) if f]
     related = voice_res.get("related") or []
-    rel_texts = [((m.get("text") or m.get("content") or "").strip()) for m in related]
-    rel_texts = [t for t in rel_texts if t][:3]
+    rel_texts: list[str] = []
+    seen: set[str] = set()
+    for m in related:
+        text = ((m.get("text") or m.get("content") or "").strip())
+        norm = _norm_dedup_text(text)
+        if not text or not norm or norm in seen:
+            continue
+        if any(
+            len(norm) >= 12 and len(e) >= 12 and (norm in e or e in norm)
+            for e in exclude
+        ):
+            continue
+        seen.add(norm)
+        rel_texts.append(text)
+    rel_texts = rel_texts[:3]
     if rel_texts:
         lines.append("- Memories associated with this speaker:")
         lines.extend(f"  - {t}" for t in rel_texts)
@@ -1450,27 +1964,37 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     (bloco de recall formatado, turnos ST saneados). Qualquer falha degrada
     para vazio — nunca derruba o tool loop.
 
+    A query é enriquecida com os últimos turnos quando o input é curto/deítico
+    ("faz isso", "e agora?") — sem isso o /read erra o alvo semântico.
+
     O contexto de memória de voz NÃO é buscado aqui: já foi pré-buscado pelo
     /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
     com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
+    contextual_query = _build_recall_query(query, sid)
     read_res, st_turns = await asyncio.gather(
         _memory_read_semantic(
-            query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
+            contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
         ),
         _memory_read_st_raw(sid, ORCH_ST_PAIRS),
     )
-    clean_turns = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
+    clean_turns, dropped = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
     recall_block = _format_recall_block(read_res, clean_turns)
 
-    # Injeção do contexto de voz (Fase 3 do plano) — custo O(1), se existir.
-    voice_block = _format_voice_context_block(_consume_voice_context(sid))
+    # Injeção do contexto de voz — custo O(1), se existir. Os fatos do falante
+    # que já aparecem no recall/ST são omitidos (dedup voz × memória).
+    known_frags = _known_recall_fragments(read_res, clean_turns)
+    voice_block = _format_voice_context_block(_consume_voice_context(sid), known_frags)
     if voice_block:
         recall_block = (voice_block + "\n\n" + recall_block) if recall_block else voice_block
+
+    if dropped:
+        note = "Note: earlier short-term turns were omitted for length."
+        recall_block = (recall_block + "\n\n" + note) if recall_block else note
 
     return recall_block, clean_turns
 
 
-async def _extract_memories_via_llm(u: str, a: str, sid: str):
+async def _extract_memories_via_llm(u: str, a: str, sid: str) -> bool:
     """Extração de memórias pós-turno via o modelo extrator DEDICADO do LLM.py
     (endpoint /memories/extract). Substitui o antigo _save_lt('Usuário disse:
     ...') ingênuo, que gravava QUALQUER input como fato permanente de LT —
@@ -1497,12 +2021,19 @@ async def _extract_memories_via_llm(u: str, a: str, sid: str):
                 f"Extração de memórias pós-turno: {len(saved)} gravada(s) "
                 f"{by_type or '(nada a gravar)'} (session={sid})"
             )
-        else:
-            log.warning(
-                f"Extração de memórias pós-turno: HTTP {r.status_code} — {r.text[:200]}"
-            )
+            _clear_memory_failure(sid, "extract")
+            return True
+        log.warning(
+            f"Extração de memórias pós-turno: HTTP {r.status_code} — {r.text[:200]}"
+        )
+        _metric_inc("memory_extraction_failures")
+        _note_memory_failure(sid, "extract", f"HTTP {r.status_code}")
+        return False
     except Exception as e:
         log.warning(f"Extração de memórias pós-turno falhou (não-bloqueante): {type(e).__name__}: {e}")
+        _metric_inc("memory_extraction_failures")
+        _note_memory_failure(sid, "extract", f"{type(e).__name__}: {e}")
+        return False
 
 def _sse(event: str, data: Any) -> str:
     payload = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
@@ -1865,7 +2396,7 @@ async def _plan_mcp_call(tool: str, arguments: dict) -> Any:
     data = r.json()
     result = data.get("result") or ""
     if data.get("is_error"):
-        raise RuntimeError(f"Playwright MCP reportou falha: {result}")
+        raise RuntimeError(f"Playwright MCP reported a failure: {result}")
     return result
 
 
@@ -1875,14 +2406,14 @@ async def _plan_check_expect(expect: dict, current_url: str) -> Optional[str]:
     if not expect:
         return None
     if "url_contains" in expect and expect["url_contains"] not in current_url:
-        return f"expect falhou: URL atual '{current_url}' não contém '{expect['url_contains']}'"
+        return f"expect failed: current URL '{current_url}' does not contain '{expect['url_contains']}'"
     if "selector_visible" in expect:
         try:
             await _plan_mcp_call("browser_evaluate", {
                 "function": f"() => !!document.querySelector({expect['selector_visible']!r})"
             })
         except Exception as e:
-            return f"expect falhou: seletor '{expect['selector_visible']}' não visível ({e})"
+            return f"expect failed: selector '{expect['selector_visible']}' not visible ({e})"
     return None
 
 
@@ -2031,10 +2562,10 @@ async def _plan_run_model_step(step: dict, plan_name: str,
             if schema:
                 parsed = await asyncio.to_thread(_plan_extract_json, content)
                 if parsed is None:
-                    return {"result": {"not_found": "modelo não produziu JSON no schema do passo"},
+                    return {"result": {"not_found": "model did not produce JSON in the step schema"},
                             "actions": actions, "last_call": last_call}
                 return {"result": parsed, "actions": actions, "last_call": last_call}
-            return {"result": content.strip() or {"not_found": "resposta vazia"},
+            return {"result": content.strip() or {"not_found": "empty response"},
                     "actions": actions, "last_call": last_call}
         history.append({"role": "assistant", "content": message.get("content"),
                         "tool_calls": calls})
@@ -2043,11 +2574,20 @@ async def _plan_run_model_step(step: dict, plan_name: str,
             if actions > max_actions:
                 break
             fn = call.get("function", {}) or {}
-            tool_name = fn.get("name", "")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
+            fn = fn if isinstance(fn, dict) else {}
+            tool_name = str(fn.get("name") or "")
+            args, parse_err = _parse_tool_args(fn.get("arguments"))
+            if parse_err:
+                # Erro acionável: o modelo precisa saber que a chamada NÃO
+                # executou e pode corrigir o JSON na próxima rodada — antes
+                # virava {} silencioso e o mesmo payload inválido repetia.
+                history.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                "content": (
+                                    f"ERROR: invalid JSON in tool arguments ({parse_err}). "
+                                    "Re-send this tool call with a single valid JSON object; "
+                                    "no execution happened."
+                                )})
+                continue
             # guardrail: navegação passa pela allowlist de domínios
             if tool_name == "browser_navigate":
                 url = str(args.get("url") or "")
@@ -2082,15 +2622,15 @@ async def _plan_run_model_step(step: dict, plan_name: str,
         final_message = await _llm_chat(history, tools=None, temperature=0.0)
         content = (final_message.get("content") or "").strip()
     except Exception as e:
-        return {"result": {"not_found": f"limite de {max_actions} ações esgotado e síntese final falhou: {e}"},
+        return {"result": {"not_found": f"action limit of {max_actions} exhausted and final synthesis failed: {e}"},
                 "actions": actions, "last_call": last_call}
     if schema:
         parsed = await asyncio.to_thread(_plan_extract_json, content)
         if parsed is None:
-            return {"result": {"not_found": "modelo não produziu JSON no schema do passo (pós-síntese)"},
+            return {"result": {"not_found": "model did not produce JSON in the step schema (post-synthesis)"},
                     "actions": actions, "last_call": last_call}
         return {"result": parsed, "actions": actions, "last_call": last_call}
-    return {"result": content or {"not_found": "resposta vazia após esgotar ações"},
+    return {"result": content or {"not_found": "empty response after exhausting actions"},
             "actions": actions, "last_call": last_call}
 
 
@@ -2153,8 +2693,8 @@ async def _plan_run_macro_step(step: dict, plan: dict, step_index: int) -> tuple
             isinstance(recovery.get("result"), dict) and "not_found" in recovery["result"]
         ):
             return ({"step": step_index, "executor": "macro", "success": False,
-                     "error": f"{e}; recuperação falhou"}, None)
-        result = f"recuperado pelo modelo após {recovery['actions']} ações"
+                     "error": f"{e}; recovery failed"}, None)
+        result = f"recovered by the model after {recovery['actions']} actions"
         recovered_by_model = True
         # ── Self-healing: captura o argumento corrigido da ÚLTIMA ação
         # bem-sucedida do modelo e devolve para ser gravado no plano ──
@@ -2183,7 +2723,7 @@ async def _plan_run_macro_step(step: dict, plan: dict, step_index: int) -> tuple
                      "success": False, "error": fail}, used_correction)
     except Exception as e:
         return ({"step": step_index, "executor": "macro+modelo" if recovered_by_model else "macro",
-                 "success": False, "error": f"erro ao validar expect: {e}"}, used_correction)
+                 "success": False, "error": f"error validating expect: {e}"}, used_correction)
 
     return ({"step": step_index,
              "executor": "macro+modelo" if recovered_by_model else "macro",
@@ -2234,7 +2774,7 @@ async def _tool_run_plan(args: dict, req: ExecuteRequest, sid: str = ""):
 
     steps = plan.get("steps") or []
     if len(steps) > PLANS_MAX_STEPS_SERVER:
-        return f"ERROR: plano tem {len(steps)} passos (teto {PLANS_MAX_STEPS_SERVER})"
+        return f"ERROR: plan has {len(steps)} steps (limit {PLANS_MAX_STEPS_SERVER})"
 
     log.info(f"[plan] executando '{plan['name']}' v{plan['version']} "
              f"({len(steps)} passos, id={plan['plan_id']})")
@@ -2475,6 +3015,16 @@ def _build_native_tools_schema() -> list[dict]:
     return schema
 
 
+def _available_native_tool_names() -> set[str]:
+    """Nomes das tools NATIVAS realmente ofertadas nesta rodada. Usa a MESMA
+    regra de _build_native_tools_schema (vision_objects só com a flag ligada)
+    para o gate de skills nunca divergir do schema enviado ao modelo."""
+    return {
+        name for name in TOOLS
+        if not (name == "vision_objects" and not VISION_OBJECTS_ENABLED)
+    }
+
+
 def _mcp_tool_to_openai_schema(tool: dict) -> dict:
     """Converte um registro de tool do mcp_manager (GET /servers/{name}/tools)
     pro formato OpenAI function-calling. O nome pro modelo é o GRAPH_NAME
@@ -2496,47 +3046,70 @@ def _mcp_tool_to_openai_schema(tool: dict) -> dict:
 # Descoberta em duas etapas via mcp_manager (registry dinâmico do usuário)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _select_skills(user_input: str) -> list[str]:
+async def _select_skills(user_input: str) -> tuple[list[str], dict[str, Any]]:
     """ETAPA 1 (grafo de tools): pergunta ao ToolsDB (via mcp_manager →
     memory /tools/select) quais servidores MCP têm tools relevantes pro
     pedido do usuário. Barato: kNN semântico + PPR no grafo de co-uso,
     NENHUMA conexão MCP. Retorna nomes de servidores — pode ser vazia
     (pedido não precisa de nenhuma tool MCP, só vision/memory_search).
 
-    Fallback: se o manager ou o grafo estiverem indisponíveis, libera TODOS
-    os servidores habilitados (mesma postura conservadora do registry
-    estático — melhor oferecer demais do que cair sem tools)."""
+    Também devolve um status da descoberta (degraded/reason/fallback) para o
+    loop informar o MODELO quando o toolset foi reduzido — antes a falha só
+    aparecia no log e o modelo respondia como se não houvesse ferramenta.
+
+    Fallback: se o manager ou o grafo estiverem indisponíveis, libera apenas
+    os servidores ALWAYS-ON (não todos os habilitados — carregar tudo explode
+    o schema e degrada a escolha). `AVA_MCP_SELECTOR_FALLBACK_ALL=1` restaura
+    o comportamento antigo por opt-in."""
+    always_on: list[str] = []
     try:
         r = await state.mcp_client.get("/skills", timeout=10.0)
         r.raise_for_status()
         enabled = r.json()["servers"]
     except Exception as e:
         log.warning(f"[_select_skills] mcp_manager offline ({type(e).__name__}: {e}) — seguindo sem tools MCP nesta rodada")
-        return []
+        _metric_inc("degraded", "mcp_manager_offline")
+        return [], {
+            "degraded": True, "reason": "mcp_manager_offline",
+            "fallback": False, "failed_servers": [],
+        }
     if not enabled:
-        return []
+        return [], {"degraded": False, "reason": "no_servers", "fallback": False, "failed_servers": []}
+    always_on = [s["name"] for s in enabled if s["name"] in ALWAYS_ON_MCP_SERVERS]
     try:
         r = await state.mcp_client.post("/skills/select", json={"query": user_input}, timeout=90.0)
         r.raise_for_status()
         chosen = [s["name"] for s in r.json()["skills"]]
         log.info(f"[_select_skills] grafo de tools escolheu: {chosen}")
     except Exception as e:
-        chosen = [s["name"] for s in enabled]
+        fallback_all = os.getenv("AVA_MCP_SELECTOR_FALLBACK_ALL", "0").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        chosen = [s["name"] for s in enabled] if fallback_all else list(always_on)
         log.warning(f"[_select_skills] seleção via grafo falhou ({type(e).__name__}: {e}) — "
-                    f"liberando todos os servidores habilitados: {chosen}")
+                    f"fallback={'todos os habilitados' if fallback_all else 'apenas always-on'}: {chosen}")
+        _metric_inc("degraded", "skill_selector_fallback")
+        # Always-on já está na lista de fallback; evita duplicar abaixo.
+        missing = [n for n in always_on if n not in chosen]
+        if missing:
+            chosen = chosen + missing
+        return chosen, {
+            "degraded": True, "reason": "selector_failed",
+            "fallback": True, "fallback_all": fallback_all,
+            "failed_servers": [],
+        }
     # Always-on: servidores self-hosted cujas tools (ex.: gravação de
     # memórias via alpha-mcp__memory_write_batch) devem estar disponíveis
     # em TODO turno — bypass do seletor. Filtrados pela lista de habilitados
     # acima (servidor desabilitado nunca é injetado).
-    always_on = [s["name"] for s in enabled if s["name"] in ALWAYS_ON_MCP_SERVERS]
     missing = [n for n in always_on if n not in chosen]
     if missing:
         log.info(f"[_select_skills] always-on injetado sem seletor: {missing}")
         chosen = chosen + missing
-    return chosen
+    return chosen, {"degraded": False, "reason": "ok", "fallback": False, "failed_servers": []}
 
 
-async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[str, str]]]:
+async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[str, str]], list[str], dict[str, str]]:
     """ETAPA 2: carrega do mcp_manager (cache local dele — SEM conexão MCP)
     o schema real das tools dos servidores escolhidos, com as descrições
     reais devolvidas pelo servidor MCP. Devolve:
@@ -2544,9 +3117,17 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
       - um dispatch map: graph_name (`servidor__tool`) -> (servidor, nome
         real da tool), usado no loop pra encaminhar cada tool_call pro
         /servers/{name}/call certo.
-    """
+      - a lista de servidores cujo carregamento FALHOU nesta rodada (para o
+        modelo saber que o toolset foi reduzido).
+      - um mapa `nome_final -> graph_name_original` para tools MCP que
+        colidiram com uma tool nativa (ou com outra tool já carregada) e
+        foram renomeadas com o prefixo `mcp__`. As Tool Tips continuam sendo
+        buscadas/gravadas pelo nome original."""
     schema: list[dict] = []
     dispatch: dict[str, tuple[str, str]] = {}
+    failed_servers: list[str] = []
+    tip_name_map: dict[str, str] = {}
+    used_names: set[str] = set(TOOLS.keys())
     log.debug(f"[_load_mcp_tools] carregando tools dos servidores: {skill_names}")
 
     async def _load_server(server: str) -> tuple[str, list[dict] | None]:
@@ -2556,6 +3137,7 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
             return server, r.json()["tools"]
         except Exception as e:
             log.warning(f"MCP: falha ao carregar tools do servidor '{server}': {type(e).__name__}: {e}")
+            _metric_inc("degraded", "mcp_server_load_failures")
             return server, None
 
     # T5: requisições paralelas — gather preserva a ordem dos resultados.
@@ -2563,17 +3145,161 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
     for res in results:
         if isinstance(res, BaseException):
             log.warning(f"MCP: falha inesperada ao carregar tools de um servidor: {res}")
+            _metric_inc("degraded", "mcp_server_load_failures")
             continue
         server, tools = res
         if tools is None:
+            failed_servers.append(server)
             continue
         for tool in tools:
-            schema.append(_mcp_tool_to_openai_schema(tool))
-            dispatch[tool["graph_name"]] = (server, tool["name"])
+            original_name = str(tool["graph_name"])
+            final_name = original_name
+            # Colisão com nativa ou com tool já carregada: prefixa em vez de
+            # deixar o dispatch sobrescrever silenciosamente a primeira.
+            while final_name in used_names:
+                final_name = "mcp__" + final_name
+            if final_name != original_name:
+                log.warning(
+                    f"[_load_mcp_tools] colisão de nome '{original_name}' em "
+                    f"'{server}' — tool MCP renomeada para '{final_name}'"
+                )
+                tip_name_map[final_name] = original_name
+            used_names.add(final_name)
+            spec = _mcp_tool_to_openai_schema(tool)
+            spec["function"]["name"] = final_name
+            schema.append(spec)
+            dispatch[final_name] = (server, tool["name"])
         log.debug(f"[_load_mcp_tools] '{server}': {len(tools)} tool(s) -> {[t['graph_name'] for t in tools]}")
 
     log.debug(f"[_load_mcp_tools] tools MCP disponíveis nesta rodada: {list(dispatch.keys())}")
-    return schema, dispatch
+    return schema, dispatch, failed_servers, tip_name_map
+
+
+def _cap_mcp_tools(
+    schema: list[dict],
+    dispatch: dict[str, tuple[str, str]],
+    tip_name_map: dict[str, str],
+    max_tools: int,
+) -> tuple[list[dict], dict[str, tuple[str, str]], dict[str, str]]:
+    """Aplica o teto de tools MCP por rodada com prioridade:
+    always-on → ordem da seleção do grafo → restante do schema.
+
+    O cap é sobre TOOLS MCP; o chamador passa o orçamento já descontando as
+    nativas. Truncar aqui evita carregar/servir um schema gigante — o modelo
+    escolhe melhor com menos opções do que com todas."""
+    if max_tools < 0 or len(schema) <= max_tools:
+        return schema, dispatch, tip_name_map
+    # 1) Keep set por prioridade: always-on → ordem do schema (grafo) → resto.
+    #    A PRIORIDADE define quem entra; a ORDEM de saída continua a do schema.
+    keep: list[str] = []
+    seen: set[str] = set()
+    for spec in schema:
+        name = spec["function"]["name"]
+        server = dispatch.get(name, ("", ""))[0]
+        if server in ALWAYS_ON_MCP_SERVERS and name not in seen:
+            keep.append(name)
+            seen.add(name)
+            if len(keep) >= max_tools:
+                break
+    if len(keep) < max_tools:
+        for spec in schema:
+            name = spec["function"]["name"]
+            if name not in seen:
+                keep.append(name)
+                seen.add(name)
+                if len(keep) >= max_tools:
+                    break
+    kept_names = set(keep)
+    kept = [spec for spec in schema if spec["function"]["name"] in kept_names]
+    dropped = [
+        spec["function"]["name"] for spec in schema
+        if spec["function"]["name"] not in kept_names
+    ]
+    log.warning(
+        f"[_cap_mcp_tools] teto de {max_tools} tool(s) MCP atingido — "
+        f"{len(dropped)} tool(s) truncada(s): {dropped}"
+    )
+    return (
+        kept,
+        {k: v for k, v in dispatch.items() if k in kept_names},
+        {k: v for k, v in tip_name_map.items() if k in kept_names},
+    )
+
+
+# Verbos/tokens conservadores para decidir se uma tool MCP pode rodar em
+# paralelo. Só entra em paralelo quem parece read-only/idempotente; qualquer
+# verbo de escrita/ação tem prioridade negativa. A allowlist por env
+# (`AVA_MCP_PARALLEL_SAFE_TOOLS`) força safe sem alterar o código.
+_MCP_SAFE_TOKENS = {
+    "get", "list", "search", "read", "fetch", "status", "check", "query",
+    "snapshot", "describe", "inspect", "export", "find", "lookup", "preview",
+    "count", "history", "show", "take", "screenshot", "wait", "health", "info",
+}
+_MCP_UNSAFE_TOKENS = {
+    "create", "update", "delete", "write", "send", "post", "put", "remove",
+    "run", "execute", "click", "type", "navigate", "fill", "press", "upload",
+    "install", "start", "stop", "kill", "set", "open", "close", "apply",
+    "submit", "save", "edit", "move", "rename", "copy", "evaluate", "drag",
+}
+_NATIVE_PARALLEL_SAFE = {"list_plans", "memory_search", "use_skill", "skill_file"}
+
+
+def _is_parallel_safe(tool_name: str, kind: str = "mcp") -> bool:
+    """Heurística conservadora por nome + allowlist por env. Na dúvida, NÃO
+    paraleliza. Nativas usam allowlist fixa (só leitura)."""
+    if not tool_name:
+        return False
+    if kind == "native":
+        return tool_name in _NATIVE_PARALLEL_SAFE
+    if tool_name in MCP_PARALLEL_SAFE_ALLOWLIST:
+        return True
+    short = tool_name.split("__")[-1].lower()
+    tokens = {t for t in re.split(r"[^a-z0-9]+", short) if t}
+    if tokens & _MCP_UNSAFE_TOKENS:
+        return False
+    return bool(tokens & _MCP_SAFE_TOKENS)
+
+
+async def _mcp_call_with_retry(
+    server: str, tool: str, args: dict, timeout: float, cwd: Optional[str],
+    safe: bool,
+) -> dict:
+    """POST /servers/{server}/call com UM retry de infraestrutura para tools
+    idempotentes. Não retenta erro de negócio (is_error) nem 4xx. Um 5xx ou
+    timeout transitório do manager não deve consumir um turno do modelo."""
+    attempts = 2 if safe else 1
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            r = await asyncio.wait_for(
+                state.mcp_client.post(
+                    f"/servers/{server}/call",
+                    json={"tool": tool, "arguments": args,
+                          "timeout": timeout,
+                          **({"cwd": cwd} if cwd else {})},
+                ),
+                timeout=timeout + 10.0,
+            )
+            if 500 <= r.status_code < 600 and attempt + 1 < attempts:
+                log.warning(
+                    f"[MCP retry] {server}__{tool} HTTP {r.status_code} — "
+                    f"tentando de novo ({attempt + 1}/{attempts})"
+                )
+                await asyncio.sleep(0.5)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (httpx.TransportError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt + 1 < attempts:
+                log.warning(
+                    f"[MCP retry] {server}__{tool} {type(e).__name__}: {e} — "
+                    f"tentando de novo ({attempt + 1}/{attempts})"
+                )
+                await asyncio.sleep(0.5)
+                continue
+            raise
+    raise last_error or RuntimeError("MCP call failed without an error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2590,6 +3316,14 @@ _agent_skills_sync_lock = asyncio.Lock()
 _agent_skills_last_sig: Optional[str] = None
 _agent_skills_scan: dict[str, Any] = {"at": 0.0, "skills": [], "lock": {}}
 AGENT_SKILLS_SCAN_TTL_S = 20.0
+# Auditoria de seleção: quantos turnos já tentaram selecionar skills e quantas
+# vezes cada skill foi efetivamente escolhida. Alimenta /status (skills nunca
+# selecionadas em N turnos = description fraca, o único sinal de match).
+_agent_skills_stats: dict[str, Any] = {
+    "turns": 0,
+    "counts": {},
+    "last_selected": {},
+}
 
 
 def _agent_skills_cached(rescan: bool = False) -> tuple[list[AgentSkill], dict[str, str]]:
@@ -2658,28 +3392,166 @@ async def _ensure_agent_skills_index(force: bool = False) -> None:
         log.debug(f"Agent Skills: ensure-index ignorou falha: {type(e).__name__}: {e}")
 
 
-async def _select_agent_skills(user_input: str) -> Optional[list[dict]]:
+# ── Tool Tips de tools NATIVAS ───────────────────────────────────────────────
+# As dicas ficam no ToolsDB por nome de tool. Tools nativas (memory_search,
+# list_plans, use_skill...) não passam pelo /sync de servidores MCP, então
+# precisam ser registradas aqui para o tool_tip_add aceitá-las e para o bloco
+# "Tool tips" do prompt incluí-las. Best-effort: memory offline não bloqueia
+# o turno; a assinatura estática é retentada no próximo turno.
+_native_tools_sync_lock = asyncio.Lock()
+_native_tools_last_sig: Optional[str] = None
+
+
+def _native_tools_signature() -> str:
+    return "\n".join(
+        f"{name}\x00{spec.get('description') or ''}"
+        for name, spec in TOOLS.items()
+        if name != "vision_objects" or VISION_OBJECTS_ENABLED
+    )
+
+
+async def _sync_native_tools_index() -> None:
+    """Registra as tools nativas no ToolsDB (idempotente por doc_hash).
+    Nunca levanta — falha só adia a sincronização."""
+    global _native_tools_last_sig
+    async with _native_tools_sync_lock:
+        sig = _native_tools_signature()
+        if sig == _native_tools_last_sig:
+            return
+        try:
+            registered: list[str] = []
+            for name, spec in TOOLS.items():
+                if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
+                    continue
+                await _memory_request("POST", "/tools/register", {
+                    "name": name,
+                    "description": spec.get("description") or name,
+                    "examples": [],
+                    "core": False,
+                })
+                registered.append(name)
+            _native_tools_last_sig = sig
+            log.info(f"Tools nativas: índice sincronizado ({len(registered)} tool(s): "
+                     f"{', '.join(registered) or 'nenhuma'})")
+        except Exception as e:
+            log.warning(f"Tools nativas: sincronização do índice falhou ({type(e).__name__}: {e}) — "
+                        "tenta de novo no próximo turno")
+
+
+async def _ensure_native_tools_index(force: bool = False) -> None:
+    """Re-sincroniza as tools nativas só quando a assinatura mudou. Nunca
+    levanta."""
+    try:
+        if force or _native_tools_signature() != _native_tools_last_sig:
+            await _sync_native_tools_index()
+    except Exception as e:
+        log.debug(f"Tools nativas: ensure-index ignorou falha: {type(e).__name__}: {e}")
+
+
+def _normalize_for_lexical(text: str) -> str:
+    """Normaliza acentos e caixa para comparação lexical."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c)).lower()
+
+
+def _lexical_skill_fallback(query: str, skills: list[AgentSkill]) -> list[dict]:
+    """Fallback lexical: encontra skills por sobreposição de palavras-chave
+    quando o seletor semântico falha ou retorna nada. O índice semântico pode
+    ficar indisponível (memory API offline) — o scan local do disco já está em
+    memória, então um match barato por tokens evita zerar as skills do turno."""
+    if not query or not skills:
+        return []
+
+    query_norm = _normalize_for_lexical(query)
+    query_tokens = set(re.findall(r"\w+", query_norm))
+    if not query_tokens:
+        return []
+
+    scored: list[dict] = []
+    for skill in skills:
+        name_norm = _normalize_for_lexical(skill.name)
+        desc_norm = _normalize_for_lexical(skill.description or "")
+        name_tokens = set(re.findall(r"\w+", name_norm))
+        desc_tokens = set(re.findall(r"\w+", desc_norm))
+        name_overlap = len(query_tokens & name_tokens)
+        desc_overlap = len(query_tokens & desc_tokens)
+        # Peso maior no nome (é o sinal mais forte) e normaliza pelo tamanho
+        # da query para não punir descrições longas.
+        score = (name_overlap * 2.0 + desc_overlap) / max(len(query_tokens), 1)
+        if score >= AGENT_SKILLS_FALLBACK_MIN_OVERLAP:
+            scored.append({
+                "name": skill.name,
+                "description": skill.description,
+                "score": round(score, 4),
+                "match_type": "lexical",
+            })
+    scored.sort(key=lambda s: s["score"], reverse=True)
+    return scored[:AGENT_SKILLS_FALLBACK_TOP_K]
+
+
+def _record_agent_skills_selection(skills: list[dict]) -> None:
+    """Atualiza os contadores de auditoria de skills efetivamente escolhidas."""
+    now = time.time()
+    for s in skills:
+        name = str(s.get("name") or "").strip()
+        if not name:
+            continue
+        _agent_skills_stats["counts"][name] = _agent_skills_stats["counts"].get(name, 0) + 1
+        _agent_skills_stats["last_selected"][name] = now
+
+
+async def _select_agent_skills(user_input: str) -> tuple[Optional[list[dict]], Optional[str]]:
     """Seleção semântica de Agent Skills para ESTE pedido: /agent-skills/select
     (kNN + PPR no ToolsDB — barato, sem tocar no disco além do scan com TTL) →
     lista de dicts name/description das skills casadas. O bloco de hint é
     montado em _tools_system_prompt, que aplica o gate de MCP tools
-    (MCP_GATED_AGENT_SKILLS) antes de anunciar. Falha → None (turno segue sem
-    skills, mesma postura do _recall_plans)."""
+    (MCP_GATED_AGENT_SKILLS) antes de anunciar.
+
+    Devolve (skills, falha). falha != None só quando a SELEÇÃO falhou — assim
+    o loop informa o modelo de que o toolset/hints foi reduzido nesta rodada,
+    em vez de confundir falha com "nenhuma skill relevante"."""
     if not user_input:
-        return None
+        return None, None
+
+    _agent_skills_stats["turns"] = _agent_skills_stats.get("turns", 0) + 1
     await _ensure_agent_skills_index()
+
     try:
         data = await _memory_request("POST", "/agent-skills/select", {
             "query": user_input, "top_k": AGENT_SKILLS_TOP_K, "include_related": True,
         })
+        raw_matched = [s for s in (data.get("skills") or []) if s.get("description")]
+        matched: list[dict] = []
+        for s in raw_matched:
+            # core e lexical são always-on/fallback: não passam pelo threshold
+            if s.get("match_type") in ("core", "lexical"):
+                matched.append(s)
+            elif float(s.get("score") or 0.0) >= AGENT_SKILLS_MIN_SCORE:
+                matched.append(s)
+        if matched:
+            _record_agent_skills_selection(matched)
+            log.info(f"[_select_agent_skills] skills escolhidas: {[s['name'] for s in matched]}")
+            return matched, None
+        # API respondeu 200 mas nada passou no threshold → tenta lexical
+        fallback = _lexical_skill_fallback(user_input, _agent_skills_cached()[0])
+        if fallback:
+            _record_agent_skills_selection(fallback)
+            log.info(f"[_select_agent_skills] fallback lexical: {[s['name'] for s in fallback]}")
+            return fallback, None
+        return None, None
     except Exception as e:
-        log.warning(f"[_select_agent_skills] seleção falhou ({type(e).__name__}: {e}) — turno segue sem skills")
-        return None
-    matched = [s for s in (data.get("skills") or []) if s.get("description")]
-    if not matched:
-        return None
-    log.info(f"[_select_agent_skills] skills escolhidas: {[s['name'] for s in matched]}")
-    return matched
+        log.warning(f"[_select_agent_skills] seleção falhou ({type(e).__name__}: {e}) — tentando fallback lexical")
+        try:
+            fallback = _lexical_skill_fallback(user_input, _agent_skills_cached()[0])
+            if fallback:
+                _record_agent_skills_selection(fallback)
+                log.info(f"[_select_agent_skills] fallback lexical (API offline): {[s['name'] for s in fallback]}")
+                return fallback, "agent_skill_selection_failed_fallback"
+        except Exception as e2:
+            log.warning(f"[_select_agent_skills] fallback lexical falhou: {type(e2).__name__}: {e2}")
+        return None, "agent_skill_selection_failed"
 
 
 async def _ensure_browser() -> None:
@@ -2734,18 +3606,37 @@ ORCHESTRATOR_LLM_BACKOFF_S = 2.0
 # as dicas são ADITIVAS e entram só no tail dinâmico do system prompt (prefixo
 # cacheável intacto), e só das tools carregadas nesta rodada.
 
-async def _fetch_tool_tips(tool_names: list[str]) -> dict[str, list[dict]]:
-    """Busca as Tool Tips das tools MCP carregadas NESTA rodada (batch único na
+TOOL_TIPS_MAX_PER_TOOL = int(os.getenv("AVA_TOOL_TIPS_MAX_PER_TOOL", "3"))
+
+
+async def _fetch_tool_tips(
+    tool_names: list[str],
+    alias_map: Optional[dict[str, str]] = None,
+) -> dict[str, list[dict]]:
+    """Busca as Tool Tips das tools carregadas NESTA rodada (batch único na
     memory — ver memory_ops_tips). Best-effort: memory offline → rodada segue
-    sem dicas (o custo é só o bloco ausente, nunca uma falha do loop)."""
+    sem dicas (o custo é só o bloco ausente, nunca uma falha do loop).
+
+    `alias_map`: nome_final -> graph_name_original para tools MCP renomeadas
+    por colisão. A busca usa o nome original (é a chave no ToolsDB), mas o
+    bloco devolve o nome final que o modelo vê. Cada tool fica com no máximo
+    TOOL_TIPS_MAX_PER_TOOL dicas — as MAIS RECENTES (a query da memory já
+    ordena por created_at DESC)."""
     if not tool_names:
         return {}
+    alias_map = alias_map or {}
+    request_names = [alias_map.get(n, n) for n in tool_names]
     try:
         data = await _memory_request(
             "GET", "/tools/tips",
-            params={"names": ",".join(tool_names)},
+            params={"names": ",".join(dict.fromkeys(request_names))},
         )
-        tips = (data or {}).get("tips") or {}
+        raw = (data or {}).get("tips") or {}
+        tips: dict[str, list[dict]] = {}
+        reverse = {orig: final for final, orig in alias_map.items()}
+        for name, tip_list in raw.items():
+            final_name = reverse.get(name, name)
+            tips[final_name] = list(tip_list)[:TOOL_TIPS_MAX_PER_TOOL]
         if tips:
             log.info(f"Tool tips: {sum(len(v) for v in tips.values())} dica(s) "
                      f"para {len(tips)} tool(s) desta rodada")
@@ -2975,7 +3866,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
                           plans_hint: Optional[str] = None,
                           matched_agent_skills: Optional[list[dict]] = None,
                           tool_tips: Optional[dict[str, list[dict]]] = None,
-                          active_project: Optional[str] = None) -> str:
+                          active_project: Optional[str] = None,
+                          tool_status: Optional[str] = None) -> str:
     """System prompt BASE do turno (BASE_PROMPT — prompts.txt): só o que vale
     pra QUALQUER tarefa (papel, loop de execução, fim de turno, autonomia,
     tools, memória, output, contexto). O que era específico de domínio saiu
@@ -2986,9 +3878,16 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     descoberta (_load_mcp_tools) para ESTA rodada específica — usados como
     gate de visibilidade das skills cujo playbook referencia MCP tools por
     nome (MCP_GATED_AGENT_SKILLS) — nunca anuncia skill cuja tool esteja
-    ausente. As tools em si NÃO são listadas aqui: o modelo as recebe SÓ
-    via tool calling nativo (lista `tools` no payload, embutida pelo chat
-    template).
+    ausente. O mesmo gate vale para tools NATIVAS (NATIVE_GATED_AGENT_SKILLS):
+    skills cujo playbook cita tools do registry TOOLS somem do hint se a tool
+    não estiver no schema desta rodada. Sem use_skill, nenhuma skill é
+    anunciada (não haveria como carregar o playbook). As tools em si NÃO são
+    listadas aqui: o modelo as recebe SÓ via tool calling nativo (lista
+    `tools` no payload, embutida pelo chat template).
+    Blocos dinâmicos (plans_hint, tool tips, skills) passam por _truncate_block
+    com os tetos PLANS_HINT_MAX_CHARS / TOOL_TIPS_MAX_CHARS /
+    SKILLS_HINT_MAX_CHARS — corte com marcador só no tail; o prefixo estático
+    cacheável nunca é truncado.
     `tool_tips`: dicas de execução gravadas pelo PRÓPRIO modelo em turnos
     passados (tool_tip_add — ver memory_ops_tips), SÓ das tools carregadas
     nesta rodada. Bloco dinâmico no FIM (com plans_hint) — nunca na
@@ -3002,6 +3901,11 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     use_skill antes de agir no domínio da skill.
     `active_project`: slug do projeto ativo (escopo de memória) — injeta o
     project_line no <context>.
+    `tool_status`: resumo opcional de degradação da descoberta de tools nesta
+    rodada (MCP offline, seletor falhou, servidor não carregou, seleção de
+    Agent Skills falhou). Vira bloco <tool_status> no tail dinâmico para o
+    modelo saber que o toolset está reduzido — sem isso ele tende a responder
+    "não consigo" em vez de explicar a indisponibilidade temporária.
     <context> fica por ÚLTIMO de propósito: o prefixo estático é idêntico
     entre conversas e o llama-server reaproveita o cache. A data usa
     granularidade de DIA (a hora exata vive na mensagem user — ver
@@ -3029,12 +3933,20 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
     if active_project:
         # project_line (NEW projetos): o modelo precisa saber que as memórias
         # recuperadas podem vir do escopo do projeto E do geral, e que fatos
-        # NOVOS devem ser gravados no contexto do projeto ativo.
-        context_lines.append(
-            f"Active project: {active_project}. Long-term memory merges this "
-            "project's scope with general memory; new facts you save belong to "
-            "this project."
-        )
+        # NOVOS devem ser gravados no contexto do projeto ativo. Quando não há
+        # projeto, diga isso explicitamente: "sem projeto" ≠ "falha ao afirmar
+        # o projeto".
+        if active_project == "general":
+            context_lines.append(
+                "Active project: general (no project scope). Long-term memory "
+                "is general; new facts you save belong to general memory."
+            )
+        else:
+            context_lines.append(
+                f"Active project: {active_project}. Long-term memory merges this "
+                "project's scope with general memory; new facts you save belong to "
+                "this project."
+            )
     lines = [
         "<role>",
         f"{persona}. You complete tasks by using tools, and you deliver a verified result.",
@@ -3064,9 +3976,12 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "</ending_the_turn>",
         "",
         "<autonomy>",
-        "Act without asking when the action is reversible and low-risk. Ask first before",
-        "deleting, overwriting, spending resources, sending anything outside the machine, or",
-        "when an ambiguity would change the result. Ask one precise question, not several.",
+        "Act without asking when the action is reversible and low-risk. Reversible means you",
+        "can undo it or it leaves no lasting effect: reading files, searching, listing, looking",
+        "things up — just do it. Ask first when the effect is hard to undo or leaves the",
+        "machine: deleting or overwriting files, sending messages or email, publishing,",
+        "spending money or other resources. Also ask when an ambiguity would change the",
+        "result. Ask one precise question, not several.",
         "</autonomy>",
         "",
         "<tools>",
@@ -3074,8 +3989,12 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "conversation); you are not limited to your training data. If a tool result was thin or",
         "off-target, say exactly what it did and did not contain instead of giving a generic",
         "disclaimer. Do not call a tool for something already in the conversation.",
+        "There is no finish tool; a plain-text reply ends the turn.",
+        "If a tool result doesn't support a claim, say what is missing instead of filling the",
+        "gap.",
         "Specialized procedures are provided as Agent Skills; when a skill is loaded for the",
-        "current task, follow it.",
+        "current task, follow it. When a skill playbook conflicts with generic thinking",
+        "instructions in this prompt, the playbook wins.",
         "</tools>",
         "",
         "<memory>",
@@ -3105,55 +4024,109 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
             "When a tool result reveals a durable, non-obvious constraint (failure mode,",
             "ordering requirement, parameter pitfall), record it for your future turns with",
             "tool_tip_add — at most one per turn, one imperative sentence, general rather than",
-            "specific to this task. Never record task facts (memory tools do that), tool",
-            "preferences or rankings, or what the tool's description already says. If a tip you",
-            "recorded proved wrong or outdated, remove it with tool_tip_remove.",
+            "specific to this task. Tips apply to MCP and native tools alike (use the exact",
+            "tool name as shown in this request). Never record task facts (memory tools do that),",
+            "tool preferences or rankings, or what the tool's description already says. If a tip",
+            "you recorded proved wrong or outdated, remove it with tool_tip_remove.",
             "</recording_tips>",
         ])
 
     if plans_hint:
+        # Orçamento do bloco de planos (PLANS_HINT_MAX_CHARS) — corte com
+        # marcador só no bloco dinâmico, nunca no prefixo estático.
+        _plans = _truncate_block(plans_hint, PLANS_HINT_MAX_CHARS, "saved plans")
+        if _plans != plans_hint:
+            log.info(
+                f"plans_hint truncado: {len(plans_hint)} → {len(_plans)} chars"
+            )
         lines.append("")
-        lines.append(plans_hint)
+        lines.append(_plans)
     if tool_tips:
         # Dicas de execução das tools DESTA rodada — tail dinâmico (o prefixo
         # estático acima permanece cacheável no llama-server). Ids curtos
         # (#n) para o modelo poder retratar via tool_tip_remove.
-        lines.append("")
-        lines.append(
+        _tips_lines = [
             "## Tool tips (your own notes from past tool usage — may be "
             "outdated; trust the current tool result over any tip)"
-        )
+        ]
         for _tip_tool, _tip_list in tool_tips.items():
             for _t in _tip_list:
-                lines.append(f"- {_tip_tool} [#{_t['id']}]: {_t['text']}")
+                _created = _age_label(_t.get("created_at"))
+                _last = _t.get("last_used")
+                _uses = int(_t.get("use_count") or 0)
+                _used = (
+                    f"tool usada há {_age_label(_last)}, {_uses}x"
+                    if _last else "tool nunca usada"
+                )
+                _tips_lines.append(
+                    f"- {_tip_tool} [#{_t['id']}; dica há {_created}; {_used}]: "
+                    f"{_t['text']}"
+                )
+        _tips = _truncate_block(
+            "\n".join(_tips_lines), TOOL_TIPS_MAX_CHARS, "tool tips"
+        )
+        if _tips != "\n".join(_tips_lines):
+            log.info(f"tool_tips truncado para {len(_tips)} chars")
+        lines.append("")
+        lines.append(_tips)
+    # think_instruction ANTES do bloco de skills: o playbook da skill é a
+    # instrução autoritativa do domínio e deve prevalecer sobre orientação
+    # genérica de raciocínio (ordem de leitura = ordem de precedência).
+    if think_instruction:
+        lines.append("")
+        lines.append(think_instruction)
     if matched_agent_skills:
         # Gate por MCP tools carregadas nesta rodada: playbook que referencia
         # tool ausente não entra no hint (o antigo bloco fixo condicionado de
         # projects/skills virou a skill projects-and-skills — o condicionamento
         # sobreviveu como visibilidade da skill, ver MCP_GATED_AGENT_SKILLS).
+        # Gate também por tools NATIVAS (NATIVE_GATED_AGENT_SKILLS): use_skill,
+        # skill_file etc. são nativas e podem sumir se o schema mudar.
         available_tools = set(mcp_tool_names or [])
-        visible_skills = [
-            s for s in matched_agent_skills
-            if not (MCP_GATED_AGENT_SKILLS.get(s.get("name") or "", set()) - available_tools)
-        ]
+        available_native = _available_native_tool_names()
+        # Sem use_skill não há como carregar playbook — não anuncia skills.
+        if "use_skill" in available_native:
+            visible_skills = [
+                s for s in matched_agent_skills
+                if not (MCP_GATED_AGENT_SKILLS.get(s.get("name") or "", set()) - available_tools)
+                and not (
+                    NATIVE_GATED_AGENT_SKILLS.get(s.get("name") or "", set())
+                    - available_native
+                )
+            ]
+        else:
+            visible_skills = []
         if visible_skills:
-            lines.append("")
-            lines.append(
-                "## Agent skills matching this request (playbooks you can load)\n"
+            _skills_lines = [
+                "## Agent skills matching this request (authoritative for their domain)\n"
                 "Installed Agent Skills whose description matches this request. For work in the "
                 "matched domain, call use_skill(name) FIRST and follow the loaded playbook — it is "
-                "authoritative for its domain and may point to more files via skill_file and to "
-                "commands you can run via other tools:"
-            )
+                "authoritative for its domain, takes precedence over the generic thinking "
+                "instructions above, and may point to more files via skill_file and to "
+                "commands you can run via other tools. If a tool named in the skill is unavailable "
+                "this turn, say so and use the closest alternative; do not silently improvise:"
+            ]
             for s in visible_skills:
-                lines.append(f"- {s['name']}: {s['description']}")
-    if think_instruction:
+                _skills_lines.append(f"- {s['name']}: {s['description']}")
+            _skills = _truncate_block(
+                "\n".join(_skills_lines), SKILLS_HINT_MAX_CHARS, "agent skills"
+            )
+            if _skills != "\n".join(_skills_lines):
+                log.info(f"skills_hint truncado para {len(_skills)} chars")
+            lines.append("")
+            lines.append(_skills)
+    if tool_status:
+        # Degradação da descoberta de tools nesta rodada — tail dinâmico.
         lines.append("")
-        lines.append(think_instruction)
+        lines.append("<tool_status>")
+        lines.extend(tool_status.splitlines())
+        lines.append("</tool_status>")
     return "\n".join(lines)
 
 
-async def _force_finish(history: list[dict], eid: str) -> str:
+async def _force_finish(history: list[dict], eid: str,
+                        lang_hint: Optional[str] = None,
+                        reason: str = "max_steps") -> str:
     """
     Rede de segurança do teto de turnos (max_steps): chamada quando o loop
     atinge o teto sem o modelo ter entregado a resposta final (texto puro
@@ -3162,14 +4135,20 @@ async def _force_finish(history: list[dict], eid: str) -> str:
     texto livre) pedindo explicitamente uma resposta final com o que já
     foi coletado no histórico. Se isso falhar por qualquer motivo, cai num
     texto fixo — nunca deixamos o loop rodar indefinidamente.
+
+    O nudge é NEUTRO de propósito: o teto pode ser atingido por tools
+    diversas (não necessariamente a mesma repetida). O fallback fixo é
+    localizado por `lang_hint`; usuário em inglês não recebe mais resposta
+    em português.
     """
     nudge = {
         "role": "user",
         "content": (
-            "You've been trying the same tool repeatedly without concluding. Stop here: "
-            "using only the information already gathered above, give me your best final "
-            "answer now in plain text. If it's incomplete, say so plainly instead of "
-            "searching more."
+            "You have reached the maximum number of tool steps for this turn without a "
+            "final answer. Stop here: using only the information already gathered above, "
+            "give me your best final answer now in plain text. If it's incomplete, say so "
+            "plainly instead of searching more. Reply in the same language as the user's "
+            "request."
         ),
     }
     try:
@@ -3179,12 +4158,47 @@ async def _force_finish(history: list[dict], eid: str) -> str:
             return text
     except Exception as e:
         log.warning(f"[{eid[:8]}] _force_finish: chamada de fechamento falhou: {e}")
-    return (
-        "Não consegui reunir informação suficiente para responder com confiança a essa "
-        "pergunta depois de várias tentativas de busca — os resultados retornados não "
-        "foram relevantes o bastante. Posso tentar de outro jeito se você me der mais "
-        "contexto ou uma fonte específica."
-    )
+
+    fallback = {
+        "pt": (
+            "Não consegui reunir informação suficiente para responder com confiança a essa "
+            "pergunta depois de várias tentativas de busca — os resultados retornados não "
+            "foram relevantes o bastante. Posso tentar de outro jeito se você me der mais "
+            "contexto ou uma fonte específica."
+        ),
+        "en": (
+            "I couldn't gather enough information to answer this question confidently after "
+            "several search attempts — the returned results weren't relevant enough. I can try "
+            "another approach if you give me more context or a specific source."
+        ),
+        "es": (
+            "No pude reunir suficiente información para responder a esta pregunta con confianza "
+            "después de varios intentos de búsqueda — los resultados no fueron lo suficientemente "
+            "relevantes. Puedo intentarlo de otra manera si me das más contexto o una fuente específica."
+        ),
+    }
+    lang = (lang_hint or "").lower()
+    if lang in fallback:
+        return fallback[lang]
+    return fallback["pt"] if not lang else fallback["en"]
+
+
+def _build_agent_skills_query(user_input: str, st_turns: Optional[list[dict]] = None) -> str:
+    """Monta a query de seleção de Agent Skills com contexto conversacional.
+
+    Mesmo problema do recall: inputs curtos/deíticos ("faz isso", "pode
+    gerar") não casam com a description da skill. Os últimos turnos do ST
+    dão o alvo semântico sem diluir demais um input longo."""
+    raw = (user_input or "").strip()
+    if not raw:
+        return raw
+    turns = [t for t in (st_turns or []) if (t.get("role") or "") == "user"]
+    recent = [(t.get("content") or "").strip() for t in turns[-2:]]
+    recent = [r for r in recent if r]
+    if not recent:
+        return _clip_with_marker(raw, RECALL_QUERY_MAX_CHARS, 200)
+    query = raw + "\n\nRecent conversation:\n" + "\n".join(recent)
+    return _clip_with_marker(query, RECALL_QUERY_MAX_CHARS, 200)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3212,6 +4226,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
          REPEAT_NUDGE_AT/REPEAT_HARD_LIMIT — foi removido a pedido:
          interrompia trabalho legítimo e repetitivo mais do que loops.)
     """
+    _metric_inc("turns_total")
     depth, think_instruction = await _think_instruction(req.input)
 
     # ── NEW (projetos): re-afirma o escopo ativo (registry → memory) ANTES do
@@ -3228,38 +4243,108 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # ── Recall de planos salvos (em paralelo) — orienta o modelo a preferir
     # run_plan quando existe plano compatível com o pedido (ver _recall_plans).
     plans_task = asyncio.ensure_future(_recall_plans(req.input)) if req.input else None
-    # ── Agent Skills (SKILL.md): seleção semântica (kNN+PPR no ToolsDB) em
-    # paralelo — hint no system prompt quando algo casa com o pedido
-    # (ver _select_agent_skills).
-    skills_task = asyncio.ensure_future(_select_agent_skills(req.input)) if req.input else None
 
     # ── Descoberta de tools em duas etapas ──
     # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
     # usando só os resumos leves — sem conectar em nada ainda.
-    chosen_skills = await _select_skills(req.input)
-    
+    chosen_skills, select_status = await _select_skills(req.input)
+
     # Etapa 2: conecta só nessas skills e carrega as tools reais delas.
-    mcp_schema, mcp_dispatch = await _load_mcp_tools(chosen_skills)
-    mcp_tool_names = [spec["function"]["name"] for spec in mcp_schema]
+    mcp_schema, mcp_dispatch, failed_mcp_servers, mcp_tip_name_map = await _load_mcp_tools(chosen_skills)
     # Tool Tips (best-effort): notas de execução gravadas pelo próprio modelo
-    # em turnos passados — só das tools carregadas NESTA rodada.
-    tool_tips = await _fetch_tool_tips(mcp_tool_names)
+    # em turnos passados — MCP + nativas carregadas NESTA rodada. As nativas
+    # são registradas no ToolsDB (idempotente) para o tool_tip_add aceitá-las.
+    await _ensure_native_tools_index()
+    native_tools_schema = _build_native_tools_schema()
+    native_tool_names = [spec["function"]["name"] for spec in native_tools_schema]
+    # Teto TOTAL de tools por rodada (nativas contam): sempre-on → grafo →
+    # resto. Truncar aqui é o que impede o schema de crescer sem limite.
+    _mcp_budget = max(0, MCP_MAX_TOOLS_PER_TURN - len(native_tools_schema))
+    mcp_schema, mcp_dispatch, mcp_tip_name_map = _cap_mcp_tools(
+        mcp_schema, mcp_dispatch, mcp_tip_name_map, _mcp_budget
+    )
+    mcp_tool_names = [spec["function"]["name"] for spec in mcp_schema]
+    tool_tips = await _fetch_tool_tips(
+        mcp_tool_names + native_tool_names, alias_map=mcp_tip_name_map
+    )
 
     # Coleta o recall disparado acima (já deve ter terminado — o MCP costuma
     # levar mais; se não, esperamos aqui mesmo).
     recall_block, st_turns = ("", []) if recall_task is None else await recall_task
     plans_hint = None if plans_task is None else await plans_task
-    matched_skills = None if skills_task is None else await skills_task
+
+    # ── Agent Skills (SKILL.md): seleção semântica COM CONTEXTO do recall.
+    # Roda DEPOIS do recall (não em paralelo) para usar os últimos turnos do
+    # ST na query — inputs curtos/deíticos precisam do contexto para casar.
+    matched_skills = None
+    skills_status = None
+    if req.input:
+        skills_query = _build_agent_skills_query(req.input, st_turns)
+        matched_skills, skills_status = await _select_agent_skills(skills_query)
+        if on_event and matched_skills:
+            skill_data = [
+                {
+                    "name": s.get("name"),
+                    "description": s.get("description"),
+                    "score": s.get("score"),
+                    "match_type": s.get("match_type"),
+                }
+                for s in matched_skills
+            ]
+            await on_event("skill_loaded", {"skills": skill_data})
+
+    # ── Status de degradação da descoberta de tools ─────────────────────
+    # Vai no tail dinâmico do system prompt (não no prefixo cacheável) para o
+    # modelo saber que o toolset foi reduzido e explicar isso ao usuário em
+    # vez de responder "não consigo" genericamente.
+    status_lines: list[str] = []
+    if select_status.get("degraded"):
+        reason = select_status.get("reason") or "tool_discovery_degraded"
+        if reason == "mcp_manager_offline":
+            status_lines.append(
+                "MCP tool discovery is offline this turn: no MCP tools are "
+                "available; only native tools remain."
+            )
+        elif reason == "selector_failed":
+            status_lines.append(
+                "MCP tool selector failed this turn; only always-on servers "
+                "were loaded."
+            )
+        else:
+            status_lines.append(
+                f"MCP tool discovery is degraded this turn ({reason})."
+            )
+        status_lines.append(
+            "If a needed tool is missing, say the toolset is reduced this turn; "
+            "do not claim the capability does not exist."
+        )
+    if failed_mcp_servers:
+        status_lines.append(
+            "These MCP servers failed to load and their tools are unavailable "
+            "this turn: " + ", ".join(failed_mcp_servers) + "."
+        )
+    if skills_status:
+        status_lines.append(
+            "Agent Skill recommendations are unavailable this turn; proceed "
+            "without skill hints."
+        )
+    tool_status = "\n".join(status_lines) or None
+    if tool_status:
+        _metric_inc("turns_degraded")
+        if skills_status:
+            _metric_inc("degraded", "agent_skills_unavailable")
+        log.warning(
+            f"[{eid[:8]}] toolset degradado nesta rodada: {select_status} "
+            f"failed_servers={failed_mcp_servers} skills={skills_status}"
+        )
 
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang,
                                          mcp_tool_names=mcp_tool_names,
                                          plans_hint=plans_hint,
                                          tool_tips=tool_tips,
                                          matched_agent_skills=matched_skills,
-                                         active_project=(
-                                             active_project
-                                             if active_project != "general" else None
-                                         ))
+                                         active_project=active_project,
+                                         tool_status=tool_status)
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
     if matched_skills:
@@ -3268,23 +4353,36 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         # Recall entra no system prompt (não como mensagem user/assistant) —
         # preserva a alternância estrita do chat template e mantém o bloco
         # fixo durante o loop inteiro. O modelo deve tratar como memória
-        # própria, sem citar o mecanismo.
+        # própria; quando o fato pode estar desatualizado, pode sinalizar
+        # incerteza ("from what I remember") em vez de afirmar como certeza.
         system_prompt += (
-            "\n\n## Recovered memory (your own recollection — use it naturally, "
-            "never mention this retrieval mechanism)\n"
+            "\n\n## Recovered memory (your own recollection — may be partial or "
+            "outdated; use it naturally). These are your own memories, not "
+            "guaranteed current. When a memory might be outdated or uncertain — "
+            "or when its confidence/age suggests it — say so briefly (e.g. "
+            "\"from what I remember…\") and verify with a tool when the answer "
+            "matters. Do not mention retrieval scores, mechanisms or internal "
+            "metadata to the user.\n"
             + recall_block
         )
         log.info(f"[{eid[:8]}] Recall pré-loop: {len(recall_block)} chars de memória LT/knowledge, "
                  f"{len(st_turns)} turno(s) ST injetados")
-    tools_schema = _build_native_tools_schema() + mcp_schema
+    memory_warning = _consume_memory_warning(sid)
+    if memory_warning:
+        system_prompt += "\n\n" + memory_warning
+        log.warning(f"[{eid[:8]}] aviso de falha de memória do turno anterior injetado")
+    tools_schema = native_tools_schema + mcp_schema
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
 
     # Hora exata vive aqui (mensagem user), não no system prompt — o prefixo
     # cacheável do system prompt fica com data apenas (prompt caching).
+    # NÃO mutar req.input: o texto original é a query de aprendizado do grafo
+    # de tools (/tools/record-usage), o turno salvo no ST e a entrada do
+    # extrator de memórias. A hora é só contexto para ESTA chamada ao LLM.
     time_hint = datetime.datetime.now().strftime('%H:%M:%S')
-    req.input = f"[Current local time: {time_hint}]\n\n{req.input}"
-    user_content: str | list[dict] = req.input
+    turn_input = f"[Current local time: {time_hint}]\n\n{req.input}"
+    user_content: str | list[dict] = turn_input
 
     # Documento anexado via /attach na TUI: injeta o conteúdo extraído
     # no user_content que vai ao modelo, sem poluir a mensagem exibida no
@@ -3308,7 +4406,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             # e pede pro usuário reenviar, mesmo com req.image_base64
             # preenchido.
             user_content = (
-                f"{req.input}\n\n"
+                f"{turn_input}\n\n"
                 "[An image was attached to this message. Use the vision_objects "
                 "tool to see it before answering — do not ask the user to send "
                 "it again.]"
@@ -3325,7 +4423,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 {
                     "type": "text",
                     "text": (
-                        f"{req.input}\n\n"
+                        f"{turn_input}\n\n"
                         "[An image was attached to this message — see it above; "
                         "do not ask the user to send it again.]"
                     ),
@@ -3433,7 +4531,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
                 "forçando resposta final sem tools."
             )
-            final_response = await _force_finish(history, eid)
+            final_response = await _force_finish(history, eid, lang_hint=req.lang)
             # Chamada de fechamento é síncrona (_llm_chat) — delta único.
             if on_event:
                 await on_event("delta", final_response)
@@ -3485,45 +4583,100 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             break
 
         finished = False
-        for call in tool_calls:
-            fn = call.get("function", {}) or {}
-            tool_name = fn.get("name", "")
-            call_id = call.get("id", "")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
 
-            is_native = tool_name in TOOLS
-            is_mcp = tool_name in mcp_dispatch
+        # ── Prepara TODAS as chamadas antes de executar qualquer uma ──
+        # A execução é concorrente por lane: MCP por servidor (ordem interna
+        # preservada) e nativas em lanes próprias. Histórico/step_results são
+        # anexados na ORDEM ORIGINAL depois do gather — o chat template exige
+        # tool messages na mesma ordem dos tool_calls do assistant.
+        prepared: list[dict[str, Any]] = []
+        for idx, call in enumerate(tool_calls):
+            fn = call.get("function") if isinstance(call, dict) else {}
+            fn = fn if isinstance(fn, dict) else {}
+            tool_name = str(fn.get("name") or "")
+            call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
+            raw_args = fn.get("arguments")
+            args, parse_err = _parse_tool_args(raw_args)
+            if not tool_name or (tool_name not in TOOLS and tool_name not in mcp_dispatch):
+                kind = "unknown"
+                err = _format_tool_error(
+                    "NOT_FOUND",
+                    f"tool '{tool_name or '(empty)'}' does not exist in this session. "
+                    "End the turn now with a plain-text answer and no tool call.",
+                )
+                _metric_inc("unknown_tool_calls")
+                _metric_inc("tool_failures_by_category", "NOT_FOUND")
+                action = f"unknown tool {tool_name!r}"[:300]
+            elif parse_err:
+                kind = "invalid"
+                err = _format_tool_error(
+                    "BAD_ARGS",
+                    f"Your arguments were not valid JSON ({parse_err}). Re-send the call "
+                    "with valid JSON matching the tool schema. Do not fall back to empty arguments.",
+                )
+                _metric_inc("invalid_json_calls")
+                _metric_inc("tool_failures_by_category", "BAD_ARGS")
+                action = str(raw_args)[:300]
+            else:
+                kind = "native" if tool_name in TOOLS else "mcp"
+                err = None
+                action = json.dumps(args, ensure_ascii=False)
+            server = mcp_dispatch[tool_name][0] if kind == "mcp" else None
+            prepared.append({
+                "index": idx, "call_id": call_id, "tool_name": tool_name,
+                "args": args, "kind": kind, "server": server,
+                "parse_error": err, "action": action,
+            })
             log.debug(
                 f"[{eid[:8]}] tool_call recebido: name={tool_name!r} args={args} "
-                f"is_native={is_native} is_mcp={is_mcp}"
+                f"kind={kind} server={server}"
             )
-            if not is_native and not is_mcp:
-                log.warning(f"[{eid[:8]}] Tool desconhecida '{tool_name}' — o modelo pediu uma tool "
-                            f"que não está no schema desta rodada (tools_schema atual: "
-                            f"{[t['function']['name'] for t in tools_schema]})")
-                history.append({"role": "tool", "tool_call_id": call_id,
-                                 "content": (
-                                     f"ERROR: tool '{tool_name}' does not exist in this session. "
-                                     "There is no `finish` tool either — to end the turn, reply "
-                                     "with plain text and NO tool call; that reply is delivered "
-                                     "to the user as the final answer."
-                                 )})
-                continue
+            if kind == "unknown":
+                log.warning(
+                    f"[{eid[:8]}] Tool desconhecida '{tool_name}' — fora do schema "
+                    f"desta rodada ({len(tools_schema)} tool(s) disponíveis)"
+                )
+                log.debug(
+                    f"[{eid[:8]}] tools disponíveis nesta rodada: "
+                    f"{[t['function']['name'] for t in tools_schema]}"
+                )
 
-            if on_event:
-                await on_event("tool_call", {"step": turn, "tool": tool_name})
-                # Tool no meio = rajada de thinking nova vem depois.
-                _reason_sep["flush"] = True
+        # AUTO_FINISH encerra o turno: mantém o caminho serial/legado para não
+        # competir com outras chamadas e preservar o "a resposta já é final".
+        serial_auto_finish = any(
+            rec["tool_name"] in AUTO_FINISH_TOOLS for rec in prepared
+        )
 
-            # ── Executa a tool: nativa (executor Python direto) ou MCP
-            # (despachada pra sessão correspondente via call_tool) ──
+        async def _run_one(rec: dict[str, Any]) -> dict[str, Any]:
+            """Executa UMA chamada já preparada. Nunca levanta. Devolve o
+            resultado, o StepResult e o texto que vai pro histórico."""
+            tool_name = rec["tool_name"]
+            args = rec["args"]
+            call_id = rec["call_id"]
+            kind = rec["kind"]
+
+            if kind in ("unknown", "invalid"):
+                sr = StepResult(
+                    step=turn, executor=tool_name or "(unknown)",
+                    action=rec["action"], success=False, error=rec["parse_error"],
+                    tool_call_id=call_id,
+                )
+                if on_event:
+                    await on_event("tool_result", sr.model_dump())
+                return {
+                    "rec": rec, "sr": sr, "success": False, "result": None,
+                    "err": rec["parse_error"],
+                    "tool_content": rec["parse_error"],
+                    "used_mcp": False, "used_skill": None,
+                }
+
+            used_mcp = False
+            used_skill: Optional[str] = None
+            mcp_is_error = False
             t0 = time.perf_counter()
             _CURRENT_HISTORY.set(history)
             try:
-                if is_native:
+                if kind == "native":
                     result = await asyncio.wait_for(
                         TOOLS[tool_name]["executor"](args, req, sid),
                         timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
@@ -3534,9 +4687,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     if (tool_name == "use_skill" and isinstance(result, str)
                             and not result.startswith("ERROR")
                             and str(args.get("name") or "").strip()):
-                        used_agent_skills.append(
-                            AGENT_SKILL_PREFIX + str(args["name"]).strip()
-                        )
+                        used_skill = AGENT_SKILL_PREFIX + str(args["name"]).strip()
                 else:
                     # MCP: proxy via mcp_manager (o executante). O timeout
                     # vai AMBOS no wait_for daqui (teto do round-trip HTTP)
@@ -3550,17 +4701,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     # do round-trip com infraestrutura).
                     if server in CDP_BROWSERS:
                         await _ensure_browser()
-                    r = await asyncio.wait_for(
-                        state.mcp_client.post(
-                            f"/servers/{server}/call",
-                            json={"tool": mcp_tool_name, "arguments": args,
-                                  "timeout": mcp_timeout,
-                                  **({"cwd": req.cwd} if req.cwd else {})},
-                        ),
-                        timeout=mcp_timeout + 10.0,
+                    call_data = await _mcp_call_with_retry(
+                        server, mcp_tool_name, args, mcp_timeout, req.cwd,
+                        safe=_is_parallel_safe(tool_name, "mcp"),
                     )
-                    r.raise_for_status()
-                    call_data = r.json()
                     # Conteúdo MCP chega como texto joinado dos blocos
                     # textuais (TextContent etc.) — formato que
                     # _result_to_text já sabe tratar.
@@ -3568,15 +4712,23 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     if call_data.get("is_error"):
                         # A tool executou e REPORTOU erro — o modelo precisa
                         # vê-lo pra reagir (reformular, desistir, encerrar).
-                        result = f"ERROR (MCP tool reportou falha): {result}"
+                        mcp_is_error = True
+                        _metric_inc("tool_failures_by_category", "UNAVAILABLE")
+                        result = _format_tool_error(
+                            "UNAVAILABLE", f"MCP tool reported failure: {result}"
+                        )
                     else:
                         # Sucesso real (sem is_error): entra no aprendizado
                         # do grafo de tools (co-uso + exemplo aprendido).
-                        used_mcp_tools.append(tool_name)
+                        used_mcp = True
                     log.debug(f"[{eid[:8]}] MCP call via manager: server={server} tool={mcp_tool_name} is_error={call_data.get('is_error')}")
-                success, err = True, None
+                success = not mcp_is_error
+                err = result if mcp_is_error else None
             except Exception as e:
-                result, success, err = None, False, f"{type(e).__name__}: {e}"
+                category, hint = _categorize_error(e)
+                err = _format_tool_error(category, str(e), hint)
+                result, success = None, False
+                _metric_inc("tool_failures_by_category", category)
             lat = round((time.perf_counter() - t0) * 1000, 2)
 
             # ── Log bruto da resposta da tool (debug) ──
@@ -3594,36 +4746,116 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
             sr = StepResult(
                 step=turn, executor=tool_name,
-                action=json.dumps(args, ensure_ascii=False),
+                action=rec["action"],
                 success=success, result=result, error=err, latency_ms=lat,
+                tool_call_id=call_id,
             )
-            step_results.append(sr)
             if on_event:
                 await on_event("tool_result", sr.model_dump())
+            return {
+                "rec": rec, "sr": sr, "success": success, "result": result,
+                "err": err,
+                "tool_content": _result_to_text(result) if success else err,
+                "used_mcp": used_mcp, "used_skill": used_skill,
+            }
 
-            # ── Resultado no histórico como mensagem role="tool" ──
+        def _apply_outcome(out: dict[str, Any]) -> None:
+            """Anexa o resultado ao histórico/step_results NA ORDEM ORIGINAL."""
+            step_results.append(out["sr"])
             history.append({
-                "role": "tool", "tool_call_id": call_id,
-                "content": _result_to_text(result) if success else f"ERROR: {err}",
+                "role": "tool", "tool_call_id": out["rec"]["call_id"],
+                "content": out["tool_content"],
             })
+            if out["used_mcp"] and out["rec"]["tool_name"] not in used_mcp_tools:
+                used_mcp_tools.append(out["rec"]["tool_name"])
+            if out["used_skill"] and out["used_skill"] not in used_agent_skills:
+                used_agent_skills.append(out["used_skill"])
 
-            # ── Auto-finish: tools cuja resposta já é final (vision_objects) ──
-            # Evita a segunda chamada ao modelo de texto — o resultado do
-            # modelo multimodal (campo "answer") vira a resposta do turno
-            # direto, sem gerar nada agora.
-            if tool_name in AUTO_FINISH_TOOLS and success and isinstance(result, dict) and result.get("answer"):
-                final_response = result["answer"]
-                # Resposta vem da tool (modelo multimodal), não do content
-                # streamado — delta único (dedup contra o content já emitido).
-                if on_event and not (message.get("streamed")
-                                     and message.get("content") == final_response):
-                    await on_event("delta", final_response)
-                finished = True
-                break
+        if serial_auto_finish:
+            # Caminho legado: tools que encerram o turno não competem com
+            # outras. Emite tool_call/executa/step_done uma a uma.
+            for rec in prepared:
+                if on_event:
+                    await on_event("tool_call", {
+                        "step": turn, "tool": rec["tool_name"] or "(unknown)",
+                        "tool_call_id": rec["call_id"],
+                    })
+                    _reason_sep["flush"] = True
+                out = await _run_one(rec)
+                _apply_outcome(out)
+                if (rec["tool_name"] in AUTO_FINISH_TOOLS and out["success"]
+                        and isinstance(out["result"], dict) and out["result"].get("answer")):
+                    final_response = out["result"]["answer"]
+                    # Resposta vem da tool (modelo multimodal), não do content
+                    # streamado — delta único (dedup contra o content emitido).
+                    if on_event and not (message.get("streamed")
+                                         and message.get("content") == final_response):
+                        await on_event("delta", final_response)
+                    finished = True
+                    break
+        else:
+            # Emite todos os tool_call antes do disparo (a UI já mostra o que
+            # está em voo). Resultados chegam por conclusão, com call_id para
+            # a UI casar a bolha certa.
+            if on_event:
+                for rec in prepared:
+                    await on_event("tool_call", {
+                        "step": turn, "tool": rec["tool_name"] or "(unknown)",
+                        "tool_call_id": rec["call_id"],
+                    })
+                _reason_sep["flush"] = True
 
-            # ── Anti-loop de MESMA tool: REMOVIDO ──
-            # (nudge em REPEAT_NUDGE_AT e hard-stop em REPEAT_HARD_LIMIT —
-            # cortava trabalho legítimo repetitivo; ver comentário acima)
+            outcomes: list[Optional[dict[str, Any]]] = [None] * len(prepared)
+            lanes: dict[str, list[dict[str, Any]]] = {}
+            for rec in prepared:
+                if rec["kind"] in ("unknown", "invalid"):
+                    # Erros não executam nada; entram direto na ordem original.
+                    outcomes[rec["index"]] = await _run_one(rec)
+                    continue
+                # MCP: uma lane por servidor (ordem interna preservada).
+                # Nativas: lane própria (chamadas independentes em paralelo).
+                # Heurística conservadora: só tools read-only/idempotentes
+                # entram em lanes paralelas. Escritas/ações vão para uma lane
+                # serial única, na ordem original — evita efeitos colaterais
+                # fora de ordem. Allowlist por env força safe.
+                if _is_parallel_safe(rec["tool_name"], rec["kind"]):
+                    key = f"mcp:{rec['server']}" if rec["kind"] == "mcp" else f"native:{rec['index']}"
+                else:
+                    key = "serial:unsafe"
+                lanes.setdefault(key, []).append(rec)
+
+            async def _run_lane(recs: list[dict[str, Any]]) -> None:
+                for rec in recs:
+                    outcomes[rec["index"]] = await _run_one(rec)
+
+            results = await asyncio.gather(
+                *(_run_lane(recs) for recs in lanes.values()),
+                return_exceptions=True,
+            )
+            for lane_result in results:
+                if isinstance(lane_result, BaseException):
+                    log.warning(f"[{eid[:8]}] lane de tools falhou: {lane_result}")
+
+            # Anexa na ordem original — mesmo que as conclusões tenham sido
+            # fora de ordem. Qualquer outcome faltante vira erro acionável.
+            for i, rec in enumerate(prepared):
+                out = outcomes[i]
+                if out is None:
+                    sr = StepResult(
+                        step=turn, executor=rec["tool_name"] or "(unknown)",
+                        action=rec["action"], success=False,
+                        error="tool lane failed without an outcome",
+                        tool_call_id=rec["call_id"],
+                    )
+                    if on_event:
+                        await on_event("tool_result", sr.model_dump())
+                    out = {
+                        "rec": rec, "sr": sr, "success": False, "result": None,
+                        "err": sr.error,
+                        "tool_content": f"ERROR: {sr.error}",
+                        "used_mcp": False, "used_skill": None,
+                    }
+                _apply_outcome(out)
 
         if finished:
             break
@@ -3697,7 +4929,8 @@ async def _execute_stream_generator(req: ExecuteRequest):
             try:
                 events_queue.get_nowait()
                 dropped_events += 1
-                log.debug(f"[{eid[:8]}] events_queue cheia — drop-oldest (total: {dropped_events})")
+                _metric_inc("queue_drops")
+                log.warning(f"[{eid[:8]}] events_queue cheia — drop-oldest (total: {dropped_events})")
             except asyncio.QueueEmpty:
                 pass
             try:
@@ -3741,8 +4974,17 @@ async def _execute_stream_generator(req: ExecuteRequest):
         frames += _sse("audio", {"data": payload.get("audio_b64", "")})
         return frames
 
+    _last_reported_drops = 0
     while True:
         name, data = await events_queue.get()
+        # Aviso de truncamento: drop-oldest protege a fila, mas o cliente
+        # precisa saber que parte do stream não chegou. Emite no máximo uma
+        # vez por avanço do contador (não inunda a UI).
+        if dropped_events > _last_reported_drops:
+            _last_reported_drops = dropped_events
+            warning = {"dropped_events": dropped_events}
+            await _mirror_conversation(CONVERSATION_HUB, "stream_warning", warning)
+            yield _sse("stream_warning", warning)
         if name == "__done__":
             step_results, final_response = data
             break
@@ -3789,6 +5031,12 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 result_text = _result_to_text(res)
                 await _mirror_conversation(CONVERSATION_HUB, "result", result_text)
                 yield _sse("result", result_text)
+        elif name == "skill_loaded":
+            # Skills selecionadas para ESTE turno — a TUI/web UI mostra qual
+            # playbook está ativo e correlaciona o comportamento do modelo.
+            # Espelha no Conversation Hub para o chat do Manager também ver.
+            await _mirror_conversation(CONVERSATION_HUB, "skill_loaded", data)
+            yield _sse("skill_loaded", data)
 
     await task
 
@@ -3821,7 +5069,9 @@ async def _execute_stream_generator(req: ExecuteRequest):
         # o histórico entre o turno do WhatsApp e o 'Pode gerar' (26/10).
         # Custo: um POST local (~100ms). Falha fica LOGADA (antes era
         # except: pass — buraco negro).
-        await _save_turn(req.input, final_response, sid)
+        saved = await _save_turn(req.input, final_response, sid)
+        if not saved:
+            log.warning(f"[{eid[:8]}] save_turn falhou — aviso de memória será injetado no próximo turno")
         # B+: extração real (modelo extrator do LLM.py, roteando semantic→LT /
         # episodic→ST) no lugar do antigo "_save_lt('Usuário disse: ...')" —
         # que gravava qualquer input como fato permanente de LT.
@@ -3836,11 +5086,13 @@ async def _execute_stream_generator(req: ExecuteRequest):
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
         "total_latency_ms": lat, "errors": errors,
+        "dropped_events": dropped_events,
     })
     yield _sse("done", {
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
         "total_latency_ms": lat, "errors": errors,
+        "dropped_events": dropped_events,
     })
 
 
@@ -4249,7 +5501,7 @@ async def chat(req: ChatRequest):
         # NEW (projetos): re-afirma o escopo ativo antes do turno (LLM.py lê
         # memória por conta própria no modo CHAT) e repassa o slug.
         await _ensure_memory_scope()
-        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts, "watch_confidence": _WATCH_CONFIDENCE, "active_project": _project_active() if _project_active() != "general" else None})
+        r = await state.llm_client.post("/chat", json={"message": req.message, "voice": req.voice, "lang": req.lang, "max_turns": 10, "tts": req.tts, "watch_confidence": _WATCH_CONFIDENCE, "active_project": _project_active() or "general"})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -4294,15 +5546,39 @@ async def status():
     except Exception as e:
         mcp_servers = {"(erro)": f"mcp_manager offline: {type(e).__name__}: {e}"}
 
+    # ── Agent Skills (auditoria de seleção) ─────────────────────────────
+    try:
+        installed, _ = _agent_skills_cached()
+        installed_names = [s.name for s in installed]
+    except Exception:
+        installed_names = []
+    counts = _agent_skills_stats.get("counts", {})
+    never_selected = [
+        name for name in installed_names
+        if counts.get(name, 0) == 0
+    ] if _agent_skills_stats.get("turns", 0) >= AGENT_SKILLS_AUDIT_MIN_TURNS else []
+    agent_skills_status = {
+        "turns": _agent_skills_stats.get("turns", 0),
+        "counts": counts,
+        "last_selected": _agent_skills_stats.get("last_selected", {}),
+        "never_selected": never_selected,
+    }
+
     return {
         "orchestrator": "ok", "architecture": "tool-calling + MCP manager (two-stage discovery)",
         "services": checks,
         "native_tools": list(TOOLS.keys()),
         "mcp_servers": mcp_servers,
+        "metrics": _metric_snapshot(),
+        "agent_skills": agent_skills_status,
     }
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
+    # O cache de turnos recentes (query de recall contextual) é best-effort e
+    # local a este processo — limpa junto para a sessão não "lembrar" de um
+    # histórico que o ST já apagou.
+    _RECENT_TURNS.pop(session_id, None)
     try:
         return await _memory_request("DELETE", f"/session/{session_id}")
     except Exception as e:

@@ -104,7 +104,7 @@ async def tool_tip_add(req: ToolTipAddRequest) -> ToolTipAddResponse:
         if row is None:
             raise MemoryToolError(
                 f"Tool '{name}' não existe no ToolsDB — só é possível dicas de "
-                "tools MCP registradas/sincronizadas (rode o sync do servidor primeiro)."
+                "tools registradas no ToolsDB (MCP ou nativas) — rode o sync do servidor primeiro."
             )
 
         # Dedup SEMÂNTICO (ver _tip_find_dup) — duplicata vira UPDATE (o modelo
@@ -143,6 +143,7 @@ async def tool_tips_list(names: str) -> ToolTipsListResponse:
     for r in rows:
         grouped.setdefault(r["name"], []).append({
             "id": r["tip_id"], "text": r["text"], "created_at": r["created_at"],
+            "last_used": r["last_used"], "use_count": r["use_count"],
         })
     return ToolTipsListResponse(tips=grouped)
 

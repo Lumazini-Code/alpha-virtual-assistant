@@ -203,6 +203,13 @@ def _server_group(tool_name: str) -> str:
     return tool_name.split("__", 1)[0] if "__" in tool_name else tool_name
 
 
+def _is_mcp_tool_name(tool_name: str) -> bool:
+    """True só para tools de servidores MCP (`servidor__tool`). Tools nativas
+    (sem `__`) e Agent Skills (prefixo agentskill__) não competem na seleção
+    de servidores MCP — as nativas são servidas direto pelo schema nativo."""
+    return "__" in tool_name and not tool_name.startswith(AGENT_SKILL_PREFIX)
+
+
 def _ranked_with_quota(ranked: list[tuple[int, float]], names: dict[int, str],
                        limit: int, min_score: float | None) -> list[tuple[int, float]]:
     """Corta `ranked` em `limit` slots com cota TOOLS_MAX_PER_SERVER por
@@ -252,7 +259,7 @@ async def tools_select(req: ToolSelectRequest):
     rank_names = {r["id"]: r["name"] for r in state.tl_db.get_by_ids(
         [t for t, _ in ranked])}
     ranked = [(t, s) for t, s in ranked
-              if not rank_names.get(t, "").startswith(AGENT_SKILL_PREFIX)]
+              if _is_mcp_tool_name(rank_names.get(t, ""))]
 
     top1 = ranked[0][1] if ranked else 0.0
     low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
@@ -272,7 +279,7 @@ async def tools_select(req: ToolSelectRequest):
     # skills "core" (always-on) NÃO vazam aqui — core é filtrado pelo prefixo
     # (skills core são servidas só pelo endpoint de agent skills).
     core_ids = {r["id"] for r in state.tl_db.list_core()
-                if not r["name"].startswith(AGENT_SKILL_PREFIX)}
+                if _is_mcp_tool_name(r["name"])}
 
     rows = {r["id"]: r for r in state.tl_db.get_by_ids(
         [t for t, _ in primary] + [t for t, _ in related_raw] + list(core_ids)
@@ -282,7 +289,7 @@ async def tools_select(req: ToolSelectRequest):
     # "agentskill" no manager. O espelho vale aqui: este endpoint só devolve
     # MCP tools; /agent-skills/select só devolve skills.
     related = [(t, s) for t, s in related_raw
-               if t in rows and not rows[t]["name"].startswith(AGENT_SKILL_PREFIX)]
+               if t in rows and _is_mcp_tool_name(rows[t]["name"])]
     out: list[ToolMatch] = []
     seen: set[int] = set()
 

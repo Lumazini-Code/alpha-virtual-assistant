@@ -2105,20 +2105,32 @@ def _build_messages(
       [0] system:     prompt ESTÁVEL
       [1] user:       "[Data: DD/MM/YYYY]\n{user_input}"
 
-    NEW (projetos): `active_project` (slug ≠ None) injeta o hint de escopo
-    como mensagem system — o /read mescla o escopo do projeto com o geral e
-    fatos novos pertencem ao projeto. None = modo geral, sem system extra
-    (prefixo de cache inalterado).
+    NEW (projetos): `active_project` injeta o hint de escopo como mensagem
+    system — o /read mescla o escopo do projeto com o geral e fatos novos
+    pertencem ao projeto. "general" é explícito: o modelo nunca deve confundir
+    "sem projeto" com "falha ao afirmar o projeto". None é tratado como
+    "general" (compatibilidade com chamadas antigas).
     """
     messages = []
 
     # NEW (projetos): hint de escopo — vira o [0] do array (system), mantendo
-    # o recall de memória como assistant logo depois.
-    if active_project and active_project != "general":
+    # o recall de memória como assistant logo depois. "general" é injetado
+    # explicitamente (nunca omitido) para o modelo saber que está no escopo
+    # geral e não que a descoberta de projeto falhou.
+    project_slug = active_project or "general"
+    if project_slug == "general":
         messages.append({
             "role": "system",
             "content": (
-                f"Active project: {active_project}. Your long-term memory currently "
+                "Active project: general (no project scope). Your long-term memory "
+                "is the general memory; new facts you save belong to general memory."
+            ),
+        })
+    else:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"Active project: {project_slug}. Your long-term memory currently "
                 f"merges this project's dedicated memory scope with your general memory; "
                 f"new facts you save (memory write) belong to this project's context."
             ),

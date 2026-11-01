@@ -70,6 +70,8 @@ header{display:flex;align-items:center;gap:8px;padding:10px 16px;min-height:52px
 .sr.running .ic{color:var(--am);animation:p 1s infinite}.sr.done .ic{color:var(--gr)}.sr.error .ic,.err{color:var(--rd)}.sr.pending .ic{color:var(--mu)}
 @keyframes p{50%{opacity:.3}}
 .err{font-size:14px;margin-top:6px}
+.skillbadge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--mu);border:1px solid var(--ln);border-radius:999px;padding:4px 10px;margin:0 0 10px;background:var(--sf)}
+.skillbadge b{font-weight:500;color:var(--ac)}
 .dots i{display:inline-block;width:6px;height:6px;margin-right:4px;border-radius:50%;background:var(--mu);animation:p 1s infinite}.dots i:nth-child(2){animation-delay:.15s}.dots i:nth-child(3){animation-delay:.3s}
 .caret::after{content:"";display:inline-block;width:7px;height:1em;background:var(--ac);margin-left:2px;vertical-align:-2px;animation:p 1s infinite}
 #hero{text-align:center;margin:12vh 0 22px}
@@ -469,7 +471,9 @@ function frame(m,{event:e,raw}){
   else if(e==='step_done'&&o&&m.plan){const s=m.plan.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}
   else if(e==='reasoning')m.reason=(m.reason||'')+raw;
   else if(e==='delta')m.text+=raw;
+  else if(e==='stream_warning'){const n=+(o?.dropped_events||0);if(n>0)m.warn=(m.warn?m.warn+'\n':'')+`⚠ parte da resposta foi truncada (${n} eventos descartados)`}
   else if(e==='error'){m.err=o?o.error:raw;m.streaming=false}
+  else if(e==='skill_loaded'&&o){const skills=(o.skills||[]).filter(s=>s&&s.name);if(skills.length)m.skills=skills}
   else if(e==='done'){m.streaming=false;if(o?.final_response)m.text=o.final_response}
   /* audio_start / audio / audio_end / result: ignorados nesta versão */
 }
@@ -508,10 +512,12 @@ function html(m){
   let h='<div class="m a"><span class="av"><img src="/assets/alpha-icon.svg" alt=""></span><div class="body">';
   if(m.reason){const R=160,c=!S.full&&m.reason.length>R;
     h+=`<div class="think"><button data-think><b style="font-weight:500">Pensamento · ${m.reason.length} caracteres</b><span>${c?'expandir':'recolher'}</span></button><p>${esc(c?'… '+m.reason.slice(-R):m.reason)}</p></div>`}
+  if(m.skills&&m.skills.length)h+=`<div class="skillbadge">🛠 Skills carregadas: <b>${esc(m.skills.map(s=>s.name).join(', '))}</b></div>`;
   if(m.plan)h+=`<div class="steps"><div class="sh">${m.plan.dyn?'Ferramentas':'Plano'} · ${m.plan.steps.length} passo(s)</div>`+m.plan.steps.map(s=>
     `<div class="sr ${s.st}"><span class="ic">${ICON[s.st]}</span><div><b style="font-weight:500">${esc(s.ex||'passo '+s.n)}</b>${s.ms!=null?` <span style="color:var(--mu)">${Math.round(s.ms)} ms</span>`:''}${s.er?` <span class="err">${esc(s.er)}</span>`:''}${s.st!=='done'&&s.act?`<small>${esc(s.act.slice(0,90))}</small>`:''}</div></div>`).join('')+'</div>';
   h+=`<div class="txt${m.streaming&&m.text?' caret':''}">${md(m.text)}${m.streaming&&!m.text&&!m.reason&&!m.plan?'<span class="dots"><i></i><i></i><i></i></span>':''}</div>`;
   if(m.err)h+=`<div class="err">⚠ ${esc(m.err)}</div>`;
+  if(m.warn)h+=`<div class="err" style="color:var(--am)">⚠ ${esc(m.warn)}</div>`;
   return h+'</div></div>';
 }
 let raf=0;

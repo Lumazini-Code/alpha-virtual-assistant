@@ -38,6 +38,7 @@ import asyncio
 
 from memory_config import (
     AGENT_SKILL_PREFIX,
+    SKILLS_FALLBACK_MIN_SCORE,
     SKILLS_FALLBACK_TOP_K,
     TOOLS_LOW_CONFIDENCE_SCORE,
     TOOLS_MAX_RELATED,
@@ -93,8 +94,11 @@ async def agent_skills_select(req: AgentSkillSelectRequest):
     top1 = ranked[0][1] if ranked else 0.0
     low_confidence = top1 < TOOLS_LOW_CONFIDENCE_SCORE
     if low_confidence:
-        # confiança baixa: recall > precisão — rede mais larga, sem threshold
-        primary = [(t, s) for t, s in ranked][:SKILLS_FALLBACK_TOP_K]
+        # confiança baixa: recall > precisão — rede mais larga, mas com piso
+        # (SKILLS_FALLBACK_MIN_SCORE) para não injetar skill irrelevante quando
+        # o top-1 já está abaixo do sinal de ruído do embed.
+        primary = [(t, s) for t, s in ranked
+                   if s >= SKILLS_FALLBACK_MIN_SCORE][:SKILLS_FALLBACK_TOP_K]
     else:
         primary = [(t, s) for t, s in ranked if s >= req.min_score][:req.top_k]
 

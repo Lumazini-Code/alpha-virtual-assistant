@@ -667,6 +667,11 @@ class ToolTipEntry(BaseModel):
     id:         int
     text:       str
     created_at: float
+    # Metadados de VALIDADE da dica/tool: quando a tool foi usada pela última
+    # vez e quantas vezes. Ajuda o modelo a desconfiar de dica antiga sem
+    # esconder a informação (a dica continua injetada).
+    last_used:  Optional[float] = None
+    use_count:  int = 0
 
 class ToolTipsListResponse(BaseModel):
     # graph_name → dicas ativas (só tools com dica aparecem)

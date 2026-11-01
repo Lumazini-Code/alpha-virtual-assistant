@@ -1510,10 +1510,11 @@ class ToolsDB(EdgeGraphMixin):
             return []
         ph = ",".join("?" * len(name_keys))
         return self._conn.execute(
-            f"SELECT tt.id AS tip_id, tt.text, tt.created_at, t.name "
+            f"SELECT tt.id AS tip_id, tt.text, tt.created_at, t.name, "
+            f"t.last_used, t.use_count "
             f"FROM tool_tips tt JOIN tools t ON t.id = tt.tool_id "
             f"WHERE t.name_key IN ({ph}) AND tt.active = 1 "
-            f"ORDER BY tt.created_at ASC, tt.id ASC",
+            f"ORDER BY tt.created_at DESC, tt.id DESC",
             name_keys,
         ).fetchall()
 

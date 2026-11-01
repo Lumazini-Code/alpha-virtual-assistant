@@ -1267,8 +1267,10 @@ async def tool_tip_add(tool: str, tip: str) -> str:
     APENAS uma limitação não-óbvia e DURÁVEL que você descobriu USANDO a tool
     nesta conversa: modo de falha ("falha com payload > 5MB"), requisito de
     ordem ("chame X antes de Y, senão retorna vazio"), armadilha de parâmetro.
-    `tool` é o nome completo ('servidor__tool', ex.: 'desktop-commander__start_process');
-    `tip` é UMA frase imperativa e GERAL — não o caso específico desta conversa.
+    `tool` é o nome exato da tool: graph_name para MCP ('servidor__tool', ex.:
+    'desktop-commander__start_process') ou o nome da tool nativa (ex.:
+    'memory_search', 'list_plans'). `tip` é UMA frase imperativa e GERAL — não
+    o caso específico desta conversa.
     NÃO use para: fatos do usuário/tarefa (memory_write_batch), preferência ou
     ranking entre tools (a seleção é automática), ou o que a description já diz.
     Se a tool já atingiu o limite de dicas, remova a mais fraca antes (tool_tip_remove)."""
