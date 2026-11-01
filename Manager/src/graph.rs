@@ -118,7 +118,7 @@ impl GraphService {
                 ])
                 .current_dir(&self.project_root);
         } else {
-            command = Command::new("docker");
+            command = crate::docker_cli::command(None);
             command.args([
                 "exec",
                 "-i",

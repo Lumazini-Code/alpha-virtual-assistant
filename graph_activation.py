@@ -1080,7 +1080,9 @@ def main(argv: list[str] | None = None):
 
     memory_api_url = args.memory_api
     if memory_api_url == "__default__":
-        memory_api_url = f"http://{internal_bind_host()}:3000"
+        _bind = internal_bind_host()
+        _client = "127.0.0.1" if _bind in ("0.0.0.0", "::") else _bind
+        memory_api_url = f"http://{_client}:3000"
 
     state = GraphState(args.db, args.tools_db, args.plans_db, args.mcp_db,
                        args.people_db)

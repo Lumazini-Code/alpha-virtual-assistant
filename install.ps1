@@ -1,4 +1,4 @@
-# install.ps1 - Instalador Alpha AI (Windows)
+﻿# install.ps1 - Instalador Alpha AI (Windows)
 #
 # Espelha o fluxo do install.sh:
 #   1. Valida prereqs (Node 24 no host; Docker Desktop OU Docker Engine no WSL)
@@ -50,26 +50,67 @@ function Die {
 
 # -- 0. Feature do Windows: Virtual Machine Platform ----------------------------
 # WSL2 roda sobre o Hyper-V (VirtualMachinePlatform). Sem essa feature o
-# `wsl --import` da rota B falha. O `dism` exige elevation (UAC).
-Write-Info 'Verificando feature do Windows: VirtualMachinePlatform...'
-$VmpState = $null
-$prevEAP = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-$DismQuery = (dism.exe /online /get-featureinfo /featurename:VirtualMachinePlatform 2>&1 | Out-String)
-$ErrorActionPreference = $prevEAP
-if ($DismQuery -match 'State\s*:\s*(\S+)') { $VmpState = $Matches[1] }
+# `wsl --import` da rota B falha.
+#
+# A deteccao NAO pode depender do texto do `dism` (em Windows pt-BR a saida e
+# "Estado : Habilitado", entao o regex 'State : Enabled' nunca casava e o
+# script tentava habilitar a feature a cada execucao) nem de elevation (sem
+# admin o dism consulta com erro 740 e tambem nao devolve o estado). Por isso
+# a consulta usa fontes independentes de idioma, em ordem:
+#   1. Win32_ComputerSystem.HypervisorPresent -> hypervisor rodando (feature
+#      ativa e PC ja reiniciado)
+#   2. Win32_OptionalFeature (CIM/WMI, funciona sem admin; InstallState 1 =
+#      habilitada)
+#   3. Get-WindowsOptionalFeature (enum 'Enabled', exige admin)
+function Test-IsAdmin {
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-if ($VmpState -eq 'Enabled') {
+# Retorna: 'Active' (hypervisor rodando) | 'Enabled' (habilitada, sem hypervisor
+# ativo ainda) | 'Disabled' | 'Unknown' (nao foi possivel consultar)
+function Get-VmpStatus {
+  try {
+    if ((Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent) { return 'Active' }
+  } catch {}
+  try {
+    $f = Get-CimInstance -ClassName Win32_OptionalFeature -Filter "Name='VirtualMachinePlatform'" -ErrorAction Stop
+    if ($f) { if ($f.InstallState -eq 1) { return 'Enabled' } else { return 'Disabled' } }
+  } catch {}
+  try {
+    $f = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
+    if ($f) { if ("$($f.State)" -eq 'Enabled') { return 'Enabled' } else { return 'Disabled' } }
+  } catch {}
+  return 'Unknown'
+}
+
+Write-Info 'Verificando feature do Windows: VirtualMachinePlatform...'
+$VmpStatus = Get-VmpStatus
+
+if ($VmpStatus -eq 'Active') {
+  Write-Ok 'VirtualMachinePlatform habilitada e ativa (hypervisor em execucao).'
+} elseif ($VmpStatus -eq 'Enabled') {
   Write-Ok 'VirtualMachinePlatform ja esta habilitada.'
+  Write-Warn2 'Hypervisor ainda nao esta em execucao - se acabou de habilitar a feature, reinicie o PC antes de usar o WSL2.'
+} elseif ($VmpStatus -eq 'Unknown') {
+  # Nao deu para consultar: nao tenta instalar as cegas (era isso que travava).
+  # Segue; se faltar mesmo, o Docker/WSL adiante acusa com mensagem clara.
+  Write-Warn2 'Nao foi possivel verificar a VirtualMachinePlatform - seguindo sem habilitar.'
+  Write-Warn2 'Se o WSL falhar adiante, rode: dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart (como Administrador) e reinicie.'
 } else {
-  Write-Warn2 'VirtualMachinePlatform desabilitada (ou sem permissao para consultar) - habilitando...'
+  # Disabled: so aqui habilita (o dism exige elevation/UAC)
+  if (-not (Test-IsAdmin)) {
+    Die 'VirtualMachinePlatform esta desabilitada e habilitar exige permissao de Administrador. Abra o PowerShell como Administrador e rode o install.ps1 de novo.'
+  }
+  Write-Warn2 'VirtualMachinePlatform desabilitada - habilitando...'
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
   $dismCode = $LASTEXITCODE
   $ErrorActionPreference = $prevEAP
-  if ($dismCode -ne 0) {
-    Die "Falha ao habilitar VirtualMachinePlatform (dism saiu com $dismCode). Rode o install.ps1 em um PowerShell como Administrador."
+  # 3010 = sucesso, reinicio necessario
+  if ($dismCode -ne 0 -and $dismCode -ne 3010) {
+    Die "Falha ao habilitar VirtualMachinePlatform (dism saiu com $dismCode)."
   }
   Write-Ok 'VirtualMachinePlatform habilitada (sem reinicio automatico).'
   Write-Host ''
@@ -99,9 +140,13 @@ function Invoke-Docker {
 function Test-DockerAlive {
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  $code = Invoke-Docker info *> $null
+  # NAO capturar o retorno de Invoke-Docker: o `*> $null` descartava tambem o
+  # codigo devolvido por `return $LASTEXITCODE` ($code ficava vazio e o teste
+  # dava sempre falso). O codigo de saida real vem de $LASTEXITCODE.
+  $null = Invoke-Docker info *> $null
+  $ok = ($LASTEXITCODE -eq 0)
   $ErrorActionPreference = $prevEAP
-  return ($code -eq 0)
+  return $ok
 }
 
 # Verifica o plugin 'docker compose' (v2)
@@ -120,17 +165,118 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
   if (Test-DockerAlive) { $DesktopDockerOk = $true }
 }
 
+# Helpers WSL. O wsl.exe existe no Windows mesmo SEM o WSL instalado (e so um
+# stub que imprime "O Subsistema do Windows para Linux nao esta instalado"). Com
+# $ErrorActionPreference='Stop', o stderr de um comando nativo vira excecao no
+# PS 5.1 (NativeCommandError) - por isso as chamadas aqui rodam em 'Continue'.
+function Test-WslInstalled {
+  if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $false }
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $null = & wsl.exe --status 2>&1; $ok = ($LASTEXITCODE -eq 0) } catch { $ok = $false }
+  $ErrorActionPreference = $prevEAP
+  return $ok
+}
+
+# Lista as distros (saida do wsl e UTF-16: remove os NULs). Vazio se nao houver.
+function Get-WslDistros {
+  if (-not (Test-WslInstalled)) { return @() }
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = (& wsl.exe --list --quiet 2>$null) } catch { $out = @() }
+  $ErrorActionPreference = $prevEAP
+  return @($out | ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
+}
+
+# Teto de RAM da VM do WSL2 (.wslconfig), calculado pela memoria LIVRE agora.
+# Sem isso o WSL2 tenta reservar 50% da RAM total e a criacao da VM aborta
+# (Wsl/Service/RegisterDistro/CreateVm/E_ABORT, 0x8007000E) quando a livre e menor.
+# Cria o arquivo se nao existir; se existir, so reduz a linha memory= quando ela
+# excede a memoria livre (guarda backup em .wslconfig.bak).
+function Set-WslMemoryCap {
+  $cfg = Join-Path $env:USERPROFILE '.wslconfig'
+  try {
+    $freeGb  = [math]::Floor((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB)
+    $totalGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+    $cap = [int][math]::Max(2, [math]::Min(8, [math]::Min([math]::Floor($totalGb / 2), [math]::Floor($freeGb * 0.7))))
+    if (-not (Test-Path $cfg)) {
+      @('[wsl2]', "memory=${cap}GB", 'swap=2GB', 'vmIdleTimeout=-1', '', '[general]', 'instanceIdleTimeout=-1') | Set-Content -Path $cfg -Encoding ASCII
+      Write-Ok ".wslconfig criado: WSL2 limitado a ${cap}GB (RAM total ${totalGb}GB, livre ${freeGb}GB)."
+      return
+    }
+    $txt = Get-Content -Raw -Path $cfg
+    if ($txt -match '(?im)^\s*memory\s*=\s*(\d+)\s*GB') {
+      $cur = [int]$Matches[1]
+      if ($cur -gt $freeGb) {
+        Copy-Item -Force $cfg "$cfg.bak"
+        $txt = [regex]::Replace($txt, '(?im)^(\s*memory\s*=\s*)\d+\s*GB', "`${1}${cap}GB")
+        Set-Content -Path $cfg -Value $txt -Encoding ASCII
+        Write-Warn2 ".wslconfig tinha memory=${cur}GB (livre: ${freeGb}GB) - reduzido para ${cap}GB (backup em .wslconfig.bak)."
+      } else {
+        Write-Ok ".wslconfig existente mantido (memory=${cur}GB)."
+      }
+    } else {
+      Write-Ok '.wslconfig existente mantido.'
+    }
+    Set-WslKeepAlive $cfg
+  } catch {
+    Write-Warn2 "Nao foi possivel ajustar o .wslconfig: $($_.Exception.Message)"
+  }
+}
+
+# WSL 3.x desliga a DISTRO ociosa em 15s ([general] instanceIdleTimeout),
+# parando dockerd e TODOS os containers ~15-20s apos o up. O vmIdleTimeout
+# (WSL2) e o timeout da VM. Desliga os dois no .wslconfig existente, sem
+# sobrescrever tuning do usuario (so acrescenta as chaves se faltarem).
+function Set-WslKeepAlive {
+  param([string]$Path)
+  try {
+    if (-not (Test-Path $Path)) { return }
+    $txt = Get-Content -Raw -Path $Path
+    $orig = $txt
+    if ($txt -notmatch '(?im)^\s*vmIdleTimeout\s*=') {
+      if ($txt -match '(?im)^\[wsl2\]') {
+        $txt = [regex]::Replace($txt, '(?im)^(\[wsl2\][^\r\n]*)', "`$1`r`nvmIdleTimeout=-1", 1)
+      } else {
+        $txt = $txt.TrimEnd() + "`r`n`r`n[wsl2]`r`nvmIdleTimeout=-1`r`n"
+      }
+    }
+    if ($txt -notmatch '(?im)^\s*instanceIdleTimeout\s*=') {
+      if ($txt -match '(?im)^\[general\]') {
+        $txt = [regex]::Replace($txt, '(?im)^(\[general\][^\r\n]*)', "`$1`r`ninstanceIdleTimeout=-1", 1)
+      } else {
+        $txt = $txt.TrimEnd() + "`r`n`r`n[general]`r`ninstanceIdleTimeout=-1`r`n"
+      }
+    }
+    if ($txt -ne $orig) {
+      Copy-Item -Force $Path "$Path.bak"
+      Set-Content -Path $Path -Value $txt -Encoding ASCII
+      Write-Ok '.wslconfig: timeouts de inatividade desligados (vmIdleTimeout=-1, instanceIdleTimeout=-1).'
+    }
+  } catch {
+    Write-Warn2 "Nao foi possivel ajustar os timeouts do .wslconfig: $($_.Exception.Message)"
+  }
+}
+
+# Converte caminho do Windows (C:\Users\...) para o do WSL (/mnt/c/Users/...)
+# direto no PowerShell. NAO usar `wsl -- wslpath -a <caminho>`: o argumento passa
+# por um shell Linux que consome as barras invertidas (C:UsersWILLIA~1...).
+function ConvertTo-WslPath {
+  param([Parameter(Mandatory)][string]$Path)
+  $full = [System.IO.Path]::GetFullPath($Path)
+  if ($full -notmatch '^[A-Za-z]:') { return $null }
+  return ('/mnt/' + $full.Substring(0, 1).ToLower() + ($full.Substring(2) -replace '\\', '/')).TrimEnd('/')
+}
+
 # Testa o Docker no WSL (Debian-slim)
 $WslDockerOk = $false
 if (-not $DesktopDockerOk) {
-  $wslCmd = Get-Command wsl -ErrorAction SilentlyContinue
-  if ($wslCmd) {
-    # Verifica se a distro Debian-slim ja existe
-    $distros = (wsl --list --quiet 2>$null) -replace "`0", '' | Where-Object { $_ }
-    if ($distros -contains 'Debian-slim') {
-      # Verifica se o docker responde dentro dela
-      if ((Invoke-Docker info *> $null) -eq 0) { $WslDockerOk = $true }
-    }
+  # Verifica se o WSL esta instalado e a distro Debian-slim ja existe
+  $distros = Get-WslDistros
+  if ($distros -contains 'Debian-slim') {
+    # Verifica se o docker responde DENTRO dela (Invoke-Docker usa o WSL so com a flag)
+    $script:UseWSLDocker = $true
+    if (Test-DockerAlive) { $WslDockerOk = $true } else { $script:UseWSLDocker = $false }
   }
 }
 
@@ -142,24 +288,67 @@ if ($DesktopDockerOk) {
 } else {
   # Configura o Docker no WSL (Debian-slim) automaticamente
   Write-Info 'Docker nao encontrado no Windows/WSL. Configurando WSL + Docker automaticamente...'
-  $wslCmd = Get-Command wsl -ErrorAction SilentlyContinue
-  if (-not $wslCmd) {
-    Die "WSL nao encontrado. Instale o WSL (ab PowerShell como Admin: 'wsl --install') e rode novamente."
+  if (-not (Test-WslInstalled)) {
+    if (-not (Test-IsAdmin)) {
+      Die "WSL nao esta instalado. Abra o PowerShell como Administrador e rode o install.ps1 de novo (ele instala o WSL), ou rode manualmente: wsl --install --no-distribution"
+    }
+    Write-Info 'WSL nao instalado - instalando (wsl --install --no-distribution)...'
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    wsl.exe --install --no-distribution
+    $wslCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+    if ($wslCode -ne 0) { Die "Falha ao instalar o WSL (codigo $wslCode). Rode 'wsl --install --no-distribution' manualmente." }
+    Write-Ok 'WSL instalado.'
+    Write-Warn2 '>> REINICIE O COMPUTADOR para concluir a instalacao do WSL. <<'
+    Write-Host '    Depois de reiniciar, execute o install.ps1 novamente - a instalacao continua daqui.'
+    $ans = Read-Host 'Reiniciar agora? [s/N]'
+    if ($ans -match '^[sS]') {
+      Write-Info 'Reiniciando em 10 segundos (Ctrl+C para cancelar)...'
+      shutdown.exe /r /t 10
+    }
+    exit 0
   }
-  $distros = (wsl --list --quiet 2>$null) -replace "`0", '' | Where-Object { $_ }
+  Set-WslMemoryCap
+  Write-Info 'Atualizando o WSL (wsl --update)...'
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  wsl.exe --update 2>&1 | Out-Null
+  wsl.exe --shutdown 2>&1 | Out-Null
+  $ErrorActionPreference = $prevEAP
+  Start-Sleep -Seconds 3
+  $distros = Get-WslDistros
   if ($distros -notcontains 'Debian-slim') {
     Write-Info 'Importando Debian-slim no WSL...'
-    $RootFs = "$env:TEMP\debian-slim.tar.xz"
-    Invoke-WebRequest -Uri 'https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-amd64/trixie/slim/rootfs.tar.xz' -OutFile $RootFs -UseBasicParsing
+    # O repo do Debian parou de publicar rootfs.tar.xz; o rootfs agora esta no
+    # blob OCI (tar.gz, ~28 MB), que o `wsl --import` aceita normalmente.
+    $RootFs = "$env:TEMP\debian-slim.tar.gz"
+    $RootFsUrl = 'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-amd64/trixie/slim/oci/blobs/rootfs.tar.gz'
+    try {
+      Invoke-WebRequest -Uri $RootFsUrl -OutFile $RootFs -UseBasicParsing
+    } catch {
+      Die "Falha ao baixar o rootfs do Debian ($RootFsUrl): $($_.Exception.Message)"
+    }
     New-Item -ItemType Directory -Force -Path 'C:\WSL\Debian-slim' | Out-Null
-    wsl --import Debian-slim C:\WSL\Debian-slim $RootFs --version 2
-    if ($LASTEXITCODE -ne 0) { Die 'Falha ao importar Debian-slim no WSL.' }
+    $imported = $false
+    for ($try = 1; $try -le 2 -and -not $imported; $try++) {
+      wsl --import Debian-slim C:\WSL\Debian-slim $RootFs --version 2
+      if ($LASTEXITCODE -eq 0) { $imported = $true }
+      elseif ($try -lt 2) {
+        Write-Warn2 'Falha ao importar - reiniciando o WSL e tentando de novo...'
+        wsl --shutdown
+        Start-Sleep -Seconds 8
+      }
+    }
+    if (-not $imported) {
+      Die "Falha ao importar Debian-slim no WSL (CreateVm). Feche apps pesados (libere RAM), confira o memory= em $env:USERPROFILE\.wslconfig, rode 'wsl --update' e reinicie o PC se a VirtualMachinePlatform foi habilitada ha pouco."
+    }
     Remove-Item $RootFs -Force
     Write-Ok 'Debian-slim importado.'
   }
   # Configura systemd, usuario e sudo
   Write-Info 'Configurando systemd/usuario no Debian-slim...'
-  wsl -d Debian-slim -u root -- bash -c "apt update && apt install -y systemd systemd-sysv sudo curl ca-certificates && adduser --disabled-password --gecos '' alpha-ai && usermod -aG sudo alpha-ai && printf '[boot]\nsystemd=true\n[user]\ndefault=alpha-ai\n' > /etc/wsl.conf"
+  wsl -d Debian-slim -u root -- bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -y systemd systemd-sysv sudo curl ca-certificates && (id alpha-ai >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo alpha-ai) && printf '[boot]\nsystemd=true\n[user]\ndefault=alpha-ai\n' > /etc/wsl.conf"
   if ($LASTEXITCODE -ne 0) { Die 'Falha ao configurar systemd no Debian-slim.' }
   wsl --shutdown
   Start-Sleep -Seconds 5
@@ -168,7 +357,13 @@ if ($DesktopDockerOk) {
   wsl -d Debian-slim -u root -- bash -c "curl -fsSL https://get.docker.com | sh && usermod -aG docker alpha-ai && systemctl enable --now docker"
   if ($LASTEXITCODE -ne 0) { Die 'Falha ao instalar o Docker Engine no Debian-slim.' }
   $script:UseWSLDocker = $true
-  if (-not (Test-DockerAlive)) { Die 'Docker no WSL nao respondeu apos instalacao.' }
+  # O daemon (systemd) pode levar alguns segundos para responder apos a instalacao
+  $alive = $false
+  for ($i = 0; $i -lt 12; $i++) {
+    if (Test-DockerAlive) { $alive = $true; break }
+    Start-Sleep -Seconds 5
+  }
+  if (-not $alive) { Die 'Docker no WSL nao respondeu apos instalacao (aguardei 1 min).' }
   Write-Ok 'Docker Engine instalado no WSL (Debian-slim).'
 }
 
@@ -244,6 +439,7 @@ if (Test-Node24) {
 $WslConfigPath = Join-Path $env:USERPROFILE '.wslconfig'
 if (Test-Path $WslConfigPath) {
   Write-Ok ".wslconfig existente mantido ($WslConfigPath)."
+  Set-WslKeepAlive $WslConfigPath
 } else {
   try {
     $TotalGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
@@ -252,6 +448,10 @@ if (Test-Path $WslConfigPath) {
 [wsl2]
 memory=${Cap}GB
 swap=2GB
+vmIdleTimeout=-1
+
+[general]
+instanceIdleTimeout=-1
 "@ | Set-Content -Path $WslConfigPath -Encoding ASCII
     Write-Ok ".wslconfig criado: WSL2 limitado a ${Cap}GB de RAM (maquina tem ${TotalGb}GB)."
     Write-Warn2 'O teto vale apos `wsl --shutdown` (ou reiniciar o PC).'
@@ -309,6 +509,90 @@ if (-not (Test-Path $ModelsZip)) {
 Set-Location $InstallDir
 Write-Ok 'Arquivos extraidos.'
 
+# -- 3a. Runtime Windows: separa BIND de CLIENT e tolera probe ----------------
+# AVA_BIND_HOST=0.0.0.0 e necessario no bridge do Windows, mas 0.0.0.0 nao e
+# destino valido para httpx. Esses patches sao idempotentes: viram no-op quando
+# o release ja vier corrigido.
+function Patch-WindowsRuntime {
+  param([Parameter(Mandatory)][string]$Root)
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+  $llm = Join-Path $Root 'Modules\LLM.py'
+  if (Test-Path $llm) {
+    $t = ([IO.File]::ReadAllText($llm)) -replace "`r`n", "`n"
+    if ($t -notmatch 'AVA_CLIENT_HOST') {
+      $old = @'
+HOST_BIND = os.getenv("AVA_BIND_HOST", "127.9.12.22")
+
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{HOST_BIND}:3000")
+TTS_URL    = f"http://{HOST_BIND}:3004"
+'@ -replace "`r`n", "`n"
+      $new = @'
+HOST_BIND = os.getenv("AVA_BIND_HOST", "127.9.12.22")
+CLIENT_HOST = os.getenv("AVA_CLIENT_HOST") or ("127.0.0.1" if HOST_BIND in ("0.0.0.0", "::") else HOST_BIND)
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{CLIENT_HOST}:3000")
+TTS_URL    = os.getenv("TTS_URL", f"http://{CLIENT_HOST}:3004")
+'@ -replace "`r`n", "`n"
+      if ($t.Contains($old)) {
+        $t = $t.Replace($old, $new)
+        [IO.File]::WriteAllText($llm, $t, $utf8)
+        Write-Ok 'LLM.py: client host separado do bind (0.0.0.0 -> 127.0.0.1).'
+      } else {
+        Write-Warn2 'LLM.py: bloco HOST_BIND nao encontrado - patch manual necessario.'
+      }
+    }
+  }
+
+  $graph = Join-Path $Root 'graph_activation.py'
+  if (Test-Path $graph) {
+    $t = ([IO.File]::ReadAllText($graph)) -replace "`r`n", "`n"
+    $oldGraph = '        memory_api_url = f"http://{internal_bind_host()}:3000"'
+    if ($t.Contains($oldGraph)) {
+      $newGraph = @(
+        '        _bind = internal_bind_host()',
+        '        _client = "127.0.0.1" if _bind in ("0.0.0.0", "::") else _bind',
+        '        memory_api_url = f"http://{_client}:3000"'
+      ) -join "`n"
+      $t = $t.Replace($oldGraph, $newGraph)
+      [IO.File]::WriteAllText($graph, $t, $utf8)
+      Write-Ok 'graph_activation.py: memory client host 127.0.0.1.'
+    }
+  }
+
+  $orch = Join-Path $Root 'orchestrator.py'
+  if (Test-Path $orch) {
+    $t = ([IO.File]::ReadAllText($orch)) -replace "`r`n", "`n"
+    $before = $t
+    $t = [regex]::Replace($t, '(?m)^(\s*)except httpx\.ConnectError:(\s*\n\s*log\.warning\(f"[^\n]*OFFLINE"\))', '$1except httpx.HTTPError:$2', 1)
+    if ($t -ne $before) {
+      [IO.File]::WriteAllText($orch, $t, $utf8)
+      Write-Ok 'orchestrator.py: probe inicial tolera HTTPError (memory subindo).'
+    }
+  }
+}
+
+# -- 3a. Compose Windows: bind 0.0.0.0 nos servicos internos -------------------
+# No bridge do Windows/WSL2 o docker-proxy encaminha 127.9.12.22:9000 para o
+# IP do container. Os servicos internos fazem bind em 127.9.12.22 (loopback
+# DENTRO do container), onde o proxy nao chega -> "Empty reply"/SSE offline.
+# AVA_BIND_HOST=0.0.0.0 faz o bind em todas as interfaces do container; o
+# healthcheck em 127.9.12.22 continua valendo. Idempotente: nao duplica.
+$WinCompose = Join-Path $InstallDir 'docker-compose.windows.yml'
+if (Test-Path $WinCompose) {
+  try {
+    $composeTxt = Get-Content -Raw -Path $WinCompose
+    if ($composeTxt -notmatch '(?m)^\s*AVA_BIND_HOST\s*:') {
+      $composeTxt = [regex]::Replace($composeTxt, '(?m)^(\s*environment:\s*)$', "`$1`r`n      AVA_BIND_HOST: `"0.0.0.0`"", 1)
+      Copy-Item -Force $WinCompose "$WinCompose.bak"
+      [System.IO.File]::WriteAllText($WinCompose, $composeTxt, (New-Object System.Text.UTF8Encoding($false)))
+      Write-Ok 'docker-compose.windows.yml: AVA_BIND_HOST=0.0.0.0 aplicado.'
+    }
+  } catch {
+    Write-Warn2 "Nao foi possivel ajustar o compose Windows: $($_.Exception.Message)"
+  }
+}
+Patch-WindowsRuntime -Root $InstallDir
+
 # -- 3b. Agent Skills (SKILL.md - hyperframes) ---------------------------------
 # .agents\ e skills-lock.json sao gitignored: um install novo NAO traz as
 # skills. O CLI `skills` roda via npx (sem install global - o --yes do NPX
@@ -318,6 +602,23 @@ Write-Ok 'Arquivos extraidos.'
 #   -y           -> pula os prompts (escopo = projeto; -y = non-interactive)
 # Idempotente (re-run re-sincroniza pelo lock). Falha (rede, p.ex.) e aviso,
 # nao morte - o sistema sobe sem skills.
+# O `skills add` clona o repo via `git` (sem git: "spawn git ENOENT"). Instala o
+# Git via winget se faltar; falha = aviso (as skills sao opcionais).
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Write-Info 'Git ausente no host - instalando via winget (Git.Git)...'
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements --disable-interactivity *> $null
+    $ErrorActionPreference = $prevEAP
+    foreach ($gd in @('C:\Program Files\Git\cmd', 'C:\Program Files (x86)\Git\cmd')) {
+      if ((Test-Path $gd) -and ($env:Path -notlike "*$gd*")) { $env:Path = "$env:Path;$gd" }
+    }
+  }
+  if (Get-Command git -ErrorAction SilentlyContinue) { Write-Ok 'Git instalado no host.' }
+  else { Write-Warn2 'Nao consegui instalar o Git (instale em https://git-scm.com) - as Agent Skills podem falhar.' }
+}
+
 $Npx = Get-Command npx -ErrorAction SilentlyContinue
 if ($Npx) {
   Write-Info 'Agent Skills: baixando heygen-com/hyperframes (npx skills add)...'
@@ -569,6 +870,31 @@ $McpHeaders = @{ Authorization = "Bearer $AvaToken" }
 $PlaywrightExtensionUrl = 'https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm'
 $PlaywrightExtensionStatusUrl = 'chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status.html'
 
+# chrome-extension:// NAO e um protocolo registrado no Windows: Start-Process
+# com essa URL da "computador nao tem aplicativo para abrir". So o proprio
+# Chrome entende - entao chama o chrome.exe explicitamente com a URL.
+function Open-InChrome {
+  param([Parameter(Mandatory)][string]$Url)
+  $candidates = @()
+  foreach ($hive in @('HKCU', 'HKLM')) {
+    try {
+      $v = (Get-ItemProperty -Path "${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe" -ErrorAction Stop).'(default)'
+      if ($v) { $candidates += $v }
+    } catch {}
+  }
+  $candidates += @(
+    (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+  )
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) {
+      try { Start-Process -FilePath $c -ArgumentList $Url; return $true } catch {}
+    }
+  }
+  return $false
+}
+
 # Procura o 'auth-token' da extensao no LevelDB de Local Storage dos perfis
 # dos navegadores Chromium instalados e imprime o token (43 chars base64url).
 # A pagina status.html renderiza o token via React - o valor confiavel esta no
@@ -580,7 +906,10 @@ function Get-PlaywrightExtensionToken {
   # LevelDB e '_chrome-extension://<id>\x00\x01auth-token' e o token (43
   # chars base64url) aparece na janela de 64B logo apos a chave.
   $extId = 'mmlmfjhmonkocbjadbfplnigmagldckm'
-  $keyNeedle = [System.Text.Encoding]::UTF8.GetBytes("chrome-extension://$extId`0`1auth-token")
+  # NUL e SOH precisam ser bytes explicitos: em PowerShell `1 NAO e escape
+  # (so `0 e). Com "`0`1" o needle virava "...\x00" + "1auth-token" e nunca
+  # casava com a chave real "...\x00\x01auth-token".
+  $keyNeedle = [System.Text.Encoding]::UTF8.GetBytes("chrome-extension://$extId" + [char]0 + [char]1 + "auth-token")
   $tokenRegex = [regex]'[A-Za-z0-9_-]{43}'
   $window = 64 + 43
 
@@ -604,7 +933,15 @@ function Get-PlaywrightExtensionToken {
   $files = $files | Sort-Object { [int]($_.BaseName -replace '\D', '') } -Descending
 
   foreach ($file in $files) {
-    try { $raw = [System.IO.File]::ReadAllBytes($file.FullName) } catch { continue }
+    # FileShare.ReadWrite: o Chrome em execucao mantem o .log aberto.
+    # O -bor precisa ser atribuido ANTES do New-Object: dentro da lista de
+    # argumentos o PowerShell trata a expressao como array e lanca
+    # "op_BitwiseOr" -> o catch ignorava TODOS os arquivos.
+    try {
+      $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+      $fs = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+      try { $ms = New-Object System.IO.MemoryStream; $fs.CopyTo($ms); $raw = $ms.ToArray() } finally { $fs.Dispose() }
+    } catch { continue }
     # Varre todas as ocorrencias da chave exata; a primeira neste arquivo
     # (mais novo) ja e o write mais recente do token.
     $pos = 0
@@ -699,6 +1036,20 @@ Write-Ok 'Docker dorme apos 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15).'
 # retenta; se falhar de vez, so avisa (nao aborta a instalacao).
 $McpManagerUrl = 'http://127.9.12.22:9001'
 
+# Instrucao de sync manual para PowerShell. O `curl` no Windows PowerShell 5.1
+# e alias de Invoke-WebRequest e nao aceita -H; o comando abaixo usa o cmdlet
+# nativo e le o token do proprio Modules\.env gerado pelo instalador.
+function Show-ManualSyncHint {
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [int]$TimeoutSec = 300
+  )
+  Write-Warn2 'Para sincronizar manualmente no PowerShell:'
+  Write-Warn2 "  `$envFile = `"$EnvFile`""
+  Write-Warn2 "  `$token = (Get-Content `$envFile | Where-Object { `$_ -match '^AVA_INTERNAL_TOKEN=' } | Select-Object -Last 1) -replace '^AVA_INTERNAL_TOKEN=',''"
+  Write-Warn2 "  Invoke-RestMethod -Uri '$McpManagerUrl/servers/$Name/sync' -Method Post -Headers @{ Authorization = `"Bearer `$token`" } -TimeoutSec $TimeoutSec"
+}
+
 function Register-PlaywrightMcp {
   # O env do registro e autocontido (o mcp_manager mescla server.env sobre o
   # ambiente herdado — a linha vale mesmo sem o tray injetando o env):
@@ -721,6 +1072,10 @@ function Register-PlaywrightMcp {
     args           = @('-y', '@playwright/mcp@latest', '--extension')
     env            = $envMap
   } | ConvertTo-Json -Depth 3
+  # Corpo em bytes UTF-8: no Windows PowerShell 5.1 o Invoke-RestMethod com
+  # string usa ISO-8859-1 e os acentos do skill_summary viram bytes inválidos
+  # em UTF-8 (o servidor responde 422 e o Playwright nunca é cadastrado).
+  $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 
   # A extensao precisa ser instalada manualmente na Chrome Web Store -
   # o Playwright MCP no modo --extension conecta a ela via bridge. Com o
@@ -742,7 +1097,11 @@ function Register-PlaywrightMcp {
   if (-not (Get-EnvVar 'PLAYWRIGHT_MCP_EXTENSION_TOKEN')) {
     Read-Host 'Instale a extensao na janela aberta e pressione ENTER para continuar' | Out-Null
     Write-Info "Abrindo a pagina de status da extensao ($PlaywrightExtensionStatusUrl)..."
-    try { Start-Process $PlaywrightExtensionStatusUrl } catch {}
+    if (-not (Open-InChrome $PlaywrightExtensionStatusUrl)) {
+      Write-Warn2 'Nao consegui abrir o Chrome automaticamente. Abra o Chrome, cole este endereco na barra e pressione Enter:'
+      Write-Warn2 "  $PlaywrightExtensionStatusUrl"
+      Read-Host 'Depois de abrir a pagina, pressione ENTER para continuar' | Out-Null
+    }
     Write-Info 'Aguardando o Chrome persistir o token (30 s)...'
     Start-Sleep -Seconds 30
     $token = Get-PlaywrightExtensionToken
@@ -762,7 +1121,7 @@ function Register-PlaywrightMcp {
   for ($i = 0; $i -lt 24; $i++) {
     try {
       Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
-        -ContentType 'application/json' -Body $payload -TimeoutSec 10 -Headers $McpHeaders | Out-Null
+        -ContentType 'application/json; charset=utf-8' -Body $payloadBytes -TimeoutSec 10 -Headers $McpHeaders | Out-Null
       $registered = $true
       break
     } catch {
@@ -788,7 +1147,7 @@ function Register-PlaywrightMcp {
   }
   if (-not $synced) {
     Write-Warn2 'Playwright MCP cadastrado, mas o sync falhou (memory_api ainda bootando?).'
-    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/playwright/sync -H `"Authorization: Bearer <AVA_INTERNAL_TOKEN de Modules\.env>`""
+    Show-ManualSyncHint -Name 'playwright' -TimeoutSec 300
     return $false
   }
   Write-Ok 'Playwright MCP registrado e sincronizado.'
@@ -841,7 +1200,7 @@ function Register-McpServer {
   }
   if (-not $synced) {
     Write-Warn2 "$Label MCP cadastrado, mas o sync falhou (memory_api ou o proprio servidor ainda bootando?)."
-    Write-Warn2 "Rode manualmente: curl -X POST $McpManagerUrl/servers/$Name/sync -H `"Authorization: Bearer <AVA_INTERNAL_TOKEN de Modules\.env>`""
+    Show-ManualSyncHint -Name $Name -TimeoutSec $SyncTimeoutSec
     return $false
   }
   Write-Ok "$Label MCP registrado e sincronizado."
@@ -849,11 +1208,12 @@ function Register-McpServer {
 }
 
 function Register-AlphaMcp {
-  # URL do MCP do alpha-mcp (server.py, streamable-http em :4010/mcp). O manager
-  # roda DENTRO do container: localhost seria ele mesmo, entao o default usa
-  # host.docker.internal (porta 4010 publicada no host). Se o alpha-mcp for um
-  # servico do mesmo compose, sobrescreva: $env:ALPHA_MCP_URL = 'http://alpha-mcp:4010/mcp'
-  $wsUrl = if ($env:ALPHA_MCP_URL) { $env:ALPHA_MCP_URL } else { 'http://host.docker.internal:4010/mcp' }
+  # URL do MCP do alpha-mcp (server.py, streamable-http em :4010/mcp). O
+  # mcp_manager roda NO HOST (embutido no tray), nao dentro do container:
+  # host.docker.internal so resolve em Docker Desktop/rota A. Na rota B ele
+  # falha sempre. 127.9.12.22:4010 e a porta publicada no host (no Windows via
+  # portproxy) e funciona nas duas rotas.
+  $wsUrl = if ($env:ALPHA_MCP_URL) { $env:ALPHA_MCP_URL } else { 'http://127.9.12.22:4010/mcp' }
   return (Register-McpServer -Label 'Alpha' -Name 'alpha-mcp' -SyncTimeoutSec 120 -Spec @{
     name          = 'alpha-mcp'
     skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.'
@@ -975,21 +1335,27 @@ if ($script:UseWSLDocker) {
   Write-Info 'Rota B: instalando relays socat no Debian-slim...'
 
   # (1a) socat dentro da VM
-  wsl -d Debian-slim -u root -- bash -c "command -v socat >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq socat; }"
+  wsl -d Debian-slim -u root -- bash -c "export DEBIAN_FRONTEND=noninteractive; { command -v socat >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; } || { apt-get update -qq && apt-get install -y -qq socat iproute2; }"
   if ($LASTEXITCODE -ne 0) { Die 'Falha ao instalar o socat no Debian-slim.' }
 
   # Script de relay: alvos do stack sao fixos (127.9.12.22 na VM); os do HOST
   # dependem do gateway do WSL (vEthernet do Windows) — resolvido a cada boot.
+  # IMPORTANTE: os relays do stack escutam no IP DA VM (eth0), NAO em 0.0.0.0.
+  # Docker publica em 127.9.12.22:PORTA; se o socat escutar em 0.0.0.0:PORTA e
+  # o container ainda nao subiu, o connect para 127.9.12.22:PORTA cai no
+  # proprio socat (loopback) -> fork() por conexao em loop -> pids esgotados,
+  # WSL/dockerd derrubados ("fork(): Resource temporarily unavailable").
   $RelaySh = @'
 #!/bin/bash
 # Alpha AI - relays socat da rota WSL (gerado pelo install.ps1)
-# (a) stack: 0.0.0.0:PORTA -> 127.9.12.22:PORTA (publicacao do docker na VM)
-# (b) host:  0.0.0.0:PORTA -> GW:PORTA          (tray/CDP/transcribe no Windows)
+# (a) stack: VMIP:PORTA -> 127.9.12.22:PORTA (publicacao do docker na VM)
+# (b) host:  0.0.0.0:PORTA -> GW:PORTA        (tray/CDP/transcribe no Windows)
 GW="$(ip route show default | awk '{print $3}' | head -n1)"
+VMIP="$(hostname -I | awk '{print $1}')"
 APP_PORTS="3000 4005 4003 3003 3001 2002 3002 3004 4002 9000 3005 2001 8081 6379 11235 4010"
 HOST_PORTS="9001 9222 9100"
 for p in $APP_PORTS; do
-  socat "TCP-LISTEN:$p,bind=0.0.0.0,fork,reuseaddr" "TCP:127.9.12.22:$p" &
+  socat "TCP-LISTEN:$p,bind=$VMIP,fork,reuseaddr" "TCP:127.9.12.22:$p" &
 done
 for p in $HOST_PORTS; do
   socat "TCP-LISTEN:$p,bind=0.0.0.0,fork,reuseaddr" "TCP:$GW:$p" &
@@ -999,7 +1365,7 @@ wait -n
   $RelaySh = $RelaySh -replace "`r`n", "`n"
   $RelayTmp = Join-Path $env:TEMP 'alpha-ai-relay.sh'
   [System.IO.File]::WriteAllText($RelayTmp, $RelaySh, (New-Object System.Text.UTF8Encoding($false)))
-  $RelayWsl = ((wsl -d Debian-slim -- wslpath -a $RelayTmp | Out-String) -replace "`0", '').Trim()
+  $RelayWsl = (ConvertTo-WslPath $RelayTmp)
   if (-not $RelayWsl) { Die 'Nao consegui converter o caminho do relay para o WSL (wslpath).' }
 
   $SvcTmp = Join-Path $env:TEMP 'alpha-ai-relay.service'
@@ -1022,8 +1388,8 @@ WantedBy=multi-user.target
 '@
     $RelaySvc = $RelaySvc -replace "`r`n", "`n"
     [System.IO.File]::WriteAllText($SvcTmp, $RelaySvc, (New-Object System.Text.UTF8Encoding($false)))
-    $SvcWsl = ((wsl -d Debian-slim -- wslpath -a $SvcTmp | Out-String) -replace "`0", '').Trim()
-    wsl -d Debian-slim -u root -- bash -c "cp '$RelayWsl' /usr/local/bin/alpha-ai-relay.sh && chmod 755 /usr/local/bin/alpha-ai-relay.sh && cp '$SvcWsl' /etc/systemd/system/alpha-ai-relay.service && systemctl daemon-reload && systemctl enable --now alpha-ai-relay.service"
+    $SvcWsl = (ConvertTo-WslPath $SvcTmp)
+    wsl -d Debian-slim -u root -- bash -c "cp '$RelayWsl' /usr/local/bin/alpha-ai-relay.sh && chmod 755 /usr/local/bin/alpha-ai-relay.sh && cp '$SvcWsl' /etc/systemd/system/alpha-ai-relay.service && systemctl daemon-reload && systemctl enable alpha-ai-relay.service && systemctl restart alpha-ai-relay.service"
     if ($LASTEXITCODE -ne 0) { Die 'Falha ao registrar o servico alpha-ai-relay no Debian-slim.' }
     Write-Ok 'Relays socat ativos (systemd: alpha-ai-relay.service).'
   } else {
@@ -1091,12 +1457,12 @@ netsh advfirewall firewall add rule name="Alpha AI WSL relay" dir=in action=allo
 #      CLI docker no host. O caminho do projeto e traduzido via wslpath.
 function Invoke-Compose {
   if ($script:UseWSLDocker) {
-    $wslDir = ((wsl -d Debian-slim -- wslpath -a $InstallDir | Out-String) -replace "`0", '').Trim()
+    $wslDir = (ConvertTo-WslPath $InstallDir)
     # Skills globais do WINDOWS (%USERPROFILE%\.agents\skills) no formato da
     # VM — mesmo esquema do docker-start.bat. O docker-compose.windows.yml
     # interpola AVA_WIN_GLOBAL_SKILLS no mount /root/.agents-win/skills
     # (fallback /tmp quando vazia — nunca derruba o stack).
-    $winSkills = ((wsl -d Debian-slim -- wslpath -a "$env:USERPROFILE\.agents\skills" 2>$null | Out-String) -replace "`0", '').Trim()
+    $winSkills = (ConvertTo-WslPath "$env:USERPROFILE\.agents\skills")
     if ($winSkills) { $env:AVA_WIN_GLOBAL_SKILLS = $winSkills }
     else { Remove-Item Env:\AVA_WIN_GLOBAL_SKILLS -ErrorAction SilentlyContinue }
     # WSLENV: o wsl.exe so exporta env do Windows p/ o Linux se a var estiver
@@ -1147,14 +1513,33 @@ if (-not $SkipBuild) {
   Invoke-Compose build
   if ($LASTEXITCODE -ne 0) { Die 'docker compose build falhou - rode o build novamente para ver o erro.' }
 
-  # Manager primeiro: e ele quem sobe o stack Docker (POST /docker/start).
-  # Se o Manager falhar, cai para o compose direto.
-  $viaManager = (Start-Manager) -and (Start-DockerViaManager)
+  # Baixa as imagens de terceiros ANTES do primeiro up via Manager.
+  # O /docker/start do Manager sobe o stack; se as imagens ainda nao estiverem
+  # no cache, o compose baixa tudo dentro do request e o Manager pode estourar
+  # o timeout. Lista explicita: ava e alpha-mcp sao build local e NAO entram no
+  # pull (evita tentar sobrescrever com tag do registry).
+  Write-Info 'Baixando imagens Docker de terceiros (searxng, valkey, crawl4ai, docker-socket-proxy)...'
+  Invoke-Compose pull searxng valkey crawl4ai docker-socket-proxy | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 'Falha ao baixar alguma imagem - o up tentara baixar novamente.'
+  }
+
+  # Rota A (Docker Desktop): Manager sobe o stack (POST /docker/start).
+  # Rota B (Docker no WSL): o tray roda no Windows SEM CLI docker. O health
+  # check dele (`docker compose ps`) falha, ele conclui que os containers
+  # pararam e o auto-stop derruba o stack. Nessa rota o instalador sobe o
+  # compose direto e o Manager sobe depois apenas para API/MCP/WebUI.
+  $viaManager = $false
+  if (-not $script:UseWSLDocker) {
+    $viaManager = (Start-Manager) -and (Start-DockerViaManager)
+  }
   if (-not $viaManager) {
-    Write-Warn2 'Subindo o stack diretamente via compose...'
+    Write-Info 'Subindo o stack diretamente via compose...'
     Invoke-Compose up -d
     if ($LASTEXITCODE -ne 0) { Die 'docker compose up falhou.' }
   }
+  # Rota B: Manager de pe para a API :9001 + mcp_manager, sem /docker/start.
+  if (-not (Test-ManagerUp)) { Start-Manager | Out-Null }
 
   # mcp_manager (host) ativo antes do cadastro dos MCPs
   Ensure-McpManager | Out-Null
@@ -1283,8 +1668,8 @@ Write-Info '  3. Abra chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/status
 Write-Info '     e copie o token para PLAYWRIGHT_MCP_EXTENSION_TOKEN em Modules\.env.'
 Write-Info '     (Ou rode novamente: install.ps1 -SkipBuild -NoLaunch, que extrai o token.)'
 Write-Info ''
-Write-Info '  4. Reinicie o ava-tray e execute o sync do Playwright:'
-Write-Info '       curl -X POST http://127.9.12.22:9001/servers/playwright/sync -H "Authorization: Bearer <AVA_INTERNAL_TOKEN>"'
+Write-Info '  4. Reinicie o ava-tray e execute o sync do Playwright (PowerShell):'
+Show-ManualSyncHint -Name 'playwright' -TimeoutSec 300
 Write-Info ''
 Write-Info 'O patch NAO e instalado automaticamente no Windows: o Chrome bloqueia'
 Write-Info 'CRX local/registro externo fora da Chrome Web Store. No Linux o install.sh'

@@ -17,13 +17,14 @@
 //! O docker continua sendo chamado via subprocess, exatamente como no
 //! script original (docker-start.bat / docker-start.sh).
 
+use crate::docker_cli;
 use crate::platform::NoWindow;
 use crate::state::{McpStatus, ProcStatus, SharedState, TranscriptStatus};
 use crate::transcript;
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -39,9 +40,18 @@ use tokio::process::Command;
 /// `docker compose ps` falha de interpolação MESMO com o stack de pé e
 /// os checks reportam estado errado.
 fn compose_env_args(state: &SharedState) -> Vec<std::ffi::OsString> {
-    let env_file = state.project_root.join("Modules").join(".env");
-    if env_file.exists() {
-        vec!["--env-file".into(), env_file.into()]
+    // Relativo à raiz do projeto: o helper docker_cli aplica current_dir
+    // (rota A) ou wsl --cd (rota B), então o mesmo argumento vale nas duas.
+    let env_file = PathBuf::from("Modules").join(".env");
+    if state.project_root.join(&env_file).exists() {
+        // Barra NORMAL sempre: na rota B o comando atravessa o wsl.exe, que
+        // consome a barra invertida e faria o compose procurar "Modules.env"
+        // (não "Modules/.env"). PathBuf::join usaria "\" no Windows e cairia
+        // exatamente nesse bug. Rota A (Docker Desktop) aceita barra normal.
+        vec![
+            "--env-file".into(),
+            std::ffi::OsString::from("Modules/.env"),
+        ]
     } else {
         Vec::new()
     }
@@ -52,35 +62,34 @@ async fn discover_docker(state: &SharedState) {
     tracing::info!("Verificando se Docker já está em execução...");
 
     // Procura o docker-compose.yml perto do script docker-start
-    let compose_file = state
+    let compose_ok = state
         .docker_start_script
         .parent()
-        .map(|p| p.join("docker-compose.yml"));
+        .map(|p| p.join("docker-compose.yml").exists())
+        .unwrap_or(false);
 
-    let compose_file = match compose_file {
-        Some(f) if f.exists() => f,
-        _ => {
-            tracing::debug!("docker-compose.yml não encontrado, pulando detecção do Docker.");
-            return;
-        }
-    };
+    if !compose_ok {
+        tracing::debug!("docker-compose.yml não encontrado, pulando detecção do Docker.");
+        return;
+    }
 
-    // Roda `docker compose ps` para verificar se há containers rodando
-    let mut compose = Command::new("docker");
+    // Roda `docker compose ps` para verificar se há containers rodando.
+    // `docker_cli` resolve rota A (docker no PATH) x rota B (WSL) e aplica
+    // o cwd correto, então os caminhos abaixo ficam relativos.
+    let mut compose = docker_cli::command(Some(state.project_root.as_path()));
     compose.arg("compose");
     for arg in compose_env_args(state) {
         compose.arg(arg);
     }
     compose.args([
         "-f",
-        compose_file.to_str().unwrap_or("docker-compose.yml"),
+        "docker-compose.yml",
         "ps",
         "--status",
         "running",
         "--format",
         "{{.Name}}",
     ]);
-    compose.no_window();
     let output = compose
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -302,12 +311,10 @@ pub async fn stop_docker(state: &SharedState) -> Result<()> {
     } else {
         // Fallback: chama docker compose diretamente.
         tracing::warn!("Script não encontrado, usando docker compose diretamente...");
-        Command::new("docker")
+        docker_cli::command(Some(state.project_root.as_path()))
             .args(["compose", "down"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .current_dir(script_dir)
-            .no_window()
             .status()
             .await
     };
@@ -492,89 +499,107 @@ pub async fn health_check_docker(state: &SharedState) -> bool {
     }
 
     // Reusa a lógica de descoberta
-    let compose_file = state
+    let compose_ok = state
         .docker_start_script
         .parent()
-        .map(|p| p.join("docker-compose.yml"));
+        .map(|p| p.join("docker-compose.yml").exists())
+        .unwrap_or(false);
 
-    let compose_file = match compose_file {
-        Some(f) if f.exists() => f,
-        _ => return true, // Não conseguimos verificar, assume que está ok
+    if !compose_ok {
+        return true; // Não conseguimos verificar, assume que está ok
+    }
+
+    // Retry com backoff: falha de COMANDO (env de interpolação ausente, WSL
+    // fora do ar, daemon reiniciando) NÃO é evidência de que os containers
+    // pararam. Sem isso, um erro transitório marcava Stopped e o auto-stop
+    // derrubava as sessões MCP — o loop que acontecia no health check da
+    // rota WSL quando o --env-file saía com barra invertida.
+    const PS_RETRIES: usize = 3;
+    const PS_BACKOFF: Duration = Duration::from_secs(2);
+
+    let mut last_error = String::new();
+    let mut success_output: Option<std::process::Output> = None;
+
+    for attempt in 0..PS_RETRIES {
+        let mut compose = docker_cli::command(Some(state.project_root.as_path()));
+        compose.arg("compose");
+        for arg in compose_env_args(state) {
+            compose.arg(arg);
+        }
+        compose.args([
+            "-f",
+            "docker-compose.yml",
+            "ps",
+            "--status",
+            "running",
+            "--quiet",
+        ]);
+        // O cwd (ou wsl --cd) já foi aplicado por docker_cli::command; o
+        // project_root absoluto continua sendo a âncora contra cwd órfão.
+
+        match compose
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                success_output = Some(out);
+                break;
+            }
+            Ok(out) => {
+                last_error = format!(
+                    "{}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                tracing::warn!(
+                    "docker compose ps falhou no health check (tentativa {}/{}): {}",
+                    attempt + 1,
+                    PS_RETRIES,
+                    last_error
+                );
+            }
+            Err(e) => {
+                last_error = e.to_string();
+                tracing::warn!(
+                    "Não foi possível executar docker no health check (tentativa {}/{}): {e}",
+                    attempt + 1,
+                    PS_RETRIES
+                );
+            }
+        }
+
+        if attempt + 1 < PS_RETRIES {
+            tokio::time::sleep(PS_BACKOFF).await;
+        }
+    }
+
+    let Some(out) = success_output else {
+        // Não conseguimos NEM FALAR com o compose depois das tentativas. Isso
+        // não prova que os containers caíram: mantém o estado atual e NÃO
+        // derruba transcript/sessões MCP. O próximo tick (30s) tenta de novo;
+        // o erro real fica no log para diagnóstico.
+        tracing::warn!(
+            "docker compose ps indisponível após {PS_RETRIES} tentativas — \
+             mantendo o estado atual do Docker (último erro: {last_error})"
+        );
+        return true;
     };
 
-    let mut compose = Command::new("docker");
-    compose.arg("compose");
-    for arg in compose_env_args(state) {
-        compose.arg(arg);
+    let has_running = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+    if !has_running {
+        tracing::warn!("Containers Docker pararam!");
+        let mut docker = state.docker.lock().await;
+        docker.status = ProcStatus::Stopped;
+        docker.pid = None;
+        docker.last_activity = None;
+        // Só aqui há evidência REAL de container caído: o `ps` respondeu com
+        // sucesso e não listou nenhum container em execução.
+        spawn_auto_stop_host_services(state);
+        return false;
     }
-    compose.args([
-        "-f",
-        compose_file.to_str().unwrap_or("docker-compose.yml"),
-        "ps",
-        "--status",
-        "running",
-        "--quiet",
-    ]);
-    // CWD explícito: SEM isto o compose herda o cwd do tray — que uma
-    // reinstalação (dir apagado e recriado com o tray de pé) transforma em
-    // um cwd órfão. O docker CLI chama getwd antes de ler o -f e morre com
-    // "getwd: no such file or directory" 30s após CADA start — o health
-    // tick interpretava como "containers caíram" e derrubava a supervisão
-    // em loop (incidente de 26/10: docker "caía sozinho" sem NENHUM erro
-    // nos logs do docker). O path absoluto do project_root resolve mesmo
-    // que o dir tenha sido recriado (novo inode, mesmo caminho).
-    compose.current_dir(state.project_root.clone());
-    compose.no_window();
-    let output = compose
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let has_running = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
-            if !has_running {
-                tracing::warn!("Containers Docker pararam!");
-                let mut docker = state.docker.lock().await;
-                docker.status = ProcStatus::Stopped;
-                docker.pid = None;
-                docker.last_activity = None;
-                // Container caiu → derruba os serviços do host (em background).
-                spawn_auto_stop_host_services(state);
-                return false;
-            }
-            true
-        }
-        Ok(out) => {
-            // compose ps FALHOU (daemon fora do ar, env de interpolação
-            // ausente...): NÃO é "assume ok" — antes o estado ficava
-            // "Running" mentindo para sempre. Marca Stopped; o próximo
-            // /docker/start tenta de novo e agora enxerga o erro real.
-            tracing::warn!(
-                "docker compose ps falhou no health check ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            let mut docker = state.docker.lock().await;
-            docker.status = ProcStatus::Stopped;
-            docker.pid = None;
-            docker.last_activity = None;
-            // Container sem resposta → mesmo tratamento de "caiu": derruba
-            // os serviços do host (em background).
-            spawn_auto_stop_host_services(state);
-            false
-        }
-        Err(e) => {
-            tracing::warn!("Não foi possível executar docker no health check: {e}");
-            let mut docker = state.docker.lock().await;
-            docker.status = ProcStatus::Stopped;
-            docker.pid = None;
-            docker.last_activity = None;
-            spawn_auto_stop_host_services(state);
-            false
-        }
-    }
+    true
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -637,7 +662,7 @@ fn find_chrome() -> Option<PathBuf> {
         let path_env = std::env::var("PATH").unwrap_or_default();
         for dir in path_env.split(':') {
             for name in ["google-chrome", "google-chrome-stable"] {
-                let p = Path::new(dir).join(name);
+                let p = std::path::Path::new(dir).join(name);
                 if p.exists() {
                     return Some(p);
                 }

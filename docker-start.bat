@@ -17,8 +17,18 @@ REM erro ":?" do compose explica qual variavel falta.
 
 setlocal enabledelayedexpansion
 
+REM ENV_ARGS e para a Rota A (compose no host Windows): o caminho Windows
+REM com backslash serve. WSL_ENV_ARGS e para a Rota B: dentro do WSL a
+REM barra invertida NAO e separador de diretorio — `Modules\.env` vira o
+REM arquivo literal "Modules\.env" (o wsl.exe ainda engole a barra e o
+REM compose procura `Modules.env`), e o `up` morre com "couldn't find env
+REM file". Use SEMPRE barra normal no comando que atravessa o wsl.exe.
 set "ENV_ARGS="
-if exist "Modules\.env" set "ENV_ARGS=--env-file Modules\.env"
+set "WSL_ENV_ARGS="
+if exist "Modules\.env" (
+  set "ENV_ARGS=--env-file Modules\.env"
+  set "WSL_ENV_ARGS=--env-file Modules/.env"
+)
 
 REM ── Agent Skills GLOBAIS do Windows ────────────────────────────────────
 REM `npx skills add -g` instala em %USERPROFILE%\.agents\skills. Na rota A
@@ -72,5 +82,5 @@ REM vez de passar um caminho Windows-style que o Docker da VM nao monta.
 set "AVA_WIN_GLOBAL_SKILLS="
 for /f "usebackq delims=" %%i in (`wsl -d Debian-slim -- wslpath -a "%USERPROFILE%\.agents\skills" 2^>nul`) do set "AVA_WIN_GLOBAL_SKILLS=%%i"
 
-wsl -d Debian-slim --cd "!WSL_DIR!" -- docker compose !ENV_ARGS! -f docker-compose.yml -f docker-compose.windows.yml %*
+wsl -d Debian-slim --cd "!WSL_DIR!" -- docker compose !WSL_ENV_ARGS! -f docker-compose.yml -f docker-compose.windows.yml %*
 endlocal & exit /b %ERRORLEVEL%

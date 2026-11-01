@@ -28,6 +28,7 @@ mod app_ipc;
 mod app_launcher;
 mod chat;
 mod docker_logs;
+mod docker_cli;
 mod graph;
 mod idle_watcher;
 mod mcp_server;
@@ -43,7 +44,7 @@ use state::new_shared_state;
 use tokio::sync::mpsc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder, TrayIconEvent,
+    MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 
 /// Comandos da thread do tray para a UI (eframe, na main thread).
@@ -329,10 +330,83 @@ fn run_tray_gtk(tx: mpsc::UnboundedSender<UiCommand>) {
     gtk::main();
 }
 
-/// Tray fora do Linux: sem loop GTK; mantém a thread viva com sleep.
+/// HWND nativo da janela de status (eframe) — preenchido no `CreationContext`
+/// e usado pela thread do tray para mostrar/restaurar a janela mesmo quando o
+/// eframe está sem update (janela escondida/minimizada).
+#[cfg(target_os = "windows")]
+static STATUS_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(target_os = "windows")]
+fn set_status_hwnd(hwnd: isize) {
+    STATUS_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Mostra/restaura a janela de status por API nativa. É o caminho que
+/// funciona mesmo quando a janela está escondida (Visible(false)): nesse
+/// estado o eframe pode não rodar `update`, então mandar apenas
+/// `UiCommand::Show` não a traria de volta.
+pub(crate) fn show_status_window() {
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        let hwnd: HWND = STATUS_HWND.load(Ordering::Relaxed) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                // SW_RESTORE mostra a janela escondida e restaura se estiver
+                // minimizada (o status é criado com with_taskbar(false), então
+                // o menu do tray é o caminho de volta).
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+    }
+}
+
+/// Tray fora do Linux.
+///
+/// No Windows, `tray-icon` cria uma janela oculta e SÓ entrega clique/menu
+/// se a thread que criou o ícone tiver um loop de mensagens Win32. O sleep
+/// anterior mantinha o ícone visível, mas nenhum evento era bombeado — daí
+/// o menu "Abrir aplicativo"/"Status" nunca abrir e o clique não restaurar
+/// a janela.
 #[cfg(not(target_os = "linux"))]
 fn run_tray(tx: mpsc::UnboundedSender<UiCommand>) {
     let _tray_icon = build_tray(tx);
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+        };
+
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if ret == 0 {
+                    // WM_QUIT: processo encerrando.
+                    break;
+                }
+                if ret == -1 {
+                    tracing::error!(
+                        "tray: GetMessageW falhou: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    // Mantém o TrayIcon vivo enquanto o processo viver (inclusive se o loop
+    // de mensagens terminar por erro); quem encerra é a main thread.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
@@ -366,21 +440,36 @@ fn build_tray(tx: mpsc::UnboundedSender<UiCommand>) -> TrayIconData {
         .build()
         .expect("falha ao criar o ícone de tray");
 
-    // Clique simples no ícone (abre a janela direto).
+    // Clique simples no ícone (abre a janela de status direto). Só o botão
+    // ESQUERDO: o direito é do menu de contexto — antes qualquer evento
+    // (inclusive hover/right-click) disparava Show e o menu nem abria.
     {
         let tx = tx.clone();
-        TrayIconEvent::set_event_handler(Some(move |_event| {
-            let _ = tx.send(UiCommand::Show);
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_status_window();
+                let _ = tx.send(UiCommand::Show);
+            }
         }));
     }
 
-    // Menu de contexto (botão direito → Abrir / Sair).
+    // Menu de contexto (botão direito → Abrir / Status / Sair).
     {
         let tx = tx;
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id == app_id {
                 app_launcher::open_or_focus();
             } else if event.id == open_id {
+                // Nativo primeiro (funciona com a janela escondida/minimizada)
+                // e o comando mantém o estado do chat/visibilidade em sincronia.
+                show_status_window();
                 let _ = tx.send(UiCommand::Show);
             } else if event.id == quit_id {
                 let _ = tx.send(UiCommand::Quit);
@@ -423,7 +512,22 @@ fn run_ui(
     eframe::run_native(
         "AVA Tray",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(ui::TrayApp::new(state, rt_handle, cmd_rx)))),
+        Box::new(move |_cc| {
+            // Guarda o HWND nativo: a thread do tray o usa para mostrar a
+            // janela por ShowWindow mesmo quando o eframe está escondido e
+            // sem update.
+            #[cfg(target_os = "windows")]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = _cc.window_handle() {
+                    if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                        set_status_hwnd(win32.hwnd.get());
+                    }
+                }
+            }
+
+            Ok(Box::new(ui::TrayApp::new(state, rt_handle, cmd_rx)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("Erro na janela: {e}"))
 }

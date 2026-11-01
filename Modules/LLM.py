@@ -81,9 +81,12 @@ load_dotenv(Path(__file__).parent / ".env")
 
 BASEFOLDER = Path(__file__).parent.parent
 HOST_BIND = os.getenv("AVA_BIND_HOST", "127.9.12.22")
+CLIENT_HOST = os.getenv("AVA_CLIENT_HOST") or (
+    "127.0.0.1" if HOST_BIND in ("0.0.0.0", "::") else HOST_BIND
+)
 
-MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{HOST_BIND}:3000")
-TTS_URL    = f"http://{HOST_BIND}:3004"
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", f"http://{CLIENT_HOST}:3000")
+TTS_URL = os.getenv("TTS_URL", f"http://{CLIENT_HOST}:3004")
 
 # ── NEW: Provider de inferência genérico (qualquer API OpenAI-compatible) ─────
 # Um único provider ativo por vez, escolhido por env (arquivo Modules/.env):
@@ -102,7 +105,7 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip(
 LLM_API_KEY  = (
     os.getenv("LLM_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
 )
-LLM_MODEL    = os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017")
+LLM_MODEL    = os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017:floor")
 
 # Host do provider — decide se API key é exigida (local: nunca é) e alimenta
 # o /health (llm_key: "ok" | "not-required" | "missing"). LLM_PROVIDER_LOCAL=1

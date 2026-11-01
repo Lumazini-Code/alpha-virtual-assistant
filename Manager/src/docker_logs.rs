@@ -36,7 +36,7 @@ pub async fn tail(tail: usize) -> DockerLogs {
         .unwrap_or_else(|| "ava".to_string());
     let tail = tail.clamp(1, MAX_TAIL).to_string();
 
-    let mut command = tokio::process::Command::new("docker");
+    let mut command = crate::docker_cli::command(None);
     command
         .args(["logs", "--tail", &tail, &container])
         .stdin(Stdio::null())

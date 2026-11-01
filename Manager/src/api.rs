@@ -734,6 +734,10 @@ async fn post_ui_chat_open(
         tokio::sync::mpsc::UnboundedSender<crate::UiCommand>,
     >,
 ) -> impl IntoResponse {
+    // Mostra a janela por API nativa antes de enfileirar o comando: se ela
+    // estiver escondida, o eframe pode não rodar `update` e o ShowChat ficaria
+    // parado na fila (mesmo caminho do clique no tray em main.rs).
+    crate::show_status_window();
     if let Err(e) = ui_tx.send(crate::UiCommand::ShowChat) {
         tracing::warn!("ui/chat-open: falha ao enviar ShowChat (UI fechada?): {e}");
     } else {
