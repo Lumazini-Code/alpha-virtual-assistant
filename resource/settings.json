@@ -1,3 +1,4 @@
 {
-  "watch_confidence": true
+  "watch_confidence": false,
+  "reasoning_effort": "low"
 }

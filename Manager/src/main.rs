@@ -1,3 +1,7 @@
+// No Windows, o build de release não abre janela de console.
+// Em modo debug o console continua aparecendo, para facilitar o desenvolvimento.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 // Alpha AI (AVA) — Tray — gerenciador de processos do docker
 // Copyright (C) 2026  Felipe lumazini
 // This program is free software: you can redistribute it and/or modify
@@ -355,7 +359,7 @@ pub(crate) fn show_status_window() {
         };
 
         let hwnd: HWND = STATUS_HWND.load(Ordering::Relaxed) as HWND;
-        if !hwnd.is_null() {
+        if hwnd != 0 {
             unsafe {
                 // SW_RESTORE mostra a janela escondida e restaura se estiver
                 // minimizada (o status é criado com with_taskbar(false), então
@@ -387,7 +391,7 @@ fn run_tray(tx: mpsc::UnboundedSender<UiCommand>) {
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             loop {
-                let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                let ret = GetMessageW(&mut msg, 0, 0, 0);
                 if ret == 0 {
                     // WM_QUIT: processo encerrando.
                     break;
@@ -518,7 +522,7 @@ fn run_ui(
             // sem update.
             #[cfg(target_os = "windows")]
             {
-                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 if let Ok(handle) = _cc.window_handle() {
                     if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                         set_status_hwnd(win32.hwnd.get());

@@ -38,7 +38,6 @@ pub trait NoWindow {
 #[cfg(target_os = "windows")]
 impl NoWindow for Command {
     fn no_window(&mut self) -> &mut Self {
-        use std::os::windows::process::CommandExt;
         self.creation_flags(CREATE_NO_WINDOW);
         self
     }

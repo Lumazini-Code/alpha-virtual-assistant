@@ -221,6 +221,7 @@ dependencies = [
  "tray-icon",
  "webbrowser",
  "which",
+ "windows-sys 0.48.0",
  "winit",
  "winresource",
  "wry",

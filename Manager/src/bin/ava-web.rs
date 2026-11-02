@@ -1,3 +1,7 @@
+// No Windows, o build de release não abre janela de console.
+// Em modo debug o console continua aparecendo, para facilitar o desenvolvimento.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 // Alpha AI (AVA) — janela nativa do WebUI (ava-web)
 // Copyright (C) 2026  Felipe lumazini
 //

@@ -10,7 +10,7 @@ services:
     # Teto de RAM — rede de proteção em máquina fraca: o stack não pode
     # sufocar as outras apps. Valores folgados (OOM kill é pior que RAM alta);
     # com os defaults econômicos (TTS/grafo off) o uso real fica ~600-800MB.
-    mem_limit: 1500m
+    mem_limit: 2000m
 
     volumes:
       - ./mcp_servers:/app/mcp_servers

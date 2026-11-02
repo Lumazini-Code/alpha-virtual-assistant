@@ -568,7 +568,7 @@ SEGMENT_MAX_COUNT     = 4    # teto de segmentos por query (custo de embed/batch
 # ── /read_st — leitura crua do short-term (sem busca semântica) ───────────────
 # Usada pelo LLM para montar o histórico recente da conversa como contexto,
 # sem passar pelo pipeline de embeddings/scoring do /read.
-ST_READ_DEFAULT_PAIRS = 5
+ST_READ_DEFAULT_PAIRS = 10
 
 _STOP_WORDS: frozenset[str] = frozenset({
     "o","a","os","as","um","uma","uns","umas","de","do","da","dos","das",

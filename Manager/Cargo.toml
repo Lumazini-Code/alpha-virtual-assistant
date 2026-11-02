@@ -113,3 +113,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # CPU/RAM/GPU do host para o painel de status do WebUI (mesmo dado que a
 # TUI antiga lia via systeminformation).
 sysinfo = { version = "0.40", default-features = false, features = ["system", "gpu"] }
+
+# ── API nativa do Windows (tray + janela de status) ─────────────────────────
+# Usada em main.rs para ShowWindow/SetForegroundWindow e o loop de mensagens
+# Win32 do tray-icon. Versão alinhada com a do winit 0.29 para evitar
+# duplicação de tipos de handle.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

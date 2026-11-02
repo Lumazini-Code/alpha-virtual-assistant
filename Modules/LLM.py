@@ -147,7 +147,7 @@ MEMORY_EXTRACTOR_FALLBACK_MODEL = os.getenv("MEMORY_EXTRACTOR_FALLBACK_MODEL", "
 
 # Contexto de curto prazo: quantas duplas pergunta-resposta (turn groups)
 # são lidas cruas do /read_st a cada turno, em paralelo com o /read semântico.
-ST_CONTEXT_PAIRS = 5
+ST_CONTEXT_PAIRS = 10
 
 # Recall de chat: overrides de orçamento enviados ao /read (ReadRequest do
 # memory_api). O default server-side é conservador (3 entradas / 2400 chars) —
