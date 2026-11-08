@@ -128,22 +128,17 @@ as_root() {
 # instalador tentar reinstalá-los para sempre e morrer mesmo com tudo
 # instalado. O teste correto é pkg-config (ou o header, sem pkg-config).
 dep_ok() {
-  case "$1" in
-    libwebkit2gtk-4.1-dev)
-      if command -v pkg-config >/dev/null 2>&1; then
-        pkg-config --exists webkit2gtk-4.1
-      else
-        [ -f /usr/include/webkitgtk-4.1/webkit2/webkit2.h ]
-      fi
-      ;;
-    libsoup-3.0-dev)
-      if command -v pkg-config >/dev/null 2>&1; then
-        pkg-config --exists libsoup-3.0
-      else
-        [ -f /usr/include/libsoup-3.0/libsoup/soup.h ]
-      fi
-      ;;
-    *) command -v "$1" >/dev/null 2>&1 ;;
+  command -v "$1" >/dev/null 2>&1 && return 0
+  case "$PKG" in
+    apt-get)
+      # dpkg-query (não `dpkg -s`) + variante t64 (Ubuntu 24.04+/Debian 13 renomearam
+      # várias libs para <nome>t64). Contamos linhas "installed" em vez de usar o
+      # status do pipe, que com `set -o pipefail` falharia se só um dos nomes existe.
+      [ "$(dpkg-query -W -f='${db:Status-Status}\n' "$1" "${1}t64" 2>/dev/null \
+            | grep -c '^installed$')" -gt 0 ] ;;
+    dnf|dnf5|yum) rpm -q "$1" >/dev/null 2>&1 ;;
+    pacman)   pacman -Qi "$1" >/dev/null 2>&1 ;;
+    *)        return 1 ;;
   esac
 }
 
@@ -152,7 +147,13 @@ for dep in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev libxdo3 libayatana-a
     info "'$dep' não encontrado — instalando..."
     [ -n "$PKG" ] || die "'$dep' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
     case "$PKG" in
-      apt-get) as_root apt-get update -qq && as_root apt-get install -y -qq "$dep" ;;
+      apt-get)
+        # `update` pode sair != 0 só porque UM repositório de terceiros está com
+        # erro (PPA/GPG); encadear com && impedia o install de rodar. Também não
+        # usamos -qq no install: o erro real precisa aparecer para o usuário.
+        as_root apt-get update -qq || warn "apt-get update reportou erro (algum repositório?) — tentando instalar mesmo assim."
+        as_root apt-get install -y "$dep" || as_root apt-get install -y "${dep}t64" || true
+        ;;
       dnf|dnf5) as_root "$PKG" install -y "$dep" ;;
       yum)      as_root yum install -y "$dep" ;;
       pacman)   as_root pacman -S --noconfirm --needed "$dep" ;;
