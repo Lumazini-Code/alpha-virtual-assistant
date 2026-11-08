@@ -147,7 +147,7 @@ dep_ok() {
   esac
 }
 
-for dep in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev; do
+for dep in curl unzip libwebkit2gtk-4.1-dev libsoup-3.0-dev libxdo3 libayatana-appindicator3-1; do
   if ! dep_ok "$dep"; then
     info "'$dep' não encontrado — instalando..."
     [ -n "$PKG" ] || die "'$dep' não encontrado e não identifiquei o gerenciador de pacotes. Instale-o manualmente e rode novamente."
@@ -331,7 +331,25 @@ unzip -oq "$TMP_DIR/alpha-ai.zip" -d "$INSTALL_DIR"
 
 cd "$INSTALL_DIR"
 
-chmod +x Manager/ava-tray Manager/ava-web docker-start.sh 2>/dev/null || true
+# O bit de execução não é confiável vindo do zip: dependendo de como o
+# empacotador criou o arquivo (zip feito no Windows, por exemplo) o unzip
+# extrai tudo como 644 e o ava-tray/ava-web falham ao iniciar com
+# "Permission denied". Garantimos explicitamente o modo dos binários/scripts
+# — e falhamos cedo se não foi possível corrigir, em vez de deixar o erro
+# aparecer só lá na frente (ao subir o tray).
+ensure_exec() {
+  local p
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    chmod 755 "$p" 2>/dev/null || true
+    [ -x "$p" ] || warn "Sem permissão de execução em '$p' (rode: chmod +x '$p')."
+  done
+}
+
+ensure_exec Manager/ava-tray Manager/ava-web docker-start.sh start.sh \
+            install.sh uninstall.sh
+[ -x Manager/ava-tray ] || die "Manager/ava-tray não ficou executável — verifique o zip do release."
+[ -x Manager/ava-web ] || die "Manager/ava-web não ficou executável — verifique o zip do release."
 ok "Arquivos extraídos."
 
 # ── 3a. Rebind dos containers (reinstalação sobre stack rodando) ──────────────
@@ -1157,7 +1175,11 @@ start_manager() {
     return 0
   fi
   local bin="$INSTALL_DIR/Manager/ava-tray"
-  [ -x "$bin" ] || { warn "Manager não encontrado/executável em $bin."; return 1; }
+  [ -f "$bin" ] || { warn "Manager não encontrado em $bin."; return 1; }
+  if [ ! -x "$bin" ]; then
+    chmod 755 "$bin" 2>/dev/null || true
+  fi
+  [ -x "$bin" ] || { warn "Manager sem permissão de execução: $bin (rode: chmod +x '$bin')."; return 1; }
   has_gui || { warn "Sem sessão gráfica — o Manager (tray) não pode iniciar agora."; return 1; }
 
   info "Iniciando o Manager (ava-tray)..."
@@ -1364,6 +1386,10 @@ StartupNotify=false
 X-GNOME-Autostart-enabled=true
 EOF
 ok "Auto-start configurado: $AUTOSTART_DIR/alpha-ai-tray.desktop"
+
+# Reforço antes de executar: garante o bit x mesmo se algo (backup, cópia
+# manual, update externo) tiver mexido nos arquivos após a extração.
+ensure_exec "$INSTALL_DIR/Manager/ava-tray" "$INSTALL_DIR/Manager/ava-web"
 
 if manager_up; then
   ok "ava-tray já está em execução."

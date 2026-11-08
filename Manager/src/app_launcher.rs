@@ -69,5 +69,28 @@ fn binary_path() -> Option<PathBuf> {
     };
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let path = dir.join(name);
-    path.is_file().then_some(path)
+    if !path.is_file() {
+        return None;
+    }
+
+    // Defesa extra: se o binário veio de um zip/atualização sem o bit de
+    // execução, o spawn falharia com "Permission denied". Corrigimos aqui
+    // (o instalador já faz isso, mas o tray não deve depender dele).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o111 == 0 {
+                if let Err(e) = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(mode | 0o111),
+                ) {
+                    tracing::warn!("não consegui tornar ava-web executável ({}): {e}", path.display());
+                }
+            }
+        }
+    }
+
+    Some(path)
 }
