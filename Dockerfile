@@ -22,6 +22,7 @@ RUN apt-get update \
         libvulkan1 \
         mesa-vulkan-drivers \
         ripgrep \
+        nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependências Python via uv:

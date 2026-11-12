@@ -266,6 +266,16 @@ try:
 except ImportError:  # execução fora da raiz do projeto (CWD diferente)
     from tools import ToolContext, ToolHooks, ToolPolicy, ToolRegistry, ToolResult, ToolSpec  # type: ignore
 
+try:
+    from Modules.codemode import Catalog, CodeModeRuntime, make_execute_spec, render_instructions
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from codemode import (  # type: ignore
+        Catalog,
+        CodeModeRuntime,
+        make_execute_spec,
+        render_instructions,
+    )
+
 _SESSION_STORE: Optional[SessionStore] = None
 _COMPACTOR: Optional[CompactionManager] = None
 _INSTRUCTION_STATE: Optional[InstructionState] = None
@@ -275,6 +285,13 @@ INSTRUCTIONS_ENABLED = os.getenv("AVA_INSTRUCTIONS", "1").strip().lower() in (
 TOOL_REGISTRY_ENABLED = os.getenv("AVA_TOOL_REGISTRY", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
+CODEMODE_ENABLED = os.getenv("AVA_CODEMODE", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "30000")))
+CODEMODE_MAX_TOOL_CALLS = max(1, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "50")))
+CODEMODE_MAX_OUTPUT_CHARS = max(1_000, int(os.getenv("AVA_CODEMODE_MAX_OUTPUT_CHARS", "200000")))
+_CODEMODE_RUNTIME: Optional[CodeModeRuntime] = None
 _INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
 # Limite de segurança do histórico injetado no modelo. A compactação é o
 # mecanismo principal; 0 (padrão) desliga o corte. Use um valor positivo apenas
@@ -321,6 +338,20 @@ def _session_append(sid: str, message: dict[str, Any]) -> None:
         store.append_message(sid, message)
     except Exception as e:
         log.warning(f"[session] falha ao gravar mensagem ({sid[:8]}): {type(e).__name__}: {e}")
+
+
+def _codemode_runtime() -> Optional[CodeModeRuntime]:
+    global _CODEMODE_RUNTIME
+    if not CODEMODE_ENABLED:
+        return None
+    if _CODEMODE_RUNTIME is None:
+        _CODEMODE_RUNTIME = CodeModeRuntime()
+        if not _CODEMODE_RUNTIME.available:
+            log.warning(
+                "Code Mode indisponível: Node.js/worker.js não encontrado — "
+                "usando o schema nativo de tools."
+            )
+    return _CODEMODE_RUNTIME if _CODEMODE_RUNTIME.available else None
 
 
 def _compactor() -> Optional[CompactionManager]:
@@ -3492,6 +3523,48 @@ def _build_tool_snapshot(
     return registry.snapshot(ToolPolicy.from_env())
 
 
+def _tool_spec_definition(spec: ToolSpec) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.input_schema or {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _build_codemode_snapshot(
+    req: "ExecuteRequest",
+    sid: str,
+    eid: str,
+    native_schema: list[dict[str, Any]],
+    mcp_schema: list[dict[str, Any]],
+    mcp_dispatch: dict[str, tuple[str, str]],
+) -> tuple[ToolSnapshot, Optional[Catalog], Optional[ToolSpec]]:
+    """Registry com a tool `execute` + catálogo MCP para o Code Mode."""
+    base = _build_tool_snapshot(req, sid, eid, native_schema, mcp_schema, mcp_dispatch)
+    runtime = _codemode_runtime()
+    if runtime is None:
+        return base, None, None
+    catalog = Catalog.from_specs(
+        [spec for spec in base.specs.values() if spec.source == "mcp"]
+    )
+    execute_spec = make_execute_spec(
+        base,
+        runtime,
+        catalog,
+        timeout_ms=CODEMODE_TIMEOUT_MS,
+        max_tool_calls=CODEMODE_MAX_TOOL_CALLS,
+        max_output_chars=CODEMODE_MAX_OUTPUT_CHARS,
+    )
+    registry = ToolRegistry(hooks=ToolHooks(), error_formatter=_format_tool_exception)
+    for spec in base.specs.values():
+        registry.register(spec)
+    registry.register(execute_spec)
+    return registry.snapshot(ToolPolicy.from_env()), catalog, execute_spec
+
+
 def _build_native_tools_schema() -> list[dict]:
     """Converte o TOOLS registry (nativas: memory_search + vision_objects
     quando VISION_OBJECTS_ENABLED=1) para a lista `tools` no formato OpenAI.
@@ -4849,6 +4922,38 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             f"failed_servers={failed_mcp_servers} skills={skills_status}"
         )
 
+    # ── Tool snapshot (nativo + MCP + Code Mode) ────────────────────────────
+    tool_snapshot: Optional[ToolSnapshot] = None
+    codemode_catalog: Optional[Catalog] = None
+    codemode_execute_spec: Optional[ToolSpec] = None
+    codemode_tool_names: set[str] = set()
+    if TOOL_REGISTRY_ENABLED:
+        if CODEMODE_ENABLED:
+            tool_snapshot, codemode_catalog, codemode_execute_spec = _build_codemode_snapshot(
+                req, sid, eid, native_tools_schema, mcp_schema, mcp_dispatch,
+            )
+            if codemode_catalog is not None and codemode_execute_spec is not None:
+                codemode_tool_names = {codemode_execute_spec.name}
+                tools_schema = list(native_tools_schema) + [
+                    _tool_spec_definition(codemode_execute_spec)
+                ]
+            else:
+                tools_schema = tool_snapshot.definitions
+        else:
+            tool_snapshot = _build_tool_snapshot(
+                req, sid, eid, native_tools_schema, mcp_schema, mcp_dispatch,
+            )
+            tools_schema = tool_snapshot.definitions
+    else:
+        tools_schema = native_tools_schema + mcp_schema
+    log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
+             f"{[t['function']['name'] for t in tools_schema]}")
+    if codemode_catalog is not None:
+        log.info(
+            f"[{eid[:8]}] Code Mode ativo: {len(codemode_catalog.entries)} tool(s) MCP "
+            f"no catálogo, schema nativo com {len(tools_schema)} definição(ões)"
+        )
+
     system_prompt = _tools_system_prompt(think_instruction, lang_hint=req.lang,
                                          mcp_tool_names=mcp_tool_names,
                                          plans_hint=plans_hint,
@@ -4857,6 +4962,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                                          active_project=active_project,
                                          tool_status=tool_status,
                                          always_on_mcp_tool_names=always_on_mcp_tool_names)
+    if codemode_catalog is not None:
+        system_prompt += "\n\n" + render_instructions(codemode_catalog)
     instruction_block = await _instruction_block(sid, req.cwd)
     if instruction_block:
         system_prompt += (
@@ -4891,16 +4998,6 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     if memory_warning:
         system_prompt += "\n\n" + memory_warning
         log.warning(f"[{eid[:8]}] aviso de falha de memória do turno anterior injetado")
-    tool_snapshot: Optional[ToolSnapshot] = None
-    if TOOL_REGISTRY_ENABLED:
-        tool_snapshot = _build_tool_snapshot(
-            req, sid, eid, native_tools_schema, mcp_schema, mcp_dispatch,
-        )
-        tools_schema = tool_snapshot.definitions
-    else:
-        tools_schema = native_tools_schema + mcp_schema
-    log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
-             f"{[t['function']['name'] for t in tools_schema]}")
 
     # ── Compactação antes do primeiro request ───────────────────────────────
     # Estima system + tools + histórico durável. Se passar do limiar, resume o
@@ -5166,7 +5263,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
             raw_args = fn.get("arguments")
             args, parse_err = _parse_tool_args(raw_args)
-            if not tool_name or (tool_name not in TOOLS and tool_name not in mcp_dispatch):
+            if not tool_name or (
+                tool_name not in TOOLS
+                and tool_name not in mcp_dispatch
+                and tool_name not in codemode_tool_names
+            ):
                 kind = "unknown"
                 err = _format_tool_error(
                     "NOT_FOUND",
@@ -5187,7 +5288,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 _metric_inc("tool_failures_by_category", "BAD_ARGS")
                 action = str(raw_args)[:300]
             else:
-                kind = "native" if tool_name in TOOLS else "mcp"
+                kind = "native" if (tool_name in TOOLS or tool_name in codemode_tool_names) else "mcp"
                 err = None
                 action = json.dumps(args, ensure_ascii=False)
             server = mcp_dispatch[tool_name][0] if kind == "mcp" else None
@@ -5237,10 +5338,12 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     "err": rec["parse_error"],
                     "tool_content": rec["parse_error"],
                     "used_mcp": False, "used_skill": None,
+                    "used_mcp_names": [],
                 }
 
             used_mcp = False
             used_skill: Optional[str] = None
+            used_mcp_names: list[str] = []
             mcp_is_error = False
             t0 = time.perf_counter()
             _CURRENT_HISTORY.set(history)
@@ -5264,6 +5367,14 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                                 and str(args.get("name") or "").strip()):
                             used_skill = AGENT_SKILL_PREFIX + str(args["name"]).strip()
                         used_mcp = kind == "mcp"
+                        if tool_name == "execute" and tool_result.metadata:
+                            for call in tool_result.metadata.get("toolCalls") or []:
+                                if not isinstance(call, dict) or call.get("status") != "completed":
+                                    continue
+                                name = str(call.get("name") or "")
+                                resolved = name if name in mcp_dispatch else name.replace(".", "__", 1)
+                                if resolved in mcp_dispatch:
+                                    used_mcp_names.append(resolved)
                         err = None
                     else:
                         result = None
@@ -5356,6 +5467,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 "err": err,
                 "tool_content": _result_to_text(result) if success else err,
                 "used_mcp": used_mcp, "used_skill": used_skill,
+                "used_mcp_names": used_mcp_names,
             }
 
         def _apply_outcome(out: dict[str, Any]) -> None:
@@ -5369,6 +5481,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             _session_append(sid, tool_message)
             if out["used_mcp"] and out["rec"]["tool_name"] not in used_mcp_tools:
                 used_mcp_tools.append(out["rec"]["tool_name"])
+            for name in out.get("used_mcp_names") or []:
+                if name not in used_mcp_tools:
+                    used_mcp_tools.append(name)
             if out["used_skill"] and out["used_skill"] not in used_agent_skills:
                 used_agent_skills.append(out["used_skill"])
 
@@ -5460,6 +5575,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                         "err": sr.error,
                         "tool_content": f"ERROR: {sr.error}",
                         "used_mcp": False, "used_skill": None,
+                    "used_mcp_names": [],
                     }
                 _apply_outcome(out)
 
