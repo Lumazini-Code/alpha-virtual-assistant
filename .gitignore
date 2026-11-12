@@ -54,6 +54,8 @@ Modules/transcribe/build
 
 Modules/memory/db/*
 
+Modules/session/db/*
+
 Modules/.playwright-mcp
 
 .graphifyignore

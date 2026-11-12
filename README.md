@@ -177,6 +177,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   │   ├── memory.py        #   fachada que reexporta os submódulos (API plana)
 │   │   ├── memory_api.py    #   FastAPI (:3000)
 │   │   └── memory_*.py      #   config/db/graph/vector/search/ops/status…
+│   ├── session/             # Session store durável: eventos, mensagens, usage
 │   ├── transcribe/          # Pipeline de voz em C++ (integrado!) — NO HOST
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
 │   │   └── linux/ windows/  #   builds por plataforma
@@ -279,6 +280,8 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_TTS_ENABLED` | `start.sh` | `0` | Liga o serviço de TTS (Supertonic, ~470 MB/worker na RAM). Desligado = fala não sintetiza |
 | `AVA_VOICE` | tray | `0` | Liga o pipeline de voz no host (wake word + ASR, ~600 MB). Desligado = transcript não sobe no auto-init; `POST /transcript/start` sobe à mão |
 | `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) mesclado no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
+| `AVA_SESSION_STORE` | orchestrator | `1` | Session store durável em dual-write. `0` desliga; a leitura ainda é do ST antigo |
+| `AVA_SESSION_DB_PATH` | orchestrator | `Modules/session/db/ava_sessions.db` | Caminho do SQLite de sessões/mensagens |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |

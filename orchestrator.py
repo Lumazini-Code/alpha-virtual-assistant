@@ -225,6 +225,61 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
     )
 AGENT_SKILL_PREFIX  = "agentskill__"  # tem que bater com memory_config.AGENT_SKILL_PREFIX
 
+# ── Session store durável ────────────────────────────────────────────────────
+# Grava cada mensagem do turno (incluindo tool calls/resultados) em um SQLite
+# separado. Ativo por padrão; `AVA_SESSION_STORE=0` desliga. A leitura ainda é
+# do ST antigo (dual-write) até o cutover.
+SESSION_STORE_ENABLED = os.getenv("AVA_SESSION_STORE", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+try:
+    from Modules.session import SessionStore
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from session import SessionStore  # type: ignore
+
+_SESSION_STORE: Optional[SessionStore] = None
+
+
+def _session_store() -> Optional[SessionStore]:
+    """Store lazy — não abre o SQLite se a flag estiver desligada."""
+    global _SESSION_STORE
+    if not SESSION_STORE_ENABLED:
+        return None
+    if _SESSION_STORE is None:
+        try:
+            _SESSION_STORE = SessionStore()
+            log.info(f"Session store habilitado: {_SESSION_STORE.db.path}")
+        except Exception as e:
+            log.warning(f"Session store indisponível ({type(e).__name__}: {e}) — seguindo sem ele")
+            return None
+    return _SESSION_STORE
+
+
+def _session_ensure(sid: str, req: "ExecuteRequest", project_id: Optional[str] = None) -> None:
+    """Cria/atualiza a sessão durável. Nunca derruba o turno."""
+    store = _session_store()
+    if store is None or not sid:
+        return
+    try:
+        store.create(
+            session_id=sid,
+            project_id=project_id,
+            title=(req.input or "").strip().replace("\n", " ")[:80] or None,
+        )
+    except Exception as e:
+        log.warning(f"[session] falha ao criar sessão {sid[:8]}: {type(e).__name__}: {e}")
+
+
+def _session_append(sid: str, message: dict[str, Any]) -> None:
+    """Dual-write de UMA mensagem. Best-effort: nunca quebra o loop."""
+    store = _session_store()
+    if store is None or not sid:
+        return
+    try:
+        store.append_message(sid, message)
+    except Exception as e:
+        log.warning(f"[session] falha ao gravar mensagem ({sid[:8]}): {type(e).__name__}: {e}")
+
 
 def _default_skills_dirs() -> list[str]:
     """Skills PROJECT (.agents/skills ao lado do orchestrator.py — no
@@ -1020,8 +1075,17 @@ async def lifespan(app: FastAPI):
     # tool_tip_add aceitá-las e o bloco "Tool tips" incluí-las.
     await _ensure_native_tools_index(force=True)
 
+    # Inicializa o session store no boot quando habilitado (falha aqui não
+    # impede o orchestrator de subir; o helper é lazy).
+    _session_store()
+
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
+    if _SESSION_STORE is not None:
+        try:
+            _SESSION_STORE.close()
+        except Exception as e:
+            log.warning(f"Session store: falha ao fechar ({type(e).__name__}: {e})")
     for c in (state.memory_client, state.tts_client, state.llm_client,
               state.vision_client, state.deep_search_client,
               state.alpha_code_client, state.process_manager_client,
@@ -4234,6 +4298,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # também vira hint no system prompt.
     active_project = await _ensure_memory_scope()
 
+    # ── Session store durável (dual-write) ──────────────────────────────────
+    # Cria a sessão antes de qualquer mensagem. A leitura ainda é do ST antigo;
+    # o store só grava, para validarmos a migração sem risco.
+    _session_ensure(sid, req, active_project)
+
     # ── A: Recall de memória em background ──────────────────────────────────
     # Dispara JÁ, em paralelo com a descoberta de tools — o custo do recall
     # (2 round-trips HTTP para a memory_api) fica escondido atrás do handshake
@@ -4451,6 +4520,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         *[{"role": t["role"], "content": t["content"]} for t in st_turns],
         {"role": "user", "content": user_content},
     ]
+    # Dual-write: a mensagem do usuário (com anexos, se houver) é o primeiro
+    # fato durável do turno. O system prompt ainda não é persistido aqui — o
+    # sistema de instruções versionadas o transformará em baseline.
+    _session_append(sid, {"role": "user", "content": user_content})
 
     step_results: list[StepResult] = []
     final_response = ""
@@ -4532,6 +4605,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 "forçando resposta final sem tools."
             )
             final_response = await _force_finish(history, eid, lang_hint=req.lang)
+            _session_append(sid, {"role": "assistant", "content": final_response})
             # Chamada de fechamento é síncrona (_llm_chat) — delta único.
             if on_event:
                 await on_event("delta", final_response)
@@ -4562,6 +4636,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         history.append(assistant_msg)
+        _session_append(sid, assistant_msg)
 
         if not tool_calls:
             # Modelo respondeu sem chamar nenhuma tool: este texto É a resposta
@@ -4762,10 +4837,12 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         def _apply_outcome(out: dict[str, Any]) -> None:
             """Anexa o resultado ao histórico/step_results NA ORDEM ORIGINAL."""
             step_results.append(out["sr"])
-            history.append({
+            tool_message = {
                 "role": "tool", "tool_call_id": out["rec"]["call_id"],
                 "content": out["tool_content"],
-            })
+            }
+            history.append(tool_message)
+            _session_append(sid, tool_message)
             if out["used_mcp"] and out["rec"]["tool_name"] not in used_mcp_tools:
                 used_mcp_tools.append(out["rec"]["tool_name"])
             if out["used_skill"] and out["used_skill"] not in used_agent_skills:
@@ -5579,10 +5656,47 @@ async def clear_session(session_id: str):
     # local a este processo — limpa junto para a sessão não "lembrar" de um
     # histórico que o ST já apagou.
     _RECENT_TURNS.pop(session_id, None)
+    store = _session_store()
+    if store is not None:
+        try:
+            store.clear(session_id)
+        except Exception as e:
+            log.warning(f"[session] falha ao limpar {session_id[:8]}: {type(e).__name__}: {e}")
     try:
         return await _memory_request("DELETE", f"/session/{session_id}")
     except Exception as e:
         raise HTTPException(502, f"Session clear falhou: {e}")
+
+
+# ── Session store — inspeção do dual-write ───────────────────────────────────
+
+@app.get("/sessions")
+async def list_sessions(limit: int = 50):
+    store = _session_store()
+    if store is None:
+        return {"enabled": False, "sessions": []}
+    return {"enabled": True, "sessions": store.list_sessions(limit)}
+
+
+@app.get("/session/{session_id}/messages")
+async def session_messages(session_id: str, limit: int = 200):
+    store = _session_store()
+    if store is None:
+        return {"enabled": False, "session": None, "messages": []}
+    messages = store.load_messages(session_id)
+    return {
+        "enabled": True,
+        "session": store.get(session_id),
+        "messages": messages[-limit:] if limit > 0 else [],
+    }
+
+
+@app.get("/session/{session_id}/usage")
+async def session_usage(session_id: str):
+    store = _session_store()
+    if store is None:
+        return {"enabled": False, "usage": {}}
+    return {"enabled": True, "usage": store.usage(session_id)}
 
 @app.post("/tts/cancel")
 async def cancel_tts():
