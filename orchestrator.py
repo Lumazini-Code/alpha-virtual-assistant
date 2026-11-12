@@ -266,10 +266,18 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
         make_source,
     )
 
+try:
+    from Modules.tools import ToolContext, ToolHooks, ToolPolicy, ToolRegistry, ToolResult, ToolSpec
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from tools import ToolContext, ToolHooks, ToolPolicy, ToolRegistry, ToolResult, ToolSpec  # type: ignore
+
 _SESSION_STORE: Optional[SessionStore] = None
 _COMPACTOR: Optional[CompactionManager] = None
 _INSTRUCTION_STATE: Optional[InstructionState] = None
 INSTRUCTIONS_ENABLED = os.getenv("AVA_INSTRUCTIONS", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+TOOL_REGISTRY_ENABLED = os.getenv("AVA_TOOL_REGISTRY", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
 _INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
@@ -3407,6 +3415,87 @@ def _detect_image_mime(b64: str) -> str:
     return "image/jpeg"
 
 
+def _native_input_schema(spec: dict[str, Any]) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for field_name, field_type, field_required in spec["fields"]:
+        properties[field_name] = {"type": _JSON_SCHEMA_TYPES.get(field_type, "string")}
+        if field_required:
+            required.append(field_name)
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def _format_tool_exception(error: BaseException) -> str:
+    category, hint = _categorize_error(error)
+    return _format_tool_error(category, str(error), hint)
+
+
+def _build_tool_snapshot(
+    req: "ExecuteRequest",
+    sid: str,
+    eid: str,
+    native_schema: list[dict[str, Any]],
+    mcp_schema: list[dict[str, Any]],
+    mcp_dispatch: dict[str, tuple[str, str]],
+) -> ToolSnapshot:
+    """Constrói o snapshot do turno a partir das tools nativas e MCP."""
+    registry = ToolRegistry(hooks=ToolHooks(), error_formatter=_format_tool_exception)
+
+    for spec in native_schema:
+        name = spec["function"]["name"]
+
+        async def execute(args: dict[str, Any], _ctx: ToolContext, _name: str = name):
+            return await asyncio.wait_for(
+                TOOLS[_name]["executor"](args, req, sid),
+                timeout=EXECUTOR_TIMEOUTS.get(_name, 60.0),
+            )
+
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=spec["function"]["description"],
+                input_schema=spec["function"]["parameters"],
+                execute=execute,
+                parallel_safe=name in _NATIVE_PARALLEL_SAFE,
+                source="native",
+            )
+        )
+
+    for spec in mcp_schema:
+        name = spec["function"]["name"]
+
+        async def execute(args: dict[str, Any], _ctx: ToolContext, _name: str = name):
+            server, mcp_tool_name = mcp_dispatch[_name]
+            timeout = EXECUTOR_TIMEOUTS.get(_name, MCP_CALL_TIMEOUT)
+            if server in CDP_BROWSERS:
+                await _ensure_browser()
+            call_data = await _mcp_call_with_retry(
+                server,
+                mcp_tool_name,
+                args,
+                timeout,
+                req.cwd,
+                safe=_is_parallel_safe(_name, "mcp"),
+            )
+            result = call_data.get("result") or ""
+            if call_data.get("is_error"):
+                raise RuntimeError(f"MCP tool reported failure: {result}")
+            return result
+
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=spec["function"]["description"],
+                input_schema=spec["function"]["parameters"] or {"type": "object", "properties": {}},
+                execute=execute,
+                parallel_safe=_is_parallel_safe(name, "mcp"),
+                source="mcp",
+            )
+        )
+
+    return registry.snapshot(ToolPolicy.from_env())
+
+
 def _build_native_tools_schema() -> list[dict]:
     """Converte o TOOLS registry (nativas: memory_search + vision_objects
     quando VISION_OBJECTS_ENABLED=1) para a lista `tools` no formato OpenAI.
@@ -3416,20 +3505,12 @@ def _build_native_tools_schema() -> list[dict]:
     for name, spec in TOOLS.items():
         if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
             continue
-        properties = {}
-        required = []
-        for field_name, field_type, field_required in spec["fields"]:
-            properties[field_name] = {"type": _JSON_SCHEMA_TYPES.get(field_type, "string")}
-            if field_required:
-                required.append(field_name)
         schema.append({
             "type": "function",
             "function": {
                 "name": name,
                 "description": spec["description"],
-                "parameters": {
-                    "type": "object", "properties": properties, "required": required,
-                },
+                "parameters": _native_input_schema(spec),
             },
         })
     return schema
@@ -4804,7 +4885,14 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     if memory_warning:
         system_prompt += "\n\n" + memory_warning
         log.warning(f"[{eid[:8]}] aviso de falha de memória do turno anterior injetado")
-    tools_schema = native_tools_schema + mcp_schema
+    tool_snapshot: Optional[ToolSnapshot] = None
+    if TOOL_REGISTRY_ENABLED:
+        tool_snapshot = _build_tool_snapshot(
+            req, sid, eid, native_tools_schema, mcp_schema, mcp_dispatch,
+        )
+        tools_schema = tool_snapshot.definitions
+    else:
+        tools_schema = native_tools_schema + mcp_schema
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
 
@@ -5151,54 +5239,79 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             t0 = time.perf_counter()
             _CURRENT_HISTORY.set(history)
             try:
-                if kind == "native":
-                    result = await asyncio.wait_for(
-                        TOOLS[tool_name]["executor"](args, req, sid),
-                        timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                if TOOL_REGISTRY_ENABLED and tool_snapshot is not None:
+                    tool_result = await tool_snapshot.execute(
+                        tool_name,
+                        args,
+                        ToolContext(
+                            session_id=sid,
+                            call_id=call_id,
+                            request=req,
+                            extra={"eid": eid, "kind": kind},
+                        ),
                     )
-                    # use_skill bem-sucedida → aprendizado do grafo (mesmo
-                    # registro das MCP tools). Resultado de erro (string
-                    # "ERROR: ...") não conta como uso.
-                    if (tool_name == "use_skill" and isinstance(result, str)
-                            and not result.startswith("ERROR")
-                            and str(args.get("name") or "").strip()):
-                        used_skill = AGENT_SKILL_PREFIX + str(args["name"]).strip()
-                else:
-                    # MCP: proxy via mcp_manager (o executante). O timeout
-                    # vai AMBOS no wait_for daqui (teto do round-trip HTTP)
-                    # e no corpo do request (teto do call_tool no manager —
-                    # com folga de 10s pra overhead de rede/spawn).
-                    server, mcp_tool_name = mcp_dispatch[tool_name]
-                    mcp_timeout = EXECUTOR_TIMEOUTS.get(tool_name, MCP_CALL_TIMEOUT)
-                    # Tools de browser (CDP_BROWSERS) precisam do Chrome do
-                    # host aberto — o tray garante (best-effort, FORA do
-                    # teto de timeout da tool, para não comer o orçamento
-                    # do round-trip com infraestrutura).
-                    if server in CDP_BROWSERS:
-                        await _ensure_browser()
-                    call_data = await _mcp_call_with_retry(
-                        server, mcp_tool_name, args, mcp_timeout, req.cwd,
-                        safe=_is_parallel_safe(tool_name, "mcp"),
-                    )
-                    # Conteúdo MCP chega como texto joinado dos blocos
-                    # textuais (TextContent etc.) — formato que
-                    # _result_to_text já sabe tratar.
-                    result = call_data.get("result") or ""
-                    if call_data.get("is_error"):
-                        # A tool executou e REPORTOU erro — o modelo precisa
-                        # vê-lo pra reagir (reformular, desistir, encerrar).
-                        mcp_is_error = True
-                        _metric_inc("tool_failures_by_category", "UNAVAILABLE")
-                        result = _format_tool_error(
-                            "UNAVAILABLE", f"MCP tool reported failure: {result}"
-                        )
+                    success = not tool_result.is_error
+                    if success:
+                        result = tool_result.output
+                        if (tool_name == "use_skill" and isinstance(result, str)
+                                and not result.startswith("ERROR")
+                                and str(args.get("name") or "").strip()):
+                            used_skill = AGENT_SKILL_PREFIX + str(args["name"]).strip()
+                        used_mcp = kind == "mcp"
+                        err = None
                     else:
-                        # Sucesso real (sem is_error): entra no aprendizado
-                        # do grafo de tools (co-uso + exemplo aprendido).
-                        used_mcp = True
-                    log.debug(f"[{eid[:8]}] MCP call via manager: server={server} tool={mcp_tool_name} is_error={call_data.get('is_error')}")
-                success = not mcp_is_error
-                err = result if mcp_is_error else None
+                        result = None
+                        err = tool_result.content or "ERROR: tool failed"
+                        _metric_inc("tool_failures_by_category", "REGISTRY")
+                else:
+                    if kind == "native":
+                        result = await asyncio.wait_for(
+                            TOOLS[tool_name]["executor"](args, req, sid),
+                            timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                        )
+                        # use_skill bem-sucedida → aprendizado do grafo (mesmo
+                        # registro das MCP tools). Resultado de erro (string
+                        # "ERROR: ...") não conta como uso.
+                        if (tool_name == "use_skill" and isinstance(result, str)
+                                and not result.startswith("ERROR")
+                                and str(args.get("name") or "").strip()):
+                            used_skill = AGENT_SKILL_PREFIX + str(args["name"]).strip()
+                    else:
+                        # MCP: proxy via mcp_manager (o executante). O timeout
+                        # vai AMBOS no wait_for daqui (teto do round-trip HTTP)
+                        # e no corpo do request (teto do call_tool no manager —
+                        # com folga de 10s pra overhead de rede/spawn).
+                        server, mcp_tool_name = mcp_dispatch[tool_name]
+                        mcp_timeout = EXECUTOR_TIMEOUTS.get(tool_name, MCP_CALL_TIMEOUT)
+                        # Tools de browser (CDP_BROWSERS) precisam do Chrome do
+                        # host aberto — o tray garante (best-effort, FORA do
+                        # teto de timeout da tool, para não comer o orçamento
+                        # do round-trip com infraestrutura).
+                        if server in CDP_BROWSERS:
+                            await _ensure_browser()
+                        call_data = await _mcp_call_with_retry(
+                            server, mcp_tool_name, args, mcp_timeout, req.cwd,
+                            safe=_is_parallel_safe(tool_name, "mcp"),
+                        )
+                        # Conteúdo MCP chega como texto joinado dos blocos
+                        # textuais (TextContent etc.) — formato que
+                        # _result_to_text já sabe tratar.
+                        result = call_data.get("result") or ""
+                        if call_data.get("is_error"):
+                            # A tool executou e REPORTOU erro — o modelo precisa
+                            # vê-lo pra reagir (reformular, desistir, encerrar).
+                            mcp_is_error = True
+                            _metric_inc("tool_failures_by_category", "UNAVAILABLE")
+                            result = _format_tool_error(
+                                "UNAVAILABLE", f"MCP tool reported failure: {result}"
+                            )
+                        else:
+                            # Sucesso real (sem is_error): entra no aprendizado
+                            # do grafo de tools (co-uso + exemplo aprendido).
+                            used_mcp = True
+                        log.debug(f"[{eid[:8]}] MCP call via manager: server={server} tool={mcp_tool_name} is_error={call_data.get('is_error')}")
+                    success = not mcp_is_error
+                    err = result if mcp_is_error else None
             except Exception as e:
                 category, hint = _categorize_error(e)
                 err = _format_tool_error(category, str(e), hint)
@@ -5300,7 +5413,12 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 # entram em lanes paralelas. Escritas/ações vão para uma lane
                 # serial única, na ordem original — evita efeitos colaterais
                 # fora de ordem. Allowlist por env força safe.
-                if _is_parallel_safe(rec["tool_name"], rec["kind"]):
+                safe = (
+                    tool_snapshot.parallel_safe(rec["tool_name"])
+                    if TOOL_REGISTRY_ENABLED and tool_snapshot is not None
+                    else _is_parallel_safe(rec["tool_name"], rec["kind"])
+                )
+                if safe:
                     key = f"mcp:{rec['server']}" if rec["kind"] == "mcp" else f"native:{rec['index']}"
                 else:
                     key = "serial:unsafe"

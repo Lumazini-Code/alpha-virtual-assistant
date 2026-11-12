@@ -292,6 +292,8 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_INSTRUCTIONS_DIRS` | orchestrator | repo + CWD | Diretórios onde procurar AGENTS.md (separados por `:` ou vírgula) |
 | `AVA_INSTRUCTION_FILES` | orchestrator | — | Arquivos/globs extras de instruções |
 | `AVA_GLOBAL_AGENTS_MD` | orchestrator/tray | `~/.config/alpha-ai/AGENTS.md` (Linux/macOS) ou `%APPDATA%\alpha-ai\AGENTS.md` (Windows) | Arquivo global de instruções |
+| `AVA_TOOL_REGISTRY` | orchestrator | `1` | Registry unificado de tools (validação, permissões, hooks) |
+| `AVA_TOOL_ALLOW` / `AVA_TOOL_DENY` | orchestrator | — | Padrões glob de allow/deny de tools (ex.: `browser__*`) |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
