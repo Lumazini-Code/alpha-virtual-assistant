@@ -183,12 +183,7 @@ ALWAYS_ON_MCP_SERVERS = {
         "AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp"
     ).split(",") if s.strip()
 }
-# desktop-commander SEMPRE-on (26/10): é o EXECUTOR do agente (shell/arquivos/
-# processos). Sem ele no schema, o modelo improvise execução pela única tool
-# de "código" disponível — playwright__browser_run_code_unsafe (contexto de
-# PÁGINA, sem require/process) → 'ReferenceError' ao tentar rodar o CLI que o
-# playbook do officecli pedia. Executor é base: não pode depender do kNN (que
-# hoje é dominado pelas queries aprendidas das sessões de browser).
+
 
 # ── Agent Skills (SKILL.md — padrão "Agent Skills"/skills.sh) ─────────────────
 # Playbooks SKILL.md instalados pelo CLI `skills` (npx skills add owner/repo —
@@ -3490,6 +3485,7 @@ def _build_tool_snapshot(
                 execute=execute,
                 parallel_safe=_is_parallel_safe(name, "mcp"),
                 source="mcp",
+                always_on=mcp_dispatch.get(name, ("", ""))[0] in ALWAYS_ON_MCP_SERVERS,
             )
         )
 
@@ -3516,14 +3512,21 @@ def _build_native_tools_schema() -> list[dict]:
     return schema
 
 
-def _available_native_tool_names() -> set[str]:
+def _available_native_tool_names(extra: Optional[set[str]] = None) -> set[str]:
     """Nomes das tools NATIVAS realmente ofertadas nesta rodada. Usa a MESMA
     regra de _build_native_tools_schema (vision_objects só com a flag ligada)
-    para o gate de skills nunca divergir do schema enviado ao modelo."""
-    return {
+    para o gate de skills nunca divergir do schema enviado ao modelo.
+
+    ``extra`` inclui tools de servidores MCP ALWAYS_ON: para o gate de uma
+    skill, uma tool sempre disponível vale como nativa mesmo sendo executada
+    por um servidor MCP."""
+    names = {
         name for name in TOOLS
         if not (name == "vision_objects" and not VISION_OBJECTS_ENABLED)
     }
+    if extra:
+        names |= set(extra)
+    return names
 
 
 def _mcp_tool_to_openai_schema(tool: dict) -> dict:
@@ -3690,27 +3693,20 @@ def _cap_mcp_tools(
     escolhe melhor com menos opções do que com todas."""
     if max_tools < 0 or len(schema) <= max_tools:
         return schema, dispatch, tip_name_map
-    # 1) Keep set por prioridade: always-on → ordem do schema (grafo) → resto.
-    #    A PRIORIDADE define quem entra; a ORDEM de saída continua a do schema.
-    keep: list[str] = []
-    seen: set[str] = set()
+    # Always-on é BASE: nunca é descartado pelo teto (pode até ultrapassá-lo,
+    # se o operador configurar mais always-on do que o teto). O restante usa
+    # as vagas que sobrarem, mantendo a ordem original do schema.
+    always_on_names: list[str] = []
+    other_names: list[str] = []
     for spec in schema:
         name = spec["function"]["name"]
         server = dispatch.get(name, ("", ""))[0]
-        if server in ALWAYS_ON_MCP_SERVERS and name not in seen:
-            keep.append(name)
-            seen.add(name)
-            if len(keep) >= max_tools:
-                break
-    if len(keep) < max_tools:
-        for spec in schema:
-            name = spec["function"]["name"]
-            if name not in seen:
-                keep.append(name)
-                seen.add(name)
-                if len(keep) >= max_tools:
-                    break
-    kept_names = set(keep)
+        if server in ALWAYS_ON_MCP_SERVERS:
+            always_on_names.append(name)
+        else:
+            other_names.append(name)
+    remaining = max(0, max_tools - len(always_on_names))
+    kept_names = set(always_on_names) | set(other_names[:remaining])
     kept = [spec for spec in schema if spec["function"]["name"] in kept_names]
     dropped = [
         spec["function"]["name"] for spec in schema
@@ -3719,6 +3715,10 @@ def _cap_mcp_tools(
     log.warning(
         f"[_cap_mcp_tools] teto de {max_tools} tool(s) MCP atingido — "
         f"{len(dropped)} tool(s) truncada(s): {dropped}"
+        + (
+            f" (always-on preservadas: {len(always_on_names)})"
+            if always_on_names else ""
+        )
     )
     return (
         kept,
@@ -4368,7 +4368,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
                           matched_agent_skills: Optional[list[dict]] = None,
                           tool_tips: Optional[dict[str, list[dict]]] = None,
                           active_project: Optional[str] = None,
-                          tool_status: Optional[str] = None) -> str:
+                          tool_status: Optional[str] = None,
+                          always_on_mcp_tool_names: Optional[set[str]] = None) -> str:
     """System prompt BASE do turno (BASE_PROMPT — prompts.txt): só o que vale
     pra QUALQUER tarefa (papel, loop de execução, fim de turno, autonomia,
     tools, memória, output, contexto). O que era específico de domínio saiu
@@ -4584,7 +4585,7 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         # Gate também por tools NATIVAS (NATIVE_GATED_AGENT_SKILLS): use_skill,
         # skill_file etc. são nativas e podem sumir se o schema mudar.
         available_tools = set(mcp_tool_names or [])
-        available_native = _available_native_tool_names()
+        available_native = _available_native_tool_names(always_on_mcp_tool_names)
         # Sem use_skill não há como carregar playbook — não anuncia skills.
         if "use_skill" in available_native:
             visible_skills = [
@@ -4770,6 +4771,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         mcp_schema, mcp_dispatch, mcp_tip_name_map, _mcp_budget
     )
     mcp_tool_names = [spec["function"]["name"] for spec in mcp_schema]
+    always_on_mcp_tool_names = {
+        name for name in mcp_tool_names
+        if mcp_dispatch.get(name, ("", ""))[0] in ALWAYS_ON_MCP_SERVERS
+    }
     tool_tips = await _fetch_tool_tips(
         mcp_tool_names + native_tool_names, alias_map=mcp_tip_name_map
     )
@@ -4850,7 +4855,8 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                                          tool_tips=tool_tips,
                                          matched_agent_skills=matched_skills,
                                          active_project=active_project,
-                                         tool_status=tool_status)
+                                         tool_status=tool_status,
+                                         always_on_mcp_tool_names=always_on_mcp_tool_names)
     instruction_block = await _instruction_block(sid, req.cwd)
     if instruction_block:
         system_prompt += (

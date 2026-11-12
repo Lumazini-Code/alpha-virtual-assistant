@@ -43,6 +43,7 @@ class ToolSpec:
     codemode: bool = True
     namespace: Optional[str] = None
     source: str = "native"
+    always_on: bool = False
 
 
 class ToolRegistry:
@@ -117,6 +118,9 @@ class ToolSnapshot:
     def parallel_safe(self, name: str) -> bool:
         spec = self.specs.get(name)
         return bool(spec and spec.parallel_safe)
+
+    def always_on_names(self) -> set[str]:
+        return {name for name, spec in self.specs.items() if spec.always_on}
 
     async def execute(
         self,
