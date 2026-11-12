@@ -110,6 +110,19 @@ class SessionDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_session
                     ON session_usage(session_id, time_created);
+
+                CREATE TABLE IF NOT EXISTS instruction_state (
+                    session_id     TEXT PRIMARY KEY,
+                    baseline_text  TEXT NOT NULL,
+                    values_json    TEXT NOT NULL,
+                    deltas_json    TEXT NOT NULL,
+                    time_updated   REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS instruction_blob (
+                    hash          TEXT PRIMARY KEY,
+                    value         TEXT NOT NULL
+                );
                 """
             )
 

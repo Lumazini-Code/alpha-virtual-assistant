@@ -10,13 +10,16 @@ validada.
 """
 
 from .db import SessionDatabase, default_db_path
+from .compaction import CompactionManager, Settings as CompactionSettings, estimate_tokens
 from .events import Event
-from .history import History, SessionHistory
+from .history import History, SessionHistory, message_text, sanitize_for_model
 from .ids import new_message_id, new_part_id, new_session_id, now
 from .projector import Projector
 from .store import SessionStore
 
 __all__ = [
+    "CompactionManager",
+    "CompactionSettings",
     "Event",
     "History",
     "Projector",
@@ -24,8 +27,11 @@ __all__ = [
     "SessionHistory",
     "SessionStore",
     "default_db_path",
+    "estimate_tokens",
+    "message_text",
     "new_message_id",
     "new_part_id",
     "new_session_id",
     "now",
+    "sanitize_for_model",
 ]

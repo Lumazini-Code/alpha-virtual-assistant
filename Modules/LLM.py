@@ -64,6 +64,32 @@ import os
 import queue
 import threading
 
+# Session store durável compartilhado com o orchestrator. O modo CHAT usa o
+# mesmo histórico do modo tools; o ST antigo fica como fallback quando
+# AVA_SESSION_STORE=0.
+try:
+    from Modules.session import SessionStore, message_text, sanitize_for_model
+except ImportError:  # execução a partir de Modules/
+    from session import SessionStore, message_text, sanitize_for_model  # type: ignore
+
+SESSION_STORE_ENABLED = os.getenv("AVA_SESSION_STORE", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+_SESSION_STORE: Optional[SessionStore] = None
+
+
+def _session_store() -> Optional[SessionStore]:
+    global _SESSION_STORE
+    if not SESSION_STORE_ENABLED:
+        return None
+    if _SESSION_STORE is None:
+        try:
+            _SESSION_STORE = SessionStore()
+            log.info(f"Session store habilitado (LLM): {_SESSION_STORE.db.path}")
+        except Exception as e:
+            log.info(f"Session store indisponível (LLM): {type(e).__name__}: {e}")
+            return None
+    return _SESSION_STORE
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM] %(message)s")
@@ -928,13 +954,31 @@ async def memory_read(
 
 async def memory_read_st(session_id: Optional[str], n_pairs: int = ST_CONTEXT_PAIRS) -> list[dict]:
     """
-    Lê as N duplas pergunta-resposta mais recentes do short-term (histórico
-    cru da conversa, sem busca semântica) via a tool memory_read_short_term.
-    Roda em paralelo com o memory_read semântico — juntos formam o contexto
-    completo enviado ao modelo.
+    Lê o histórico conversacional do session store (ou do ST legado).
+
+    No modo store, o histórico completo é sanitizado e reduzido a mensagens
+    user/assistant — o chat conversacional não executa tools, então chamadas
+    de tool ficam de fora.
     """
     if not session_id:
-        return []
+        if _session_store() is None:
+            return []
+        session_id = "default"
+
+    store = _session_store()
+    if store is not None:
+        try:
+            messages = sanitize_for_model(store.load_messages(session_id))
+            history = [
+                {"role": message["role"], "content": message_text(message.get("content"))}
+                for message in messages
+                if message.get("role") in ("user", "assistant") and not message.get("tool_calls")
+            ]
+            return history[-2 * n_pairs:] if n_pairs > 0 else []
+        except Exception as e:
+            log.info(f"[MEMORY] Falha na leitura do session store: {e}")
+            return []
+
     try:
         resp = await _call_memory_tool(
             "memory_read_short_term",
@@ -947,9 +991,20 @@ async def memory_read_st(session_id: Optional[str], n_pairs: int = ST_CONTEXT_PA
 
 
 async def memory_save_turn(session_id: str, user_input: str, assistant_response: str):
-    """Grava o par de turnos na memória de curto prazo — fire-and-forget."""
+    """Grava o par de turnos no histórico durável — fire-and-forget."""
+    store = _session_store()
+    if store is not None:
+        session_id = session_id or "default"
+        try:
+            store.append_message(session_id, {"role": "user", "content": user_input})
+            store.append_message(session_id, {"role": "assistant", "content": assistant_response})
+        except Exception as e:
+            log.info(f"[MEMORY] Falha ao salvar turno no session store: {e}")
+        return
+
     if not session_id:
         return
+
     try:
         await _call_memory_tool(
             "memory_write_short_term",

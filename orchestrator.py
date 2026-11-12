@@ -233,11 +233,50 @@ SESSION_STORE_ENABLED = os.getenv("AVA_SESSION_STORE", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
 try:
-    from Modules.session import SessionStore
+    from Modules.session import (
+        CompactionManager,
+        SessionStore,
+        estimate_tokens,
+        message_text,
+        sanitize_for_model,
+    )
 except ImportError:  # execução fora da raiz do projeto (CWD diferente)
-    from session import SessionStore  # type: ignore
+    from session import (  # type: ignore
+        CompactionManager,
+        SessionStore,
+        estimate_tokens,
+        message_text,
+        sanitize_for_model,
+    )
+
+try:
+    from Modules.instructions import (
+        InstructionFile,
+        InstructionState,
+        discover_near,
+        load_sources,
+        make_source,
+    )
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from instructions import (  # type: ignore
+        InstructionFile,
+        InstructionState,
+        discover_near,
+        load_sources,
+        make_source,
+    )
 
 _SESSION_STORE: Optional[SessionStore] = None
+_COMPACTOR: Optional[CompactionManager] = None
+_INSTRUCTION_STATE: Optional[InstructionState] = None
+INSTRUCTIONS_ENABLED = os.getenv("AVA_INSTRUCTIONS", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+_INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
+# Limite de segurança do histórico injetado no modelo. A compactação é o
+# mecanismo principal; 0 (padrão) desliga o corte. Use um valor positivo apenas
+# como fallback quando a compactação estiver desabilitada.
+HISTORY_MAX_CHARS = max(0, int(os.getenv("AVA_HISTORY_MAX_CHARS", "0")))
 
 
 def _session_store() -> Optional[SessionStore]:
@@ -279,6 +318,304 @@ def _session_append(sid: str, message: dict[str, Any]) -> None:
         store.append_message(sid, message)
     except Exception as e:
         log.warning(f"[session] falha ao gravar mensagem ({sid[:8]}): {type(e).__name__}: {e}")
+
+
+def _compactor() -> Optional[CompactionManager]:
+    global _COMPACTOR
+    store = _session_store()
+    if store is None:
+        return None
+    if _COMPACTOR is None:
+        try:
+            _COMPACTOR = CompactionManager(store)
+        except Exception as e:
+            log.warning(f"Compactação indisponível ({type(e).__name__}: {e})")
+            return None
+    return _COMPACTOR
+
+
+def _instruction_state() -> Optional[InstructionState]:
+    global _INSTRUCTION_STATE
+    store = _session_store()
+    if store is None:
+        return None
+    if _INSTRUCTION_STATE is None:
+        try:
+            _INSTRUCTION_STATE = InstructionState(store)
+        except Exception as e:
+            log.warning(f"Instruções versionadas indisponíveis ({type(e).__name__}: {e})")
+            return None
+    return _INSTRUCTION_STATE
+
+
+async def _fetch_instruction_files(
+    cwd: Optional[str],
+    project: Optional[str] = None,
+) -> Optional[list[InstructionFile]]:
+    """Lê AGENTS.md do host via mcp_manager (cwd configurado na WebUI).
+
+    Retorna ``None`` quando a rota não está disponível (tray antigo/offline),
+    para o chamador cair na descoberta local.
+    """
+    if not INSTRUCTIONS_ENABLED:
+        return None
+    global _INSTRUCTIONS_HOST_DISABLED_UNTIL
+    if time.time() < _INSTRUCTIONS_HOST_DISABLED_UNTIL:
+        return None
+    client = state.mcp_client
+    if client is None:
+        return None
+    try:
+        response = await client.post(
+            "/fs/instructions",
+            json={"cwd": cwd, "project": project or _project_active()},
+            timeout=2.0,
+        )
+        if response.status_code == 422:
+            # Caminho inválido/não é diretório — não derruba a rota para os
+            # próximos turnos; o chamador tenta o diretório pai.
+            return None
+        if response.status_code != 200:
+            _INSTRUCTIONS_HOST_DISABLED_UNTIL = time.time() + 30.0
+            return None
+        data = response.json()
+    except Exception as e:
+        _INSTRUCTIONS_HOST_DISABLED_UNTIL = time.time() + 30.0
+        log.debug(f"[instructions] /fs/instructions indisponível: {type(e).__name__}: {e}")
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return [
+        InstructionFile(str(item["path"]), str(item["content"]))
+        for item in files
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("content"), str)
+    ]
+
+
+async def _instruction_block(sid: str, cwd: Optional[str] = None) -> str:
+    """Baseline + deltas de AGENTS.md e instruções aninhadas da sessão."""
+    if not INSTRUCTIONS_ENABLED:
+        return ""
+    instruction_state = _instruction_state()
+    if instruction_state is None or not sid:
+        return ""
+    try:
+        files = await _fetch_instruction_files(cwd)
+        if files is not None:
+            sources = [make_source(files)]
+        else:
+            sources = load_sources(Path(cwd) if cwd else None)
+        prepared = instruction_state.prepare(sid, sources)
+        text = prepared.text
+        synthetic = instruction_state.synthetic_text(sid)
+    except Exception as e:
+        log.warning(f"[instructions] falha ao preparar instruções ({sid[:8]}): {type(e).__name__}: {e}")
+        return ""
+    if synthetic:
+        text = (text + "\n\n" + synthetic) if text else synthetic
+    return text
+
+
+def _is_read_tool(name: str) -> bool:
+    lowered = (name or "").lower()
+    return (
+        lowered in ("read", "read_file", "read_text_file")
+        or lowered.endswith("__read_file")
+        or lowered.endswith("__read_text_file")
+        or lowered.endswith("__read")
+    )
+
+
+async def _load_nearby_agents_md(sid: str, path: str) -> None:
+    """Injeta AGENTS.md próximos após uma leitura bem-sucedida.
+
+    Usa o mcp_manager (host) para caminhos do host; se a rota não existir,
+    tenta a descoberta local (execução nativa).
+    """
+    instruction_state = _instruction_state()
+    if not INSTRUCTIONS_ENABLED or instruction_state is None or not sid or not path:
+        return
+    try:
+        files = await _fetch_instruction_files(path)
+        if files is None:
+            parent = os.path.dirname(path.rstrip("/\\"))
+            files = await _fetch_instruction_files(parent or None)
+        if files is None:
+            files = discover_near(Path(path))
+        known = instruction_state.source_paths(sid)
+        for file in files:
+            if file.path in known:
+                continue
+            if instruction_state.append_synthetic(sid, file.path, file.content):
+                log.info(f"[instructions] AGENTS.md aninhado carregado: {file.path}")
+    except Exception as e:
+        log.debug(f"[instructions] descoberta próxima falhou ({type(e).__name__}: {e})")
+
+
+def _session_history(sid: str, *, keep_trailing_tools: bool = False) -> Optional[list[dict[str, Any]]]:
+    """Histórico durável sanitizado para o chat template."""
+    store = _session_store()
+    if store is None or not sid:
+        return None
+    try:
+        return sanitize_for_model(
+            store.load_messages(sid),
+            max_chars=HISTORY_MAX_CHARS,
+            keep_trailing_tools=keep_trailing_tools,
+        )
+    except Exception as e:
+        log.warning(f"[session] falha ao ler histórico ({sid[:8]}): {type(e).__name__}: {e}")
+        return None
+
+
+def _session_compaction_summary(sid: str) -> str:
+    store = _session_store()
+    if store is None or not sid:
+        return ""
+    try:
+        compaction = store.latest_compaction(sid)
+        if not compaction:
+            return ""
+        return str(compaction.get("message", {}).get("content") or "").strip()
+    except Exception as e:
+        log.warning(f"[session] falha ao ler compactação ({sid[:8]}): {type(e).__name__}: {e}")
+        return ""
+
+
+def _with_compaction_summary(system_prompt: str, sid: str) -> str:
+    summary = _session_compaction_summary(sid)
+    marker = "\n\n## Summary of earlier conversation (compacted)\n"
+    base = system_prompt.split(marker, 1)[0]
+    if not summary:
+        return base
+    return base + marker + summary
+
+
+def _is_context_overflow(error: BaseException) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "contexto excede",
+            "context length",
+            "maximum context",
+            "too_large",
+            "request too large",
+            "request_too_large",
+        )
+    )
+
+
+def _session_append_user(sid: str, content: Any) -> None:
+    """Grava a mensagem do usuário sem duplicar um turno retomado."""
+    store = _session_store()
+    if store is None or not sid:
+        return
+    try:
+        last = store.last_message(sid)
+        if last is not None and last.get("role") == "user":
+            if message_text(last.get("content")).strip() == message_text(content).strip():
+                return
+        store.append_message(sid, {"role": "user", "content": content})
+    except Exception as e:
+        log.warning(f"[session] falha ao gravar mensagem do usuário ({sid[:8]}): {type(e).__name__}: {e}")
+
+
+def _session_finalize_turn(sid: str, assistant_text: str) -> bool:
+    """Garante que a resposta final do turno está no histórico durável.
+
+    As mensagens do loop já foram gravadas; isto cobre o caso de o turno ter
+    terminado por um caminho que não passou pelo append normal (ex.: resposta
+    forçada) e evita duplicar quando a última mensagem já é a resposta.
+    """
+    store = _session_store()
+    if store is None or not sid:
+        return False
+    try:
+        last = store.last_message(sid)
+        if last is not None and last.get("role") == "assistant":
+            if message_text(last.get("content")).strip() == (assistant_text or "").strip():
+                return True
+        store.append_message(sid, {"role": "assistant", "content": assistant_text})
+        return True
+    except Exception as e:
+        log.warning(f"[session] falha ao finalizar turno ({sid[:8]}): {type(e).__name__}: {e}")
+        return False
+
+
+async def _summarize_for_compaction(prompt: str) -> str:
+    """Chama o modelo principal para produzir o resumo de compactação."""
+    message = await _llm_chat(
+        [{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return str(message.get("content") or "")
+
+
+async def _maybe_compact(
+    sid: str,
+    system_prompt: str,
+    tools_schema: list[dict[str, Any]],
+    *,
+    reason: str = "auto",
+    eid: str = "",
+    extra_text: str = "",
+    force: bool = False,
+) -> bool:
+    """Compacta o histórico se o request estimado passar do limiar.
+
+    Retorna True quando um checkpoint novo foi gravado. A compactação usa
+    apenas o histórico durável; a mensagem atual ainda não entrou no store
+    neste ponto do turno.
+    """
+    compactor = _compactor()
+    store = _session_store()
+    if compactor is None or store is None or not sid:
+        return False
+    try:
+        entries = store.entries(sid)
+    except Exception as e:
+        log.warning(f"[{eid[:8]}] Compactação: falha ao ler entradas: {type(e).__name__}: {e}")
+        return False
+    if not entries:
+        return False
+
+    try:
+        tools_chars = len(json.dumps(tools_schema, ensure_ascii=False, default=str))
+    except Exception:
+        tools_chars = 0
+    total = (
+        estimate_tokens(system_prompt)
+        + max(0, tools_chars // 4)
+        + compactor.estimate_entries(entries)
+        + estimate_tokens(extra_text)
+    )
+    if not compactor.settings.auto:
+        return False
+    if not force and not compactor.should_compact(total):
+        return False
+
+    try:
+        result = await compactor.compact(
+            sid,
+            entries,
+            _summarize_for_compaction,
+            reason=reason,
+        )
+    except Exception as e:
+        log.warning(f"[{eid[:8]}] Compactação falhou: {type(e).__name__}: {e}")
+        return False
+    if not result:
+        return False
+    log.info(
+        f"[{eid[:8]}] Compactação ({reason}): {result['summarized']} mensagem(ns) "
+        f"resumidas, cauda mantida a partir de {str(result['keepID'])[:12]} "
+        f"(estimativa antes={total} tokens)"
+    )
+    return True
 
 
 def _default_skills_dirs() -> list[str]:
@@ -430,11 +767,12 @@ TOOL_TIPS_MAX_CHARS     = int(os.getenv("TOOL_TIPS_MAX_CHARS", "1200"))
 SKILLS_HINT_MAX_CHARS   = int(os.getenv("SKILLS_HINT_MAX_CHARS", "1500"))
 ORCH_ST_PAIRS           = int(os.getenv("ORCH_ST_PAIRS", "5"))
 ORCH_ST_MAX_CHARS       = int(os.getenv("ORCH_ST_MAX_CHARS", "2400"))
-# Teto do par cru gravado no ST (cabeça + cauda com marcador). Mantém o recall
-# da sessão inteira dentro do orçamento ORCH_ST_MAX_CHARS.
+# Teto do par cru no caminho legado do ST e no cache de query (cabeça + cauda
+# com marcador). O histórico durável usa o session store, sem este corte.
 ST_SAVE_MAX_CHARS       = int(os.getenv("ST_SAVE_MAX_CHARS", "2000"))
 
-# Marcador ÚNICO de corte semântico — reutilizado no ST salvo e no bloco final.
+# Marcador ÚNICO de corte semântico — reutilizado no ST legado e no cache de
+# query.
 ST_OMIT_MARKER          = "\n[…trecho omitido…]\n"
 
 # Metadados de confiança/recência injetados no bloco de recall. O modelo precisa
@@ -1442,7 +1780,7 @@ def _consume_memory_warning(sid: str) -> str:
             return ""
         parts: list[str] = []
         if item.get("save_failed"):
-            parts.append("the raw turn was not saved to short-term history")
+            parts.append("the raw turn was not saved to conversation history")
         if item.get("extract_failed"):
             parts.append("post-turn memory extraction failed")
         if not parts:
@@ -1461,28 +1799,33 @@ def _consume_memory_warning(sid: str) -> str:
 
 
 async def _save_turn(u, a, sid):
-    """Grava o par cru (user, assistant) no ST da sessão. É o ÚNICO histórico
-    de conversa que o próximo turno recebe (via /read-short-term) — se falhar,
-    o turno seguinte nasce AMNÉSICO ('Pode gerar' sem saber do documento).
+    """Finaliza o turno no histórico durável.
 
-    O dedup semântico da memory compara o par contra o st_index COMPARTILHADO
-    (que contém TAMBÉM as memórias episódicas que a extração pós-turno grava
-    — resumos do próprio turno): se o resumo entrar primeiro, o par cru é
-    recusado (duplicate_semantic ~0.95) — por isso o await ANTES da extração
-    no fim do turno (ver _execute_stream_generator)."""
-    # Resposta longa é truncada (cabeça = o que foi feito; cauda = oferta/
-    # próximo passo — onde fica o 'quer que eu gere?'). O recall do ST tem
-    # orçamento de ORCH_ST_MAX_CHARS (2400) p/ a SESSÃO INTEIRA; um turno
-    # gigante sozinho já o estoura e a sanitizer descartaria os demais.
-    u, a = _clip_with_marker(u, ST_SAVE_MAX_CHARS), _clip_with_marker(a, ST_SAVE_MAX_CHARS)
+    Com o session store habilitado, as mensagens já foram gravadas durante o
+    loop; aqui garantimos a resposta final e atualizamos o cache de turnos
+    recentes. Sem o store, mantém o caminho legado do ``/write-short-term``.
+    """
+    u_clipped = _clip_with_marker(u, ST_SAVE_MAX_CHARS)
+    a_clipped = _clip_with_marker(a, ST_SAVE_MAX_CHARS)
 
     # Cache de turnos recentes p/ enriquecer a query de recall do PRÓXIMO turno.
-    # Independe do /write-short-term ter aceitado o par (dedup etc.): o turno
-    # aconteceu e serve de contexto conversacional.
-    _remember_turn(sid, u, a)
+    _remember_turn(sid, u_clipped, a_clipped)
+
+    if _session_store() is not None:
+        if _session_finalize_turn(sid, a):
+            _clear_memory_failure(sid, "save")
+            log.info(f"[save_turn] turno finalizado no session store (session={sid[:8]})")
+            return True
+        _metric_inc("memory_save_failures")
+        _note_memory_failure(sid, "save", "session store finalize failed")
+        return False
+
     payload = {
         "session_id": sid,
-        "turns": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
+        "turns": [
+            {"role": "user", "content": u_clipped},
+            {"role": "assistant", "content": a_clipped},
+        ],
     }
     last_error = ""
     for attempt in (1, 2):
@@ -1670,7 +2013,7 @@ def _known_recall_fragments(read_res: Optional[dict],
         if n:
             frags.append(n)
     for t in st_turns or []:
-        n = _norm_dedup_text(t.get("content") or "")
+        n = _norm_dedup_text(message_text(t.get("content")))
         if n:
             frags.append(n)
     return frags
@@ -1752,7 +2095,7 @@ def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]
     recent_blob = ""
     if st_turns:
         recent_blob = " ".join(
-            _norm_dedup_text(t.get("content") or "") for t in st_turns if t.get("content")
+            _norm_dedup_text(message_text(t.get("content"))) for t in st_turns if t.get("content")
         )
 
     lt_primary: list[str] = []
@@ -2024,9 +2367,12 @@ def _format_voice_context_block(voice_res: Optional[dict],
 
 
 async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
-    """Recall pré-loop: /read e /read-short-term EM PARALELO. Retorna
-    (bloco de recall formatado, turnos ST saneados). Qualquer falha degrada
-    para vazio — nunca derruba o tool loop.
+    """Recall pré-loop: memória de longo prazo + histórico durável.
+
+    O histórico conversacional vem do ``SessionStore`` (mensagens completas,
+    incluindo tool calls e resultados) quando ele está habilitado. Sem ele,
+    cai no antigo ``/read-short-term``. Qualquer falha degrada para vazio —
+    nunca derruba o tool loop.
 
     A query é enriquecida com os últimos turnos quando o input é curto/deítico
     ("faz isso", "e agora?") — sem isso o /read erra o alvo semântico.
@@ -2035,27 +2381,37 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
     com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
     contextual_query = _build_recall_query(query, sid)
-    read_res, st_turns = await asyncio.gather(
-        _memory_read_semantic(
+    store = _session_store()
+
+    if store is not None:
+        stored = _session_history(sid) or []
+        text_turns = [m for m in stored if m.get("role") in ("user", "assistant")]
+        read_res = await _memory_read_semantic(
             contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
-        ),
-        _memory_read_st_raw(sid, ORCH_ST_PAIRS),
-    )
-    clean_turns, dropped = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
-    recall_block = _format_recall_block(read_res, clean_turns)
+        )
+        recall_block = _format_recall_block(read_res, text_turns)
+    else:
+        read_res, st_turns = await asyncio.gather(
+            _memory_read_semantic(
+                contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
+            ),
+            _memory_read_st_raw(sid, ORCH_ST_PAIRS),
+        )
+        stored, dropped = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
+        text_turns = stored
+        recall_block = _format_recall_block(read_res, stored)
+        if dropped:
+            note = "Note: earlier short-term turns were omitted for length."
+            recall_block = (recall_block + "\n\n" + note) if recall_block else note
 
     # Injeção do contexto de voz — custo O(1), se existir. Os fatos do falante
-    # que já aparecem no recall/ST são omitidos (dedup voz × memória).
-    known_frags = _known_recall_fragments(read_res, clean_turns)
+    # que já aparecem no recall/histórico são omitidos (dedup voz × memória).
+    known_frags = _known_recall_fragments(read_res, text_turns)
     voice_block = _format_voice_context_block(_consume_voice_context(sid), known_frags)
     if voice_block:
         recall_block = (voice_block + "\n\n" + recall_block) if recall_block else voice_block
 
-    if dropped:
-        note = "Note: earlier short-term turns were omitted for length."
-        recall_block = (recall_block + "\n\n" + note) if recall_block else note
-
-    return recall_block, clean_turns
+    return recall_block, stored
 
 
 async def _extract_memories_via_llm(u: str, a: str, sid: str) -> bool:
@@ -4257,7 +4613,7 @@ def _build_agent_skills_query(user_input: str, st_turns: Optional[list[dict]] = 
     if not raw:
         return raw
     turns = [t for t in (st_turns or []) if (t.get("role") or "") == "user"]
-    recent = [(t.get("content") or "").strip() for t in turns[-2:]]
+    recent = [message_text(t.get("content")).strip() for t in turns[-2:]]
     recent = [r for r in recent if r]
     if not recent:
         return _clip_with_marker(raw, RECALL_QUERY_MAX_CHARS, 200)
@@ -4414,6 +4770,14 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                                          matched_agent_skills=matched_skills,
                                          active_project=active_project,
                                          tool_status=tool_status)
+    instruction_block = await _instruction_block(sid, req.cwd)
+    if instruction_block:
+        system_prompt += (
+            "\n\n## Project instructions (AGENTS.md)\n"
+            "These are project conventions, not user requests. Follow them while "
+            "working in this project; newer deltas supersede earlier text.\n\n"
+            + instruction_block
+        )
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
     if matched_skills:
@@ -4435,7 +4799,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             + recall_block
         )
         log.info(f"[{eid[:8]}] Recall pré-loop: {len(recall_block)} chars de memória LT/knowledge, "
-                 f"{len(st_turns)} turno(s) ST injetados")
+                 f"{len(st_turns)} mensagem(ns) de histórico injetadas")
     memory_warning = _consume_memory_warning(sid)
     if memory_warning:
         system_prompt += "\n\n" + memory_warning
@@ -4443,6 +4807,15 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     tools_schema = native_tools_schema + mcp_schema
     log.info(f"[{eid[:8]}] Tools oferecidas ao modelo nesta rodada: "
              f"{[t['function']['name'] for t in tools_schema]}")
+
+    # ── Compactação antes do primeiro request ───────────────────────────────
+    # Estima system + tools + histórico durável. Se passar do limiar, resume o
+    # passado e mantém a cauda recente verbatim. Depois recarrega o histórico
+    # e anexa o resumo ao system prompt.
+    if _session_store() is not None:
+        if await _maybe_compact(sid, system_prompt, tools_schema, eid=eid, extra_text=req.input):
+            st_turns = _session_history(sid) or []
+        system_prompt = _with_compaction_summary(system_prompt, sid)
 
     # Hora exata vive aqui (mensagem user), não no system prompt — o prefixo
     # cacheável do system prompt fica com data apenas (prompt caching).
@@ -4507,23 +4880,31 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 "embutida no contexto do modelo principal"
             )
 
-    # ── Histórico: system (com recall) + turnos ST crus + user atual ────────
-    # Os turnos ST dão continuidade conversacional literal (mesmo contrato do
-    # modo CHAT do LLM.py). Ajuste de alternância: turnos user pendentes no
-    # FIM do ST (grupo episódico sem resposta) são descartados — o novo user
-    # emenda neles e dois user consecutivos violam o chat template.
-    while st_turns and st_turns[-1]["role"] == "user":
-        st_turns.pop()
+    # ── Histórico: system + histórico durável + user atual ──────────────────
+    # Com o session store, `st_turns` já vem como mensagens completas
+    # (user/assistant/tool) e sanitizado para o chat template. Sem ele, cai
+    # no caminho legado de turnos crus do ST.
+    if _session_store() is not None:
+        session_messages = list(st_turns)
+        # O turno atual é sempre representado pela mensagem abaixo. Qualquer
+        # user pendente no fim do histórico (turno interrompido ou retomado)
+        # sairia como dois user consecutivos e violaria o chat template.
+        while session_messages and session_messages[-1].get("role") == "user":
+            session_messages.pop()
+    else:
+        while st_turns and st_turns[-1]["role"] == "user":
+            st_turns.pop()
+        session_messages = [{"role": t["role"], "content": t["content"]} for t in st_turns]
 
     history: list[dict] = [
         {"role": "system", "content": system_prompt},
-        *[{"role": t["role"], "content": t["content"]} for t in st_turns],
+        *session_messages,
         {"role": "user", "content": user_content},
     ]
-    # Dual-write: a mensagem do usuário (com anexos, se houver) é o primeiro
-    # fato durável do turno. O system prompt ainda não é persistido aqui — o
-    # sistema de instruções versionadas o transformará em baseline.
-    _session_append(sid, {"role": "user", "content": user_content})
+    # A mensagem do usuário (com anexos, se houver) é o primeiro fato durável
+    # do turno. O system prompt ainda não é persistido aqui — o sistema de
+    # instruções versionadas o transformará em baseline.
+    _session_append_user(sid, user_content)
 
     step_results: list[StepResult] = []
     final_response = ""
@@ -4594,6 +4975,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                         or (_SETTINGS.get("reasoning_effort") or "")
                         or os.getenv("AVA_REASONING_EFFORT", "")).strip().lower() or None
 
+    overflow_recovered = False
     while True:
         # ── Guarda-corpo: teto de turnos ────────────────────────────────────
         # UMA chamada final SEM tools (_force_finish) sintetizando o que já
@@ -4617,15 +4999,33 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             break
 
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
-        if on_delta is not None:
-            message = await _llm_chat_stream(history, tools=tools_schema,
-                                             temperature=0.3, on_delta=on_delta,
-                                             on_thinking=on_thinking,
-                                             reasoning_effort=reasoning_effort,
-                                             session_id=sid)
-        else:
-            message = await _llm_chat(history, tools=tools_schema, temperature=0.3,
-                                      reasoning_effort=reasoning_effort)
+        try:
+            if on_delta is not None:
+                message = await _llm_chat_stream(history, tools=tools_schema,
+                                                 temperature=0.3, on_delta=on_delta,
+                                                 on_thinking=on_thinking,
+                                                 reasoning_effort=reasoning_effort,
+                                                 session_id=sid)
+            else:
+                message = await _llm_chat(history, tools=tools_schema, temperature=0.3,
+                                          reasoning_effort=reasoning_effort)
+        except Exception as exc:
+            if overflow_recovered or not _is_context_overflow(exc):
+                raise
+            overflow_recovered = True
+            log.warning(
+                f"[{eid[:8]}] contexto excedido — compactando e retentando o step."
+            )
+            if not await _maybe_compact(
+                sid, system_prompt, tools_schema, reason="overflow", eid=eid, force=True,
+            ):
+                raise
+            system_prompt = _with_compaction_summary(system_prompt, sid)
+            recovered = _session_history(sid, keep_trailing_tools=True) or []
+            history = [{"role": "system", "content": system_prompt}, *recovered]
+            if not recovered or recovered[-1].get("role") not in ("user", "tool"):
+                history.append({"role": "user", "content": user_content})
+            continue
         tool_calls = message.get("tool_calls") or []
         log.debug(
             f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "
@@ -4819,6 +5219,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     f"{lat}ms) args={json.dumps(args, ensure_ascii=False)} FAILED err={err}"
                 )
 
+            if success and _is_read_tool(tool_name) and isinstance(args, dict):
+                read_path = args.get("path") or args.get("file_path") or args.get("filePath")
+                if isinstance(read_path, str):
+                    await _load_nearby_agents_md(sid, read_path)
+
             sr = StepResult(
                 step=turn, executor=tool_name,
                 action=rec["action"],
@@ -4971,7 +5376,9 @@ async def _record_tool_usage(query: str, tools_used: list[str]) -> None:
 async def _execute_stream_generator(req: ExecuteRequest):
     t0 = time.perf_counter()
     eid = str(uuid.uuid4())
-    sid = req.session_id or str(uuid.uuid4())
+    # Sessão estável quando o cliente não envia uma: o ST antigo era global,
+    # então "default" preserva a continuidade entre turnos/anônimos.
+    sid = req.session_id or "default"
     # Propaga o CWD do turno para os executores MCP auxiliares (planos/macros)
     # via ContextVar — o tool loop normal repassa req.cwd explicitamente.
     _CURRENT_MCP_CWD.set(req.cwd)
@@ -5139,13 +5546,9 @@ async def _execute_stream_generator(req: ExecuteRequest):
         _spawn(_fire_tts(final_response, req))
 
     if final_response:
-        # Await (não fire-and-forget): o par cru PRECISA entrar no ST antes da
-        # extração — as memórias episódicas do extrator vão pro MESMO st_index
-        # e o dedup do /write-short-term recusaria o par cru (~0.95 de simi-
-        # laridade com o resumo do próprio turno). Foi exatamente o que zerou
-        # o histórico entre o turno do WhatsApp e o 'Pode gerar' (26/10).
-        # Custo: um POST local (~100ms). Falha fica LOGADA (antes era
-        # except: pass — buraco negro).
+        # O turno precisa estar durável antes da extração de memórias. Com o
+        # session store, as mensagens já foram gravadas durante o loop e isto
+        # só garante a resposta final; sem ele, mantém o caminho legado do ST.
         saved = await _save_turn(req.input, final_response, sid)
         if not saved:
             log.warning(f"[{eid[:8]}] save_turn falhou — aviso de memória será injetado no próximo turno")
@@ -5697,6 +6100,64 @@ async def session_usage(session_id: str):
     if store is None:
         return {"enabled": False, "usage": {}}
     return {"enabled": True, "usage": store.usage(session_id)}
+
+
+@app.post("/session/{session_id}/compact")
+async def compact_session(session_id: str):
+    store = _session_store()
+    compactor = _compactor()
+    if store is None or compactor is None:
+        raise HTTPException(503, "Session store/compactação desabilitados")
+    if store.get(session_id) is None:
+        raise HTTPException(404, f"Session não encontrada: {session_id}")
+    entries = store.entries(session_id)
+    before = compactor.estimate_entries(entries)
+    result = await compactor.compact(
+        session_id, entries, _summarize_for_compaction, reason="manual",
+    )
+    if not result:
+        return {"compacted": False, "before_tokens": before, "reason": "nothing_to_compact"}
+    after = compactor.estimate_entries(store.entries(session_id))
+    return {
+        "compacted": True,
+        "summarized": result["summarized"],
+        "keepID": result["keepID"],
+        "before_tokens": before,
+        "after_tokens": after,
+    }
+
+
+@app.get("/session/{session_id}/instructions")
+async def session_instructions(session_id: str):
+    state = _instruction_state()
+    if state is None:
+        return {"enabled": False, "baseline": "", "deltas": [], "synthetic": ""}
+    row = state.db.fetchone(
+        "SELECT * FROM instruction_state WHERE session_id = ?",
+        (session_id,),
+    )
+    if row is None:
+        return {"enabled": True, "baseline": "", "deltas": [], "synthetic": ""}
+    try:
+        deltas = json.loads(row["deltas_json"] or "[]")
+    except ValueError:
+        deltas = []
+    return {
+        "enabled": True,
+        "baseline": row["baseline_text"] or "",
+        "deltas": deltas,
+        "synthetic": state.synthetic_text(session_id),
+    }
+
+
+@app.post("/session/{session_id}/instructions/reload")
+async def reload_session_instructions(session_id: str):
+    state = _instruction_state()
+    if state is None:
+        raise HTTPException(503, "Instruções versionadas desabilitadas")
+    state.reset(session_id)
+    prepared = state.prepare(session_id, load_sources())
+    return {"enabled": True, "baseline": prepared.baseline, "deltas": prepared.deltas}
 
 @app.post("/tts/cancel")
 async def cancel_tts():

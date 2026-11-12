@@ -10,6 +10,7 @@ semanticSearch_onnx/*
 resource/Vosk_Model/*
 
 test/*
+tests/*
 
 openclaude
 

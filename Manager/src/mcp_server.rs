@@ -119,6 +119,178 @@ fn user_home_dir(project_root: &FsPath) -> PathBuf {
         .unwrap_or_else(|| project_root.to_path_buf())
 }
 
+// ── AGENTS.md no host ──────────────────────────────────────────────────────
+// O orchestrator roda no container e não enxerga o filesystem do host. Esta
+// rota (protegida pelo auth interno do router MCP) lê os AGENTS.md do cwd
+// configurado na WebUI e o AGENTS.md global do usuário.
+
+#[derive(Deserialize)]
+struct FsInstructionsRequest {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+fn project_root(cfg: &Config) -> PathBuf {
+    cfg.db_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| cfg.default_cwd.clone())
+}
+
+fn cwd_store_path(cfg: &Config) -> PathBuf {
+    project_root(cfg).join("cache").join("webui_cwd.json")
+}
+
+fn read_cwd_store(cfg: &Config) -> HashMap<String, String> {
+    std::fs::read_to_string(cwd_store_path(cfg))
+        .ok()
+        .and_then(|text| serde_json::from_str::<HashMap<String, String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn resolve_instructions_cwd(st: &AppState, requested: Option<&str>, project: &str) -> Result<PathBuf, String> {
+    if let Some(raw) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err("cwd deve ser um caminho absoluto".into());
+        }
+        let canonical = std::fs::canonicalize(&path).map_err(|e| format!("cwd inacessível: {e}"))?;
+        if !canonical.is_dir() {
+            return Err("cwd não é um diretório".into());
+        }
+        return Ok(canonical);
+    }
+    let store = read_cwd_store(&st.cfg);
+    if let Some(raw) = store.get(project) {
+        if let Ok(canonical) = std::fs::canonicalize(raw) {
+            if canonical.is_dir() {
+                return Ok(canonical);
+            }
+        }
+    }
+    Ok(st.cfg.default_cwd.clone())
+}
+
+fn global_agents_path(home: &FsPath) -> PathBuf {
+    if let Ok(raw) = std::env::var("AVA_GLOBAL_AGENTS_MD") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Some(rest) = trimmed.strip_prefix("~/") {
+                return home.join(rest);
+            }
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata).join("alpha-ai").join("AGENTS.md");
+    }
+    home.join(".config").join("alpha-ai").join("AGENTS.md")
+}
+
+fn read_agents_file(path: &FsPath) -> Option<(String, String)> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if metadata.len() > 512 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    Some((
+        canonical.to_string_lossy().into_owned(),
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
+}
+
+fn find_git_root(start: &FsPath) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(directory) = current {
+        if directory.join(".git").exists() {
+            return Some(directory.to_path_buf());
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+fn instruction_dirs(cwd: &FsPath, home: &FsPath) -> Vec<PathBuf> {
+    if cwd == home {
+        return Vec::new();
+    }
+    let under_home = cwd.starts_with(home);
+    let stop = if under_home {
+        home.to_path_buf()
+    } else {
+        find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+    };
+    let mut directories = Vec::new();
+    let mut current = cwd.to_path_buf();
+    loop {
+        if under_home && current == home {
+            break;
+        }
+        directories.push(current.clone());
+        if current == stop {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    directories
+}
+
+async fn fs_instructions(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<FsInstructionsRequest>,
+) -> Response {
+    let project = req
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("general");
+    let cwd = match resolve_instructions_cwd(&st, req.cwd.as_deref(), project) {
+        Ok(path) => path,
+        Err(error) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": error }))).into_response();
+        }
+    };
+    let home = st.cfg.default_cwd.clone();
+    let is_default = cwd == home;
+    let global = global_agents_path(&home);
+    let mut files = Vec::new();
+    if let Some((path, content)) = read_agents_file(&global) {
+        files.push(json!({ "path": path, "content": content }));
+    }
+    if !is_default {
+        for directory in instruction_dirs(&cwd, &home) {
+            if let Some((path, content)) = read_agents_file(&directory.join("AGENTS.md")) {
+                if files
+                    .iter()
+                    .any(|item| item.get("path").and_then(Value::as_str) == Some(path.as_str()))
+                {
+                    continue;
+                }
+                files.push(json!({ "path": path, "content": content }));
+            }
+        }
+    }
+    Json(json!({
+        "cwd": cwd.to_string_lossy(),
+        "default": is_default,
+        "global": global.to_string_lossy(),
+        "files": files,
+    }))
+    .into_response()
+}
+
 fn env_parse<T: FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -2430,6 +2602,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tools", get(all_tools))
         .route("/skills", get(skills))
         .route("/skills/select", post(skills_select))
+        .route("/fs/instructions", post(fs_instructions))
         .with_state(state)
         .layer(axum::middleware::from_fn(auth_middleware))
         .layer(DefaultBodyLimit::max(2_000_000))

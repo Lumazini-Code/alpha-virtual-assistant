@@ -20,6 +20,7 @@ export AVA_SESSION_DB_PATH=/caminho/ava_sessions.db
 - `events.py` — tipos de evento (`session.message.appended`, `session.step.*`...).
 - `projector.py` — traduz evento em linha durável.
 - `store.py` — API de sessão/mensagem/usage.
+- `compaction.py` — estimativa de tokens, resumo e checkpoint (`keepID`).
 - `history.py` — leitura para o runner (boundary por compactação).
 - `ids.py` — `ses_`, `msg_`, `part_`.
 
@@ -30,6 +31,27 @@ Com o orchestrator rodando:
 - `GET /sessions` — sessões recentes.
 - `GET /session/{id}/messages` — histórico durável.
 - `GET /session/{id}/usage` — tokens/custo acumulados.
+
+## Compactação
+
+Quando o request estimado passa do limiar, o histórico antigo é resumido e a
+cauda recente é mantida verbatim:
+
+- `AVA_COMPACTION=1` (default)
+- `AVA_COMPACTION_CONTEXT_TOKENS` (default `128000`)
+- `AVA_COMPACTION_BUFFER` (default `0.15`)
+- `AVA_COMPACTION_KEEP_TOKENS` (default `15000`)
+
+O resumo é gravado como uma mensagem `type=compaction` com
+`metadata.keepID`; `SessionStore.entries()` reexpande como
+`[resumo, ...cauda, ...mensagens novas]`. O resumo entra no system prompt via
+`_with_compaction_summary()`, não como mensagem do histórico.
+
+Compactação manual:
+
+```bash
+curl -X POST /session/<id>/compact
+```
 
 ## Migração do ST antigo
 

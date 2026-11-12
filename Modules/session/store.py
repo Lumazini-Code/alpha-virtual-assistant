@@ -115,28 +115,100 @@ class SessionStore:
     def load_messages(self, session_id: str, *, boundary: str = "latest") -> list[dict[str, Any]]:
         """Mensagens na ordem do modelo, a partir da última compactação.
 
-        ``boundary="latest"`` inclui a compactação como mensagem de sistema.
+        A compactação é reexpandida como ``[resumo, ...cauda mantida, ...]``:
+        o ``metadata.keepID`` aponta a primeira mensagem que continua verbatim.
         ``boundary="local"`` (reservado) ignora compactações nativas.
         """
-        compaction = self.latest_compaction(session_id)
-        start_seq = int(compaction["seq"]) if compaction else 0
-        rows = self.db.fetchall(
-            "SELECT * FROM session_message WHERE session_id = ? AND seq >= ? ORDER BY seq ASC",
-            (session_id, start_seq),
+        return [entry["message"] for entry in self.entries(session_id, boundary=boundary)]
+
+    def entries(self, session_id: str, *, boundary: str = "latest") -> list[dict[str, Any]]:
+        """Mensagens com id/seq, já reexpandidas a partir da compactação.
+
+        Formato de cada item: ``{"id", "seq", "type", "data", "message"}``.
+        """
+        compaction = self._latest_compaction_row(session_id)
+        if compaction is None:
+            rows = self.db.fetchall(
+                "SELECT * FROM session_message WHERE session_id = ? ORDER BY seq ASC",
+                (session_id,),
+            )
+            return [self._entry(row) for row in rows]
+
+        compaction_entry = self._entry(compaction)
+        data = json.loads(compaction["data"])
+        keep_id = (data.get("metadata") or {}).get("keepID")
+        kept: list[dict[str, Any]] = []
+        if keep_id:
+            keep_row = self.db.fetchone(
+                "SELECT seq FROM session_message WHERE session_id = ? AND id = ?",
+                (session_id, keep_id),
+            )
+            keep_seq = int(keep_row["seq"]) if keep_row is not None else int(compaction["seq"])
+            kept_rows = self.db.fetchall(
+                "SELECT * FROM session_message "
+                "WHERE session_id = ? AND seq >= ? AND seq < ? AND type != 'compaction' "
+                "ORDER BY seq ASC",
+                (session_id, keep_seq, compaction["seq"]),
+            )
+            kept = [self._entry(row) for row in kept_rows]
+        after_rows = self.db.fetchall(
+            "SELECT * FROM session_message WHERE session_id = ? AND seq > ? ORDER BY seq ASC",
+            (session_id, compaction["seq"]),
         )
-        return [self._row_to_message(row) for row in rows]
+        return [compaction_entry, *kept, *[self._entry(row) for row in after_rows]]
+
+    def append_compaction(
+        self,
+        session_id: str,
+        *,
+        text: str,
+        keep_id: Optional[str] = None,
+        reason: str = "auto",
+        model: Optional[str] = None,
+        usage: Optional[dict[str, Any]] = None,
+        status: str = "completed",
+    ) -> str:
+        message: dict[str, Any] = {
+            "type": "compaction",
+            "status": status,
+            "reason": reason,
+            "text": text,
+            "metadata": {"keepID": keep_id} if keep_id else {},
+        }
+        if model:
+            message["model"] = model
+        if usage:
+            message["usage"] = usage
+        return self.append_message(session_id, message)
 
     def latest_compaction(self, session_id: str) -> Optional[dict[str, Any]]:
-        row = self.db.fetchone(
+        row = self._latest_compaction_row(session_id)
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "seq": row["seq"],
+            "message": self._row_to_message(row),
+            "data": json.loads(row["data"]),
+        }
+
+    def _latest_compaction_row(self, session_id: str) -> Any:
+        return self.db.fetchone(
             "SELECT * FROM session_message "
             "WHERE session_id = ? AND type = 'compaction' "
             "AND json_extract(data, '$.status') = 'completed' "
             "ORDER BY seq DESC LIMIT 1",
             (session_id,),
         )
-        if row is None:
-            return None
-        return {"seq": row["seq"], "message": self._row_to_message(row)}
+
+    def _entry(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "seq": row["seq"],
+            "type": row["type"],
+            "data": json.loads(row["data"]),
+            "message": self._row_to_message(row),
+        }
 
     def _row_to_message(self, row: Any) -> dict[str, Any]:
         data = json.loads(row["data"])
@@ -187,6 +259,7 @@ class SessionStore:
         with self.db.transaction() as tx:
             tx.execute("DELETE FROM session_message WHERE session_id = ?", (session_id,))
             tx.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
+            tx.execute("DELETE FROM instruction_state WHERE session_id = ?", (session_id,))
             tx.execute("UPDATE session SET time_updated = ? WHERE id = ?", (now(), session_id))
 
     def has_source(self, session_id: str, source_id: int) -> bool:

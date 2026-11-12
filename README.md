@@ -94,7 +94,7 @@ O único jeito de encerrar o turno é **responder em texto puro** — não exist
 - **Sincronização**: boot + assinatura por turno (nome/hash/always-on mudou → re-registra via `/tools/register`, idempotente por `doc_hash` com self-heal; skill removida do disco → prune). Env: `AVA_SKILLS_DIRS` (default: projeto + skills-created + global, substitui a lista inteira), `AVA_ALWAYS_ON_AGENT_SKILLS` (core — entram em TODA seleção), `AVA_SKILLS_TOP_K`. Inspeção: `GET /skills` e `POST /skills/sync` no orchestrator. Nomenclatura: **Agent Skills** (SKILL.md) ≠ "skills" MCP (servidores do mcp_manager).
 
 ### Memória — grafo hebbiano (o "hipocampo" sintético)
-- Curto prazo (SQLite) + longo prazo (LanceDB vetorial) + **grafo de memórias e tools** com arestas que se **reforçam por co-uso e co-ativação** (regra hebbiana), com auto-link na escrita e decay podando o que esquece.
+- **Histórico de conversa durável** (`Modules/session`: mensagens + tool calls + resultados) + longo prazo (LanceDB vetorial) + **grafo de memórias e tools** com arestas que se **reforçam por co-uso e co-ativação** (regra hebbiana), com auto-link na escrita e decay podando o que esquece.
 - Busca semântica com **E5 multilingual** (ONNX, onnxManager :2002) + **rerank cross-encoder** (ms-marco MiniLM) + **Personalized PageRank** com spread de ativação + MMR (inibição lateral).
 - **Grafo de tools (ToolsDB)**: cada tool MCP tem um snippet (o "skill.md" dela); o selector de servidores usa kNN + PPR no grafo de co-uso para escolher **quais** servidores carregar por rodada (economia de contexto com servidores de 20+ tools), com **cota de 4 tools por servidor** (um servidor grande não monopoliza o kNN), **exemplos de uso aprendidos** pós-turno (a query vira vetor "learned") e **self-heal** de vetores perdidos (re-embeda pelo doc_hash).
 - **Dicionários sensoriais** integrados: `visual_dict` (significado de objetos), `face_dict` (rostos) e `voice_dict` (vozes cadastradas pela WebUI/TUI) — embeddings consultados por kNN, texto pesquisável pela leitura normal de memória.
@@ -178,6 +178,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   │   ├── memory_api.py    #   FastAPI (:3000)
 │   │   └── memory_*.py      #   config/db/graph/vector/search/ops/status…
 │   ├── session/             # Session store durável: eventos, mensagens, usage
+│   ├── instructions/        # AGENTS.md: descoberta, baseline e deltas versionados
 │   ├── transcribe/          # Pipeline de voz em C++ (integrado!) — NO HOST
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
 │   │   └── linux/ windows/  #   builds por plataforma
@@ -282,6 +283,15 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) mesclado no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
 | `AVA_SESSION_STORE` | orchestrator | `1` | Session store durável em dual-write. `0` desliga; a leitura ainda é do ST antigo |
 | `AVA_SESSION_DB_PATH` | orchestrator | `Modules/session/db/ava_sessions.db` | Caminho do SQLite de sessões/mensagens |
+| `AVA_HISTORY_MAX_CHARS` | orchestrator | `0` | Teto opcional do histórico injetado; `0` deixa a compactação controlar o tamanho |
+| `AVA_COMPACTION` | orchestrator | `1` | Liga a compactação automática (resumo + cauda verbatim) |
+| `AVA_COMPACTION_CONTEXT_TOKENS` | orchestrator | `128000` | Janela assumida para o gatilho de compactação |
+| `AVA_COMPACTION_BUFFER` | orchestrator | `0.15` | Fração da janela mantida livre antes de compactar |
+| `AVA_COMPACTION_KEEP_TOKENS` | orchestrator | `15000` | Tokens recentes mantidos verbatim |
+| `AVA_INSTRUCTIONS` | orchestrator | `1` | Liga a descoberta/injeção de AGENTS.md e instruções configuradas |
+| `AVA_INSTRUCTIONS_DIRS` | orchestrator | repo + CWD | Diretórios onde procurar AGENTS.md (separados por `:` ou vírgula) |
+| `AVA_INSTRUCTION_FILES` | orchestrator | — | Arquivos/globs extras de instruções |
+| `AVA_GLOBAL_AGENTS_MD` | orchestrator/tray | `~/.config/alpha-ai/AGENTS.md` (Linux/macOS) ou `%APPDATA%\alpha-ai\AGENTS.md` (Windows) | Arquivo global de instruções |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
