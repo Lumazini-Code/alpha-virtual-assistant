@@ -180,6 +180,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   ├── session/             # Session store durável: eventos, mensagens, usage
 │   ├── instructions/        # AGENTS.md: descoberta, baseline e deltas versionados
 │   ├── codemode/            # Tool execute: JS sandbox + catálogo de tools MCP
+│   ├── skills/              # Catálogo de SKILL.md + carregamento sob demanda
 │   ├── tools/               # Registry unificado de tools (validação/permissões/hooks)
 │   ├── transcribe/          # Pipeline de voz em C++ (integrado!) — NO HOST
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
@@ -301,6 +302,10 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_CODEMODE_TIMEOUT_MS` | orchestrator | `30000` | Timeout de uma execução Code Mode |
 | `AVA_CODEMODE_MAX_TOOL_CALLS` | orchestrator | `50` | Máximo de chamadas de tool dentro de um `execute` |
 | `AVA_CODEMODE_MAX_OUTPUT_CHARS` | orchestrator | `200000` | Teto de saída de uma execução Code Mode |
+| `AVA_SKILL_CATALOG` | orchestrator | `1` | Injeta o catálogo completo de skills e usa a tool `skill` |
+| `AVA_SKILL_ALLOW` / `AVA_SKILL_DENY` | orchestrator | — | Filtro glob de skills no catálogo e no carregamento |
+| `AVA_IMAGE_BUDGET_TRIGGER_BYTES` | orchestrator | `26214400` (25 MiB) | Gatilho para remover as imagens mais antigas do request |
+| `AVA_IMAGE_BUDGET_TARGET_BYTES` | orchestrator | `15728640` (15 MiB) | Alvo após o corte de imagens |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |

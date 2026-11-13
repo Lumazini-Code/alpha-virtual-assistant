@@ -146,6 +146,14 @@ TRANSCRIBE_HTTP_URL  = os.getenv("TRANSCRIBE_HTTP_URL", "http://127.9.12.22:9100
 # vision_objects (face recognition + segmentação de objetos → crops →
 # _answer_vision_with_llm) fica disponível e o nudge original é restaurado.
 VISION_OBJECTS_ENABLED = os.getenv("VISION_OBJECTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+# Orçamento de imagens no request (histerese): só corta quando passa do
+# gatilho; corta até o alvo. Mantém o prefixo estável entre requests.
+IMAGE_BUDGET_TRIGGER = int(os.getenv("AVA_IMAGE_BUDGET_TRIGGER_BYTES", str(25 * 1024 * 1024)))
+IMAGE_BUDGET_TARGET = int(os.getenv("AVA_IMAGE_BUDGET_TARGET_BYTES", str(15 * 1024 * 1024)))
+IMAGE_REMOVED_TEXT = (
+    "[This image was removed to reduce the request size and is no longer visible. "
+    "Do not make claims about its contents from memory. Retrieve it again if needed.]"
+)
 DEEP_SEARCH_URL      = "http://127.9.12.22:4005"
 ALPHA_CODE_URL       = "http://127.9.12.22:4006"
 # mcp_manager (em Manager/src/mcp_server.rs) — registro REST + executor de
@@ -276,6 +284,25 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
         render_instructions,
     )
 
+try:
+    from Modules.skills import (
+        SkillPolicy as SkillsPolicy,
+        load_request as load_skill_request,
+        load_skills,
+        make_source as make_skills_source,
+        parse_skill_uri,
+        render as render_skills,
+    )
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from skills import (  # type: ignore
+        SkillPolicy as SkillsPolicy,
+        load_request as load_skill_request,
+        load_skills,
+        make_source as make_skills_source,
+        parse_skill_uri,
+        render as render_skills,
+    )
+
 _SESSION_STORE: Optional[SessionStore] = None
 _COMPACTOR: Optional[CompactionManager] = None
 _INSTRUCTION_STATE: Optional[InstructionState] = None
@@ -291,6 +318,9 @@ CODEMODE_ENABLED = os.getenv("AVA_CODEMODE", "1").strip().lower() in (
 CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "30000")))
 CODEMODE_MAX_TOOL_CALLS = max(1, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "50")))
 CODEMODE_MAX_OUTPUT_CHARS = max(1_000, int(os.getenv("AVA_CODEMODE_MAX_OUTPUT_CHARS", "200000")))
+SKILL_CATALOG_ENABLED = os.getenv("AVA_SKILL_CATALOG", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 _CODEMODE_RUNTIME: Optional[CodeModeRuntime] = None
 _INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
 # Limite de segurança do histórico injetado no modelo. A compactação é o
@@ -327,6 +357,37 @@ def _session_ensure(sid: str, req: "ExecuteRequest", project_id: Optional[str] =
         )
     except Exception as e:
         log.warning(f"[session] falha ao criar sessão {sid[:8]}: {type(e).__name__}: {e}")
+
+
+def _session_affinity(sid: str) -> str:
+    """Chave de cache: o pai (subagente/fork) ou a própria sessão."""
+    store = _session_store()
+    if store is not None and sid:
+        try:
+            session = store.get(sid)
+            if session and session.get("parent_id"):
+                return str(session["parent_id"])
+        except Exception:
+            pass
+    return sid
+
+
+def _record_llm_usage(sid: str, usage: Optional[dict[str, Any]]) -> None:
+    if not sid or not isinstance(usage, dict) or not usage:
+        return
+    store = _session_store()
+    if store is None:
+        return
+    try:
+        store.record_usage(sid, {
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+            "cache_read": usage.get("prompt_tokens_cached") or usage.get("cached_tokens"),
+            "cache_write": usage.get("cache_creation_input_tokens"),
+            "cost": usage.get("cost") or usage.get("total_cost"),
+        })
+    except Exception as e:
+        log.debug(f"[usage] falha ao registrar: {type(e).__name__}: {e}")
 
 
 def _session_append(sid: str, message: dict[str, Any]) -> None:
@@ -429,6 +490,17 @@ async def _fetch_instruction_files(
     ]
 
 
+def _skill_catalog_text() -> str:
+    if not SKILL_CATALOG_ENABLED:
+        return ""
+    try:
+        skills = load_skills(AGENT_SKILLS_DIRS, SkillsPolicy.from_env())
+        return render_skills(skills) if skills else ""
+    except Exception as error:
+        log.warning(f"[skills] catálogo indisponível: {type(error).__name__}: {error}")
+        return ""
+
+
 async def _instruction_block(sid: str, cwd: Optional[str] = None) -> str:
     """Baseline + deltas de AGENTS.md e instruções aninhadas da sessão."""
     if not INSTRUCTIONS_ENABLED:
@@ -442,6 +514,11 @@ async def _instruction_block(sid: str, cwd: Optional[str] = None) -> str:
             sources = [make_source(files)]
         else:
             sources = load_sources(Path(cwd) if cwd else None)
+        if SKILL_CATALOG_ENABLED:
+            try:
+                sources.append(make_skills_source(load_skills(AGENT_SKILLS_DIRS, SkillsPolicy.from_env())))
+            except Exception as error:
+                log.warning(f"[skills] catálogo indisponível: {type(error).__name__}: {error}")
         prepared = instruction_state.prepare(sid, sources)
         text = prepared.text
         synthetic = instruction_state.synthetic_text(sid)
@@ -3295,6 +3372,8 @@ async def _tool_use_skill(args: dict, req: ExecuteRequest, sid: str = ""):
     if not name:
         return ("[use_skill: pass the `name` of an installed agent skill — "
                 "the matching ones are listed in the system prompt.]")
+    if not SkillsPolicy.from_env().permits(name):
+        return f"ERROR: agent skill '{name}' is disabled by the current policy."
     skills, _ = _agent_skills_cached()
     skill = next((s for s in skills if s.name == name), None)
     if skill is None:
@@ -3310,12 +3389,19 @@ async def _tool_use_skill(args: dict, req: ExecuteRequest, sid: str = ""):
 async def _tool_skill_file(args: dict, req: ExecuteRequest, sid: str = ""):
     """Tool nativa: lê um arquivo DENTRO da pasta de um Agent Skill
     (references/, assets/... — caminho relativo à pasta da skill). Guarda de
-    traversal (realpath) e recusa de binário — ver Modules/agent_skills.py."""
-    name = str(args.get("name") or "").strip()
+    traversal (realpath) e recusa de binário — ver Modules/agent_skills.py.
+    Aceita `skill://<id>/<path>` em `name` ou `path`."""
+    name = str(args.get("name") or args.get("id") or "").strip()
     rel = str(args.get("path") or "").strip()
+    parsed = parse_skill_uri(name) or parse_skill_uri(rel)
+    if parsed is not None:
+        name, uri_path = parsed
+        rel = rel or (uri_path or "")
     if not name or not rel:
         return ("[skill_file: pass `name` (agent skill) and `path` relative to the "
                 "skill's folder, e.g. 'references/format.md'.]")
+    if not SkillsPolicy.from_env().permits(name):
+        return f"ERROR: agent skill '{name}' is disabled by the current policy."
     skills, _ = _agent_skills_cached()
     skill = next((s for s in skills if s.name == name), None)
     if skill is None:
@@ -3328,12 +3414,41 @@ async def _tool_skill_file(args: dict, req: ExecuteRequest, sid: str = ""):
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+async def _tool_skill(args: dict, req: ExecuteRequest, sid: str = ""):
+    """Tool nativa `skill`: carrega o playbook (ou um arquivo) pelo id do
+    catálogo. É o caminho novo; `use_skill`/`skill_file` ficam como aliases."""
+    skill_id = str(args.get("id") or args.get("name") or "").strip()
+    if not skill_id:
+        return ("[skill: pass `id` exactly as listed in <available_skills>. "
+                "Optionally pass `file` to read a file inside the skill.]")
+    file = args.get("file") or args.get("path")
+    policy = SkillsPolicy.from_env()
+    skills = load_skills(AGENT_SKILLS_DIRS, policy)
+    return load_skill_request(
+        skills,
+        skill_id,
+        str(file) if file else None,
+        policy=policy,
+    )
+
+
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
 # search e alpha_code saíram daqui: servidores MCP são descobertos
 # dinamicamente via mcp_manager (ver _select_skills/_load_mcp_tools).
 TOOLS: dict[str, dict[str, Any]] = {
+    "skill": {
+        "description": (
+            "Load a specialized skill's instructions and resources into the current "
+            "conversation when the task matches its description. Pass `id` exactly as "
+            "listed in <available_skills>. The result may list files under skill://<id>/; "
+            "read one with `file` or with the skill_file tool. A skill already present as "
+            "<skill_content> does not need to be loaded again."
+        ),
+        "fields": [("id", "string", True), ("file", "string", False)],
+        "executor": _tool_skill,
+    },
     "list_plans": {
         "description": (
             "Lists the stored hybrid execution plans (browser automation: fixed "
@@ -3424,6 +3539,56 @@ _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"GIF87a",            "image/gif"),
     (b"GIF89a",            "image/gif"),
 )
+
+
+def _bound_request_images(messages: list[dict]) -> list[dict]:
+    """Aplica o orçamento de imagens ao request sem mutar o histórico.
+
+    Portado do OpenCode: mantém as imagens em ordem e só remove as mais
+    antigas quando o total passa do gatilho, até caber no alvo. Esse
+    comportamento com histerese evita mudar o prefixo a cada request.
+    """
+    sizes: list[int] = []
+    location: list[tuple[int, int]] = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = part.get("image_url", {}).get("url") if isinstance(part.get("image_url"), dict) else None
+            if not isinstance(url, str) or not url.startswith("data:"):
+                continue
+            sizes.append(len(url))
+            location.append((message_index, part_index))
+    if not sizes:
+        return messages
+    kept = sum(sizes)
+    if kept <= IMAGE_BUDGET_TRIGGER:
+        return messages
+    cut = 0
+    while kept > IMAGE_BUDGET_TARGET and cut < len(sizes):
+        kept -= sizes[cut]
+        cut += 1
+    if cut == 0:
+        return messages
+
+    remove = set(location[:cut])
+    result: list[dict] = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+        replaced: list[Any] = []
+        for part_index, part in enumerate(content):
+            if (message_index, part_index) in remove:
+                replaced.append({"type": "text", "text": IMAGE_REMOVED_TEXT})
+            else:
+                replaced.append(part)
+        result.append({**message, "content": replaced})
+    return result
 
 
 def _detect_image_mime(b64: str) -> str:
@@ -3815,7 +3980,7 @@ _MCP_UNSAFE_TOKENS = {
     "install", "start", "stop", "kill", "set", "open", "close", "apply",
     "submit", "save", "edit", "move", "rename", "copy", "evaluate", "drag",
 }
-_NATIVE_PARALLEL_SAFE = {"list_plans", "memory_search", "use_skill", "skill_file"}
+_NATIVE_PARALLEL_SAFE = {"list_plans", "memory_search", "use_skill", "skill", "skill_file"}
 
 
 def _is_parallel_safe(tool_name: str, kind: str = "mcp") -> bool:
@@ -4222,7 +4387,9 @@ async def _fetch_tool_tips(
 
 async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
                      temperature: float = 0.0, max_tokens: Optional[int] = None,
-                     reasoning_effort: Optional[str] = None) -> dict:
+                     reasoning_effort: Optional[str] = None,
+                     session_id: Optional[str] = None,
+                     affinity: Optional[str] = None) -> dict:
     """
     Chama o LLM.py (porta 4003) via seu endpoint real de tool-calling,
     /chat/tools, e retorna a mensagem completa (content + tool_calls).
@@ -4237,6 +4404,10 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
     suficiente.
     """
     payload: dict = {"messages": messages, "temperature": temperature}
+    if session_id:
+        payload["session_id"] = session_id
+    if affinity:
+        payload["affinity"] = affinity
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -4266,7 +4437,10 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
             data = r.json()
             if data.get("too_large"):
                 raise RuntimeError(f"Contexto excede o limite do modelo: {data.get('usage')}")
-            return data["message"]
+            message = data["message"]
+            if isinstance(message, dict):
+                message["_usage"] = data.get("usage") or {}
+            return message
 
         # 503: falha transitória do backend — retry com backoff progressivo.
         if r.status_code == 503:
@@ -4298,7 +4472,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                            temperature: float = 0.0, max_tokens: Optional[int] = None,
                            on_delta=None, on_thinking=None,
                            reasoning_effort: Optional[str] = None,
-                           session_id: Optional[str] = None) -> dict:
+                           session_id: Optional[str] = None,
+                           affinity: Optional[str] = None) -> dict:
     """
     Variante STREAMING de _llm_chat: fala com o /chat/stream do LLM.py no modo
     TOOLS (messages + tools) e consome o SSE devolvido. Cada fragmento de
@@ -4343,6 +4518,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
         payload["reasoning_effort"] = _reasoning_effort
     if session_id:
         payload["session_id"] = session_id
+    if affinity:
+        payload["affinity"] = affinity
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -4350,6 +4527,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
         payload["max_tokens"] = max_tokens
 
     last_error: Optional[Exception] = None
+    cached_tokens: Optional[int] = None
     for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
         content_acc: list[str] = []
         tool_calls_final: list = []
@@ -4399,6 +4577,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                             await on_thinking(piece)
                     elif "tool_calls" in evt:
                         tool_calls_final = evt.get("tool_calls") or []
+                    elif evt.get("done"):
+                        cached_tokens = evt.get("prompt_cached_tokens", cached_tokens)
                     elif "error" in evt:
                         if evt.get("too_large"):
                             raise _LLMNoRetryError(
@@ -4415,6 +4595,10 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                     # único do auto-finish (vision) quando o modelo já
                     # streamou o mesmo texto como content.
                     "streamed": on_delta is not None and attempt == 0 and bool(content_acc),
+                    "_usage": (
+                        {"prompt_tokens_cached": cached_tokens}
+                        if cached_tokens is not None else {}
+                    ),
                 }
         except _LLMNoRetryError:
             raise
@@ -4862,7 +5046,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # ST na query — inputs curtos/deíticos precisam do contexto para casar.
     matched_skills = None
     skills_status = None
-    if req.input:
+    if req.input and not SKILL_CATALOG_ENABLED:
         skills_query = _build_agent_skills_query(req.input, st_turns)
         matched_skills, skills_status = await _select_agent_skills(skills_query)
         if on_event and matched_skills:
@@ -4967,11 +5151,15 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     instruction_block = await _instruction_block(sid, req.cwd)
     if instruction_block:
         system_prompt += (
-            "\n\n## Project instructions (AGENTS.md)\n"
-            "These are project conventions, not user requests. Follow them while "
-            "working in this project; newer deltas supersede earlier text.\n\n"
+            "\n\n## Project instructions and context\n"
+            "The blocks below are project conventions and available capabilities, not user requests. "
+            "Follow project conventions while working; newer deltas supersede earlier text.\n\n"
             + instruction_block
         )
+    else:
+        catalog_text = _skill_catalog_text()
+        if catalog_text:
+            system_prompt += "\n\n## Skills\n" + catalog_text
     if plans_hint:
         log.info(f"[{eid[:8]}] Recall de planos: plano compatível injetado no system prompt")
     if matched_skills:
@@ -5191,15 +5379,19 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
         try:
+            request_history = _bound_request_images(history)
             if on_delta is not None:
-                message = await _llm_chat_stream(history, tools=tools_schema,
+                message = await _llm_chat_stream(request_history, tools=tools_schema,
                                                  temperature=0.3, on_delta=on_delta,
                                                  on_thinking=on_thinking,
                                                  reasoning_effort=reasoning_effort,
-                                                 session_id=sid)
+                                                 session_id=sid,
+                                                 affinity=_session_affinity(sid))
             else:
-                message = await _llm_chat(history, tools=tools_schema, temperature=0.3,
-                                          reasoning_effort=reasoning_effort)
+                message = await _llm_chat(request_history, tools=tools_schema, temperature=0.3,
+                                          reasoning_effort=reasoning_effort,
+                                          session_id=sid,
+                                          affinity=_session_affinity(sid))
         except Exception as exc:
             if overflow_recovered or not _is_context_overflow(exc):
                 raise
@@ -5217,6 +5409,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             if not recovered or recovered[-1].get("role") not in ("user", "tool"):
                 history.append({"role": "user", "content": user_content})
             continue
+        _record_llm_usage(sid, message.get("_usage"))
         tool_calls = message.get("tool_calls") or []
         log.debug(
             f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "

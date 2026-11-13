@@ -470,6 +470,18 @@ def _get_internal_auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {tok}"} if tok else {}
 
 
+def _cache_headers(affinity: Optional[str]) -> dict[str, str]:
+    """Headers de afinidade de cache do provider (ignorados se não suportados)."""
+    key = (affinity or "").strip()
+    if not key:
+        return {}
+    return {
+        "x-session-affinity": key,
+        "x-ava-session-id": key,
+        "X-Session-Id": key,
+    }
+
+
 def _get_memory_client() -> httpx.AsyncClient:
     """Persistent client para a API REST de memória (memory_api.py) —
     connection pooling + keep-alive, mesmo padrão do client OpenRouter/TTS."""
@@ -662,7 +674,8 @@ def _reasoning_payload_extra(thinking_depth: int) -> dict:
     return {"reasoning": {"effort": effort}}
 
 
-async def _execute_inference(json_payload: dict, stream: bool = False, model: str = MAIN_MODEL):
+async def _execute_inference(json_payload: dict, stream: bool = False, model: str = MAIN_MODEL,
+                             headers: Optional[dict[str, str]] = None):
     """
     Executa a inferência contra o provider configurado (LLM_BASE_URL).
 
@@ -672,8 +685,8 @@ async def _execute_inference(json_payload: dict, stream: bool = False, model: st
     client = await _get_llm_client()
     payload = {**json_payload, "model": model, "stream": stream}
     if stream:
-        return client, model, await _llm_post(payload, stream=True, label="LLM stream")
-    r = await _llm_post(payload, label="LLM stream")
+        return client, model, await _llm_post(payload, stream=True, label="LLM stream", headers=headers)
+    r = await _llm_post(payload, label="LLM stream", headers=headers)
     return client, model, r
 
 
@@ -781,6 +794,7 @@ async def _llm_post(
     max_retries: int = LLM_MAX_RETRIES,
     retry_backoff: float = LLM_RETRY_BACKOFF,
     label: str = "LLM",
+    headers: Optional[dict[str, str]] = None,
 ):
     """POST genérico em {LLM_BASE_URL}/chat/completions.
 
@@ -796,13 +810,18 @@ async def _llm_post(
 
     def _post():
         kw = {"timeout": timeout} if timeout is not None else {}
+        if headers:
+            kw["headers"] = headers
         return client.post("/chat/completions", json=payload, **kw)
 
     # ── STREAMING ──
     if stream:
         strip_passes = 0
         while True:
-            ctx = client.stream("POST", "/chat/completions", json=payload)
+            ctx = client.stream(
+                "POST", "/chat/completions", json=payload,
+                **({"headers": headers} if headers else {}),
+            )
             r = await ctx.__aenter__()
             if r.status_code == 400 and strip_passes < 2:
                 try:
@@ -885,6 +904,7 @@ async def _openrouter_post_with_retry(
     json_payload: dict,
     stream: bool = False,
     model: str = MAIN_MODEL,
+    headers: Optional[dict[str, str]] = None,
 ):
     """
     Executa POST no /chat/completions do provider configurado, com retry
@@ -898,9 +918,9 @@ async def _openrouter_post_with_retry(
     if stream:
         # No streaming, devolvemos o context manager — 5xx/erro de rede
         # dentro do stream é tratado por quem consome (ver /chat/stream).
-        return client, model, await _llm_post(payload, stream=True, label="LLM /chat")
+        return client, model, await _llm_post(payload, stream=True, label="LLM /chat", headers=headers)
 
-    r = await _llm_post(payload, label="LLM /chat")
+    r = await _llm_post(payload, label="LLM /chat", headers=headers)
     return client, model, r
 
 
@@ -2256,6 +2276,7 @@ class ChatRequest(BaseModel):
     # ── Modo CHAT: mensagem única — o servidor monta o prompt (memória + data) ──
     message: Optional[str] = Field(default=None, description="Mensagem do usuário (modo chat). Obrigatório quando `messages` não for enviado.")
     session_id: Optional[str] = Field(default="default", description="ID da sessão para memória de curto prazo")
+    affinity: Optional[str] = Field(default=None, description="Chave de afinidade de cache (pai/fork).")
     voice:   Optional[str] = Field(default=None, description="Voz TTS. None = usa padrão.")
     lang:    Optional[str] = Field(default=None, description="Idioma forçado. None = detectado.")
     max_turns: int = Field(default=10,  ge=1, le=40, description="Limite de contexto recuperado")
@@ -2358,6 +2379,8 @@ class ToolUseRequest(BaseModel):
     messages: list[ToolCallMessage]
     tools: list[dict] = Field(default_factory=list, description="Lista de tool schemas no formato OpenAI function-calling. IGNORADO quando `grammar` está presente — nesse caso o OpenRouter usa response_format json_object para restringir o output.")
     tool_choice: Optional[str] = Field(default="auto", description="auto | required | none | {type:function,function:{name:...}}. IGNORADO quando `grammar` está presente.")
+    session_id: Optional[str] = Field(default=None, description="Sessão do AVA para afinidade de cache.")
+    affinity: Optional[str] = Field(default=None, description="Chave de afinidade de cache (filho/fork usa a do pai).")
     grammar: Optional[str] = Field(default=None, description="Mantido por compatibilidade com chamadores antigos do llama-server. No OpenRouter, quando presente, ativamos response_format=json_object (equivalente aproximado de GBNF). A resposta vem em message.content e o caller é responsável por parsear.")
     model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
@@ -2508,6 +2531,7 @@ async def chat(req: ChatRequest):
             },
             stream=False,
             model=MAIN_MODEL,
+            headers=_cache_headers(req.affinity or req.session_id),
         )
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -2774,6 +2798,7 @@ async def chat_stream(req: ChatRequest):
                     json_payload={**payload, "messages": current_messages},
                     stream=True,
                     model=MAIN_MODEL,
+                    headers=_cache_headers(req.affinity or req.session_id),
                 )
 
                 try:
@@ -3189,7 +3214,8 @@ async def _openrouter_tool_call(
     max_retries: int = 3,
     grammar: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
-) -> tuple[dict, str, bool]:
+    affinity: Optional[str] = None,
+) -> tuple[dict, str, dict, bool]:
     """
     Executa tool call no provider configurado (LLM_BASE_URL).
 
@@ -3232,11 +3258,16 @@ async def _openrouter_tool_call(
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
 
-    r = await _llm_post(payload, max_retries=max_retries, label="LLM /chat/tools")
+    r = await _llm_post(
+        payload,
+        max_retries=max_retries,
+        label="LLM /chat/tools",
+        headers=_cache_headers(affinity),
+    )
 
     if r.status_code == 200:
         data = r.json()
-        return data["choices"][0]["message"], MAIN_MODEL, False
+        return data["choices"][0]["message"], MAIN_MODEL, data.get("usage") or {}, False
 
     # Erro de contexto grande demais: não faz sentido retentar
     try:
@@ -3291,7 +3322,7 @@ async def chat_tools(req: ToolUseRequest):
 
     t0 = time.perf_counter()
     try:
-        message, model_used, fallback = await _openrouter_tool_call(
+        message, model_used, provider_usage, fallback = await _openrouter_tool_call(
             messages=messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
@@ -3299,6 +3330,7 @@ async def chat_tools(req: ToolUseRequest):
             max_retries=req.max_retries,
             grammar=req.grammar,
             reasoning_effort=req.reasoning_effort,
+            affinity=req.affinity or req.session_id,
         )
     except RequestTooLargeError as e:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -3325,6 +3357,7 @@ async def chat_tools(req: ToolUseRequest):
         message=message,
         model=model_used,
         usage={
+            **(provider_usage or {}),
             "prompt_tokens_approx":     approx_prompt_tokens,
             "completion_tokens_approx": approx_completion_tokens,
             "total_approx":             approx_prompt_tokens + approx_completion_tokens,
