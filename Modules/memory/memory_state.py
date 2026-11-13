@@ -24,9 +24,9 @@ LanceDB), startup()/shutdown() e a integração opcional com o VectorStore
 """
 
 import asyncio
-import asyncio
 import shutil
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -279,6 +279,28 @@ async def switch_scope(name: str) -> dict:
     return {"scope": name, "opened": opened, "previous": previous}
 
 
+async def ensure_scope(name: str) -> bool:
+    """Abre o escopo no cache SEM alterar `state.active_scope`.
+
+    Turnos com projeto explícito (multi-chat) levam `scope` em cada chamada
+    de memória; este helper garante que os DBs/índices do projeto estão
+    abertos antes do primeiro uso. Devolve True se abriu agora.
+    """
+    if not is_valid_scope(name):
+        raise RuntimeError(f"Escopo inválido: {name!r}")
+    if name in state.scopes:
+        return False
+    async with state.scope_lock:
+        if name in state.scopes:
+            return False
+        shared = state.lance if name == GENERAL_SCOPE else None
+        sc = await asyncio.get_event_loop().run_in_executor(
+            None, _open_scope, name, shared
+        )
+        state.scopes[name] = sc
+    return True
+
+
 async def delete_scope(name: str) -> None:
     """Fecha (se aberto) e APAGA o diretório do escopo — memórias LT, grafo,
     planos, arquivos indexados, LanceDB e log, tudo. Recusa o escopo geral e
@@ -299,6 +321,40 @@ async def delete_scope(name: str) -> None:
         if str(d) != str(scope_db_dir(GENERAL_SCOPE)) and d.is_dir():
             await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, d)
     log.info(f"Escopo '{name}' removido ({d})")
+
+
+@asynccontextmanager
+async def scoped_scope(name: Optional[str]):
+    """Executa o bloco com `name` como escopo ativo, restaurando ao sair.
+
+    Handlers que aceitam `scope` por requisição usam isto em torno das
+    ESCRITAS (que acessam `state.lt_db`/`state.plans_db`, propriedades do
+    escopo ativo). O lock global serializa apenas trechos que trocam de
+    escopo: dois turnos no mesmo projeto continuam concorrentes, e leituras
+    (`lt_views(scope)`) não passam por aqui.
+
+    `name` vazio/ausente ou igual ao escopo já ativo → no-op (sem lock).
+    """
+    target = (name or "").strip()
+    if not target or target == state.active_scope:
+        yield state.scope
+        return
+    if target != GENERAL_SCOPE and not is_valid_scope(target):
+        raise RuntimeError(f"Escopo inválido: {target!r}")
+    async with state.scope_lock:
+        sc = state.scopes.get(target)
+        if sc is None:
+            shared = state.lance if target == GENERAL_SCOPE else None
+            sc = await asyncio.get_event_loop().run_in_executor(
+                None, _open_scope, target, shared
+            )
+            state.scopes[target] = sc
+        previous = state.active_scope
+        state.active_scope = target
+        try:
+            yield sc
+        finally:
+            state.active_scope = previous
 
 
 def _all_indices() -> list["MemoryIndex"]:

@@ -69,7 +69,7 @@ from memory_models import (
     IndexedFileWriteResponse,
     MemoryToolError,
 )
-from memory_state import state
+from memory_state import state, scoped_scope
 from memory_vector import _chunk_text
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -851,8 +851,9 @@ async def indexed_file_write(req: IndexedFileWriteRequest):
             stored=False, reason=f"content_too_large:{len(content)}>{IF_MAX_CONTENT_SIZE}",
         )
     content_hash = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
-    async with _PATH_LOCKS.hold(req.file_path):
-        return await _write_locked(req, content, content_hash)
+    async with scoped_scope(req.scope):
+        async with _PATH_LOCKS.hold(req.file_path):
+            return await _write_locked(req, content, content_hash)
 
 
 async def _write_locked(req, content: str, content_hash: str):
@@ -1156,6 +1157,13 @@ def _overlaps(ranges, s, e) -> bool:
 
 
 async def indexed_file_read(req: IndexedFileReadRequest):
+    # NEW (multi-chat): a leitura de arquivos resolve os backends pelo escopo
+    # ativo; `scoped_scope` aplica o escopo da requisição durante o handler.
+    async with scoped_scope(req.scope):
+        return await _indexed_file_read_impl(req)
+
+
+async def _indexed_file_read_impl(req: IndexedFileReadRequest):
     """
     Lê arquivos indexados. Três modos, mutuamente exclusivos:
 

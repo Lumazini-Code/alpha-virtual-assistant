@@ -94,14 +94,18 @@ class LTView:
     encode: bool
 
 
-def lt_views() -> list[LTView]:
-    """Views de LT para leitura: escopo ATIVO primeiro; quando um projeto
-    está ativo, o escopo geral entra ao final (leitura mesclada — /read funde
-    os dois). Escopo geral ativo → uma view só, comportamento idêntico ao de
-    antes (ids cruas, sem campo scope nas entradas)."""
-    active = state.scopes.get(state.active_scope) or state.scopes[GENERAL_SCOPE]
+def lt_views(scope: Optional[str] = None) -> list[LTView]:
+    """Views de LT para leitura: escopo pedido primeiro; quando é um projeto,
+    o escopo geral entra ao final (leitura mesclada — /read funde os dois).
+    Escopo geral → uma view só (ids cruas, sem campo scope nas entradas).
+
+    `scope` None usa o escopo ativo do processo (compatibilidade TUI). Com
+    escopo explícito a leitura não depende de `state.active_scope`, o que
+    permite leituras concorrentes em projetos diferentes."""
+    name = (scope or "").strip() or state.active_scope
+    active = state.scopes.get(name) or state.scopes[GENERAL_SCOPE]
     views = [LTView(name=active.name, db=active.lt_db, index=active.lt_index, encode=False)]
-    if state.active_scope != GENERAL_SCOPE:
+    if active.name != GENERAL_SCOPE:
         gen = state.scopes.get(GENERAL_SCOPE)
         if gen is not None:
             views.append(LTView(name=GENERAL_SCOPE, db=gen.lt_db, index=gen.lt_index, encode=True))
@@ -488,6 +492,7 @@ async def _ppr_spread(
 async def _dict_graph_related(
     seeds: list[tuple[Optional[int], float]],
     loop: asyncio.AbstractEventLoop,
+    scope: Optional[str] = None,
 ) -> list[RelatedMemory]:
     """Busca por grafo a partir de hits de dicionário (objeto/rosto/voz): usa o
     `memory_id` de cada candidato como semente (score = similaridade do hit)
@@ -503,7 +508,7 @@ async def _dict_graph_related(
     real = [(mid, s) for mid, s in seeds if mid is not None]
     if not real:
         return []
-    views = lt_views()
+    views = lt_views(scope)
     # Resolve o escopo dono de cada semente (probe barato em SQLite)
     per_view: dict[int, list[tuple[int, float]]] = {}   # índice da view → sementes
     unmatched: list[tuple[int, float]] = []

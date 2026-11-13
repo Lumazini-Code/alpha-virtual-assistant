@@ -103,7 +103,7 @@ from memory_search import (
     _split_query_segments,
     lt_views,
 )
-from memory_state import state
+from memory_state import state, scoped_scope
 
 # ── POST /write ────────────────────────────────────────────────────────────────
 
@@ -434,7 +434,12 @@ async def _store_long_term_text(
         # cross-encoder, fire-and-forget) — a memória não fica mais isolada
         # no grafo até uma co-ativação futura. Ver _auto_link_task.
         if AUTO_LINK_ENABLED:
-            asyncio.ensure_future(_auto_link_task(memory_id, embedding, text))
+            # Passa db/index DO escopo explicitamente: a task roda depois que
+            # a escrita sai do `scoped_scope` (o escopo ativo pode já ter
+            # voltado ao anterior), então não pode depender de state.lt_db.
+            asyncio.ensure_future(
+                _auto_link_task(memory_id, embedding, text, state.lt_db, state.lt_index)
+            )
 
     log.info(f"LT #{memory_id} gravada: {text[:60]}")
     return True, "ok", memory_id, None
@@ -567,7 +572,10 @@ async def _process_write_request(req: WriteRequest) -> WriteResponse:
 
 
 async def write_memory(req: WriteRequest):
-    return await _process_write_request(req)
+    # NEW (multi-chat): a escrita resolve os artefatos pelo escopo ativo;
+    # `scoped_scope` troca o ponteiro só durante a requisição (e restaura).
+    async with scoped_scope(req.scope):
+        return await _process_write_request(req)
 
 
 # ── POST /write_batch ──────────────────────────────────────────────────────
@@ -577,31 +585,39 @@ async def write_memory(req: WriteRequest):
 # (ex.: duplicata) não impede os demais de serem processados.
 
 async def write_memory_batch(req: WriteBatchRequest):
-    results: list[WriteResponse] = []
-    loop = asyncio.get_event_loop()
-    prev_id: Optional[int] = None
-    for item in req.items:
-        resp = await _process_write_request(item)
-        results.append(resp)
-        # ── NEW: batch sequencial → aresta temporal_precedence (anterior → seguinte)
-        # NEW (projetos): aresta só quando AMBAS as ids são do MESMO escopo —
-        # ids compostas (offset) indicam memória do geral (update em modo
-        # projeto); arestas nunca cruzam escopos.
-        if req.sequential and resp.stored and resp.memory_id is not None:
-            if (
-                prev_id is not None and prev_id != resp.memory_id
-                and not is_general_ref(prev_id) and not is_general_ref(resp.memory_id)
-            ):
-                await loop.run_in_executor(
-                    None, state.lt_db.upsert_edge, prev_id, resp.memory_id,
-                    EDGE_LEARNING_RATE, time.time(), EDGE_TEMPORAL,
-                )
-            prev_id = resp.memory_id
-    stored_count = sum(1 for r in results if r.stored)
-    log.info(f"write_batch: {stored_count}/{len(results)} memórias gravadas")
-    return WriteBatchResponse(
-        results=results, stored_count=stored_count, total=len(results),
-    )
+    # Um batch inteiro roda num escopo só (o do request, ou o do primeiro item
+    # que declarar um): as arestas temporais do modo sequencial usam
+    # `state.lt_db` DEPOIS do processamento de cada item, então precisam do
+    # escopo ativo estável durante todo o batch.
+    batch_scope = req.scope
+    if not batch_scope:
+        batch_scope = next((it.scope for it in req.items if it.scope), None)
+    async with scoped_scope(batch_scope):
+        results: list[WriteResponse] = []
+        loop = asyncio.get_event_loop()
+        prev_id: Optional[int] = None
+        for item in req.items:
+            resp = await _process_write_request(item)
+            results.append(resp)
+            # ── NEW: batch sequencial → aresta temporal_precedence (anterior → seguinte)
+            # NEW (projetos): aresta só quando AMBAS as ids são do MESMO escopo —
+            # ids compostas (offset) indicam memória do geral (update em modo
+            # projeto); arestas nunca cruzam escopos.
+            if req.sequential and resp.stored and resp.memory_id is not None:
+                if (
+                    prev_id is not None and prev_id != resp.memory_id
+                    and not is_general_ref(prev_id) and not is_general_ref(resp.memory_id)
+                ):
+                    await loop.run_in_executor(
+                        None, state.lt_db.upsert_edge, prev_id, resp.memory_id,
+                        EDGE_LEARNING_RATE, time.time(), EDGE_TEMPORAL,
+                    )
+                prev_id = resp.memory_id
+        stored_count = sum(1 for r in results if r.stored)
+        log.info(f"write_batch: {stored_count}/{len(results)} memórias gravadas")
+        return WriteBatchResponse(
+            results=results, stored_count=stored_count, total=len(results),
+        )
 
 
 # ── POST /write_st ─────────────────────────────────────────────────────────────
@@ -710,7 +726,7 @@ async def read_memory(req: ReadRequest):
     loop = asyncio.get_event_loop()
     effective_strategy = "none"
 
-    views = lt_views()
+    views = lt_views(req.scope)
     merged = len(views) > 1
     # Escopo ativo é sempre views[0]; state.scopes dá acesso a vs/if_index/if_db.
     scope_states = [state.scopes[v.name] for v in views]

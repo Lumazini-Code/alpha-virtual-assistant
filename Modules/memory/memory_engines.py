@@ -110,7 +110,9 @@ class EmbeddingEngine:
                 miss_texts.append(text)
 
         if miss_texts:
-            embeddings = await self._client.embed(self._prefixed(miss_texts, EMBED_QUERY_PREFIX))
+            embeddings = await self._client.embed(
+                self._prefixed(miss_texts, EMBED_QUERY_PREFIX), priority=1,
+            )
             # ── FIX (27/10): `misses` guarda índices ORIGINAIS em `texts`; o par
             # (posição → embedding) é com `miss_texts`. O código antigo fazia
             # miss_texts[idx] (índice original) → IndexError quando um HIT de

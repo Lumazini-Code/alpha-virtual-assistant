@@ -92,6 +92,7 @@ class EmbeddingClient:
         self,
         texts: list[str],
         prefix: Optional[str] = None,
+        priority: int = 0,
     ) -> np.ndarray:
         """
         Generate L2-normalized embeddings for a batch of texts.
@@ -109,6 +110,10 @@ class EmbeddingClient:
         payload = {"texts": texts}
         if prefix:
             payload["prefix"] = prefix
+        if priority:
+            # >0 = pool dedicado de recall interativo (não compete com
+            # indexação/extração em background).
+            payload["priority"] = int(priority)
 
         resp = await self._client.post("/v1/embed", json=payload)
         resp.raise_for_status()
@@ -124,8 +129,12 @@ class EmbeddingClient:
         return result[0]
 
     async def embed_query(self, text: str) -> np.ndarray:
-        """Embed a query with the 'query' prefix (e5 convention)."""
-        result = await self.embed([text], prefix="query")
+        """Embed a query with the 'query' prefix (e5 convention).
+
+        Prioridade alta: o recall interativo de um chat ativo não deve ficar
+        atrás de embeddings de indexação/extração em background.
+        """
+        result = await self.embed([text], prefix="query", priority=1)
         return result[0]
 
     async def embed_passages(self, texts: list[str]) -> np.ndarray:
@@ -187,12 +196,12 @@ class RerankerClient:
 
     # ── Core methods ─────────────────────────────────────────────────────────
 
-    async def score(self, query: str, passages: list[str]) -> np.ndarray:
+    async def score(self, query: str, passages: list[str], priority: int = 1) -> np.ndarray:
         """
         Raw cross-encoder scores for (query, passage) pairs.
 
-        Returns:
-            np.ndarray of shape (len(passages),), float32, sigmoid-normalized [0, 1].
+        Prioridade alta por padrão: o rerank está no caminho crítico do recall
+        do turno (o auto-link em background é fire-and-forget e pode esperar).
         """
         if not passages:
             return np.array([], dtype=np.float32)
@@ -200,6 +209,7 @@ class RerankerClient:
         resp = await self._client.post("/v1/score", json={
             "query": query,
             "passages": passages,
+            "priority": int(priority),
         })
         resp.raise_for_status()
         data = resp.json()

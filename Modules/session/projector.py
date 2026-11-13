@@ -115,7 +115,7 @@ class Projector:
                 "  person_id = COALESCE(excluded.person_id, session.person_id), "
                 "  agent = COALESCE(excluded.agent, session.agent), "
                 "  model = COALESCE(excluded.model, session.model), "
-                "  title = COALESCE(excluded.title, session.title), "
+                "  title = COALESCE(session.title, excluded.title), "
                 "  time_updated = excluded.time_updated",
                 (
                     session_id,

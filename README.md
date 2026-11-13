@@ -137,6 +137,9 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 
 ### WebUI (Manager/ava-web)
 - Janela nativa com WebView (`ava-web`) carregando o WebUI servido pelo tray em `:9001`: chat com streaming SSE, grafo hebbiano embutido, projetos e configurações (servidores MCP, vozes, planos, Docker).
+- **Vários chats ao mesmo tempo**: cada chat é uma sessão raiz (projeto fixo, histórico, uso e subagentes próprios). A lista **Chats** fica abaixo de Projetos; chats que continuam respondendo em background mostram o ponto âmbar e o contador de subagentes. `Ctrl+T` abre um chat novo, `Ctrl+I` abre/fecha os detalhes.
+- **Faixa de sessão na tela do chat**: projeto, sessão, tokens de entrada/saída, cache hit, custo e subagentes ativos. O botão *Detalhes* (ou `Ctrl+I`) abre o drawer com a sessão completa, os subagentes (clicáveis para abrir o chat filho) e ações (`compactar contexto`, `fechar conversa`).
+- **Timeline do turno**: pensamento e execuções de tools intercalados; cada resposta mostra tokens de entrada/saída, cache hit, custo e latência.
 - **Seletor de pasta de trabalho dos MCPs**: o botão `📁`/chip de pasta abre o **diálogo nativo do sistema** (GTK na thread principal no Linux; `rfd` nativo no Windows/macOS). A escolha é enviada no `cwd` de cada `/execute`.
 - O CWD é **por projeto ativo** e persistido entre sessões em `cache/webui_cwd.json`. Ao trocar de projeto, a pasta salva daquele projeto é restaurada; sem pasta configurada, usa a base do usuário (`~`/`C:\Users\%USERNAME%`).
 - A seleção nativa existe apenas dentro do `ava-web`; não há fallback de navegador de pastas em HTML.
@@ -181,6 +184,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   ├── instructions/        # AGENTS.md: descoberta, baseline e deltas versionados
 │   ├── codemode/            # Tool execute: JS sandbox + catálogo de tools MCP
 │   ├── skills/              # Catálogo de SKILL.md + carregamento sob demanda
+│   ├── observability/       # Métricas em memória + render Prometheus
 │   ├── tools/               # Registry unificado de tools (validação/permissões/hooks)
 │   ├── transcribe/          # Pipeline de voz em C++ (integrado!) — NO HOST
 │   │   ├── main.cpp         #   VAD + wake word + ASR streaming + CAM++ (:9100)
@@ -284,7 +288,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_TTS_ENABLED` | `start.sh` | `0` | Liga o serviço de TTS (Supertonic, ~470 MB/worker na RAM). Desligado = fala não sintetiza |
 | `AVA_VOICE` | tray | `0` | Liga o pipeline de voz no host (wake word + ASR, ~600 MB). Desligado = transcript não sobe no auto-init; `POST /transcript/start` sobe à mão |
 | `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) mesclado no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
-| `AVA_SESSION_STORE` | orchestrator | `1` | Session store durável em dual-write. `0` desliga; a leitura ainda é do ST antigo |
+| `AVA_SESSION_STORE` | LLM.py (CHAT) | `1` | Fallback do modo CHAT; o orchestrator usa o session store sempre |
 | `AVA_SESSION_DB_PATH` | orchestrator | `Modules/session/db/ava_sessions.db` | Caminho do SQLite de sessões/mensagens |
 | `AVA_HISTORY_MAX_CHARS` | orchestrator | `0` | Teto opcional do histórico injetado; `0` deixa a compactação controlar o tamanho |
 | `AVA_COMPACTION` | orchestrator | `1` | Liga a compactação automática (resumo + cauda verbatim) |
@@ -307,6 +311,12 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_IMAGE_BUDGET_TRIGGER_BYTES` | orchestrator | `26214400` (25 MiB) | Gatilho para remover as imagens mais antigas do request |
 | `AVA_IMAGE_BUDGET_TARGET_BYTES` | orchestrator | `15728640` (15 MiB) | Alvo após o corte de imagens |
 | `AVA_SESSION_RUNNER` | orchestrator | `1` | Recarrega histórico do store por step e trata `finish_reason=length` |
+| `AVA_SUBAGENTS` | orchestrator | `1` | Liga a tool `subagent` e jobs em background |
+| `AVA_SUBAGENT_MAX` | orchestrator | `3` | Máximo de subagentes simultâneos por sessão pai |
+| `AVA_MAX_CONCURRENT_TURNS` | orchestrator | `8` | Teto de turnos concorrentes no processo (`0` desliga o limite) |
+| `AVA_MCP_MAX_SESSIONS` | tray/mcp_manager | `16` | Teto de sessões MCP vivas (chave servidor + cwd); a mais antiga é derrubada |
+| `AVA_MCP_EXCLUSIVE_SERVERS` | tray/mcp_manager | `playwright,playwright-mcp` | Servidores cujas chamadas são serializadas (automação de browser) |
+| `ONNX_EMBED_HI_WORKERS` / `ONNX_RERANK_HI_WORKERS` | onnxManager | `1` / `1` | Workers dedicados ao recall interativo (não competem com indexação em background) |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
@@ -321,7 +331,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_TTS_OUTPUT` | TUI | `client` | Onde a fala toca: `client` (a TUI toca no host via pacat/aplay/ffplay) ou `device` (container, via PulseAudio) |
 | `ONNX_PROVIDERS` | compose | `CPUExecutionProvider` | Provedores do ONNX Runtime |
 
-**CWD dos MCPs stdio**: não é variável de ambiente — é escolhido pela WebUI (`📁`) e persistido por projeto em `cache/webui_cwd.json`. Sem seleção, o padrão é a pasta base do usuário (`HOME`/`USERPROFILE`). A troca de pasta respawna o servidor stdio na próxima chamada; servidores `http` não são afetados. O tray expõe `GET/PUT/DELETE /fs/cwd` (loopback-only) para ler/gravar esse estado.
+**CWD dos MCPs stdio**: não é variável de ambiente — é escolhido pela WebUI (`📁`) e persistido por projeto em `cache/webui_cwd.json`. Sem seleção, o padrão é a pasta base do usuário (`HOME`/`USERPROFILE`). O mcp_manager mantém uma sessão por par **(servidor, cwd)**: chats em pastas diferentes coexistem sem derrubar um ao outro, limitados por `AVA_MCP_MAX_SESSIONS` (LRU). Servidores `http` compartilham uma sessão por nome. O tray expõe `GET/PUT/DELETE /fs/cwd` (loopback-only) para ler/gravar esse estado.
 
 ### Providers de inferência (OpenAI-compatible)
 

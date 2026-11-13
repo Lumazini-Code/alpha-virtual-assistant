@@ -32,6 +32,7 @@ Lock _plans_write_lock vive aqui — mesmo padrão dos demais módulos de handle
 import asyncio
 import json
 import time
+from typing import Optional
 
 from memory_config import (
     EDGE_CO_ACTIVATION,
@@ -57,7 +58,7 @@ from memory_models import (
     PlanUpdateRequest,
     PlanUpdateResponse,
 )
-from memory_state import state
+from memory_state import state, scoped_scope
 
 _plans_write_lock = asyncio.Lock()
 
@@ -161,7 +162,7 @@ def _plan_out_id(db, real_id: int) -> int:
 
 
 async def plan_create(req: PlanCreateRequest) -> PlanCreateResponse:
-    async with _plans_write_lock:
+    async with scoped_scope(req.scope), _plans_write_lock:
         existing = state.plans_db.get_by_name(req.name)
         if existing is not None:
             raise MemoryToolError(
@@ -188,19 +189,25 @@ async def plan_create(req: PlanCreateRequest) -> PlanCreateResponse:
 
 
 async def plan_read(req: PlanReadRequest) -> PlanReadResponse:
-    plans_db, row = _resolve_row(req.plan_id, req.name)
-    merged = state.active_scope != GENERAL_SCOPE
-    scope_tag = GENERAL_SCOPE if (merged and plans_db is not state.plans_db) else None
-    encode = scope_tag is not None
-    return PlanReadResponse(
-        plan=_row_to_entry(row, encode=encode, scope=scope_tag)
-    )
+    async with scoped_scope(req.scope):
+        plans_db, row = _resolve_row(req.plan_id, req.name)
+        merged = state.active_scope != GENERAL_SCOPE
+        scope_tag = GENERAL_SCOPE if (merged and plans_db is not state.plans_db) else None
+        encode = scope_tag is not None
+        return PlanReadResponse(
+            plan=_row_to_entry(row, encode=encode, scope=scope_tag)
+        )
 
 
-async def plan_list() -> PlanListResponse:
-    """Leitura MESCLADA (projetos): planos do escopo ativo (ids cruas) + os
+async def plan_list(scope: Optional[str] = None) -> PlanListResponse:
+    """Leitura MESCLADA (projetos): planos do escopo pedido (ids cruas) + os
     do geral (ids compostas + scope="general"). Modo geral → comportamento
-    idêntico ao de antes."""
+    idêntico ao de antes. `scope` None usa o escopo ativo (TUI)."""
+    async with scoped_scope(scope):
+        return _plan_list_locked()
+
+
+def _plan_list_locked() -> PlanListResponse:
     merged = state.active_scope != GENERAL_SCOPE
     entries = []
     # list_plans não traz steps/corrections (leve); completa com get_by_id
@@ -219,7 +226,7 @@ async def plan_list() -> PlanListResponse:
 
 
 async def plan_update(req: PlanUpdateRequest) -> PlanUpdateResponse:
-    async with _plans_write_lock:
+    async with scoped_scope(req.scope), _plans_write_lock:
         plans_db, row = _resolve_row(req.plan_id, req.name)
         plan_id = row["id"]
         # renomeio: checa duplicidade ANTES de gravar (name_key é UNIQUE);
@@ -267,7 +274,7 @@ async def plan_update(req: PlanUpdateRequest) -> PlanUpdateResponse:
 
 
 async def plan_delete(req: PlanDeleteRequest) -> PlanDeleteResponse:
-    async with _plans_write_lock:
+    async with scoped_scope(req.scope), _plans_write_lock:
         plans_db, row = _resolve_row(req.plan_id, req.name)
         plan_id = row["id"]
         plans_db.delete_plan(plan_id)

@@ -55,11 +55,28 @@ class SessionStore:
         row = self.db.fetchone("SELECT * FROM session WHERE id = ?", (session_id,))
         return dict(row) if row is not None else None
 
-    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.db.fetchall(
-            "SELECT * FROM session ORDER BY time_updated DESC LIMIT ?",
-            (limit,),
-        )
+    def list_sessions(
+        self,
+        limit: int = 50,
+        *,
+        root_only: bool = False,
+        project: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Sessões mais recentes primeiro.
+
+        `root_only` esconde sessões filhas (subagentes) — é o que a lista de
+        chats do WebUI mostra. `project` filtra pelo escopo de memória.
+        """
+        sql = "SELECT * FROM session WHERE 1=1"
+        params: list[Any] = []
+        if root_only:
+            sql += " AND parent_id IS NULL"
+        if project:
+            sql += " AND project_id = ?"
+            params.append(project)
+        sql += " ORDER BY time_updated DESC LIMIT ?"
+        params.append(limit)
+        rows = self.db.fetchall(sql, tuple(params))
         return [dict(row) for row in rows]
 
     # ── mensagens ─────────────────────────────────────────────────────────
@@ -245,6 +262,24 @@ class SessionStore:
             "  COALESCE(SUM(cost), 0) AS cost "
             "FROM session_usage WHERE session_id = ?",
             (session_id,),
+        )
+        return dict(row) if row is not None else {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "cost": 0,
+        }
+
+    def usage_total(self) -> dict[str, Any]:
+        row = self.db.fetchone(
+            "SELECT "
+            "  COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "  COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+            "  COALESCE(SUM(cache_read), 0) AS cache_read, "
+            "  COALESCE(SUM(cache_write), 0) AS cache_write, "
+            "  COALESCE(SUM(cost), 0) AS cost "
+            "FROM session_usage",
         )
         return dict(row) if row is not None else {
             "input_tokens": 0,

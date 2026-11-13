@@ -105,6 +105,12 @@ SERVER_PORT        = 2002
 # glibc; 2 já dão paralelismo suficiente para query + indexação.
 EMBED_POOL_WORKERS  = max(1, int(os.getenv("ONNX_EMBED_POOL_WORKERS", "2")))
 RERANK_POOL_WORKERS = max(1, int(os.getenv("ONNX_RERANK_POOL_WORKERS", "1")))
+# Pool dedicado de ALTA PRIORIDADE (recall interativo de um chat ativo). Um
+# worker reservado garante que indexação/extração em background não atrasem a
+# resposta do turno que o usuário está esperando. `priority>0` no request
+# roteia para estes pools.
+EMBED_HI_WORKERS  = max(1, int(os.getenv("ONNX_EMBED_HI_WORKERS", "1")))
+RERANK_HI_WORKERS = max(1, int(os.getenv("ONNX_RERANK_HI_WORKERS", "1")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [ONNX Manager] %(message)s")
 log = logging.getLogger("ava.onnx_serving")
@@ -118,6 +124,9 @@ class EmbedRequest(BaseModel):
         None,
         description="Optional prefix for each text: 'query' or 'passage' (e5 convention)."
     )
+    # 0 = pool normal (indexação/background); >0 = pool dedicado de recall
+    # interativo, para não ficar atrás de trabalho em background.
+    priority: int = Field(0, ge=0, le=1)
 
 class EmbedResponse(BaseModel):
     embeddings: list[list[float]]
@@ -128,6 +137,7 @@ class EmbedResponse(BaseModel):
 class RerankRequest(BaseModel):
     query: str
     passages: list[str] = Field(..., min_length=1, max_length=256)
+    priority: int = Field(0, ge=0, le=1)
 
 class RerankResult(BaseModel):
     index: int
@@ -483,6 +493,8 @@ class AppState:
     rerank_model:   Optional[RerankerModel]  = field(default=None)
     embed_pool:     concurrent.futures.ThreadPoolExecutor = field(default=None)
     rerank_pool:    concurrent.futures.ThreadPoolExecutor = field(default=None)
+    embed_hi_pool:  concurrent.futures.ThreadPoolExecutor = field(default=None)
+    rerank_hi_pool: concurrent.futures.ThreadPoolExecutor = field(default=None)
     start_time:     float = field(default=0.0)
     # Metrics
     embed_calls:    int = field(default=0)
@@ -584,6 +596,14 @@ async def lifespan(app: FastAPI):
     state.rerank_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=RERANK_POOL_WORKERS, thread_name_prefix="rerank"
     )
+    # Pools dedicados ao recall interativo (priority>0) — não competem com
+    # indexação/extração em background.
+    state.embed_hi_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=EMBED_HI_WORKERS, thread_name_prefix="embed-hi"
+    )
+    state.rerank_hi_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=RERANK_HI_WORKERS, thread_name_prefix="rerank-hi"
+    )
 
     # Warm up models — first inference is always slower (kernel compilation, etc.)
     log.info("Warming up embedding model...")
@@ -603,6 +623,9 @@ async def lifespan(app: FastAPI):
 
     state.embed_pool.shutdown(wait=False)
     state.rerank_pool.shutdown(wait=False)
+    for pool in (state.embed_hi_pool, state.rerank_hi_pool):
+        if pool is not None:
+            pool.shutdown(wait=False)
     log.info("AVA ONNX Serving shut down")
 
 
@@ -704,7 +727,7 @@ async def embed(req: EmbedRequest):
     loop = asyncio.get_event_loop()
 
     embeddings = await loop.run_in_executor(
-        state.embed_pool,
+        state.embed_hi_pool if req.priority > 0 else state.embed_pool,
         state.embed_model.embed,
         req.texts,
         req.prefix,
@@ -737,7 +760,7 @@ async def rerank(req: RerankRequest):
 
     model = _ensure_rerank_model()  # lazy-load na 1ª chamada (503 se indisponível)
     scored = await loop.run_in_executor(
-        state.rerank_pool,
+        state.rerank_hi_pool if req.priority > 0 else state.rerank_pool,
         model.rerank,
         req.query,
         req.passages,
@@ -763,6 +786,7 @@ async def rerank(req: RerankRequest):
 class ScoreRequest(BaseModel):
     query: str
     passages: list[str] = Field(..., min_length=1, max_length=256)
+    priority: int = Field(0, ge=0, le=1)
 
 class ScoreResponse(BaseModel):
     scores: list[float]
@@ -781,7 +805,7 @@ async def score(req: ScoreRequest):
 
     model = _ensure_rerank_model()  # lazy-load na 1ª chamada (503 se indisponível)
     scores = await loop.run_in_executor(
-        state.rerank_pool,
+        state.rerank_hi_pool if req.priority > 0 else state.rerank_pool,
         model.score,
         req.query,
         req.passages,

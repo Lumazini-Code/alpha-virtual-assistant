@@ -103,6 +103,13 @@ struct Config {
     /// CWD padrão dos servidores MCP stdio quando a chamada não traz um.
     /// É a pasta base do usuário (HOME/USERPROFILE), não a raiz do projeto.
     default_cwd: PathBuf,
+    /// Teto de sessões MCP vivas (chave servidor+cwd). Cada sessão stdio é um
+    /// subprocesso; o teto evita N×M processos com vários chats abertos.
+    max_sessions: usize,
+    /// Servidores cujas chamadas NÃO podem ser concorrentes (automação de
+    /// browser: dois turnos no mesmo browser se atropelam). Serializamos as
+    /// chamadas por nome de servidor.
+    exclusive_servers: Vec<String>,
 }
 
 /// Pasta base do usuário para o host atual (Linux/macOS: HOME,
@@ -321,6 +328,13 @@ impl Config {
             // Sem CWD explícito na chamada, os MCPs stdio rodam na pasta base
             // do usuário (pedido do WebUI). Servidores http ignoram.
             default_cwd: user_home_dir(project_root),
+            max_sessions: env_parse("AVA_MCP_MAX_SESSIONS", 16usize).max(1),
+            exclusive_servers: std::env::var("AVA_MCP_EXCLUSIVE_SERVERS")
+                .unwrap_or_else(|_| "playwright,playwright-mcp".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 }
@@ -620,24 +634,29 @@ struct KeeperHandle {
 
 #[derive(Default)]
 struct Runtime {
-    // Sessões MCP vivas por servidor. Spawn LAZY (só conecta na primeira
-    // chamada/sync/test). O dono real do subprocesso é o keeper task.
+    // Sessões MCP vivas, com chave COMPOSTA `skey(name, cwd)`. Spawn LAZY (só
+    // conecta na primeira chamada/sync/test). O dono real do subprocesso é o
+    // keeper task.
+    //
+    // O processo stdio roda com um cwd fixo e não muda de diretório, então
+    // cada (servidor, pasta) tem a sua própria sessão. Dois chats em pastas
+    // diferentes (ou projetos diferentes no WebUI) não derrubam a sessão um
+    // do outro; servidores http compartilham uma sessão por nome.
     sessions: IndexMap<String, Peer<RoleClient>>,
-    // CWD com que cada sessão stdio foi spawnada. Se uma chamada pedir outro
-    // CWD, a sessão é derrubada e respawnada (o CWD do processo é imutável).
-    session_cwd: HashMap<String, PathBuf>,
-    // Uma lock por servidor pra evitar spawn duplicado em chamadas concorrentes.
+    // Uma lock por chave pra evitar spawn duplicado em chamadas concorrentes.
     connect_locks: HashMap<String, Arc<AsyncMutex<()>>>,
-    // Geração por servidor: incrementada a cada drop_session. Um connect em voo
-    // que terminar DEPOIS de um drop compara sua geração e se descarta.
+    // Geração por chave: incrementada a cada drop. Um connect em voo que
+    // terminar DEPOIS de um drop compara sua geração e se descarta.
     gens: HashMap<String, u64>,
-    // Evento de parada do keeper task de cada servidor (drop_session → set).
+    // Evento de parada do keeper task de cada chave (drop → set).
     stop_events: HashMap<String, Event>,
-    // Keeper task vivo por servidor — aguardado no shutdown.
+    // Keeper task vivo por chave — aguardado no shutdown.
     keeper_tasks: HashMap<String, KeeperHandle>,
     // Servidores com falha recente de conexão/call: name → até quando
     // (time.time()+TTL) ficar fora da /skills/select.
     unhealthy: HashMap<String, f64>,
+    // Serializa chamadas de servidores não paralelo-safe (browser) por nome.
+    call_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     // Watchdog da memory_api (nasce quando o startup não a encontrou).
     memory_watchdog_task: Option<JoinHandle<()>>,
 }
@@ -1481,19 +1500,48 @@ fn build_stdio_command(
     wrap
 }
 
-/// Derruba a sessão/subprocesso do servidor (se vivo). Usado quando a config
-/// muda, o servidor é removido, ou uma chamada falhou (sessão provavelmente
-/// podre — a próxima respawna do zero). O bump de geração invalida connects em
-/// voo que começaram ANTES deste drop. O fechamento real do subprocesso é
-/// responsabilidade do keeper task — o evento `stop` é o sinal.
-fn drop_session(st: &AppState, name: &str) {
+/// Chave de sessão MCP: servidor + CWD normalizado. `\u{1}` não aparece em
+/// nomes de servidor (validados) nem em paths comuns — separador seguro.
+fn skey(name: &str, cwd: &FsPath) -> String {
+    format!("{}\u{1}{}", name, cwd.display())
+}
+
+/// Nome do servidor a partir da chave composta.
+fn skey_name(key: &str) -> &str {
+    key.split('\u{1}').next().unwrap_or(key)
+}
+
+/// Derruba a sessão/subprocesso de UMA chave (servidor + cwd).
+/// Usado quando a chamada falhou ou o shutdown precisa parar tudo.
+fn drop_session_key(st: &AppState, key: &str) {
     let mut rt = st.rt();
-    *rt.gens.entry(name.to_string()).or_insert(0) += 1;
-    rt.sessions.shift_remove(name);
-    rt.session_cwd.remove(name);
-    rt.connect_locks.remove(name);
-    if let Some(ev) = rt.stop_events.remove(name) {
+    *rt.gens.entry(key.to_string()).or_insert(0) += 1;
+    rt.sessions.shift_remove(key);
+    rt.connect_locks.remove(key);
+    if let Some(ev) = rt.stop_events.remove(key) {
         ev.set();
+    }
+}
+
+/// Derruba TODAS as sessões de um servidor (todos os cwds) — usado quando a
+/// config muda, o servidor é removido/desabilitado ou no shutdown.
+fn drop_session(st: &AppState, name: &str) {
+    let keys: Vec<String> = {
+        let rt = st.rt();
+        let mut keys: Vec<String> = rt
+            .sessions
+            .keys()
+            .chain(rt.keeper_tasks.keys())
+            .chain(rt.stop_events.keys())
+            .filter(|k| skey_name(k) == name)
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    for key in keys {
+        drop_session_key(st, &key);
     }
 }
 
@@ -1524,7 +1572,6 @@ impl KeeperGuard {
             return;
         }
         rt.sessions.shift_remove(&self.name);
-        rt.session_cwd.remove(&self.name);
         rt.keeper_tasks.remove(&self.name);
         rt.stop_events.remove(&self.name);
     }
@@ -1597,7 +1644,6 @@ async fn session_keeper(
         {
             let mut rt = st.rt();
             rt.sessions.insert(name.clone(), svc.peer().clone());
-            rt.session_cwd.insert(name.clone(), cwd.clone());
         }
         service = Some(svc);
         ready.set();
@@ -1663,24 +1709,10 @@ async fn get_session(
     cwd: &FsPath,
     allow_disabled: bool,
 ) -> Result<Peer<RoleClient>, ApiError> {
-    let existing = st.rt().sessions.get(name).cloned();
-    if let Some(s) = existing {
-        let same_cwd = st
-            .rt()
-            .session_cwd
-            .get(name)
-            .map(|current| current == cwd)
-            .unwrap_or(false);
-        if same_cwd {
-            return Ok(s);
-        }
-        // CWD mudou entre turnos: o processo stdio não muda de diretório.
-        // Derruba e respawna abaixo.
-        info!(
-            "MCP[{name}]: CWD mudou para {} — respawnando sessão stdio",
-            cwd.display()
-        );
-        drop_session(st, name);
+    // Chave composta (servidor + cwd): sessões de pastas diferentes coexistem.
+    let key = skey(name, cwd);
+    if let Some(s) = st.rt().sessions.get(&key).cloned() {
+        return Ok(s);
     }
     let row = st
         .db_get_server(name)?
@@ -1692,43 +1724,35 @@ async fn get_session(
     let lock = st
         .rt()
         .connect_locks
-        .entry(name.to_string())
+        .entry(key.clone())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone();
     let _held = lock.lock().await;
-    let existing = st.rt().sessions.get(name).cloned();
-    if let Some(s) = existing {
-        // Outro request venceu a corrida. Só reutiliza se o CWD bater.
-        let same_cwd = st
-            .rt()
-            .session_cwd
-            .get(name)
-            .map(|current| current == cwd)
-            .unwrap_or(false);
-        if same_cwd {
-            return Ok(s);
-        }
-        drop_session(st, name);
+    if let Some(s) = st.rt().sessions.get(&key).cloned() {
+        // Outro request venceu a corrida para esta chave.
+        return Ok(s);
     }
-    // Geração DEPOIS de qualquer eviction acima: é ela que o keeper guarda
-    // para não remover uma sessão nova num respawn por mudança de CWD.
-    let generation = st.rt().gens.get(name).copied().unwrap_or(0);
+    // Teto de sessões vivas: sem ele, N projetos × M servidores stdio viram
+    // N×M subprocessos. Derruba a chave mais antiga (LRU aproximada pela
+    // ordem de inserção do IndexMap) que NÃO seja a que vamos abrir.
+    enforce_session_cap(st, &key);
+    let generation = st.rt().gens.get(&key).copied().unwrap_or(0);
     let t0 = Instant::now();
     let (ready, stop, done) = (Event::new(), Event::new(), Event::new());
     let err: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let guard = KeeperGuard {
         st: st.clone(),
-        name: name.to_string(),
+        name: key.clone(),
         generation,
         done: done.clone(),
         popped: false,
     };
     let abort = {
         let mut rt = st.rt();
-        rt.stop_events.insert(name.to_string(), stop.clone());
+        rt.stop_events.insert(key.clone(), stop.clone());
         let handle = tokio::spawn(session_keeper(
             st.clone(),
-            name.to_string(),
+            key.clone(),
             row,
             cwd.to_path_buf(),
             ready.clone(),
@@ -1738,7 +1762,7 @@ async fn get_session(
         ));
         let abort = handle.abort_handle();
         rt.keeper_tasks.insert(
-            name.to_string(),
+            key.clone(),
             KeeperHandle { abort: abort.clone(), done: done.clone() },
         );
         abort
@@ -1773,18 +1797,40 @@ async fn get_session(
     }
     // Corrida re-register/delete × connect: a config mudou enquanto
     // conectávamos — a sessão recém-nascida já está obsoleta; descarta.
-    let current_gen = st.rt().gens.get(name).copied().unwrap_or(0);
+    let current_gen = st.rt().gens.get(&key).copied().unwrap_or(0);
     if current_gen != generation {
-        drop_session(st, name);
+        drop_session_key(st, &key);
         return Err(http_err(
             409,
             format!("Config do servidor '{name}' mudou durante a conexão — repita a chamada"),
         ));
     }
     clear_unhealthy(st, name);
-    info!("MCP[{name}]: conectado em {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
-    let session = st.rt().sessions.get(name).cloned();
+    info!("MCP[{name}]: conectado em {:.0}ms (cwd={})", t0.elapsed().as_secs_f64() * 1000.0, cwd.display());
+    let session = st.rt().sessions.get(&key).cloned();
     session.ok_or_else(|| ApiError::Internal(format!("KeyError: '{name}'")))
+}
+
+/// Teto de sessões MCP vivas (`AVA_MCP_MAX_SESSIONS`, default 16). Ao abrir
+/// uma nova chave, derruba a mais antiga que não seja a atual — evita N×M
+/// subprocessos quando vários chats usam pastas diferentes.
+fn enforce_session_cap(st: &AppState, keep: &str) {
+    let cap = st.cfg.max_sessions.max(1);
+    let victim = {
+        let rt = st.rt();
+        if rt.sessions.len() < cap {
+            None
+        } else {
+            rt.sessions
+                .keys()
+                .find(|k| k.as_str() != keep)
+                .cloned()
+        }
+    };
+    if let Some(victim) = victim {
+        info!("MCP: teto de {cap} sessões atingido — derrubando '{victim}'");
+        drop_session_key(st, &victim);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1842,7 +1888,13 @@ async fn memory_watchdog(st: Arc<AppState>, poll_s: f64) {
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult {
     let n = st.db_count_servers()?;
-    let connected: Vec<String> = st.rt().sessions.keys().cloned().collect();
+    let connected: Vec<String> = {
+        let rt = st.rt();
+        let mut names: Vec<String> = rt.sessions.keys().map(|k| skey_name(k).to_string()).collect();
+        names.sort();
+        names.dedup();
+        names
+    };
     Ok(Json(json!({ "status": "ok", "servers": n, "connected": connected })))
 }
 
@@ -2022,7 +2074,7 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
     let result = match list_tools_with_timeout(&session).await {
         Ok(r) => r,
         Err((label, msg)) => {
-            drop_session(st, name);
+            drop_session_key(st, &skey(name, &default_cwd));
             mark_unhealthy(st, name, &format!("list_tools falhou: {label}"));
             return Err(http_err(
                 502,
@@ -2158,7 +2210,7 @@ async fn test_server(State(st): State<Arc<AppState>>, Path(name): Path<String>) 
     let result = match list_tools_with_timeout(&session).await {
         Ok(r) => r,
         Err((label, msg)) => {
-            drop_session(&st, &name);
+            drop_session_key(&st, &skey(&name, &default_cwd));
             return Err(http_err(
                 502,
                 format!("Servidor '{name}' conectou mas list_tools falhou: {label}: {msg}"),
@@ -2528,7 +2580,25 @@ async fn server_call(
     } else {
         st.cfg.default_cwd.clone()
     };
+    // Servidores não paralelo-safe: duas chamadas simultâneas (dois chats)
+    // disputariam o mesmo browser. Serializa por nome de servidor.
+    let exclusive_lock = if st.cfg.exclusive_servers.iter().any(|s| s == &name) {
+        Some(
+            st.rt()
+                .call_locks
+                .entry(name.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let _exclusive_guard = match exclusive_lock {
+        Some(lock) => Some(lock.lock_owned().await),
+        None => None,
+    };
     let session = get_session(&st, &name, &cwd, false).await?;
+    let key = skey(&name, &cwd);
     let call = session.call_tool(CallToolRequestParam {
         name: req.tool.clone().into(),
         arguments: Some(req.arguments.clone()),
@@ -2539,14 +2609,14 @@ async fn server_call(
         Err(_) => {
             // Sem mark_unhealthy aqui: timeout de tool longa não significa servidor
             // morto — unhealthy é só pra falha de CONEXÃO (get_session).
-            drop_session(&st, &name);
+            drop_session_key(&st, &key);
             return Err(http_err(
                 502,
                 format!("call_tool '{}' falhou no servidor '{name}': TimeoutError: ", req.tool),
             ));
         }
         Ok(Err(e)) => {
-            drop_session(&st, &name);
+            drop_session_key(&st, &key);
             return Err(http_err(
                 502,
                 format!("call_tool '{}' falhou no servidor '{name}': McpError: {e}", req.tool),
@@ -2773,8 +2843,8 @@ pub async fn shutdown_all(st: &Arc<AppState>) {
         }
         set
     };
-    for name in &names {
-        drop_session(st, name);
+    for key in &names {
+        drop_session_key(st, key);
     }
     let dones: Vec<Event> = st.rt().keeper_tasks.values().map(|k| k.done.clone()).collect();
     if !dones.is_empty() {

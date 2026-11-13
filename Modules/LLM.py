@@ -944,6 +944,7 @@ async def memory_read(
     top_k_final: Optional[int] = None,
     total_max_chars: Optional[int] = None,
     min_score: float = 0.3,
+    scope: Optional[str] = None,
 ) -> list[dict]:
     """
     Busca memórias relevantes (LT semântico + ST + knowledge + arquivos
@@ -965,6 +966,10 @@ async def memory_read(
             payload["top_k_final"] = top_k_final
         if total_max_chars:
             payload["total_max_chars"] = total_max_chars
+        # Escopo explícito: a leitura não depende do /project/switch global
+        # (permite turnos concorrentes em projetos diferentes).
+        if scope:
+            payload["scope"] = scope
         resp = await _call_memory_tool("memory_read", payload)
         return resp.get("results", [])
     except Exception as e:
@@ -1118,6 +1123,7 @@ async def memory_write_fact(
     confidence: float = 0.7,
     forgettable: bool = True,
     ttl_days: Optional[float] = None,
+    scope: Optional[str] = None,
 ):
     """
     Grava UMA informação na memória de longo prazo (LT) — fire-and-forget.
@@ -1143,6 +1149,8 @@ async def memory_write_fact(
         "forgettable":  forgettable,
         "ttl_days":     ttl_days,
     }
+    if scope:
+        payload["scope"] = scope
     try:
         data = await _call_memory_tool("memory_write", payload)
     except Exception as e:
@@ -1152,7 +1160,7 @@ async def memory_write_fact(
     await _resolve_possible_update(payload, data)
 
 
-async def memory_write_facts_batch(items: list[dict]) -> list[dict]:
+async def memory_write_facts_batch(items: list[dict], scope: Optional[str] = None) -> list[dict]:
     """
     Grava VÁRIAS memórias de longo prazo (LT) em uma única chamada MCP via
     `memory_write_batch` — usada pelo extrator (`_extract_and_save_memories`)
@@ -1169,6 +1177,8 @@ async def memory_write_facts_batch(items: list[dict]) -> list[dict]:
     """
     if not items:
         return []
+    if scope:
+        items = [{**item, "scope": item.get("scope") or scope} for item in items]
     try:
         # sequential=True: fatos extraídos da MESMA dupla pergunta-resposta
         # chegam em ordem narrativa — o servidor cria a cadeia de arestas
@@ -1436,6 +1446,7 @@ async def _collect_extraction_candidates(
     assistant_response: str,
     recall_memories: Optional[list[dict]],
     session_id: Optional[str],
+    scope: Optional[str] = None,
 ) -> list[dict]:
     """
     Coleta os candidatos a memórias EXISTENTES que o extractor vai comparar.
@@ -1616,11 +1627,13 @@ def _build_extraction_user_prompt(
     return prompt, m_map
 
 
-async def _memory_write_update(payload: dict, memory_id: int):
+async def _memory_write_update(payload: dict, memory_id: int, scope: Optional[str] = None):
     """
     Reenvia uma escrita como action="update" numa memória específica —
     usado pelo extractor para UPDATE/MERGE/CONFLICT (roteamento por ID real).
     """
+    if scope and not payload.get("scope"):
+        payload = {**payload, "scope": scope}
     try:
         data = await _call_memory_tool(
             "memory_write",
@@ -1645,6 +1658,7 @@ async def _extract_and_save_memories(
     *,
     session_id: Optional[str] = None,
     recall_memories: Optional[list[dict]] = None,
+    scope: Optional[str] = None,
 ) -> list[dict]:
     """
     Roda o modelo extractor (MEMORY_EXTRACTOR_MODEL) sobre a dupla
@@ -1698,7 +1712,7 @@ async def _extract_and_save_memories(
     ]
 
     candidates = await _collect_extraction_candidates(
-        user_input, assistant_response, recall_memories, session_id,
+        user_input, assistant_response, recall_memories, session_id, scope=scope,
     )
 
     prompt_user, m_map = _build_extraction_user_prompt(
@@ -1874,13 +1888,18 @@ async def _extract_and_save_memories(
         # permanent → fato estável (preferência, identidade, decisão estrutural):
         #             não decai, confidence alta.
         # temporal  → fato que pode mudar sozinho (versão, local, projeto): decai.
-        return {
+        payload = {
             "text":        text,
             "source":      "chat:extractor",
             "confidence":  0.9 if validity == "permanent" else 0.65,
             "forgettable": validity != "permanent",
             "ttl_days":    None,
         }
+        # Escopo do turno: a memória extraída nasce no projeto do chat, não no
+        # escopo ativo do processo (que é compartilhado entre chats).
+        if scope:
+            payload["scope"] = scope
+        return payload
 
     saved: list[dict] = []
     add_payloads: list[dict] = []
@@ -1981,9 +2000,9 @@ async def _extract_and_save_memories(
     if add_payloads:
         # fire-and-forget: o /chat não espera a gravação terminar para
         # responder; os N fatos ADD viram 1 chamada MCP de batch.
-        asyncio.create_task(memory_write_facts_batch(add_payloads))
+        asyncio.create_task(memory_write_facts_batch(add_payloads, scope=scope))
     for upd_payload, upd_target in update_ops:
-        asyncio.create_task(_memory_write_update(upd_payload, upd_target))
+        asyncio.create_task(_memory_write_update(upd_payload, upd_target, scope=scope))
 
     log.info(
         f"[MEMORY-EXTRACT] {len(saved)} fato(s) processado(s) "
@@ -3151,6 +3170,8 @@ class MemoryExtractionRequest(BaseModel):
     user_input: str = Field(..., description="Pergunta original do usuário.")
     assistant_response: str = Field(..., description="Resposta final do assistente.")
     session_id: Optional[str] = Field(default=None)
+    # Escopo de memória do turno (projeto do chat). None = escopo ativo.
+    scope: Optional[str] = Field(default=None)
 
 
 @app.post("/memories/extract")
@@ -3167,6 +3188,7 @@ async def memories_extract(req: MemoryExtractionRequest):
         req.user_input,
         req.assistant_response,
         session_id=req.session_id,
+        scope=req.scope,
     )
     return {
         "extractor_model": MEMORY_EXTRACTOR_MODEL,

@@ -14,6 +14,7 @@ from .compaction import CompactionManager, Settings as CompactionSettings, estim
 from .events import Event
 from .history import History, SessionHistory, message_text, sanitize_for_model
 from .ids import new_message_id, new_part_id, new_session_id, now
+from .jobs import JobStore, new_job_id
 from .projector import Projector
 from .runner import (
     CONTINUE_AFTER_OUTPUT_LIMIT,
@@ -37,6 +38,7 @@ __all__ = [
     "CompactionSettings",
     "Event",
     "History",
+    "JobStore",
     "Outcome",
     "OutcomeKind",
     "OutputLimitTracker",
@@ -54,6 +56,7 @@ __all__ = [
     "new_message_id",
     "new_part_id",
     "new_session_id",
+    "new_job_id",
     "now",
     "output_limit",
     "retry",

@@ -45,6 +45,7 @@ from __future__ import annotations
 import os
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -379,8 +380,8 @@ async def plans_read(req: mem.PlanReadRequest):
 
 
 @app.post("/plans/list", response_model=mem.PlanListResponse)
-async def plans_list():
-    return await mem.plan_list()
+async def plans_list(scope: Optional[str] = None):
+    return await mem.plan_list(scope)
 
 
 @app.patch("/plans/update", response_model=mem.PlanUpdateResponse)
@@ -404,6 +405,14 @@ async def project_current():
 @app.post("/project/switch", response_model=mem.ScopeInfoResponse)
 async def project_switch(req: mem.ScopeSwitchRequest):
     return await mem.project_switch(req)
+
+
+@app.post("/project/ensure", response_model=mem.ScopeInfoResponse)
+async def project_ensure(req: mem.ScopeSwitchRequest):
+    # Abre o escopo no cache SEM trocar o escopo ativo do processo. Usado
+    # pelos turnos com `project` explícito: as leituras/escritas levam o
+    # escopo por request e só precisam que ele esteja aberto.
+    return await mem.project_ensure(req)
 
 
 @app.delete("/project/{slug}", response_model=mem.ScopeDeleteResponse)

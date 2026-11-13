@@ -123,6 +123,22 @@ class SessionDatabase:
                     hash          TEXT PRIMARY KEY,
                     value         TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS session_job (
+                    id            TEXT PRIMARY KEY,
+                    parent_id     TEXT NOT NULL,
+                    child_id      TEXT,
+                    kind          TEXT NOT NULL,
+                    status        TEXT NOT NULL,
+                    description   TEXT,
+                    error         TEXT,
+                    time_created  REAL NOT NULL,
+                    time_updated  REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_parent
+                    ON session_job(parent_id, time_created);
+                CREATE INDEX IF NOT EXISTS idx_job_status
+                    ON session_job(status);
                 """
             )
 

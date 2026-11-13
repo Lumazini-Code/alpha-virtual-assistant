@@ -67,6 +67,7 @@ header{display:flex;align-items:center;gap:8px;padding:10px 16px;min-height:52px
 .sh{padding:8px 12px;color:var(--am);font-weight:500;border-bottom:1px solid var(--ln)}
 .sr{display:flex;gap:9px;padding:6px 12px;align-items:baseline}.sr+.sr{border-top:1px dashed var(--ln)}
 .sr .ic{width:14px;text-align:center;flex:none}.sr small{display:block;color:var(--mu);font:12px 'JetBrains Mono',monospace;word-break:break-all}
+.sr small.res{color:var(--ink);opacity:.7;margin-top:2px}
 .sr.running .ic{color:var(--am);animation:p 1s infinite}.sr.done .ic{color:var(--gr)}.sr.error .ic,.err{color:var(--rd)}.sr.pending .ic{color:var(--mu)}
 @keyframes p{50%{opacity:.3}}
 .err{font-size:14px;margin-top:6px}
@@ -98,6 +99,15 @@ textarea{width:100%;border:0;outline:0;background:none;resize:none;max-height:22
 .mbar i{display:block;height:100%;width:0;background:var(--gr);border-radius:99px;transition:width .35s,background .35s}
 .metric.wa .mbar i{background:var(--am)}
 .metric.er .mbar i{background:var(--rd)}
+.jobs{display:flex;flex-direction:column;gap:4px;padding:2px 10px 8px;max-height:160px;overflow:auto}
+.jobcount{color:var(--ac);font-weight:500;margin-left:6px}
+.jobitem{border:1px solid var(--ln);border-radius:8px;padding:5px 8px;background:var(--bg);font-size:12px;color:var(--mu)}
+.jobitem b{font-weight:500;color:var(--ink);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.jobitem .jm{font:11px 'JetBrains Mono',monospace;color:var(--mu);margin-top:2px}
+.stats{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 0;color:var(--mu);font-size:11.5px;font-family:Geist,sans-serif}
+.stats span{white-space:nowrap}.stats b{font-weight:500;color:var(--ink)}
+.timeline{display:flex;flex-direction:column;gap:6px;margin:0 0 10px}
+.timeline .think{margin:0}.timeline .steps{margin:0}
 a.nb{text-decoration:none;color:var(--ink)}
 /* listas de planos/servidores/pessoas dentro das configurações */
 .list{display:flex;flex-direction:column;gap:6px;margin:2px 0 6px}
@@ -249,6 +259,45 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   #panel .nbr .t { font-size:10px; padding:1px 6px; border-radius:4px; white-space:nowrap; }
   .pill { display:inline-block; padding:1px 8px; border-radius:8px; font-size:10.5px; }
 
+/* ══ multi-chat: lista de chats, faixa de sessão e drawer ══ */
+  #pjs{flex:0 1 auto;max-height:34%;overflow:auto;display:flex;flex-direction:column;gap:2px}
+  #chats{flex:1 1 auto;overflow:auto;display:flex;flex-direction:column;gap:2px;min-height:64px}
+  .pj .cbadge{font-size:10.5px;color:var(--mu);border:1px solid var(--ln);border-radius:99px;
+    padding:0 6px;flex:none;max-width:86px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pj .dot.run{background:var(--am);animation:p 1s infinite}
+  .pj .dot.err{background:var(--rd)}
+  .pj .dot.on{background:var(--ac)}
+  .pj .cnt{font-size:10.5px;color:var(--ac);flex:none}
+  .pj.unread .nm{font-weight:600}
+  #sbar{display:flex;align-items:center;gap:8px;padding:0 16px 8px;font-size:12px;color:var(--mu);
+    min-height:26px;flex:none}
+  #sbar .sid{font:11.5px 'JetBrains Mono',monospace;color:var(--mu);min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #sbar b{font-weight:500;color:var(--ink)}
+  #sbar button{font-size:12px;color:var(--mu);padding:2px 8px;border-radius:8px;border:1px solid transparent}
+  #sbar button:hover{background:var(--ln);color:var(--ink)}
+  #sbar .live{display:inline-flex;align-items:center;gap:5px}
+  #sbar .live i{width:7px;height:7px;border-radius:50%;background:var(--gr)}
+  #sbar .live.run i{background:var(--am);animation:p 1s infinite}
+  #sbar .live.err i{background:var(--rd)}
+  body.graph #sbar{display:none}
+  #drawer{position:absolute;top:0;right:-390px;width:368px;height:100%;background:var(--sf);
+    border-left:1px solid var(--ln);box-shadow:var(--sh);z-index:20;transition:right .22s;
+    overflow:auto;padding:14px 18px 24px;font-size:13px}
+  #drawer.open{right:0}
+  #drawer h4{margin:16px 0 6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)}
+  #drawer .kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed var(--ln)}
+  #drawer .kv span{color:var(--mu)}
+  #drawer .kv b{font-weight:500}
+  #drawer .sub{display:flex;flex-direction:column;gap:4px}
+  #drawer .subitem{border:1px solid var(--ln);border-radius:8px;padding:6px 8px;background:var(--bg);cursor:pointer}
+  #drawer .subitem:hover{border-color:var(--ac)}
+  #drawer .subitem b{display:block;font-weight:500;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #drawer .subitem small{color:var(--mu);font:11px 'JetBrains Mono',monospace}
+  #drawer .empty{color:var(--mu);font-size:12.5px}
+  #drawer .drhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  @media(max-width:760px){#drawer{width:100%;right:-100%}}
+
 </style>
 </head>
 <body>
@@ -259,6 +308,8 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   <input id="np" type="text" placeholder="Nome do projeto, Enter cria" aria-label="Nome do projeto">
   <div id="pjs"></div>
   <div class="hint">Cada projeto tem sua própria memória; ativar mescla com a memória geral.</div>
+  <div class="lbl">Chats <span id="chatcount" class="jobcount"></span><button id="addc" title="Novo chat (Ctrl+T)">+</button></div>
+  <div id="chats" role="list"></div>
   <div class="foot">
     <div class="metrics" id="metrics" aria-label="Recursos do sistema">
       <div class="metric" id="m-cpu"><span>CPU</span><div class="mbar"><i id="bcpu"></i></div><b id="tcpu">–</b></div>
@@ -278,6 +329,17 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Grafo</button></div>
     <button class="ib" id="thm" title="Tema" aria-label="Alternar tema">◐</button>
   </header>
+  <div id="sbar">
+    <span class="live" id="sbLive"><i></i><span id="sbState">ocioso</span></span>
+    <span id="sbProj">Geral</span>
+    <span class="sid" id="sbSid">nova sessão</span>
+    <span class="sp"></span>
+    <button id="sbBtn" title="Detalhes da sessão e subagentes (Ctrl+I)">Detalhes</button>
+  </div>
+  <div id="drawer" aria-hidden="true">
+    <div class="drhead"><b>Sessão</b><button class="ib" id="drClose" aria-label="Fechar detalhes">✕</button></div>
+    <div id="drawerBody"></div>
+  </div>
   <div id="chat"><div class="col">
     <div id="hero"><h1>Como posso ajudar?</h1><p>Any model. Every tool. Zero limits.</p>
       <div class="hint2"><kbd>Ctrl</kbd>+<kbd>E</kbd> pensamento · <kbd>Ctrl</kbd>+<kbd>D</kbd> logs · <kbd>Ctrl</kbd>+<kbd>P</kbd> projetos · <kbd>Ctrl</kbd>+<kbd>S</kbd> ajustes</div></div>
@@ -419,7 +481,84 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 
 <script>
 const $=s=>document.querySelector(s);
-const S={ms:[],busy:false,view:'chat',sid:null,att:null,ctl:null,full:false,act:'general',cwd:null,pjs:[],plans:[],mcps:[],voices:[]};
+/* ══ multi-chat: cada chat é uma sessão raiz com projeto, histórico, uso e
+   subagentes próprios. `S.chats` mantém TODOS os chats (os que streamam em
+   background inclusive); `S.active` é o que a tela mostra. ══ */
+const S={chats:[],active:null,view:'chat',att:null,full:false,act:'general',pjs:[],plans:[],mcps:[],voices:[]};
+const CHAT_KEY='ava-chats';
+let _chatSig='';
+const MAX_STREAMING=4;
+const chat=()=>S.chats.find(c=>c.id===S.active)||null;
+const newSid=()=>'ses_'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+function newChat(project){
+  const c={id:'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
+    sid:newSid(),title:'',project:project||S.act||'general',cwd:null,
+    ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:true,streaming:false,err:false};
+  S.chats.unshift(c);S.active=c.id;saveChats();return c;
+}
+function saveChats(){
+  try{
+    localStorage.setItem(CHAT_KEY,JSON.stringify({
+      active:S.active,
+      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project})),
+    }));
+  }catch{}
+}
+function restoreChats(){
+  let saved=null;try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'null')}catch{}
+  if(!saved||!Array.isArray(saved.chats)||!saved.chats.length)return false;
+  S.chats=saved.chats.map(c=>({id:c.id,sid:c.sid,title:c.title||'',project:c.project||'general',
+    cwd:null,ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false}));
+  S.active=saved.active&&S.chats.some(c=>c.id===saved.active)?saved.active:S.chats[0].id;
+  return true;
+}
+function chatTitle(c){
+  if(c.title)return c.title;
+  const u=(c.ms||[]).find(m=>m.role==='u');
+  return u?String(u.text||'').slice(0,80):'Nova conversa';
+}
+async function hydrate(c){
+  if(!c||c.hydrated||!c.sid)return;
+  c.hydrated=true;
+  try{
+    const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/messages?limit=300');
+    c.ms=(d.messages||[]).map(msgToUi).filter(Boolean);
+    const s=d.session||{};
+    if(s.title&&!c.title)c.title=s.title;
+    if(s.project_id)c.project=s.project_id;
+  }catch(e){c.err=true}
+  if(c.id===S.active){draw(true);ui()}
+  renderChats();
+}
+/** Converte uma mensagem do session store no formato de bolha da UI. */
+function msgToUi(m){
+  if(!m||typeof m!=='object')return null;
+  const content=m.content;
+  const flat=v=>typeof v==='string'?v:Array.isArray(v)
+    ? v.map(p=>p&&p.type==='text'?(p.text||''):(p&&p.type==='image_url'?'[imagem]':'')).join('\n')
+    : '';
+  if(m.type==='compaction')return {role:'a',text:flat(content),compacted:true};
+  // Notificações internas de subagente (prefixo injetado no próximo turno)
+  // não são fala do usuário — aparecem no drawer, não como bolha.
+  if(m.role==='user'&&m.metadata&&m.metadata.subagent)return null;
+  if(m.role==='user')return {role:'u',text:flat(content)};
+  if(m.role==='assistant'){
+    const tl=[];
+    if(m.reasoning)tl.push({kind:'reason',text:String(m.reasoning)});
+    for(const tc of (m.tool_calls||[])){
+      tl.push({kind:'tool',id:tc.id,ex:(tc.function||{}).name||'tool',
+        act:String((tc.function||{}).arguments||'').slice(0,90),st:'done'});
+    }
+    return {role:'a',text:flat(content),timeline:tl.length?tl:undefined,usage:m.usage};
+  }
+  return null; // resultados de tool não viram bolha própria
+}
+function openChat(id){
+  const c=S.chats.find(x=>x.id===id);if(!c)return;
+  S.active=id;c.unread=false;saveChats();
+  draw(true);ui();renderChats();
+  void hydrate(c);void loadCwd(c);void loadJobs(c);void loadUsage(c);
+}
 /* Servido pelo Manager (:9001) => tudo same-origin: a API é location.origin
    e o orchestrator passa pelo proxy /orch (que injeta o token no servidor).
    Aberto como arquivo (file://) mantém as URLs absolutas antigas. */
@@ -461,20 +600,26 @@ async function*sse(body){
   if(b.trim()){const f=fr(b);if(f)yield f}
 }
 const pj=r=>{try{return JSON.parse(r)}catch{return r}};
-function frame(m,{event:e,raw}){
+function frame(m,{event:e,raw},ch){
   const d=pj(raw),o=d&&typeof d==='object'?d:null;
   const plan=dyn=>m.plan||(m.plan={dyn,steps:[]});
-  if(e==='meta'&&o?.session_id)S.sid=o.session_id;
+  const tl=()=>m.timeline||(m.timeline=[]);
+  const lastTool=()=>[...tl()].reverse().find(x=>x.kind==='tool');
+  if(e==='meta'&&o?.session_id){
+    if(ch){ch.sid=o.session_id;saveChats();if(ch.id===S.active){loadJobs(ch);loadUsage(ch)}}
+  }
   else if(e==='plan'&&o)m.plan={dyn:false,steps:(o.steps||[]).map(s=>({n:+(s.step??s.id)||0,ex:String(s.executor??s.name??''),act:String(s.action??''),st:'pending'}))};
-  else if(e==='tool_call'&&o){const p=plan(true),n=+o.step||0;if(!p.steps.some(s=>s.n===n))p.steps.push({n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'})}
-  else if(e==='step_start'&&o){const p=plan(true);let s=p.steps.find(x=>x.n===+o.step);if(!s)p.steps.push(s={n:+o.step,ex:o.executor});s.act=o.action;s.st='running'}
-  else if(e==='step_done'&&o&&m.plan){const s=m.plan.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}
-  else if(e==='reasoning')m.reason=(m.reason||'')+raw;
+  else if(e==='tool_call'&&o){const p=plan(true),n=+o.step||0;let s=p.steps.find(x=>x.n===n);if(!s)p.steps.push(s={n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'});const t={kind:'tool',id:o.tool_call_id,n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'};tl().push(t)}
+  else if(e==='step_start'&&o){const p=plan(true);let s=p.steps.find(x=>x.n===+o.step);if(!s)p.steps.push(s={n:+o.step,ex:o.executor});s.act=o.action;s.st='running';const t=lastTool();if(t&&t.n===+o.step){t.act=o.action}}
+  else if(e==='tool_result'&&o){const list=tl();const t=list.find(x=>x.kind==='tool'&&x.id&&o.tool_call_id&&x.id===o.tool_call_id)||lastTool();if(t){t.st=o.success?'done':'error';if(o.latency_ms!=null)t.ms=o.latency_ms;t.res=o.success?o.result:o.error;t.er=o.error||''}}
+  else if(e==='step_done'&&o){const p=m.plan;if(p){const s=p.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}const t=lastTool();if(t&&t.n===+o.step){t.st=o.success?'done':'error';t.ms=o.latency_ms;t.er=o.error||''}}
+  else if(e==='reasoning'){m.reason=(m.reason||'')+raw;const list=tl(),last=list.at(-1);if(last&&last.kind==='reason')last.text+=raw;else list.push({kind:'reason',text:raw})}
   else if(e==='delta')m.text+=raw;
+  else if(e==='usage'&&o)m.usage=o;
   else if(e==='stream_warning'){const n=+(o?.dropped_events||0);if(n>0)m.warn=(m.warn?m.warn+'\n':'')+`⚠ parte da resposta foi truncada (${n} eventos descartados)`}
   else if(e==='error'){m.err=o?o.error:raw;m.streaming=false}
   else if(e==='skill_loaded'&&o){const skills=(o.skills||[]).filter(s=>s&&s.name);if(skills.length)m.skills=skills}
-  else if(e==='done'){m.streaming=false;if(o?.final_response)m.text=o.final_response}
+  else if(e==='done'){m.streaming=false;if(o?.final_response)m.text=o.final_response;if(o?.usage)m.usage=o.usage;if(o?.total_latency_ms!=null)m.latency=o.total_latency_ms}
   /* audio_start / audio / audio_end / result: ignorados nesta versão */
 }
 async function*demo(q){
@@ -507,47 +652,81 @@ function md(src){
 
 /* ---------- Renderização ---------- */
 const ICON={running:'●',done:'✓',error:'✕',pending:'○'};
+const nf=n=>new Intl.NumberFormat('pt-BR').format(Number(n)||0);
+function thinkHtml(text){const R=160,c=!S.full&&text.length>R;
+  return `<div class="think"><button data-think><b style="font-weight:500">Pensamento · ${text.length} caracteres</b><span>${c?'expandir':'recolher'}</span></button><p>${esc(c?'… '+text.slice(-R):text)}</p></div>`}
+function toolHtml(s){
+  const raw=s.res;const res=raw!=null?(typeof raw==='string'?raw:JSON.stringify(raw)).replace(/\s+/g,' ').slice(0,240):'';
+  return `<div class="steps"><div class="sr ${s.st}"><span class="ic">${ICON[s.st]||'○'}</span><div><b style="font-weight:500">${esc(s.ex||'passo '+s.n)}</b>${s.ms!=null?` <span style="color:var(--mu)">${Math.round(s.ms)} ms</span>`:''}${s.er?` <span class="err">${esc(s.er)}</span>`:''}${s.st!=='done'&&s.act?`<small>${esc(String(s.act).slice(0,90))}</small>`:''}${res?`<small class="res">${esc(res)}</small>`:''}</div></div></div>`;
+}
+function statsHtml(m){
+  const u=m.usage||{};
+  if(!m.usage&&m.latency==null)return '';
+  const parts=[];
+  if(u.input_tokens!=null)parts.push(`<span>↑ <b>${nf(u.input_tokens)}</b> tokens in</span>`);
+  if(u.output_tokens!=null)parts.push(`<span>↓ <b>${nf(u.output_tokens)}</b> out</span>`);
+  if(u.cache_read!=null)parts.push(`<span title="cache read: ${nf(u.cache_read)} · write: ${nf(u.cache_write)}">cache <b>${((u.cache_read_ratio||0)*100).toFixed(1)}%</b></span>`);
+  if(u.cost!=null)parts.push(`<span><b>$${Number(u.cost).toFixed(4)}</b></span>`);
+  if(m.latency!=null)parts.push(`<span><b>${Math.round(m.latency)}</b> ms</span>`);
+  return parts.length?`<div class="stats">${parts.join('')}</div>`:'';
+}
 function html(m){
   if(m.role==='u')return`<div class="m u"><div class="bub">${m.att?`<div class="chip">📎 ${esc(m.att)}</div>`:''}${esc(m.text)}</div></div>`;
   let h='<div class="m a"><span class="av"><img src="/assets/alpha-icon.svg" alt=""></span><div class="body">';
-  if(m.reason){const R=160,c=!S.full&&m.reason.length>R;
-    h+=`<div class="think"><button data-think><b style="font-weight:500">Pensamento · ${m.reason.length} caracteres</b><span>${c?'expandir':'recolher'}</span></button><p>${esc(c?'… '+m.reason.slice(-R):m.reason)}</p></div>`}
+  if(m.compacted){
+    return h+`<div class="skillbadge">📦 contexto compactado — resumo do histórico anterior</div><div class="txt">${md(m.text||'')}</div>`+'</div></div>';
+  }
+  if(m.timeline&&m.timeline.length){
+    h+='<div class="timeline">'+m.timeline.map(x=>x.kind==='reason'?thinkHtml(x.text):toolHtml(x)).join('')+'</div>';
+  }else{
+    if(m.reason)h+=thinkHtml(m.reason);
+    if(m.plan)h+=`<div class="steps"><div class="sh">${m.plan.dyn?'Ferramentas':'Plano'} · ${m.plan.steps.length} passo(s)</div>`+m.plan.steps.map(s=>
+      `<div class="sr ${s.st}"><span class="ic">${ICON[s.st]}</span><div><b style="font-weight:500">${esc(s.ex||'passo '+s.n)}</b>${s.ms!=null?` <span style="color:var(--mu)">${Math.round(s.ms)} ms</span>`:''}${s.er?` <span class="err">${esc(s.er)}</span>`:''}${s.st!=='done'&&s.act?`<small>${esc(s.act.slice(0,90))}</small>`:''}</div></div>`).join('')+'</div>';
+  }
   if(m.skills&&m.skills.length)h+=`<div class="skillbadge">🛠 Skills carregadas: <b>${esc(m.skills.map(s=>s.name).join(', '))}</b></div>`;
-  if(m.plan)h+=`<div class="steps"><div class="sh">${m.plan.dyn?'Ferramentas':'Plano'} · ${m.plan.steps.length} passo(s)</div>`+m.plan.steps.map(s=>
-    `<div class="sr ${s.st}"><span class="ic">${ICON[s.st]}</span><div><b style="font-weight:500">${esc(s.ex||'passo '+s.n)}</b>${s.ms!=null?` <span style="color:var(--mu)">${Math.round(s.ms)} ms</span>`:''}${s.er?` <span class="err">${esc(s.er)}</span>`:''}${s.st!=='done'&&s.act?`<small>${esc(s.act.slice(0,90))}</small>`:''}</div></div>`).join('')+'</div>';
   h+=`<div class="txt${m.streaming&&m.text?' caret':''}">${md(m.text)}${m.streaming&&!m.text&&!m.reason&&!m.plan?'<span class="dots"><i></i><i></i><i></i></span>':''}</div>`;
+  h+=statsHtml(m);
   if(m.err)h+=`<div class="err">⚠ ${esc(m.err)}</div>`;
   if(m.warn)h+=`<div class="err" style="color:var(--am)">⚠ ${esc(m.warn)}</div>`;
   return h+'</div></div>';
 }
 let raf=0;
 function draw(all){
-  $('#hero').style.display=S.ms.length?'none':'';
+  const c=chat();const ms=c?c.ms:[];
+  $('#hero').style.display=ms.length?'none':'';
   const box=$('#ms');
-  if(all||box.children.length!==S.ms.length){box.innerHTML=S.ms.map(html).join('')}
-  else if(S.ms.length){const l=box.lastElementChild;l.outerHTML=html(S.ms.at(-1))}
-  if(!raf)raf=requestAnimationFrame(()=>{raf=0;const c=$('#chat');if(c.scrollHeight-c.scrollTop-c.clientHeight<160||all)c.scrollTop=c.scrollHeight});
+  if(all||box.children.length!==ms.length){box.innerHTML=ms.map(html).join('')}
+  else if(ms.length){const l=box.lastElementChild;l.outerHTML=html(ms.at(-1))}
+  if(!raf)raf=requestAnimationFrame(()=>{raf=0;const el=$('#chat');if(el.scrollHeight-el.scrollTop-el.clientHeight<160||all)el.scrollTop=el.scrollHeight});
 }
 function ui(){
-  $('#go').className='go'+(S.busy?' stop':'');$('#go').textContent=S.busy?'■':'↑';$('#go').setAttribute('aria-label',S.busy?'Parar':'Enviar');
-  $('#go').disabled=!S.busy&&!$('#in').value.trim();
+  const c=chat();
+  const busy=!!(c&&c.busy);
+  $('#go').className='go'+(busy?' stop':'');$('#go').textContent=busy?'■':'↑';$('#go').setAttribute('aria-label',busy?'Parar':'Enviar');
+  $('#go').disabled=!busy&&!$('#in').value.trim();
   const graphView=S.view==='graph';document.body.classList.toggle('graph',graphView);$('#m0').classList.toggle('on',!graphView);$('#m1').classList.toggle('on',graphView);
-  const b=$('#bdg');b.style.display=S.act!=='general'?'inline-block':'none';b.textContent='◆ '+S.act;
+  const proj=(c&&c.project)||S.act;
+  const b=$('#bdg');b.style.display=proj&&proj!=='general'?'inline-block':'none';b.textContent='◆ '+proj;
   $('#att').style.display=S.att?'block':'none';
   $('#att').innerHTML=S.att?`<span>${S.att.kind==='image'?'🖼':'📄'} ${esc(S.att.name)}<button data-rmatt aria-label="Remover anexo">✕</button></span>`:'';
   const cw=$('#cwdlabel');
   if(cw){
-    cw.textContent=(S.cwd?String(S.cwd).replace(/[\\/]+$/,'').split(/[\\/]/).pop()||S.cwd:'pasta base (~)');
-    cw.title=S.cwd||'Pasta base do usuário (~)';
+    const dir=c&&c.cwd;
+    cw.textContent=(dir?String(dir).replace(/[\\/]+$/,'').split(/[\\/]/).pop()||dir:'pasta base (~)');
+    cw.title=dir||'Pasta base do usuário (~)';
   }
+  renderSbar();
+  renderChats();
 }
 
 /* ---------- CWD por projeto (WebUI → tray → MCPs stdio) ---------- */
-async function loadCwd(){
+async function loadCwd(c){
+  c=c||chat();
+  const project=(c&&c.project)||S.act||'general';
   try{
-    const d=await jf('api','/fs/cwd?project='+encodeURIComponent(S.act||'general'));
-    S.cwd=d.cwd||null;
-  }catch(e){S.cwd=null}
+    const d=await jf('api','/fs/cwd?project='+encodeURIComponent(project));
+    if(c)c.cwd=d.cwd||null;
+  }catch(e){if(c)c.cwd=null}
   ui();
 }
 function pickCwd(){
@@ -560,11 +739,13 @@ function pickCwd(){
 }
 window.__cwdPicked=async function(path){
   if(!path)return;
+  const c=chat();
+  const project=(c&&c.project)||S.act||'general';
   try{
-    const d=await jf('api','/fs/cwd','PUT',{project:S.act||'general',cwd:path});
-    S.cwd=d.cwd||null;
+    const d=await jf('api','/fs/cwd','PUT',{project,cwd:path});
+    if(c)c.cwd=d.cwd||null;
     ui();
-    toast('Pasta de trabalho: '+S.cwd);
+    toast('Pasta de trabalho: '+(d.cwd||path));
   }catch(e){toast('Falha ao salvar a pasta: '+e.message)}
 };
 
@@ -576,31 +757,49 @@ function setView(view){
 
 /* ---------- Envio ---------- */
 async function send(text){
-  text=text.trim();if(!text||S.busy)return;
-  const c=text.toLowerCase();
-  if(c==='/attach')return $('#fi').click();
-  if(c==='/settings')return openSet();
-  if(c==='/projects'){document.body.classList.remove('nosb');return $('#addp').focus()}
-  if(c==='/clear')return clear();
+  text=text.trim();const c=chat();if(!text||!c||c.busy)return;
+  const l=text.toLowerCase();
+  if(l==='/attach')return $('#fi').click();
+  if(l==='/settings')return openSet();
+  if(l==='/projects'){document.body.classList.remove('nosb');return $('#addp').focus()}
+  if(l==='/clear'||l==='/new')return clear();
+  if(c.streaming)return;
+  // Guarda de recurso: N chats streamando ao mesmo tempo; o resto espera o
+  // término de um deles (o usuário pode parar qualquer chat pelo mismo botão).
+  if(S.chats.filter(x=>x.streaming).length>=MAX_STREAMING)return toast(`Máximo de ${MAX_STREAMING} chats simultâneos — pare um para continuar.`);
   const att=S.att;S.att=null;
-  const u={role:'u',text,att:att?.name},a={role:'a',text:'',streaming:true};
-  S.ms.push(u,a);S.busy=true;$('#in').value='';fit();ui();draw(true);
-  S.ctl=new AbortController();
-  if(!cfg.demo)fetch(cfg.api+'/docker/start',{method:'POST',headers:H()}).catch(()=>{});
-  const body={input:text,session_id:S.sid,voice:'M1',lang:'pt',tts:false,tts_output:'client',image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,search_pdfs:false,stream:true,cwd:S.cwd||null};
+  const u={role:'u',text,att:att?.name},a={role:'a',text:'',streaming:true,timeline:[],usage:null};
+  c.ms.push(u,a);c.busy=true;c.streaming=true;c.err=false;
+  if(!c.title)c.title=text.replace(/\s+/g,' ').slice(0,80);
+  $('#in').value='';fit();ui();draw(true);saveChats();
+  c.ctl=new AbortController();
+  ensureDocker();
+  const body={input:text,session_id:c.sid,project:c.project,voice:'M1',lang:'pt',tts:false,tts_output:'client',
+    image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,
+    search_pdfs:false,stream:true,cwd:c.cwd||null};
   try{
     let it;
     if(cfg.demo)it=demo(text);
     else{
-      const r=await fetch(cfg.orch+'/execute',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify(body),signal:S.ctl.signal});
+      const r=await fetch(cfg.orch+'/execute',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify(body),signal:c.ctl.signal});
       if(!r.ok||!r.body)throw new Error('HTTP '+r.status);
       it=sse(r.body);
     }
-    for await(const f of it){if(S.ctl.signal.aborted)break;frame(a,f);draw()}
-  }catch(e){if(e.name!=='AbortError')a.err=`Orchestrator offline — ${cfg.orch} (${e.message})`}
-  a.streaming=false;S.busy=false;S.ctl=null;draw();ui();
+    for await(const f of it){if(c.ctl?.signal.aborted)break;frame(a,f,c);if(c.id===S.active)draw()}
+  }catch(e){if(e.name!=='AbortError'){a.err=`Orchestrator offline — ${cfg.orch} (${e.message})`;c.err=true}}
+  c.streaming=false;c.busy=false;c.ctl=null;a.streaming=false;
+  if(c.id!==S.active&&a.text&&!a.err)c.unread=true;
+  if(c.id===S.active){draw();loadUsage(c);loadJobs(c)}
+  ui();saveChats();
 }
-function clear(){S.ctl?.abort();S.ms=[];S.sid=null;S.busy=false;draw(true);ui()}
+/** Para o chat ativo (ou o informado). Aborta o stream e avisa o servidor. */
+function stopChat(c){
+  c=c||chat();if(!c||!c.streaming)return;
+  try{c.ctl?.abort()}catch{}
+  if(c.sid)fetch(cfg.orch+'/session/'+encodeURIComponent(c.sid)+'/cancel',{method:'POST',headers:H()}).catch(()=>{});
+  if(c.sid)fetch(cfg.orch+'/tts/cancel?session_id='+encodeURIComponent(c.sid),{method:'POST',headers:H()}).catch(()=>{});
+}
+function clear(){newChat();draw(true);ui()}
 
 /* ---------- Anexos (imagem → base64, texto → document_content) ---------- */
 const TXT=/\.(txt|md|markdown|json|ya?ml|toml|ini|cfg|conf|html?|css|csv|xml|sql|sh|py|js|ts|tsx|jsx|rs|go|java|kt|swift|c|h|cc|cpp|hpp|rb|php|lua|r|scala|dart)$/i;
@@ -608,9 +807,19 @@ function attach(f){
   if(!f)return;const rd=new FileReader();
   if(f.type.startsWith('image/')){rd.onload=()=>{S.att={kind:'image',name:f.name,data:String(rd.result).split(',')[1]};ui()};rd.readAsDataURL(f)}
   else if(f.type.startsWith('text/')||TXT.test(f.name)){rd.onload=()=>{S.att={kind:'doc',name:f.name,data:String(rd.result)};ui()};rd.readAsText(f)}
-  else{const a=S.ms.at(-1);toast(`Tipo não suportado no navegador: ${f.name} (PDF/DOCX exigem o backend)`)}
+  else{toast(`Tipo não suportado no navegador: ${f.name} (PDF/DOCX exigem o backend)`)}
 }
 function toast(t){const n=$('#sdt');const o=n.textContent;n.textContent=t;setTimeout(()=>n.textContent=o,4000)}
+/** Sobe o container no máximo uma vez por minuto — vários chats enviando ao
+ * mesmo tempo não disparam N requests de start. */
+let _lastDockerStart=0;
+function ensureDocker(){
+  if(cfg.demo)return;
+  const now=Date.now();
+  if(now-_lastDockerStart<60000)return;
+  _lastDockerStart=now;
+  fetch(cfg.api+'/docker/start',{method:'POST',headers:H()}).catch(()=>{});
+}
 
 /* ---------- Projetos (escopos de memória) ---------- */
 async function loadProj(){
@@ -620,7 +829,15 @@ async function loadProj(){
     box.innerHTML=[{slug:'general',name:'Geral'},...S.pjs].map(p=>`<div class="pj${p.slug===S.act?' on':''}" role="button" tabindex="0" data-slug="${esc(p.slug)}"><span class="dot"></span><span class="nm">${esc(p.name||p.slug)}</span>${p.slug!=='general'?'<button class="x" data-del title="Apagar projeto" aria-label="Apagar projeto">✕</button>':''}</div>`).join('');
   }catch(e){box.innerHTML=`<div class="hint">${cfg.demo?'Projetos indisponíveis no modo demonstração.':'Orchestrator offline: '+esc(e.message)}</div>`;S.act='general'}
   ui();
-  await loadCwd();
+  await loadCwd(chat());
+}
+/** Ativa o projeto (escopo global, compatível com a TUI) e abre um chat nele. */
+async function pact(slug){
+  try{slug==='general'?await jf('orch','/projects/deactivate','POST'):await jf('orch','/projects/'+encodeURIComponent(slug)+'/activate','POST')}catch(e){toast(e.message)}
+  await loadProj();
+  const active=chat();
+  if(active&&!active.ms.length){active.project=slug;active.cwd=null;saveChats();await loadCwd(active);ui();}
+  else{newChat(slug);await loadCwd(chat());draw(true);ui();}
 }
 async function pact(slug){try{slug==='general'?await jf('orch','/projects/deactivate','POST'):await jf('orch','/projects/'+encodeURIComponent(slug)+'/activate','POST')}catch(e){toast(e.message)}await loadProj()}
 async function pdel(slug){
@@ -636,6 +853,125 @@ async function poll(){
   try{const s=await jf('api','/status'),st=String(s.docker?.status||'?'),l=st.toLowerCase();
     i.className=/run|ativo|ok/.test(l)?'ok':/start|inici/.test(l)?'wa':/err/.test(l)?'er':'';t.textContent='docker '+st}
   catch{i.className='er';t.textContent='process manager offline'}
+  const c=chat();
+  if(c){void loadJobs(c);void loadUsage(c);void refreshStreamingChats()}
+}
+async function refreshStreamingChats(){
+  // Chats que streamam em background: mantém o status/uso atualizados sem
+  // redesenhar a conversa (só a lista lateral).
+  for(const c of S.chats){
+    if(c.id===S.active||c.streaming||!c.sid)continue;
+    if(!c._tick||Date.now()-c._tick<15000)continue;
+    c._tick=Date.now();
+    void loadJobs(c);void loadUsage(c);
+  }
+}
+async function loadJobs(c){
+  c=c||chat();if(!c)return;
+  if(cfg.demo||!c.sid){c.jobs=[];if(c.id===S.active){renderSbar();renderDrawer();renderChats()}return}
+  try{
+    const d=await jf('orch','/jobs?parent_id='+encodeURIComponent(c.sid)+'&status=running');
+    c.jobs=(d.jobs||[]).filter(j=>j.status==='running');
+  }catch(e){c.jobs=[]}
+  if(c.id===S.active){renderSbar();renderDrawer();renderChats()}
+}
+async function loadUsage(c){
+  c=c||chat();if(!c)return;
+  if(cfg.demo||!c.sid){c.usage=null;if(c.id===S.active){renderSbar();renderDrawer()}return}
+  try{
+    const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/usage');
+    c.usage=d.usage&&(d.usage.input_tokens||d.usage.output_tokens)?d.usage:null;
+  }catch(e){/* mantém o último uso conhecido */}
+  if(c.id===S.active){renderSbar();renderDrawer()}
+}
+
+/* ---------- Lista de chats / faixa de sessão / drawer ---------- */
+function renderChats(){
+  const box=$('#chats'),cnt=$('#chatcount');if(!box)return;
+  const sig=S.chats.map(c=>[c.id,c.sid||'',c.title,c.busy?1:0,(c.jobs||[]).length,c.unread?1:0,c.project,c.err?1:0].join('|')).join('~')+'#'+S.active;
+  if(sig===_chatSig)return;
+  _chatSig=sig;
+  if(cnt)cnt.textContent=S.chats.length>1?String(S.chats.length):'';
+  if(!S.chats.length){box.innerHTML='<div class="empty">nenhum chat</div>';return}
+  box.innerHTML=S.chats.map(c=>{
+    const st=c.busy?'run':(c.err?'err':'');
+    const jobs=(c.jobs||[]).length;
+    const proj=c.project==='general'?'':`<span class="cbadge">${esc(c.project)}</span>`;
+    return `<div class="pj${c.id===S.active?' on':''}${c.unread?' unread':''}" role="listitem" tabindex="0" data-cid="${c.id}">
+      <span class="dot ${st}"></span><span class="nm">${esc(chatTitle(c))}</span>${proj}
+      ${jobs?`<span class="cnt" title="${jobs} subagente(s) ativo(s)">⚡${jobs}</span>`:''}
+      ${c.streaming?`<button class="x" data-cstop title="Parar este chat" aria-label="Parar este chat" style="opacity:1">■</button>`:''}
+      <button class="x" data-cdel title="Fechar conversa" aria-label="Fechar conversa">✕</button></div>`;
+  }).join('');
+}
+function renderSbar(){
+  const c=chat(),live=$('#sbLive'),state=$('#sbState');
+  if(!c){$('#sbProj').textContent='';$('#sbSid').textContent='';return}
+  const run=!!c.streaming;
+  live.className='live'+(run?' run':'')+(c.err?' err':'');
+  state.textContent=run?'respondendo':(c.err?'erro':'ocioso');
+  $('#sbProj').textContent=c.project==='general'?'Geral':c.project;
+  $('#sbSid').textContent=c.sid&&c.ms.length?('sessão '+String(c.sid).slice(0,8)):'nova sessão';
+  const jobs=(c.jobs||[]).length;
+  let extra='';
+  if(c.usage){
+    const u=c.usage;
+    const cache=u.input_tokens?((u.cache_read||0)/u.input_tokens*100):0;
+    extra=` · ${nf(u.input_tokens)} in / ${nf(u.output_tokens)} out · cache ${cache.toFixed(0)}% · $${Number(u.cost||0).toFixed(4)}`;
+  }
+  if(jobs)extra+=` · ⚡${jobs} subagente${jobs>1?'s':''}`;
+  $('#sbSid').textContent+=extra;
+}
+function renderDrawer(){
+  const box=$('#drawerBody');if(!box)return;
+  const c=chat();
+  if(!c){box.innerHTML='<div class="empty">sem chat ativo</div>';return}
+  const u=c.usage||{};
+  const ratio=u.input_tokens?((u.cache_read||0)/u.input_tokens*100):0;
+  const rows=[
+    ['Projeto',c.project==='general'?'Geral':c.project],
+    ['Sessão',c.ms.length?`<span class="sid">${esc(c.sid)}</span>`:'nova (criada no 1º envio)'],
+    ['Mensagens',String((c.ms||[]).length)],
+    ['Tokens in / out',`${nf(u.input_tokens||0)} / ${nf(u.output_tokens||0)}`],
+    ['Cache',`${ratio.toFixed(1)}%`],
+    ['Custo',`$${Number(u.cost||0).toFixed(4)}`],
+  ];
+  const jobs=(c.jobs||[]);
+  box.innerHTML=`<h4>Chat</h4>${rows.map(([k,v])=>`<div class="kv"><span>${k}</span><b>${v}</b></div>`).join('')}
+    <h4>Subagentes ativos${jobs.length?` (${jobs.length})`:''}</h4>
+    ${jobs.length?`<div class="sub">${jobs.map(j=>`<div class="subitem" data-job="${esc(j.child_id||'')}">
+        <b>${esc(j.description||j.kind||'job')}</b>
+        <small>${esc(j.child_id||'')}${j.kind?' · '+esc(j.kind):''}</small></div>`).join('')}</div>`
+      :'<div class="empty">nenhum subagente em execução neste chat</div>'}
+    <h4>Ações</h4>
+    <div class="sub">
+      <div class="subitem" data-act="compact">Compactar contexto agora</div>
+      <div class="subitem" data-act="close">Fechar conversa (mantém histórico)</div>
+    </div>`;
+}
+function toggleDrawer(force){
+  const d=$('#drawer');if(!d)return;
+  const open=force===undefined?!d.classList.contains('open'):force;
+  d.classList.toggle('open',open);d.setAttribute('aria-hidden',open?'false':'true');
+  if(open)renderDrawer();
+}
+/** Reconcilia a lista local com as sessões raiz do servidor. */
+async function syncChats(){
+  if(cfg.demo)return;
+  try{
+    const d=await jf('orch','/sessions?root=1&limit=40');
+    const rows=d.sessions||[];
+    let added=0;
+    for(const s of rows){
+      if(!s||!s.id)continue;
+      if(S.chats.some(c=>c.sid===s.id))continue;
+      S.chats.push({id:'c'+String(s.id).slice(-8)+Math.random().toString(36).slice(2,5),
+        sid:s.id,title:s.title||'',project:s.project_id||'general',cwd:null,ms:[],busy:false,
+        ctl:null,usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false});
+      added++;
+    }
+    if(added)renderChats();
+  }catch(e){/* orchestrator offline — mantém a lista local */}
 }
 
 /* ---------- Recursos do host (CPU/RAM/GPU) ---------- */
@@ -923,14 +1259,60 @@ function fit(){inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeigh
 inp.oninput=()=>{fit();ui()};
 inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send(inp.value)}};
 inp.onpaste=e=>{const f=[...e.clipboardData.files][0];if(f){e.preventDefault();attach(f)}};
-$('#go').onclick=()=>S.busy?S.ctl?.abort():send(inp.value);
+$('#go').onclick=()=>{const c=chat();if(c&&c.busy)stopChat(c);else send(inp.value)};
 $('#clip').onclick=()=>$('#fi').click();
 $('#fi').onchange=e=>{attach(e.target.files[0]);e.target.value=''};
 $('#cwd').onclick=pickCwd;
 $('#cwdlabel').onclick=pickCwd;
 $('#cwdlabel').onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pickCwd()}};
-$('#nw').onclick=clear;$('#oset').onclick=openSet;
+$('#nw').onclick=()=>{newChat();draw(true);ui()};$('#oset').onclick=openSet;
 $('#tsb').onclick=()=>document.body.classList.toggle('nosb');
+$('#addc').onclick=()=>{newChat();draw(true);ui();inp.focus()};
+$('#chats').onclick=e=>{
+  const row=e.target.closest('.pj');if(!row)return;
+  const c=S.chats.find(x=>x.id===row.dataset.cid);if(!c)return;
+  if(e.target.closest('[data-cstop]')){stopChat(c);return}
+  if(e.target.closest('[data-cdel]')){
+    if(c.streaming&&!confirm('Este chat ainda está respondendo. Fechar mesmo assim?'))return;
+    if(c.streaming)stopChat(c);
+    S.chats=S.chats.filter(x=>x.id!==c.id);
+    if(!S.chats.length)newChat();
+    else if(S.active===c.id)S.active=S.chats[0].id;
+    saveChats();draw(true);ui();return;
+  }
+  openChat(c.id);
+};
+$('#chats').onkeydown=e=>{const row=e.target.closest('.pj');if(row&&e.key==='Enter'&&!e.target.closest('[data-cdel]'))openChat(row.dataset.cid)};
+$('#sbBtn').onclick=()=>toggleDrawer();
+$('#drClose').onclick=()=>toggleDrawer(false);
+$('#drawerBody').onclick=async e=>{
+  const job=e.target.closest('[data-job]');
+  if(job&&job.dataset.job){
+    // Abre o chat filho (sessão do subagente) na lista.
+    const cid=job.dataset.job;
+    let child=S.chats.find(c=>c.sid===cid);
+    if(!child){
+      child={id:'c'+cid.slice(-8),sid:cid,title:'Subagente '+cid.slice(0,8),
+        project:(chat()||{}).project||'general',cwd:null,ms:[],busy:false,ctl:null,
+        usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false};
+      S.chats.unshift(child);
+    }
+    openChat(child.id);return;
+  }
+  const act=e.target.closest('[data-act]');
+  if(!act)return;
+  const c=chat();if(!c)return;
+  if(act.dataset.act==='compact'){
+    if(!c.ms.length)return toast('Envie uma mensagem primeiro.');
+    try{await jf('orch','/session/'+encodeURIComponent(c.sid)+'/compact','POST',{});toast('Contexto compactado.');void hydrate(c)}
+    catch(err){toast('Falha ao compactar: '+err.message)}
+  }else if(act.dataset.act==='close'){
+    stopChat(c);
+    S.chats=S.chats.filter(x=>x.id!==c.id);
+    if(!S.chats.length)newChat();else if(S.active===c.id)S.active=S.chats[0].id;
+    saveChats();toggleDrawer(false);draw(true);ui();
+  }
+};
 $('#m0').onclick=()=>setView('chat');$('#m1').onclick=()=>setView('graph');
 $('#thm').onclick=()=>{const d=getComputedStyle(document.body).colorScheme==='dark';cfg.theme=d?'light':'dark';keep();theme()};
 $('#addp').onclick=()=>{const n=$('#np');n.style.display='block';n.focus()};
@@ -950,11 +1332,23 @@ mn.ondragover=e=>e.preventDefault();
 mn.ondrop=e=>{e.preventDefault();dc=0;mn.classList.remove('drop');attach(e.dataTransfer.files[0])};
 document.addEventListener('keydown',e=>{
   if(!(e.ctrlKey||e.metaKey))return;const k=e.key.toLowerCase();
-  const m={e:()=>{S.full=!S.full;draw(true)},d:()=>{$('#dl').open?closeLogs():openLogs()},s:openSet,p:()=>{document.body.classList.remove('nosb');$('#addp').click()},l:clear};
+  const m={e:()=>{S.full=!S.full;draw(true)},d:()=>{$('#dl').open?closeLogs():openLogs()},s:openSet,
+    p:()=>{document.body.classList.remove('nosb');$('#addp').click()},l:clear,
+    t:()=>{newChat();draw(true);ui();inp.focus()},i:()=>toggleDrawer()};
   if(m[k]){e.preventDefault();m[k]()}
 });
 
-theme();ui();draw(true);loadProj();poll();setInterval(()=>{if(!document.hidden)poll()},5000);
+/* ---------- Boot ---------- */
+restoreChats();
+if(!S.chats.length)newChat();
+else{
+  const c=chat();
+  if(c){void hydrate(c);void loadCwd(c)}
+}
+theme();ui();draw(true);renderChats();loadProj();poll();
+void syncChats();
+setInterval(()=>{if(!document.hidden)poll()},5000);
+setInterval(()=>{if(!document.hidden)void syncChats()},30000);
 if(innerWidth<=760)document.body.classList.add('nosb');
 </script>
 <script>

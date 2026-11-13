@@ -92,6 +92,8 @@ class WriteRequest(BaseModel):
     # card no grafo Hebbiano — o PPR espalha ativação entre a pessoa e as
     # memórias sobre ela. person_id inválido → warning e grava sem vínculo.
     person_id:   Optional[int] = None
+    # ── NEW (multi-chat): escopo da escrita. None = escopo ativo do processo.
+    scope:       Optional[str] = None
 
 class WriteBatchRequest(BaseModel):
     # ── NEW (solução 1): grava várias memórias em uma única chamada,
@@ -103,6 +105,8 @@ class WriteBatchRequest(BaseModel):
     # ordem do array. Default False — a ordem do array só é sinal temporal
     # quando o extrator garante isso.
     sequential: bool = False
+    # ── NEW (multi-chat): escopo padrão do batch (itens podem sobrescrever).
+    scope:      Optional[str] = None
 
 class WriteSTRequest(BaseModel):
     # ── SESSÕES REMOVIDAS: session_id é só metadado de proveniência (fica na
@@ -132,6 +136,11 @@ class ReadRequest(BaseModel):
     # identidade do card é injetado como semente extra no PPR — memórias
     # relacionadas à pessoa vêm como "related" mesmo sem match semântico.
     person_id:   Optional[int] = None
+    # ── NEW (multi-chat): escopo de memória DESTA requisição. None usa o
+    # escopo ativo do processo (compatibilidade TUI). Com escopo explícito a
+    # leitura não depende de /project/switch e turnos em projetos diferentes
+    # podem rodar concorrentes.
+    scope:       Optional[str] = None
 
 class WriteResponse(BaseModel):
     stored:    bool
@@ -236,6 +245,8 @@ class IndexedFileWriteRequest(BaseModel):
     source:       str   = "local_scraping"
     confidence:   float = 1.0
     force_reindex: bool = False
+    # ── NEW (multi-chat): escopo de escrita (None = escopo ativo).
+    scope:        Optional[str] = None
 
 class IndexedFileWriteResponse(BaseModel):
     stored:         bool
@@ -262,6 +273,8 @@ class IndexedFileReadRequest(BaseModel):
     # Não afeta o modo "file_path" sozinho (arquivo inteiro), que sempre
     # devolve `content` preenchido — é o próprio propósito desse modo.
     include_full_content: bool = True
+    # ── NEW (multi-chat): escopo de leitura (None = escopo ativo).
+    scope:     Optional[str] = None
 
 class IndexedFileEntry(BaseModel):
     file_id:      int
@@ -750,6 +763,8 @@ class PlanCreateRequest(BaseModel):
     # ── NEW (people cards): card de pessoa ao qual o plano se relaciona.
     # Invalido → warning e grava sem vínculo (não bloqueia).
     person_id: Optional[int] = None
+    # ── NEW (multi-chat): escopo de memória da escrita (None = ativo).
+    scope: Optional[str] = None
 
 class PlanCreateResponse(BaseModel):
     plan_id: int
@@ -800,6 +815,8 @@ class PlanEntry(BaseModel):
 class PlanReadRequest(BaseModel):
     plan_id: Optional[int] = None
     name:    Optional[str] = None
+    # ── NEW (multi-chat): escopo de leitura (None = escopo ativo).
+    scope:   Optional[str] = None
 
 class PlanReadResponse(BaseModel):
     plan: Optional[PlanEntry] = None
@@ -811,6 +828,7 @@ class PlanListResponse(BaseModel):
 class PlanDeleteRequest(BaseModel):
     plan_id: Optional[int] = None
     name:    Optional[str] = None
+    scope:   Optional[str] = None
 
 class PlanDeleteResponse(BaseModel):
     deleted: bool

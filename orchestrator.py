@@ -92,6 +92,7 @@ import logging.handlers
 import os
 import queue
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -108,7 +109,7 @@ import ipaddress
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 import regex as re
 # MCP é consumido VIA mcp_manager (REST) — este processo nunca
 # spawna servidores MCP nem segura sessões; o manager é o único executante
@@ -229,16 +230,19 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
 AGENT_SKILL_PREFIX  = "agentskill__"  # tem que bater com memory_config.AGENT_SKILL_PREFIX
 
 # ── Session store durável ────────────────────────────────────────────────────
-# Grava cada mensagem do turno (incluindo tool calls/resultados) em um SQLite
-# separado. Ativo por padrão; `AVA_SESSION_STORE=0` desliga. A leitura ainda é
-# do ST antigo (dual-write) até o cutover.
-SESSION_STORE_ENABLED = os.getenv("AVA_SESSION_STORE", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+# O orchestrator usa o store como fonte única do histórico. A flag
+# AVA_SESSION_STORE permanece apenas no LLM.py (modo CHAT legado).
+SESSION_STORE_ENABLED = True
+try:
+    from Modules.observability import metrics as obs_metrics
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from observability import metrics as obs_metrics  # type: ignore
+
 try:
     from Modules.session import (
         CONTINUE_AFTER_OUTPUT_LIMIT,
         CompactionManager,
+        JobStore,
         OutputLimitTracker,
         SessionStore,
         estimate_tokens,
@@ -250,6 +254,7 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
     from session import (  # type: ignore
         CONTINUE_AFTER_OUTPUT_LIMIT,
         CompactionManager,
+        JobStore,
         OutputLimitTracker,
         SessionStore,
         estimate_tokens,
@@ -330,12 +335,61 @@ SKILL_CATALOG_ENABLED = os.getenv("AVA_SKILL_CATALOG", "1").strip().lower() in (
 SESSION_RUNNER_ENABLED = os.getenv("AVA_SESSION_RUNNER", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
+SUBAGENTS_ENABLED = os.getenv("AVA_SUBAGENTS", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+SUBAGENT_MAX_CONCURRENT = max(1, int(os.getenv("AVA_SUBAGENT_MAX", "3")))
+# Teto de turnos concorrentes no processo (chats + subagentes). Ativo por
+# padrão; `AVA_MAX_CONCURRENT_TURNS=0` desliga o limite.
+_MAX_CONCURRENT_TURNS_RAW = int(os.getenv("AVA_MAX_CONCURRENT_TURNS", "8"))
+_TURN_SEMAPHORE = asyncio.Semaphore(
+    _MAX_CONCURRENT_TURNS_RAW if _MAX_CONCURRENT_TURNS_RAW > 0 else 10_000
+)
 _CODEMODE_RUNTIME: Optional[CodeModeRuntime] = None
+_JOB_STORE: Optional[JobStore] = None
+_SUBAGENT_TASKS: set[asyncio.Task[Any]] = set()
+_SUBAGENT_CHILD_TASKS: dict[str, asyncio.Task[Any]] = {}
+_SUBAGENT_CHILDREN: set[str] = set()
 _INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
 # Limite de segurança do histórico injetado no modelo. A compactação é o
 # mecanismo principal; 0 (padrão) desliga o corte. Use um valor positivo apenas
 # como fallback quando a compactação estiver desabilitada.
 HISTORY_MAX_CHARS = max(0, int(os.getenv("AVA_HISTORY_MAX_CHARS", "0")))
+
+# ── Multi-chat: serialização e cancelamento por sessão ────────────────────────
+# Um turno por sessão por vez: dois envios no MESMO chat esperam na fila em
+# vez de intercalar linhas no session_store. Chats distintos não se bloqueiam.
+# `_TURN_TASKS` rastreia as tasks de cada turno para o POST
+# /session/{id}/cancel interromper só aquele chat.
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+_TURN_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
+# Gauge de turnos ativos (processo + por projeto) — exposto em /metrics.
+_ACTIVE_TURN_LOCK = threading.Lock()
+_ACTIVE_TURNS: list[int] = [0]
+_ACTIVE_BY_PROJECT: dict[str, int] = {}
+
+
+def _session_lock(sid: str) -> asyncio.Lock:
+    lock = _SESSION_LOCKS.get(sid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[sid] = lock
+    return lock
+
+
+def _track_turn(sid: str, task: Optional[asyncio.Task[Any]]) -> None:
+    if task is None or not sid:
+        return
+    _TURN_TASKS.setdefault(sid, set()).add(task)
+
+    def _drop(t: asyncio.Task[Any]) -> None:
+        tasks = _TURN_TASKS.get(sid)
+        if tasks is not None:
+            tasks.discard(t)
+            if not tasks:
+                _TURN_TASKS.pop(sid, None)
+
+    task.add_done_callback(_drop)
 
 
 def _session_store() -> Optional[SessionStore]:
@@ -351,6 +405,30 @@ def _session_store() -> Optional[SessionStore]:
             log.warning(f"Session store indisponível ({type(e).__name__}: {e}) — seguindo sem ele")
             return None
     return _SESSION_STORE
+
+
+def _session_project(sid: str) -> Optional[str]:
+    """Projeto persistido da sessão (None se o store está desligado)."""
+    store = _session_store()
+    if store is None or not sid:
+        return None
+    try:
+        row = store.get(sid)
+        return (row or {}).get("project_id")
+    except Exception:
+        return None
+
+
+def _resolve_turn_project(req: "ExecuteRequest", sid: str) -> Optional[str]:
+    """Projeto explícito do turno: request > sessão. None = modo legado
+    (escopo ativo global, re-afirmado a cada turno)."""
+    raw = (req.project or "").strip() or _session_project(sid)
+    if not raw:
+        return None
+    if raw == "general" or _project_by_slug(raw):
+        return raw
+    log.warning(f"Projetos: projeto '{raw}' desconhecido — turno usa o escopo global")
+    return None
 
 
 def _session_ensure(sid: str, req: "ExecuteRequest", project_id: Optional[str] = None) -> None:
@@ -399,6 +477,35 @@ def _record_llm_usage(sid: str, usage: Optional[dict[str, Any]]) -> None:
         log.debug(f"[usage] falha ao registrar: {type(e).__name__}: {e}")
 
 
+def _usage_snapshot(sid: str) -> dict[str, Any]:
+    store = _session_store()
+    if store is None:
+        return {}
+    try:
+        return store.usage(sid)
+    except Exception:
+        return {}
+
+
+def _usage_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    def diff(key: str) -> int:
+        return int(after.get(key) or 0) - int(before.get(key) or 0)
+
+    input_tokens = diff("input_tokens")
+    output_tokens = diff("output_tokens")
+    cache_read = diff("cache_read")
+    cache_write = diff("cache_write")
+    cost = float(after.get("cost") or 0) - float(before.get("cost") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "cost": round(cost, 6),
+        "cache_read_ratio": round(cache_read / input_tokens, 4) if input_tokens > 0 else 0.0,
+    }
+
+
 def _session_append(sid: str, message: dict[str, Any]) -> None:
     """Dual-write de UMA mensagem. Best-effort: nunca quebra o loop."""
     store = _session_store()
@@ -422,6 +529,20 @@ def _codemode_runtime() -> Optional[CodeModeRuntime]:
                 "usando o schema nativo de tools."
             )
     return _CODEMODE_RUNTIME if _CODEMODE_RUNTIME.available else None
+
+
+def _job_store() -> Optional[JobStore]:
+    global _JOB_STORE
+    store = _session_store()
+    if store is None:
+        return None
+    if _JOB_STORE is None:
+        try:
+            _JOB_STORE = JobStore(store)
+        except Exception as e:
+            log.warning(f"Job store indisponível ({type(e).__name__}: {e})")
+            return None
+    return _JOB_STORE
 
 
 def _compactor() -> Optional[CompactionManager]:
@@ -727,9 +848,11 @@ async def _maybe_compact(
         )
     except Exception as e:
         log.warning(f"[{eid[:8]}] Compactação falhou: {type(e).__name__}: {e}")
+        _metric_inc("compaction_failures_total")
         return False
     if not result:
         return False
+    _metric_inc("compactions_total")
     log.info(
         f"[{eid[:8]}] Compactação ({reason}): {result['summarized']} mensagem(ns) "
         f"resumidas, cauda mantida a partir de {str(result['keepID'])[:12]} "
@@ -885,11 +1008,8 @@ ORCH_RECALL_MAX_CHARS   = int(os.getenv("ORCH_RECALL_MAX_CHARS", "3000"))
 PLANS_HINT_MAX_CHARS    = int(os.getenv("PLANS_HINT_MAX_CHARS", "600"))
 TOOL_TIPS_MAX_CHARS     = int(os.getenv("TOOL_TIPS_MAX_CHARS", "1200"))
 SKILLS_HINT_MAX_CHARS   = int(os.getenv("SKILLS_HINT_MAX_CHARS", "1500"))
-ORCH_ST_PAIRS           = int(os.getenv("ORCH_ST_PAIRS", "5"))
-ORCH_ST_MAX_CHARS       = int(os.getenv("ORCH_ST_MAX_CHARS", "2400"))
-# Teto do par cru no caminho legado do ST e no cache de query (cabeça + cauda
-# com marcador). O histórico durável usa o session store, sem este corte.
-ST_SAVE_MAX_CHARS       = int(os.getenv("ST_SAVE_MAX_CHARS", "2000"))
+# Teto do par usado no cache de query de recall (não é histórico durável).
+RECENT_TURN_MAX_CHARS   = int(os.getenv("AVA_RECENT_TURN_MAX_CHARS", os.getenv("ST_SAVE_MAX_CHARS", "2000")))
 
 # Marcador ÚNICO de corte semântico — reutilizado no ST legado e no cache de
 # query.
@@ -941,48 +1061,42 @@ def _truncate_block(text: str, max_chars: int, label: str) -> str:
 
 
 # ── Métricas operacionais (agregadas, leves) ────────────────────────────────
-# Contadores em memória, resetados a cada restart. O /status expõe um snapshot
-# para que regressões agregadas (fallback de skills/tools, drops de fila,
-# falhas de memória) não fiquem só em log.warning.
-_METRICS: dict[str, Any] = {
-    "turns_total": 0,
-    "turns_degraded": 0,
-    "degraded": {
-        "skill_selector_fallback": 0,
-        "mcp_manager_offline": 0,
-        "mcp_server_load_failures": 0,
-        "agent_skills_unavailable": 0,
-    },
-    "tool_failures_by_category": {},
-    "unknown_tool_calls": 0,
-    "invalid_json_calls": 0,
-    "queue_drops": 0,
-    "memory_save_failures": 0,
-    "memory_extraction_failures": 0,
-    "force_finish_calls": 0,
-}
-
+# A implementação vive em Modules/observability/metrics.py; o /metrics expõe
+# Prometheus e o /status expõe um snapshot serializável.
 
 def _metric_inc(name: str, key: Optional[str] = None, n: int = 1) -> None:
     """Incrementa um contador global. Nunca levanta (métricas não derrubam o turno)."""
-    try:
-        if key is None:
-            _METRICS[name] = int(_METRICS.get(name, 0)) + n
-        else:
-            bucket = _METRICS.get(name)
-            if not isinstance(bucket, dict):
-                bucket = _METRICS[name] = {}
-            bucket[key] = int(bucket.get(key, 0)) + n
-    except Exception:
-        pass
+    obs_metrics.inc(name, key, n)
 
 
 def _metric_snapshot() -> dict[str, Any]:
     """Cópia rasa e serializável das métricas (para /status e eventos)."""
-    snap: dict[str, Any] = {}
-    for k, v in _METRICS.items():
-        snap[k] = dict(v) if isinstance(v, dict) else v
-    return snap
+    return obs_metrics.snapshot()
+
+
+def _open_turn(project: str) -> None:
+    """Gauge: turnos ativos no processo e por projeto."""
+    with _ACTIVE_TURN_LOCK:
+        _ACTIVE_TURNS[0] += 1
+        _ACTIVE_BY_PROJECT[project] = _ACTIVE_BY_PROJECT.get(project, 0) + 1
+        total = _ACTIVE_TURNS[0]
+        by_project = dict(_ACTIVE_BY_PROJECT)
+    obs_metrics.set("active_turns", total)
+    obs_metrics.set("active_turns_by_project", by_project)
+
+
+def _close_turn(project: str) -> None:
+    with _ACTIVE_TURN_LOCK:
+        _ACTIVE_TURNS[0] = max(0, _ACTIVE_TURNS[0] - 1)
+        left = _ACTIVE_BY_PROJECT.get(project, 0) - 1
+        if left > 0:
+            _ACTIVE_BY_PROJECT[project] = left
+        else:
+            _ACTIVE_BY_PROJECT.pop(project, None)
+        total = _ACTIVE_TURNS[0]
+        by_project = dict(_ACTIVE_BY_PROJECT)
+    obs_metrics.set("active_turns", total)
+    obs_metrics.set("active_turns_by_project", by_project)
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. Respond naturally and briefly. No reasoning needed.",
@@ -1283,6 +1397,10 @@ class ExecuteRequest(BaseModel):
     # O orchestrator roda no container e não enxerga o filesystem do host:
     # o valor é opaco aqui e validado pelo mcp_manager (tray, no host).
     cwd:           Optional[str]  = Field(None, max_length=4096)
+    # Projeto (escopo de memória) DESTE turno. Chat do WebUI manda o projeto
+    # da conversa; None usa o projeto da sessão no store e, por fim, o
+    # projeto ativo global (compatibilidade TUI/voz).
+    project:       Optional[str]  = Field(None, max_length=64)
     voice:         str            = "M1"
     lang:          str            = "pt"
     tts:           bool           = True
@@ -1429,6 +1547,16 @@ class AppState:
 state = AppState()
 
 
+def _scope_payload(body: dict) -> dict:
+    """Acrescenta o escopo do turno corrente (projeto do chat) ao payload de
+    memória quando ele existe. Sem escopo (TUI/voz/legado) o corpo fica
+    inalterado e a memory usa o escopo ativo do processo."""
+    scope = (_CURRENT_SCOPE.get() or "").strip()
+    if scope:
+        body = {**body, "scope": scope}
+    return body
+
+
 async def _memory_request(method: str, path: str, json_body: Optional[dict] = None,
                            params: Optional[dict] = None) -> Any:
     """Chama a API REST de memória (memory_api.py, FastAPI sobre memory.py,
@@ -1452,15 +1580,23 @@ async def _memory_request(method: str, path: str, json_body: Optional[dict] = No
     return r.json()
 
 
-async def _ensure_memory_scope() -> str:
-    """NEW (projetos): re-afirma o escopo ativo DESEJADO (registry) no
-    processo da memory. A memory é reiniciada pelo start.sh (restart_on_fail)
-    e volta sempre no escopo 'general' — sem o re-assert, um projeto ativo
-    "sumiria" no meio de uma conversa depois de qualquer restart. Compara
-    GET /project/current com o registry; divergente → POST /project/switch.
-    Best-effort: memory offline → só loga e segue (o recall degrada como
-    sempre). Retorna o slug desejado (p/ hint no system prompt)."""
-    desired = _project_active()
+async def _ensure_memory_scope(project: Optional[str] = None) -> str:
+    """Garante o escopo de memória do turno.
+
+    Com `project` explícito (chat do WebUI) o escopo do projeto é apenas
+    ABERTO no cache da memory (`/project/ensure`) — o escopo ativo do
+    processo não muda, então turnos em projetos diferentes podem rodar
+    concorrentes. Sem `project`, mantém o comportamento antigo: re-afirma o
+    registry na memory, que pode ter reiniciado e voltado ao 'general'.
+    Best-effort: memory offline → só loga e segue. Retorna o slug desejado.
+    """
+    desired = (project or "").strip() or _project_active()
+    if project:
+        try:
+            await _memory_request("POST", "/project/ensure", {"scope": desired})
+        except Exception as e:
+            log.warning(f"Projetos: falha ao abrir escopo '{desired}' na memory: {e}")
+        return desired
     try:
         cur = await _memory_request("GET", "/project/current")
         current = (cur or {}).get("scope")
@@ -1536,6 +1672,11 @@ async def lifespan(app: FastAPI):
     # Inicializa o session store no boot quando habilitado (falha aqui não
     # impede o orchestrator de subir; o helper é lazy).
     _session_store()
+    jobs = _job_store()
+    if jobs is not None:
+        recovered = jobs.recover_orphans()
+        if recovered:
+            log.warning(f"[subagent] {recovered} job(s) órfão(s) marcados como interrupted")
 
     log.info("Orchestrator pronto — todos os clientes HTTP inicializados")
     yield
@@ -1921,59 +2062,19 @@ def _consume_memory_warning(sid: str) -> str:
 async def _save_turn(u, a, sid):
     """Finaliza o turno no histórico durável.
 
-    Com o session store habilitado, as mensagens já foram gravadas durante o
-    loop; aqui garantimos a resposta final e atualizamos o cache de turnos
-    recentes. Sem o store, mantém o caminho legado do ``/write-short-term``.
+    As mensagens já foram gravadas durante o loop; aqui garantimos a resposta
+    final e atualizamos o cache de turnos recentes usado na query de recall.
     """
-    u_clipped = _clip_with_marker(u, ST_SAVE_MAX_CHARS)
-    a_clipped = _clip_with_marker(a, ST_SAVE_MAX_CHARS)
-
-    # Cache de turnos recentes p/ enriquecer a query de recall do PRÓXIMO turno.
+    u_clipped = _clip_with_marker(u, RECENT_TURN_MAX_CHARS)
+    a_clipped = _clip_with_marker(a, RECENT_TURN_MAX_CHARS)
     _remember_turn(sid, u_clipped, a_clipped)
 
-    if _session_store() is not None:
-        if _session_finalize_turn(sid, a):
-            _clear_memory_failure(sid, "save")
-            log.info(f"[save_turn] turno finalizado no session store (session={sid[:8]})")
-            return True
-        _metric_inc("memory_save_failures")
-        _note_memory_failure(sid, "save", "session store finalize failed")
-        return False
-
-    payload = {
-        "session_id": sid,
-        "turns": [
-            {"role": "user", "content": u_clipped},
-            {"role": "assistant", "content": a_clipped},
-        ],
-    }
-    last_error = ""
-    for attempt in (1, 2):
-        try:
-            r = await _memory_request("POST", "/write-short-term", payload)
-            stored = bool(r.get("stored")) if isinstance(r, dict) else False
-            reason = str(r.get("reason") or "?") if isinstance(r, dict) else str(r)
-            if stored:
-                log.info(f"[save_turn] ST gravado (session={sid[:8]})")
-                _clear_memory_failure(sid, "save")
-                return True
-            if reason.startswith("duplicate_semantic"):
-                log.info(f"[save_turn] ST recusado por dedup ({reason}) — "
-                         "resumo episódico já cobre o turno")
-                _clear_memory_failure(sid, "save")
-                return True
-            last_error = f"short-term save rejected: {reason}"
-            log.warning(f"[save_turn] ST NÃO gravado (reason={reason}) — "
-                        f"session={sid[:8]} — turno seguinte nasce sem histórico!")
-            break
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            log.warning(f"[save_turn] write-short-term falhou (tentativa {attempt}/2): "
-                        f"{type(e).__name__}: {e}")
-            if attempt == 1:
-                await asyncio.sleep(1.0)
+    if _session_finalize_turn(sid, a):
+        _clear_memory_failure(sid, "save")
+        log.info(f"[save_turn] turno finalizado no session store (session={sid[:8]})")
+        return True
     _metric_inc("memory_save_failures")
-    _note_memory_failure(sid, "save", last_error or "unknown failure")
+    _note_memory_failure(sid, "save", "session store finalize failed")
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1984,38 +2085,27 @@ async def _save_turn(u, a, sid):
 # havia nenhuma leitura do lado do orchestrator — só escritas pós-turno.
 
 async def _memory_read_semantic(query: str, sid: str,
-                                 top_k: int, top_k_final: int, max_chars: int) -> Optional[dict]:
+                                 top_k: int, top_k_final: int, max_chars: int,
+                                 scope: Optional[str] = None) -> Optional[dict]:
     """POST /read — LT semântico + ST + knowledge store + arquivos indexados,
     com a estratégia auto do próprio memory.py (dual/expanded, segmentação,
     PPR, MMR, rerank cross-encoder)."""
+    body = {
+        "query": query,
+        "top_k": top_k,
+        "min_score": 0.3,
+        "session_id": sid,
+        "strategy": "auto",
+        "top_k_final": top_k_final,
+        "total_max_chars": max_chars,
+    }
+    if scope:
+        body["scope"] = scope
     try:
-        return await _memory_request("POST", "/read", {
-            "query": query,
-            "top_k": top_k,
-            "min_score": 0.3,
-            "session_id": sid,
-            "strategy": "auto",
-            "top_k_final": top_k_final,
-            "total_max_chars": max_chars,
-        })
+        return await _memory_request("POST", "/read", body)
     except Exception as e:
         log.warning(f"Recall LT (/read) falhou (seguindo sem memória): {type(e).__name__}: {e}")
         return None
-
-
-async def _memory_read_st_raw(sid: str, n_pairs: int) -> list[dict]:
-    """POST /read-short-term — histórico cru (últimas N duplas user/assistant
-    da sessão), para dar continuidade conversacional ao tool loop."""
-    if not sid:
-        return []
-    try:
-        resp = await _memory_request("POST", "/read-short-term", {
-            "session_id": sid, "n_pairs": n_pairs,
-        })
-        return resp.get("turns", []) or []
-    except Exception as e:
-        log.warning(f"Recall ST (/read-short-term) falhou (seguindo sem histórico): {type(e).__name__}: {e}")
-        return []
 
 
 def _norm_st_fragments(text: str) -> list[str]:
@@ -2282,44 +2372,6 @@ def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]
     return "\n\n".join(sections)
 
 
-def _sanitize_st_turns(turns: list[dict], max_chars: int) -> tuple[list[dict], bool]:
-    """Turnos crus do /read-short-term → mensagens user/assistant alternadas
-    e válidas para a alternância estrita do chat template:
-      * descarta roles desconhecidos e conteúdos vazios;
-      * mescla mensagens consecutivas do MESMO role (grupos episódicos do ST
-        só têm assistant, o que quebraria user/assistant/user);
-      * corta as MAIS ANTIGAS até caber no orçamento de chars;
-      * se um único turno ainda estourar, corta com marcador explícito
-        (nunca corta silenciosamente no meio de uma frase).
-    Retorna (turnos_saneados, houve_descarte).
-    """
-    cleaned: list[dict] = []
-    for t in turns:
-        role = t.get("role")
-        content = (t.get("content") or "").strip()
-        if role not in ("user", "assistant") or not content:
-            continue
-        if cleaned and cleaned[-1]["role"] == role:
-            cleaned[-1]["content"] += "\n" + content
-        else:
-            cleaned.append({"role": role, "content": content})
-
-    dropped = False
-    while len(cleaned) > 1 and sum(len(m["content"]) for m in cleaned) > max_chars:
-        cleaned.pop(0)
-        dropped = True
-
-    # Caso extremo: um único turno maior que o orçamento inteiro. Corta com
-    # o marcador padrão para o modelo saber que houve omissão.
-    if cleaned and sum(len(m["content"]) for m in cleaned) > max_chars:
-        for m in cleaned:
-            if len(m["content"]) > max_chars:
-                m["content"] = _clip_with_marker(m["content"], max_chars, 200)
-                dropped = True
-
-    return cleaned, dropped
-
-
 def _plan_match_score(user_input: str, plan: dict) -> float:
     """Score simples de overlap de tokens entre o input do usuário e
     name/description do plano. Propositalmente sem embedding (PlansDB é
@@ -2340,13 +2392,14 @@ def _plan_match_score(user_input: str, plan: dict) -> float:
     return len(q & ref) / min(len(q), len(ref))
 
 
-async def _recall_plans(user_input: str) -> Optional[str]:
+async def _recall_plans(user_input: str, scope: Optional[str] = None) -> Optional[str]:
     """Recall pré-loop de planos salvos: lista os planos da memory e, se
     algum der match com o pedido, devolve um bloco para o system prompt
     orientando o modelo a preferir run_plan. Qualquer falha degrada para
     None — nunca derruba o tool loop."""
     try:
-        data = await _memory_request("POST", "/plans/list", {})
+        params = {"scope": scope} if scope else None
+        data = await _memory_request("POST", "/plans/list", {}, params=params)
         plans = data.get("plans") or []
     except Exception as e:
         log.debug(f"[_recall_plans] /plans/list falhou (ignorado): {type(e).__name__}: {e}")
@@ -2486,12 +2539,12 @@ def _format_voice_context_block(voice_res: Optional[dict],
     return "\n".join(lines)
 
 
-async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
+async def _recall_for_turn(query: str, sid: str,
+                           scope: Optional[str] = None) -> tuple[str, list[dict]]:
     """Recall pré-loop: memória de longo prazo + histórico durável.
 
     O histórico conversacional vem do ``SessionStore`` (mensagens completas,
-    incluindo tool calls e resultados) quando ele está habilitado. Sem ele,
-    cai no antigo ``/read-short-term``. Qualquer falha degrada para vazio —
+    incluindo tool calls e resultados). Qualquer falha degrada para vazio —
     nunca derruba o tool loop.
 
     A query é enriquecida com os últimos turnos quando o input é curto/deítico
@@ -2501,28 +2554,13 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
     com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
     contextual_query = _build_recall_query(query, sid)
-    store = _session_store()
-
-    if store is not None:
-        stored = _session_history(sid) or []
-        text_turns = [m for m in stored if m.get("role") in ("user", "assistant")]
-        read_res = await _memory_read_semantic(
-            contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
-        )
-        recall_block = _format_recall_block(read_res, text_turns)
-    else:
-        read_res, st_turns = await asyncio.gather(
-            _memory_read_semantic(
-                contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
-            ),
-            _memory_read_st_raw(sid, ORCH_ST_PAIRS),
-        )
-        stored, dropped = _sanitize_st_turns(st_turns, ORCH_ST_MAX_CHARS)
-        text_turns = stored
-        recall_block = _format_recall_block(read_res, stored)
-        if dropped:
-            note = "Note: earlier short-term turns were omitted for length."
-            recall_block = (recall_block + "\n\n" + note) if recall_block else note
+    stored = _session_history(sid) or []
+    text_turns = [m for m in stored if m.get("role") in ("user", "assistant")]
+    read_res = await _memory_read_semantic(
+        contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
+        scope=scope,
+    )
+    recall_block = _format_recall_block(read_res, text_turns)
 
     # Injeção do contexto de voz — custo O(1), se existir. Os fatos do falante
     # que já aparecem no recall/histórico são omitidos (dedup voz × memória).
@@ -2534,7 +2572,8 @@ async def _recall_for_turn(query: str, sid: str) -> tuple[str, list[dict]]:
     return recall_block, stored
 
 
-async def _extract_memories_via_llm(u: str, a: str, sid: str) -> bool:
+async def _extract_memories_via_llm(u: str, a: str, sid: str,
+                                    scope: Optional[str] = None) -> bool:
     """Extração de memórias pós-turno via o modelo extrator DEDICADO do LLM.py
     (endpoint /memories/extract). Substitui o antigo _save_lt('Usuário disse:
     ...') ingênuo, que gravava QUALQUER input como fato permanente de LT —
@@ -2544,7 +2583,8 @@ async def _extract_memories_via_llm(u: str, a: str, sid: str) -> bool:
     try:
         r = await state.llm_client.post(
             "/memories/extract",
-            json={"user_input": u, "assistant_response": a, "session_id": sid},
+            json={"user_input": u, "assistant_response": a, "session_id": sid,
+                  **({"scope": scope} if scope else {})},
             timeout=httpx.Timeout(120.0, connect=10.0),
         )
         if r.status_code == 200:
@@ -2635,6 +2675,10 @@ _CURRENT_HISTORY: ContextVar[list[dict]] = ContextVar("_current_history", defaul
 # CWD do turno corrente — lido por executores MCP auxiliares (planos/macros)
 # que não recebem o ExecuteRequest inteiro. Setado no /execute.
 _CURRENT_MCP_CWD: ContextVar[Optional[str]] = ContextVar("_current_mcp_cwd", default=None)
+# Escopo de memória do turno corrente (projeto do chat). Lido pelos
+# executores de tools de memória e pelos endpoints /memory/* para que cada
+# turno grave/leia no projeto certo — sem depender do /project/switch global.
+_CURRENT_SCOPE: ContextVar[Optional[str]] = ContextVar("_current_scope", default=None)
 
 
 def _sanitize_history_for_submodel(history: list[dict]) -> list[dict]:
@@ -2874,7 +2918,7 @@ async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
         top_k = ORCH_RECALL_TOP_K
     effective_sid = sid or req.session_id or "default"
     try:
-        read_res = await _memory_request("POST", "/read", {
+        read_res = await _memory_request("POST", "/read", _scope_payload({
             "query": query,
             "top_k": top_k,
             "min_score": 0.3,
@@ -2882,7 +2926,7 @@ async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
             "strategy": "auto",
             "top_k_final": ORCH_RECALL_TOP_K_FINAL,
             "total_max_chars": ORCH_RECALL_MAX_CHARS,
-        })
+        }))
     except Exception as e:
         return f"ERROR: memory_search failed: {type(e).__name__}: {e}"
     block = _format_recall_block(read_res)
@@ -3274,7 +3318,9 @@ async def _plan_run_macro_step(step: dict, plan: dict, step_index: int) -> tuple
 async def _tool_list_plans(args: dict, req: ExecuteRequest, sid: str = ""):
     """Tool nativa: lista os planos persistidos na memory."""
     try:
-        data = await _memory_request("POST", "/plans/list", {})
+        data = await _memory_request("POST", "/plans/list", {}, params=(
+            {"scope": _CURRENT_SCOPE.get()} if _CURRENT_SCOPE.get() else None
+        ))
     except Exception as e:
         return f"ERROR: list_plans failed: {type(e).__name__}: {e}"
     plans = data.get("plans", [])
@@ -3299,7 +3345,7 @@ async def _tool_run_plan(args: dict, req: ExecuteRequest, sid: str = ""):
                 "to see available plans.]")
     try:
         read_req = {"plan_id": plan_id} if plan_id is not None else {"name": plan_name}
-        data = await _memory_request("POST", "/plans/read", read_req)
+        data = await _memory_request("POST", "/plans/read", _scope_payload(read_req))
     except Exception as e:
         detail = ""
         if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
@@ -3441,12 +3487,176 @@ async def _tool_skill(args: dict, req: ExecuteRequest, sid: str = ""):
     )
 
 
+def _append_subagent_notification(
+    parent_id: str,
+    child_id: str,
+    job_id: str,
+    status: str,
+    text: str,
+) -> None:
+    store = _session_store()
+    if store is None or not parent_id:
+        return
+    content = (
+        f'<subagent sessionID="{child_id}" jobID="{job_id}" status="{status}">\n'
+        f"{text.strip()}\n"
+        "</subagent>"
+    )
+    try:
+        store.append_message(
+            parent_id,
+            {
+                "role": "user",
+                "content": content,
+                "metadata": {"subagent": {"child": child_id, "job": job_id, "status": status}},
+            },
+        )
+    except Exception as e:
+        log.warning(f"[subagent] falha ao notificar {parent_id[:8]}: {type(e).__name__}: {e}")
+
+
+async def _run_subagent_job(
+    parent_id: str,
+    child_id: str,
+    prompt: str,
+    req: "ExecuteRequest",
+    job_id: str,
+) -> None:
+    jobs = _job_store()
+    _SUBAGENT_CHILDREN.add(child_id)
+    eid = f"sub-{job_id}"
+    try:
+        child_req = ExecuteRequest(
+            input=prompt,
+            session_id=child_id,
+            cwd=req.cwd,
+            # O subagente herda o projeto (escopo de memória) do chat pai.
+            project=req.project,
+            lang=req.lang,
+            tts=False,
+            stream=False,
+            source=req.source,
+            max_steps=req.max_steps,
+        )
+        _steps, final = await _run_tool_loop(child_req, eid, child_id, on_event=None)
+        if jobs is not None:
+            jobs.update(job_id, "completed")
+        _append_subagent_notification(
+            parent_id, child_id, job_id, "completed",
+            final or "(subagent finished without a textual answer)",
+        )
+        log.info(f"[subagent] {child_id} concluído (job={job_id})")
+    except asyncio.CancelledError:
+        if jobs is not None:
+            jobs.update(job_id, "cancelled", "subagent cancelled")
+        _append_subagent_notification(parent_id, child_id, job_id, "cancelled", "Subagent cancelled.")
+        raise
+    except Exception as e:
+        if jobs is not None:
+            jobs.update(job_id, "failed", f"{type(e).__name__}: {e}")
+        _append_subagent_notification(
+            parent_id, child_id, job_id, "failed",
+            f"{type(e).__name__}: {e}",
+        )
+        log.warning(f"[subagent] {child_id} falhou: {type(e).__name__}: {e}")
+    finally:
+        _SUBAGENT_CHILDREN.discard(child_id)
+
+
+async def _tool_subagent(args: dict, req: ExecuteRequest, sid: str = ""):
+    """Tool nativa: inicia um subagente em background e retorna imediatamente."""
+    if not SUBAGENTS_ENABLED:
+        return "ERROR: subagents are disabled (AVA_SUBAGENTS=0)."
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return "[subagent: pass `prompt` with the complete task.]"
+    if not sid:
+        return "ERROR: subagent requires a parent session."
+    if sid in _SUBAGENT_CHILDREN:
+        return "ERROR: nested subagents are not supported."
+    store = _session_store()
+    jobs = _job_store()
+    if store is None or jobs is None:
+        return "ERROR: session store is unavailable; cannot start a subagent."
+    parent_id = sid
+    if jobs.active_count(parent_id) >= SUBAGENT_MAX_CONCURRENT:
+        return (
+            f"ERROR: too many subagents running for this session "
+            f"(limit {SUBAGENT_MAX_CONCURRENT}). Wait for one to finish."
+        )
+    description = str(args.get("description") or "").strip() or prompt[:60]
+    requested = str(args.get("sessionID") or "").strip()
+    if requested:
+        child = store.get(requested)
+        if child is None or child.get("parent_id") != parent_id:
+            return f"ERROR: subagent session '{requested}' not found for this parent."
+        running = _SUBAGENT_CHILD_TASKS.get(requested)
+        if running is not None and not running.done():
+            return (
+                f"ERROR: subagent '{requested}' is still working. "
+                "Wait for the <subagent> notification before sending a follow-up."
+            )
+        child_id = requested
+    else:
+        child_id = f"sub_{uuid.uuid4().hex[:16]}"
+        store.create(
+            session_id=child_id,
+            parent_id=parent_id,
+            title=description[:80],
+        )
+    job_id = jobs.create(
+        parent_id=parent_id,
+        child_id=child_id,
+        kind="subagent",
+        description=description,
+    )
+    _metric_inc("subagent_jobs_total")
+    task = asyncio.create_task(_run_subagent_job(parent_id, child_id, prompt, req, job_id))
+    _SUBAGENT_TASKS.add(task)
+    _SUBAGENT_CHILD_TASKS[child_id] = task
+
+    def _cleanup(done: asyncio.Task[Any]) -> None:
+        _SUBAGENT_TASKS.discard(done)
+        if _SUBAGENT_CHILD_TASKS.get(child_id) is done:
+            _SUBAGENT_CHILD_TASKS.pop(child_id, None)
+
+    task.add_done_callback(_cleanup)
+    output = (
+        f"The subagent is working in the background (sessionID: {child_id}). "
+        "You will receive a <subagent> message when it goes idle. "
+        "DO NOT sleep, poll, or duplicate its work; continue with non-overlapping tasks "
+        "or end your response."
+    )
+    return json.dumps(
+        {"sessionID": child_id, "status": "running", "jobID": job_id, "output": output},
+        ensure_ascii=False,
+    )
+
+
 # name -> (description, [(field, type, required)], async executor)
 # Só as tools NATIVAS ficam aqui agora — as que exigem estado/acoplamento
 # demais com o próprio loop pra virar um servidor MCP genérico. memory,
 # search e alpha_code saíram daqui: servidores MCP são descobertos
 # dinamicamente via mcp_manager (ver _select_skills/_load_mcp_tools).
 TOOLS: dict[str, dict[str, Any]] = {
+    "subagent": {
+        "description": (
+            "Spawn a subagent in a child session to work on a task in the background. "
+            "The call returns immediately with a sessionID; you receive a <subagent> "
+            "message when it goes idle. Use it for long, independent work (builds, "
+            "research, multi-step file tasks) and keep working on non-overlapping tasks. "
+            "Do not poll, sleep, or duplicate its work. Pass `sessionID` to send a "
+            "follow-up to a finished subagent."
+        ),
+        "fields": [
+            ("description", "string", True),
+            ("prompt", "string", True),
+            ("agent", "string", False),
+            ("model", "string", False),
+            ("sessionID", "string", False),
+        ],
+        "executor": _tool_subagent,
+    },
     "skill": {
         "description": (
             "Load a specialized skill's instructions and resources into the current "
@@ -4746,6 +4956,17 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
         "tool call. When you are done, write the complete answer as plain text.",
         "</ending_the_turn>",
         "",
+        *([
+            "<subagents>",
+            "Subagents run in the background. When you start one, keep working on",
+            "non-overlapping tasks or end your response; do not sleep, poll, or ask",
+            "the subagent for status. You will receive a <subagent> message when it",
+            "finishes. Use a follow-up with the same sessionID only after that message.",
+            "For long shell commands, use the executor's background/start_process tool",
+            "when available and do not poll for completion.",
+            "</subagents>",
+            "",
+        ] if SUBAGENTS_ENABLED else []),
         "<autonomy>",
         "Act without asking when the action is reversible and low-risk. Reversible means you",
         "can undo it or it leaves no lasting effect: reading files, searching, listing, looking",
@@ -4983,6 +5204,25 @@ def _build_agent_skills_query(user_input: str, st_turns: Optional[list[dict]] = 
 
 async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                           on_event=None) -> tuple[list[StepResult], str]:
+    """Turno serializado por sessão e limitado por um semáforo global.
+
+    - `_session_lock`: um turno por chat por vez (histórico não intercala).
+    - `_TURN_SEMAPHORE`: teto de turnos concorrentes no processo
+      (`AVA_MAX_CONCURRENT_TURNS`, default 8) para não estourar o provider.
+    O corpo real vive em _run_tool_loop_unlocked.
+    """
+    project = (req.project or "").strip() or _project_active()
+    async with _session_lock(sid):
+        async with _TURN_SEMAPHORE:
+            _open_turn(project)
+            try:
+                return await _run_tool_loop_unlocked(req, eid, sid, on_event=on_event)
+            finally:
+                _close_turn(project)
+
+
+async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
+                                  on_event=None) -> tuple[list[StepResult], str]:
     """
     Fluxo (tool-calling nativo via Jinja):
       1. LLM recebe o histórico + a lista `tools` (formato OpenAI). O servidor
@@ -5005,10 +5245,11 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     _metric_inc("turns_total")
     depth, think_instruction = await _think_instruction(req.input)
 
-    # ── NEW (projetos): re-afirma o escopo ativo (registry → memory) ANTES do
-    # recall — a memory pode ter reiniciado e voltado ao 'general'. O slug
-    # também vira hint no system prompt.
-    active_project = await _ensure_memory_scope()
+    # ── NEW (multi-chat): projeto do turno. Com projeto explícito (request
+    # ou sessão) a memory só ABRE o escopo — o escopo ativo do processo não
+    # muda, então chats em projetos diferentes rodam concorrentes.
+    active_project = await _ensure_memory_scope(_resolve_turn_project(req, sid))
+    _CURRENT_SCOPE.set(active_project)
 
     # ── Session store durável (dual-write) ──────────────────────────────────
     # Cria a sessão antes de qualquer mensagem. A leitura ainda é do ST antigo;
@@ -5020,10 +5261,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # (2 round-trips HTTP para a memory_api) fica escondido atrás do handshake
     # MCP. Antes deste bloco o loop montava o histórico do zero e nunca lia
     # memória (só escrevia pós-turno) — a memória gravada nunca voltava.
-    recall_task = asyncio.ensure_future(_recall_for_turn(req.input, sid)) if req.input else None
+    recall_task = asyncio.ensure_future(_recall_for_turn(req.input, sid, scope=active_project)) if req.input else None
     # ── Recall de planos salvos (em paralelo) — orienta o modelo a preferir
     # run_plan quando existe plano compatível com o pedido (ver _recall_plans).
-    plans_task = asyncio.ensure_future(_recall_plans(req.input)) if req.input else None
+    plans_task = asyncio.ensure_future(_recall_plans(req.input, scope=active_project)) if req.input else None
 
     # ── Descoberta de tools em duas etapas ──
     # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
@@ -5280,17 +5521,27 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
     # Com o session store, `st_turns` já vem como mensagens completas
     # (user/assistant/tool) e sanitizado para o chat template. Sem ele, cai
     # no caminho legado de turnos crus do ST.
-    if _session_store() is not None:
-        session_messages = list(st_turns)
-        # O turno atual é sempre representado pela mensagem abaixo. Qualquer
-        # user pendente no fim do histórico (turno interrompido ou retomado)
-        # sairia como dois user consecutivos e violaria o chat template.
-        while session_messages and session_messages[-1].get("role") == "user":
+    session_messages = list(st_turns)
+    # O turno atual é sempre representado pela mensagem abaixo. Qualquer
+    # user pendente no fim do histórico (turno interrompido ou retomado)
+    # sairia como dois user consecutivos e violaria o chat template.
+    # Exceção: notificação de subagente vira prefixo do user atual.
+    subagent_notice = None
+    if session_messages and session_messages[-1].get("role") == "user":
+        last = session_messages[-1]
+        metadata = last.get("metadata") if isinstance(last.get("metadata"), dict) else {}
+        if "subagent" in metadata:
+            subagent_notice = message_text(last.get("content")).strip()
             session_messages.pop()
-    else:
-        while st_turns and st_turns[-1]["role"] == "user":
-            st_turns.pop()
-        session_messages = [{"role": t["role"], "content": t["content"]} for t in st_turns]
+        else:
+            while session_messages and session_messages[-1].get("role") == "user":
+                session_messages.pop()
+
+    if subagent_notice:
+        if isinstance(user_content, str):
+            user_content = subagent_notice + "\n\n" + user_content
+        elif isinstance(user_content, list):
+            user_content = [{"type": "text", "text": subagent_notice}, *user_content]
 
     history: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -5379,6 +5630,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         # foi lido — o histórico fica intacto, nada é descartado. Único
         # guarda-corpo de loop restante (o anti-loop de MESMA tool saiu).
         if turn >= max_steps:
+            _metric_inc("force_finish_calls")
             log.warning(
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
                 "forçando resposta final sem tools."
@@ -5431,6 +5683,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 history.append({"role": "user", "content": user_content})
             continue
         _record_llm_usage(sid, message.get("_usage"))
+        _metric_inc("steps_total")
         tool_calls = message.get("tool_calls") or []
         log.debug(
             f"[{eid[:8]}] Turn {turn}: content={message.get('content')!r} "
@@ -5574,6 +5827,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
             used_mcp_names: list[str] = []
             mcp_is_error = False
             t0 = time.perf_counter()
+            _metric_inc("tool_calls_total")
             _CURRENT_HISTORY.set(history)
             try:
                 if TOOL_REGISTRY_ENABLED and tool_snapshot is not None:
@@ -5676,6 +5930,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                     f"[{eid[:8]}] TOOL RESULT '{tool_name}' (call_id={call_id}, "
                     f"{lat}ms) args={json.dumps(args, ensure_ascii=False)} FAILED err={err}"
                 )
+
+            if not success:
+                _metric_inc("tool_failures_total")
 
             if success and _is_read_tool(tool_name) and isinstance(args, dict):
                 read_path = args.get("path") or args.get("file_path") or args.get("filePath")
@@ -5855,9 +6112,13 @@ async def _execute_stream_generator(req: ExecuteRequest):
     # Sessão estável quando o cliente não envia uma: o ST antigo era global,
     # então "default" preserva a continuidade entre turnos/anônimos.
     sid = req.session_id or "default"
+    usage_before = _usage_snapshot(sid)
     # Propaga o CWD do turno para os executores MCP auxiliares (planos/macros)
     # via ContextVar — o tool loop normal repassa req.cwd explicitamente.
     _CURRENT_MCP_CWD.set(req.cwd)
+    # Escopo do turno acessível aos executores de tools (e à extração de
+    # memórias pós-turno, que roda num task criado aqui no gerador).
+    _CURRENT_SCOPE.set(_resolve_turn_project(req, sid) or _project_active())
     log.info(f"[{eid[:8]}] Executando (tool loop, source={req.source or 'tui'}): '{req.input[:80]}'")
 
     # Espelho no Conversation Hub: `meta` inclui a pergunta (o chat do Manager
@@ -5910,6 +6171,8 @@ async def _execute_stream_generator(req: ExecuteRequest):
             _put_event_nowait("__error__", str(e))
 
     task = asyncio.create_task(run())
+    _track_turn(sid, task)
+    _track_turn(sid, asyncio.current_task())
 
     step_results: list[StepResult] = []
     final_response = ""
@@ -6022,33 +6285,35 @@ async def _execute_stream_generator(req: ExecuteRequest):
         _spawn(_fire_tts(final_response, req))
 
     if final_response:
-        # O turno precisa estar durável antes da extração de memórias. Com o
-        # session store, as mensagens já foram gravadas durante o loop e isto
-        # só garante a resposta final; sem ele, mantém o caminho legado do ST.
+        # As mensagens já foram gravadas durante o loop; isto garante a
+        # resposta final no session store antes da extração de memórias.
         saved = await _save_turn(req.input, final_response, sid)
         if not saved:
             log.warning(f"[{eid[:8]}] save_turn falhou — aviso de memória será injetado no próximo turno")
         # B+: extração real (modelo extrator do LLM.py, roteando semantic→LT /
         # episodic→ST) no lugar do antigo "_save_lt('Usuário disse: ...')" —
         # que gravava qualquer input como fato permanente de LT.
-        _spawn(_extract_memories_via_llm(req.input, final_response, sid))
+        _spawn(_extract_memories_via_llm(req.input, final_response, sid,
+                                        scope=_CURRENT_SCOPE.get()))
 
     lat = round((time.perf_counter() - t0) * 1000, 2)
+    turn_usage = _usage_delta(usage_before, _usage_snapshot(sid))
     errors = [f"Step {s.step} [{s.executor}]: {s.error}" for s in step_results if not s.success]
     if error_msg:
         errors.append(error_msg)
 
+    yield _sse("usage", turn_usage)
     await _mirror_conversation(CONVERSATION_HUB, "done", {
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
         "total_latency_ms": lat, "errors": errors,
-        "dropped_events": dropped_events,
+        "dropped_events": dropped_events, "usage": turn_usage,
     })
     yield _sse("done", {
         "execution_id": eid, "final_response": final_response,
         "steps": [s.model_dump() for s in step_results],
         "total_latency_ms": lat, "errors": errors,
-        "dropped_events": dropped_events,
+        "dropped_events": dropped_events, "usage": turn_usage,
     })
 
 
@@ -6386,28 +6651,28 @@ async def voice_register(req: VoiceRegisterRequest):
 @app.post("/memory/read")
 async def memory_read(req: MemoryReadRequest):
     try:
-        return await _memory_request("POST", "/read", {
+        return await _memory_request("POST", "/read", _scope_payload({
             "query": req.query, "top_k": req.top_k, "min_score": req.min_score,
             "session_id": req.session_id, "strategy": "auto",
-        })
+        }))
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/memory/write")
 async def memory_write(req: MemoryWriteRequest):
     try:
-        return await _memory_request("POST", "/write", {
+        return await _memory_request("POST", "/write", _scope_payload({
             "text": req.text, "source": req.source, "confidence": req.confidence,
             "forgettable": req.forgettable, "ttl_days": req.ttl_days,
             "action": req.action, "memory_id": req.memory_id,
-        })
+        }))
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
 
 @app.post("/memory/write-batch")
 async def memory_write_batch(reqs: list[MemoryWriteRequest]):
     try:
-        return await _memory_request("POST", "/write/batch", {
+        return await _memory_request("POST", "/write/batch", _scope_payload({
             "items": [
                 {
                     "text": r.text, "source": r.source, "confidence": r.confidence,
@@ -6416,7 +6681,7 @@ async def memory_write_batch(reqs: list[MemoryWriteRequest]):
                 }
                 for r in reqs
             ],
-        })
+        }))
     except Exception as e:
         raise HTTPException(502, f"Memory falhou: {e}")
 
@@ -6465,6 +6730,26 @@ async def chat(req: ChatRequest):
 
 
 # ── Status / utilitários ─────────────────────────────────────────────────────
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics():
+    lines = [obs_metrics.render_prometheus().rstrip()]
+    store = _session_store()
+    usage = store.usage_total() if store is not None else {
+        "input_tokens": 0, "output_tokens": 0, "cache_read": 0,
+        "cache_write": 0, "cost": 0,
+    }
+    lines.append(f"ava_session_input_tokens_total {int(usage.get('input_tokens') or 0)}")
+    lines.append(f"ava_session_output_tokens_total {int(usage.get('output_tokens') or 0)}")
+    lines.append(f"ava_session_cache_read_tokens_total {int(usage.get('cache_read') or 0)}")
+    lines.append(f"ava_session_cache_write_tokens_total {int(usage.get('cache_write') or 0)}")
+    lines.append(f"ava_session_cost_usd_total {float(usage.get('cost') or 0)}")
+    prompt = int(usage.get("input_tokens") or 0)
+    cached = int(usage.get("cache_read") or 0)
+    ratio = (cached / prompt) if prompt > 0 else 0.0
+    lines.append(f"ava_cache_read_ratio {ratio:.6f}")
+    return "\n".join(lines) + "\n"
+
 
 @app.get("/status")
 async def status():
@@ -6550,11 +6835,15 @@ async def clear_session(session_id: str):
 # ── Session store — inspeção do dual-write ───────────────────────────────────
 
 @app.get("/sessions")
-async def list_sessions(limit: int = 50):
+async def list_sessions(limit: int = 50, root: bool = False,
+                        project: Optional[str] = None):
     store = _session_store()
     if store is None:
         return {"enabled": False, "sessions": []}
-    return {"enabled": True, "sessions": store.list_sessions(limit)}
+    return {
+        "enabled": True,
+        "sessions": store.list_sessions(limit, root_only=root, project=project),
+    }
 
 
 @app.get("/session/{session_id}/messages")
@@ -6576,6 +6865,30 @@ async def session_usage(session_id: str):
     if store is None:
         return {"enabled": False, "usage": {}}
     return {"enabled": True, "usage": store.usage(session_id)}
+
+
+@app.post("/session/{session_id}/cancel")
+async def cancel_session_turn(session_id: str):
+    """Interrompe o(s) turno(s) ativos DESTA sessão.
+
+    O WebUI usa ao parar um chat que continuou em background (o abort do
+    fetch resolve o caso normal — este endpoint cobre reconexão/órfãos).
+    """
+    tasks = list(_TURN_TASKS.get(session_id, ()))
+    cancelled = 0
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+            cancelled += 1
+    return {"cancelled": cancelled}
+
+
+@app.get("/jobs")
+async def list_jobs(parent_id: Optional[str] = None, status: Optional[str] = None, limit: int = 50):
+    jobs = _job_store()
+    if jobs is None:
+        return {"enabled": False, "jobs": []}
+    return {"enabled": True, "jobs": jobs.list(parent_id=parent_id, status=status, limit=limit)}
 
 
 @app.post("/session/{session_id}/compact")
@@ -6636,7 +6949,18 @@ async def reload_session_instructions(session_id: str):
     return {"enabled": True, "baseline": prepared.baseline, "deltas": prepared.deltas}
 
 @app.post("/tts/cancel")
-async def cancel_tts():
+async def cancel_tts(session_id: Optional[str] = None):
+    """Cancela a síntese em andamento.
+
+    O serviço de TTS só tem um cancelamento global. Com `session_id`, o
+    cancelamento global é evitado quando OUTRO turno ainda está ativo — assim
+    parar um chat não corta o áudio de outro. Sem `session_id` mantém o
+    comportamento antigo (TUI/voz).
+    """
+    if session_id:
+        others = {s for s in _TURN_TASKS if s != session_id}
+        if others:
+            return {"cancelled": 0, "scoped": True, "global_skipped": True}
     try:
         r = await state.tts_client.post("/cancel", timeout=5.0)
         r.raise_for_status()

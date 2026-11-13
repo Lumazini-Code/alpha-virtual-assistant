@@ -38,7 +38,7 @@ from memory_models import (
     ScopeInfoResponse,
     ScopeSwitchRequest,
 )
-from memory_state import state, switch_scope, delete_scope
+from memory_state import state, switch_scope, delete_scope, ensure_scope
 
 
 async def project_current() -> ScopeInfoResponse:
@@ -71,6 +71,26 @@ async def project_switch(req: ScopeSwitchRequest) -> ScopeInfoResponse:
     )
 
 
+async def project_ensure(req: ScopeSwitchRequest) -> ScopeInfoResponse:
+    """Abre o escopo no cache (POST /project/ensure) SEM trocar o escopo
+    ativo. Turnos com `project` explícito levam o escopo por requisição; aqui
+    só garantimos que os DBs/índices do projeto estão abertos."""
+    scope = (req.scope or "").strip()
+    if not scope:
+        raise MemoryToolError("scope vazio")
+    if scope != GENERAL_SCOPE and not is_valid_scope(scope):
+        raise MemoryToolError(
+            f"scope inválido: {scope!r} — use 'general' ou slug [a-z0-9][a-z0-9_-]{{0,63}}"
+        )
+    opened = await ensure_scope(scope)
+    sc = state.scopes.get(scope) or state.scope
+    return ScopeInfoResponse(
+        scope=scope,
+        db_dir=sc.paths.db_dir if sc is not None else resolve_scope_paths(scope).db_dir,
+        opened=opened,
+    )
+
+
 async def project_delete(slug: str) -> ScopeDeleteResponse:
     """Remove um projeto (DELETE /project/{slug}): fecha o escopo (se aberto)
     e apaga o diretório db/<slug>/ INTEIRO — memórias LT, grafo Hebbiano,
@@ -93,5 +113,6 @@ async def project_delete(slug: str) -> ScopeDeleteResponse:
 __all__ = [
     'project_current',
     'project_delete',
+    'project_ensure',
     'project_switch',
 ]
