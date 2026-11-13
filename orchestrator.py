@@ -237,17 +237,23 @@ SESSION_STORE_ENABLED = os.getenv("AVA_SESSION_STORE", "1").strip().lower() in (
 )
 try:
     from Modules.session import (
+        CONTINUE_AFTER_OUTPUT_LIMIT,
         CompactionManager,
+        OutputLimitTracker,
         SessionStore,
         estimate_tokens,
+        is_output_limit,
         message_text,
         sanitize_for_model,
     )
 except ImportError:  # execução fora da raiz do projeto (CWD diferente)
     from session import (  # type: ignore
+        CONTINUE_AFTER_OUTPUT_LIMIT,
         CompactionManager,
+        OutputLimitTracker,
         SessionStore,
         estimate_tokens,
+        is_output_limit,
         message_text,
         sanitize_for_model,
     )
@@ -319,6 +325,9 @@ CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "30000
 CODEMODE_MAX_TOOL_CALLS = max(1, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "50")))
 CODEMODE_MAX_OUTPUT_CHARS = max(1_000, int(os.getenv("AVA_CODEMODE_MAX_OUTPUT_CHARS", "200000")))
 SKILL_CATALOG_ENABLED = os.getenv("AVA_SKILL_CATALOG", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+SESSION_RUNNER_ENABLED = os.getenv("AVA_SESSION_RUNNER", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
 _CODEMODE_RUNTIME: Optional[CodeModeRuntime] = None
@@ -4528,6 +4537,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
 
     last_error: Optional[Exception] = None
     cached_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
     for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
         content_acc: list[str] = []
         tool_calls_final: list = []
@@ -4579,6 +4589,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                         tool_calls_final = evt.get("tool_calls") or []
                     elif evt.get("done"):
                         cached_tokens = evt.get("prompt_cached_tokens", cached_tokens)
+                        finish_reason = evt.get("finish_reason", finish_reason)
                     elif "error" in evt:
                         if evt.get("too_large"):
                             raise _LLMNoRetryError(
@@ -4599,6 +4610,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                         {"prompt_tokens_cached": cached_tokens}
                         if cached_tokens is not None else {}
                     ),
+                    "_finish_reason": finish_reason,
                 }
         except _LLMNoRetryError:
             raise
@@ -4885,7 +4897,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
 
 async def _force_finish(history: list[dict], eid: str,
                         lang_hint: Optional[str] = None,
-                        reason: str = "max_steps") -> str:
+                        reason: str = "max_steps",
+                        session_id: Optional[str] = None) -> str:
     """
     Rede de segurança do teto de turnos (max_steps): chamada quando o loop
     atinge o teto sem o modelo ter entregado a resposta final (texto puro
@@ -4911,7 +4924,11 @@ async def _force_finish(history: list[dict], eid: str,
         ),
     }
     try:
-        message = await _llm_chat(history + [nudge], tools=None, temperature=0.3)
+        message = await _llm_chat(
+            history + [nudge], tools=None, temperature=0.3,
+            session_id=session_id,
+            affinity=_session_affinity(session_id) if session_id else None,
+        )
         text = (message.get("content") or "").strip()
         if text:
             return text
@@ -5287,6 +5304,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
     step_results: list[StepResult] = []
     final_response = ""
+    output_tracker = OutputLimitTracker()
     turn = 0
 
     # ── Guarda-corpo anti-repetição: REMOVIDO ────────────────────────────
@@ -5365,7 +5383,7 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
                 "forçando resposta final sem tools."
             )
-            final_response = await _force_finish(history, eid, lang_hint=req.lang)
+            final_response = await _force_finish(history, eid, lang_hint=req.lang, session_id=sid)
             _session_append(sid, {"role": "assistant", "content": final_response})
             # Chamada de fechamento é síncrona (_llm_chat) — delta único.
             if on_event:
@@ -5392,6 +5410,9 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                                           reasoning_effort=reasoning_effort,
                                           session_id=sid,
                                           affinity=_session_affinity(sid))
+        except asyncio.CancelledError:
+            log.warning(f"[{eid[:8]}] Turn {turn}: execução interrompida — cancelando step")
+            raise
         except Exception as exc:
             if overflow_recovered or not _is_context_overflow(exc):
                 raise
@@ -5423,20 +5444,34 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
         _session_append(sid, assistant_msg)
 
         if not tool_calls:
-            # Modelo respondeu sem chamar nenhuma tool: este texto É a resposta
-            # final do turno — a ÚNICA forma de encerramento (não existe tool
-            # "finish").
-            #
-            # Importante: NÃO dá para simplesmente re-chamar o LLM de novo com
-            # o mesmo histórico (sem nova mensagem de user/tool no meio) —
-            # isso produziria duas mensagens role="assistant" consecutivas no
-            # histórico, o que viola a alternância estrita user/assistant/tool
-            # exigida pelo chat template do modelo e derruba a chamada
-            # seguinte com 400 Bad Request no backend de LLM.
-            final_response = message.get("content") or ""
+            # Modelo respondeu sem chamar nenhuma tool. Texto puro encerra o
+            # turno — mas se o provider cortou por limite de output, injeta um
+            # user sintético e continua (até duas vezes), em vez de entregar
+            # uma resposta truncada.
+            piece = message.get("content") or ""
+            final_response += piece
+            if SESSION_RUNNER_ENABLED and is_output_limit(message):
+                if output_tracker.record(message):
+                    history.append({"role": "user", "content": CONTINUE_AFTER_OUTPUT_LIMIT})
+                    _session_append(sid, {"role": "user", "content": CONTINUE_AFTER_OUTPUT_LIMIT})
+                    step_results.append(StepResult(
+                        step=turn, executor="llm",
+                        action="output limit — continuando a resposta",
+                        success=True, result=None,
+                    ))
+                    log.warning(f"[{eid[:8]}] Turn {turn}: finish_reason=length — continuando")
+                    continue
+                step_results.append(StepResult(
+                    step=turn, executor="llm",
+                    action="output limit — continuações esgotadas",
+                    success=False, result=piece, error="output-limit",
+                ))
+                log.warning(f"[{eid[:8]}] Turn {turn}: limite de output esgotado")
+                break
+            output_tracker.reset()
             step_results.append(StepResult(
                 step=turn, executor="llm", action="(resposta direta, sem tool_calls)",
-                success=True, result=final_response,
+                success=True, result=piece,
             ))
             log.debug(f"[{eid[:8]}] Turn {turn}: resposta sem tool_calls, finalizando")
             break
@@ -5742,10 +5777,14 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
                 for rec in recs:
                     outcomes[rec["index"]] = await _run_one(rec)
 
-            results = await asyncio.gather(
-                *(_run_lane(recs) for recs in lanes.values()),
-                return_exceptions=True,
-            )
+            try:
+                results = await asyncio.gather(
+                    *(_run_lane(recs) for recs in lanes.values()),
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError:
+                log.warning(f"[{eid[:8]}] Turn {turn}: tools interrompidas — cancelando")
+                raise
             for lane_result in results:
                 if isinstance(lane_result, BaseException):
                     log.warning(f"[{eid[:8]}] lane de tools falhou: {lane_result}")
@@ -5774,6 +5813,10 @@ async def _run_tool_loop(req: ExecuteRequest, eid: str, sid: str,
 
         if finished:
             break
+        if SESSION_RUNNER_ENABLED and _session_store() is not None:
+            reloaded = _session_history(sid, keep_trailing_tools=True) or []
+            if reloaded:
+                history = [{"role": "system", "content": system_prompt}, *reloaded]
         turn += 1
 
     # ── Loop de aprendizado do grafo de tools ──

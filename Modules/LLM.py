@@ -2774,6 +2774,7 @@ async def chat_stream(req: ChatRequest):
         full_response = ""       # texto exposto ao usuário (sem os blocos <MEMORY_CORRECTION>)
         full_reasoning = ""
         tool_calls_acc: dict[int, dict] = {}   # index -> tool_call em montagem
+        finish_reason: Optional[str] = None
         t0 = time.perf_counter()
         cached_tokens = 0
 
@@ -2854,6 +2855,9 @@ async def chat_stream(req: ChatRequest):
                                                          usage.get("cached_tokens", 0)
                                     continue
                                 delta_obj = choices[0].get("delta", {}) or {}
+                                finish = choices[0].get("finish_reason")
+                                if finish:
+                                    finish_reason = finish
 
                                 if req.stream_reasoning:
                                     reasoning = delta_obj.get("reasoning_content", "") or delta_obj.get("reasoning", "")
@@ -3079,7 +3083,7 @@ async def chat_stream(req: ChatRequest):
             # responder com role="tool".
             yield f"data: {json.dumps({'tool_calls': tool_calls_final})}\n\n"
 
-        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prep_ms': round(prep_elapsed * 1000), 'prompt_cached_tokens': cached_tokens, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prep_ms': round(prep_elapsed * 1000), 'prompt_cached_tokens': cached_tokens, 'finish_reason': finish_reason, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
 
         # Persistência pós-stream — apenas turno FINAL do modo chat
         if turno_final and (not tool_mode) and full_response:
@@ -3267,7 +3271,11 @@ async def _openrouter_tool_call(
 
     if r.status_code == 200:
         data = r.json()
-        return data["choices"][0]["message"], MAIN_MODEL, data.get("usage") or {}, False
+        choice = data["choices"][0]
+        message = choice["message"]
+        if isinstance(message, dict):
+            message["_finish_reason"] = choice.get("finish_reason")
+        return message, MAIN_MODEL, data.get("usage") or {}, False
 
     # Erro de contexto grande demais: não faz sentido retentar
     try:

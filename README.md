@@ -306,6 +306,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_SKILL_ALLOW` / `AVA_SKILL_DENY` | orchestrator | — | Filtro glob de skills no catálogo e no carregamento |
 | `AVA_IMAGE_BUDGET_TRIGGER_BYTES` | orchestrator | `26214400` (25 MiB) | Gatilho para remover as imagens mais antigas do request |
 | `AVA_IMAGE_BUDGET_TARGET_BYTES` | orchestrator | `15728640` (15 MiB) | Alvo após o corte de imagens |
+| `AVA_SESSION_RUNNER` | orchestrator | `1` | Recarrega histórico do store por step e trata `finish_reason=length` |
 | `WEB_STACK_ON_DEMAND` | alpha-mcp | `1` | searxng + valkey sobem na 1ª `web_search` e dormem após 5 min sem busca (`WEB_STACK_IDLE_STOP_S`) |
 | `AVA_CHROME_PATH` | tray | autodetect | Caminho do Chrome (aberto pelo tray em modo normal) |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | `Modules/.env` | — | Token da extensão "Playwright MCP Bridge" (injetado no @playwright/mcp; conexão sem aprovação manual) |
