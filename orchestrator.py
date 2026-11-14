@@ -787,11 +787,12 @@ def _session_finalize_turn(sid: str, assistant_text: str) -> bool:
         return False
 
 
-async def _summarize_for_compaction(prompt: str) -> str:
+async def _summarize_for_compaction(prompt: str, model: Optional[str] = None) -> str:
     """Chama o modelo principal para produzir o resumo de compactação."""
     message = await _llm_chat(
         [{"role": "user", "content": prompt}],
         temperature=0.2,
+        model=model,
     )
     return str(message.get("content") or "")
 
@@ -805,6 +806,7 @@ async def _maybe_compact(
     eid: str = "",
     extra_text: str = "",
     force: bool = False,
+    model: Optional[str] = None,
 ) -> bool:
     """Compacta o histórico se o request estimado passar do limiar.
 
@@ -843,7 +845,7 @@ async def _maybe_compact(
         result = await compactor.compact(
             sid,
             entries,
-            _summarize_for_compaction,
+            lambda prompt: _summarize_for_compaction(prompt, model=model),
             reason=reason,
         )
     except Exception as e:
@@ -1081,8 +1083,8 @@ def _open_turn(project: str) -> None:
         _ACTIVE_BY_PROJECT[project] = _ACTIVE_BY_PROJECT.get(project, 0) + 1
         total = _ACTIVE_TURNS[0]
         by_project = dict(_ACTIVE_BY_PROJECT)
-    obs_metrics.set("active_turns", total)
-    obs_metrics.set("active_turns_by_project", by_project)
+    obs_metrics.gauge("active_turns", total)
+    obs_metrics.gauge("active_turns_by_project", by_project)
 
 
 def _close_turn(project: str) -> None:
@@ -1095,8 +1097,8 @@ def _close_turn(project: str) -> None:
             _ACTIVE_BY_PROJECT.pop(project, None)
         total = _ACTIVE_TURNS[0]
         by_project = dict(_ACTIVE_BY_PROJECT)
-    obs_metrics.set("active_turns", total)
-    obs_metrics.set("active_turns_by_project", by_project)
+    obs_metrics.gauge("active_turns", total)
+    obs_metrics.gauge("active_turns_by_project", by_project)
 
 THINK_DEPTH_INSTRUCTIONS: dict[int, str] = {
     0: "This is a trivial interaction — a greeting, acknowledgment, or simple social exchange. Respond naturally and briefly. No reasoning needed.",
@@ -1445,6 +1447,10 @@ class ExecuteRequest(BaseModel):
     # request > resource/settings.json (aba settings da TUI) > env
     # AVA_REASONING_EFFORT > nativo (template do modelo decide).
     reasoning_effort: Optional[Literal["low", "medium", "high", "none"]] = None
+    # Modelo escolhido na WebUI para ESTE chat (override de LLM_MODEL).
+    # O provider (base URL/key) continua sendo o do Modules/.env; só o ID do
+    # modelo muda por turno, então trocar de modelo não reinicia o stack.
+    model:         Optional[str]  = Field(None, max_length=200)
 
 class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
@@ -3537,6 +3543,7 @@ async def _run_subagent_job(
             stream=False,
             source=req.source,
             max_steps=req.max_steps,
+            model=req.model,
         )
         _steps, final = await _run_tool_loop(child_req, eid, child_id, on_event=None)
         if jobs is not None:
@@ -4608,7 +4615,8 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
                      temperature: float = 0.0, max_tokens: Optional[int] = None,
                      reasoning_effort: Optional[str] = None,
                      session_id: Optional[str] = None,
-                     affinity: Optional[str] = None) -> dict:
+                     affinity: Optional[str] = None,
+                     model: Optional[str] = None) -> dict:
     """
     Chama o LLM.py (porta 4003) via seu endpoint real de tool-calling,
     /chat/tools, e retorna a mensagem completa (content + tool_calls).
@@ -4623,6 +4631,8 @@ async def _llm_chat(messages: list[dict], tools: Optional[list[dict]] = None,
     suficiente.
     """
     payload: dict = {"messages": messages, "temperature": temperature}
+    if model:
+        payload["model"] = model
     if session_id:
         payload["session_id"] = session_id
     if affinity:
@@ -4692,7 +4702,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                            on_delta=None, on_thinking=None,
                            reasoning_effort: Optional[str] = None,
                            session_id: Optional[str] = None,
-                           affinity: Optional[str] = None) -> dict:
+                           affinity: Optional[str] = None,
+                           model: Optional[str] = None) -> dict:
     """
     Variante STREAMING de _llm_chat: fala com o /chat/stream do LLM.py no modo
     TOOLS (messages + tools) e consome o SSE devolvido. Cada fragmento de
@@ -4731,6 +4742,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     payload: dict = {"messages": messages, "temperature": temperature,
                      "stream_reasoning": os.environ.get("AVA_STREAM_REASONING", "1").strip() != "0",
                      "watch_confidence": _WATCH_CONFIDENCE}
+    if model:
+        payload["model"] = model
     _reasoning_effort = (reasoning_effort
                          or os.environ.get("AVA_REASONING_EFFORT", "")).strip().lower() or None
     if _reasoning_effort:
@@ -4748,6 +4761,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     last_error: Optional[Exception] = None
     cached_tokens: Optional[int] = None
     finish_reason: Optional[str] = None
+    stream_usage: dict = {}
     for attempt in range(ORCHESTRATOR_LLM_RETRIES + 1):
         content_acc: list[str] = []
         tool_calls_final: list = []
@@ -4800,6 +4814,8 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                     elif evt.get("done"):
                         cached_tokens = evt.get("prompt_cached_tokens", cached_tokens)
                         finish_reason = evt.get("finish_reason", finish_reason)
+                        if isinstance(evt.get("usage"), dict) and evt["usage"]:
+                            stream_usage = evt["usage"]
                     elif "error" in evt:
                         if evt.get("too_large"):
                             raise _LLMNoRetryError(
@@ -4816,9 +4832,14 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
                     # único do auto-finish (vision) quando o modelo já
                     # streamou o mesmo texto como content.
                     "streamed": on_delta is not None and attempt == 0 and bool(content_acc),
+                    # Usage completo (tokens/cache/custo) quando o provider
+                    # reporta no stream; senão o LLM.py já devolveu uma
+                    # estimativa marcada com `estimated`.
                     "_usage": (
-                        {"prompt_tokens_cached": cached_tokens}
-                        if cached_tokens is not None else {}
+                        stream_usage
+                        if stream_usage
+                        else ({"prompt_tokens_cached": cached_tokens}
+                              if cached_tokens is not None else {})
                     ),
                     "_finish_reason": finish_reason,
                 }
@@ -4838,7 +4859,7 @@ async def _llm_chat_stream(messages: list[dict], tools: Optional[list[dict]] = N
     # o próprio ciclo de retry; sem streaming, a resposta sai em bloco único).
     log.warning("LLM.py /chat/stream falhou após retries — caindo para /chat/tools síncrono")
     return await _llm_chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
-                           reasoning_effort=_reasoning_effort)
+                           reasoning_effort=_reasoning_effort, model=model)
 
 
 def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Optional[str] = None,
@@ -5119,7 +5140,8 @@ def _tools_system_prompt(think_instruction: Optional[str] = None, lang_hint: Opt
 async def _force_finish(history: list[dict], eid: str,
                         lang_hint: Optional[str] = None,
                         reason: str = "max_steps",
-                        session_id: Optional[str] = None) -> str:
+                        session_id: Optional[str] = None,
+                        model: Optional[str] = None) -> str:
     """
     Rede de segurança do teto de turnos (max_steps): chamada quando o loop
     atinge o teto sem o modelo ter entregado a resposta final (texto puro
@@ -5149,6 +5171,7 @@ async def _force_finish(history: list[dict], eid: str,
             history + [nudge], tools=None, temperature=0.3,
             session_id=session_id,
             affinity=_session_affinity(session_id) if session_id else None,
+            model=model,
         )
         text = (message.get("content") or "").strip()
         if text:
@@ -5450,7 +5473,8 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     # passado e mantém a cauda recente verbatim. Depois recarrega o histórico
     # e anexa o resumo ao system prompt.
     if _session_store() is not None:
-        if await _maybe_compact(sid, system_prompt, tools_schema, eid=eid, extra_text=req.input):
+        if await _maybe_compact(sid, system_prompt, tools_schema, eid=eid, extra_text=req.input,
+                                model=(req.model or "").strip() or None):
             st_turns = _session_history(sid) or []
         system_prompt = _with_compaction_summary(system_prompt, sid)
 
@@ -5622,6 +5646,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     reasoning_effort = (req.reasoning_effort
                         or (_SETTINGS.get("reasoning_effort") or "")
                         or os.getenv("AVA_REASONING_EFFORT", "")).strip().lower() or None
+    turn_model = (req.model or "").strip() or None
 
     overflow_recovered = False
     while True:
@@ -5635,7 +5660,8 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
                 "forçando resposta final sem tools."
             )
-            final_response = await _force_finish(history, eid, lang_hint=req.lang, session_id=sid)
+            final_response = await _force_finish(history, eid, lang_hint=req.lang, session_id=sid,
+                                                 model=turn_model)
             _session_append(sid, {"role": "assistant", "content": final_response})
             # Chamada de fechamento é síncrona (_llm_chat) — delta único.
             if on_event:
@@ -5656,12 +5682,14 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                                                  on_thinking=on_thinking,
                                                  reasoning_effort=reasoning_effort,
                                                  session_id=sid,
-                                                 affinity=_session_affinity(sid))
+                                                 affinity=_session_affinity(sid),
+                                                 model=turn_model)
             else:
                 message = await _llm_chat(request_history, tools=tools_schema, temperature=0.3,
                                           reasoning_effort=reasoning_effort,
                                           session_id=sid,
-                                          affinity=_session_affinity(sid))
+                                          affinity=_session_affinity(sid),
+                                          model=turn_model)
         except asyncio.CancelledError:
             log.warning(f"[{eid[:8]}] Turn {turn}: execução interrompida — cancelando step")
             raise
@@ -5674,6 +5702,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
             )
             if not await _maybe_compact(
                 sid, system_prompt, tools_schema, reason="overflow", eid=eid, force=True,
+                model=turn_model,
             ):
                 raise
             system_prompt = _with_compaction_summary(system_prompt, sid)

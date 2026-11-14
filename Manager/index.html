@@ -142,6 +142,59 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 .row{display:flex;align-items:center;gap:10px;justify-content:space-between;margin:10px 0}.row small{display:block;color:var(--mu)}
 .btn{background:var(--ink);color:var(--bg);border-radius:10px;padding:7px 14px;font-weight:500;margin-top:8px}
 .note{font-size:13px;color:var(--mu);margin-top:8px;min-height:1.2em}
+/* ══ cadastro de provedores (primeira execução + Configurações) ══ */
+#setup{width:min(820px,96vw)}
+#setup .db{max-height:78vh}
+.sp-intro{color:var(--mu);font-size:13.5px;margin:8px 0 10px}
+#sp-search{width:100%;border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg);margin:6px 0 10px}
+.sp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:7px;max-height:46vh;overflow:auto;padding:2px}
+.sp-card{display:flex;align-items:center;gap:9px;border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg);text-align:left}
+.sp-card:hover{border-color:var(--ac)}
+.sp-card.on{border-color:var(--ac);background:var(--acs)}
+.sp-avatar{width:26px;height:26px;border-radius:7px;background:var(--sb);border:1px solid var(--ln);display:grid;place-items:center;font-weight:600;font-size:12px;flex:none;color:var(--ac)}
+.sp-card b{display:block;font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sp-card small{display:block;color:var(--mu);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sp-custom{width:100%;margin-top:10px;border:1px dashed var(--ln);border-radius:10px;padding:9px;color:var(--mu);font-size:13px}
+.sp-custom:hover{border-color:var(--ac);color:var(--ink)}
+.sp-back{color:var(--mu);font-size:13px;padding:4px 0;margin-bottom:6px}
+.sp-back:hover{color:var(--ink)}
+.sp-head{display:flex;align-items:center;gap:10px;margin:2px 0 8px}
+.sp-head .sp-avatar{width:34px;height:34px;font-size:14px}
+.sp-head b{font-size:15px}
+.sp-head small{display:block;color:var(--mu);font-size:12px;word-break:break-all}
+.db input[type=url]{width:100%;border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg)}
+.sp-section{border-top:1px solid var(--ln);margin-top:14px;padding-top:8px}
+.sp-conf{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.sp-conf b{font-weight:500}
+.sp-conf small{display:block;color:var(--mu);font-size:12px;word-break:break-all}
+#setup .dh .ib:only-child{}
+/* ══ seletor de modelo (barra sob a caixa + diálogo) ══ */
+.modelbar{max-width:760px;margin:6px auto 0;padding:0 4px;font:12.5px Geist,sans-serif}
+.modelbar button{display:flex;align-items:center;gap:6px;padding:3px 7px;border-radius:8px;color:var(--mu);max-width:100%;overflow:hidden}
+.modelbar button:hover{background:var(--ln)}
+.mb-mode{color:var(--ac);font-weight:500}
+.mb-sep{color:var(--mu)}
+.mb-model{color:var(--ink);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mb-prov{color:var(--mu);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mb-eff{color:var(--am);font-weight:500}
+#mdl{width:min(620px,96vw)}
+#mdl-search{width:100%;border:1px solid var(--ln);border-radius:10px;padding:8px 10px;background:var(--bg);margin:6px 0 8px}
+.mdl-list{max-height:52vh;overflow:auto;padding:2px}
+.mdl-group{margin:0 0 10px}
+.mdl-gh{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mu);padding:8px 8px 4px;font-weight:600}
+.mdl-row{display:flex;align-items:center;gap:4px;border-radius:9px;padding:1px 2px}
+.mdl-row:hover,.mdl-row.on{background:var(--sb)}
+.mdl-pick{flex:1;display:flex;align-items:baseline;gap:6px;padding:7px 8px;text-align:left;min-width:0}
+.mdl-name{font-size:13.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mdl-prov{font-size:12px;color:var(--mu);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:none;max-width:45%}
+.mdl-fav{width:26px;height:26px;border-radius:7px;color:var(--mu);flex:none;font-size:14px}
+.mdl-fav:hover{background:var(--ln);color:var(--am)}
+.mdl-fav.on{color:var(--am)}
+.mdl-check{width:20px;color:var(--gr);flex:none;text-align:center}
+.mdl-manual{display:flex;gap:6px;align-items:center;margin-top:8px}
+.mdl-manual input{flex:1;border:1px solid var(--ln);border-radius:10px;padding:7px 9px;background:var(--bg)}
+.mdl-manual .btn{margin-top:0}
+.mdl-empty{color:var(--mu);font-size:13px;padding:12px 8px}
 @media(max-width:760px){aside{position:fixed;inset:0 auto 0 0;z-index:9;margin-left:-264px}body:not(.nosb) aside{margin-left:0;box-shadow:var(--sh)}body.nosb aside{margin-left:-264px}#hero h1{font-size:30px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 /* ══ grafo embutido (estilos escopados por #graph-view) ══ */
@@ -407,12 +460,17 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
       <button class="go" id="go" aria-label="Enviar" disabled>↑</button>
     </div>
     <input type="file" id="fi" hidden>
-  </div></div>
+  </div>
+  <div class="modelbar"><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-mode">Chat</span><span class="mb-sep">·</span><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
+  </div>
 </main>
 
 <dialog id="ds">
   <div class="dh">Configurações <button class="ib" id="cs" aria-label="Fechar">✕</button></div>
   <div class="db">
+    <h3>Provedor de IA</h3>
+    <div id="provider-info" class="item"><div class="empty">Carregando…</div></div>
+    <button class="btn" id="sp-open">Listar / trocar provedor</button>
     <h3>Conexão</h3>
     <label for="c-orch">Orchestrator (URL direta :9000 ou proxy /orch)</label><input type="text" id="c-orch">
     <label for="c-api">Process manager (porta 9001)</label><input type="text" id="c-api">
@@ -479,6 +537,43 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   </div>
 </dialog>
 
+<dialog id="setup">
+  <div class="dh"><span id="setup-title">Conectar provedor de IA</span><button class="ib" id="setup-close" aria-label="Fechar">✕</button></div>
+  <div class="db">
+    <div id="sp-list">
+      <p class="sp-intro">Escolha o provedor de IA que o Alpha AI vai usar. O catálogo vem do models.dev e só lista APIs compatíveis com o protocolo OpenAI usado pelo runtime. O modelo é escolhido depois, na barra abaixo da caixa de escrita.</p>
+      <input id="sp-search" type="text" placeholder="Buscar provedor…" aria-label="Buscar provedor">
+      <div id="sp-grid" class="sp-grid"></div>
+      <button class="sp-custom" id="sp-custom">＋ Outro provedor OpenAI-compatible (base URL manual)</button>
+    </div>
+    <div id="sp-form" hidden>
+      <button class="sp-back" id="sp-back">← Trocar provedor</button>
+      <div class="sp-head"><span class="sp-avatar" id="sp-avatar">?</span><div><b id="sp-name">Provedor</b><small id="sp-doc"></small></div></div>
+      <label for="sp-base">Base URL da API</label>
+      <input id="sp-base" type="url" spellcheck="false" placeholder="https://api.exemplo.com/v1">
+      <label for="sp-key">API key <small id="sp-env" style="display:inline;color:var(--mu)"></small></label>
+      <input id="sp-key" type="password" autocomplete="off" spellcheck="false" placeholder="cole a chave do provedor">
+      <div class="row"><div>Provider local (sem API key)<small>localhost, 127.0.0.1, [::1] ou *.local</small></div><input type="checkbox" id="sp-local"></div>
+      <button class="btn" id="sp-save">Salvar e conectar</button>
+      <div class="note" id="sp-note"></div>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="mdl">
+  <div class="dh"><span>Selecionar modelo</span><button class="ib" id="mdl-close" aria-label="Fechar">✕</button></div>
+  <div class="db">
+    <input id="mdl-search" type="search" placeholder="Buscar modelo…" aria-label="Buscar modelo">
+    <div id="mdl-list" class="mdl-list"></div>
+    <div class="mdl-manual">
+      <input id="mdl-custom" type="text" placeholder="Outro modelo (ID)" spellcheck="false" aria-label="Outro modelo">
+      <button class="btn" id="mdl-use">Usar</button>
+    </div>
+    <button class="sp-custom" id="mdl-provider">＋ Cadastrar / trocar provedor</button>
+    <div class="note" id="mdl-note"></div>
+  </div>
+</dialog>
+
 <script>
 const $=s=>document.querySelector(s);
 /* ══ multi-chat: cada chat é uma sessão raiz com projeto, histórico, uso e
@@ -492,22 +587,22 @@ const chat=()=>S.chats.find(c=>c.id===S.active)||null;
 const newSid=()=>'ses_'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
 function newChat(project){
   const c={id:'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
-    sid:newSid(),title:'',project:project||S.act||'general',cwd:null,
+    sid:newSid(),title:'',project:project||S.act||'general',cwd:null,model:null,
     ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:true,streaming:false,err:false};
-  S.chats.unshift(c);S.active=c.id;saveChats();return c;
+  S.chats.unshift(c);S.active=c.id;ensureChatModel(c);saveChats();return c;
 }
 function saveChats(){
   try{
     localStorage.setItem(CHAT_KEY,JSON.stringify({
       active:S.active,
-      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project})),
+      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null})),
     }));
   }catch{}
 }
 function restoreChats(){
   let saved=null;try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'null')}catch{}
   if(!saved||!Array.isArray(saved.chats)||!saved.chats.length)return false;
-  S.chats=saved.chats.map(c=>({id:c.id,sid:c.sid,title:c.title||'',project:c.project||'general',
+  S.chats=saved.chats.map(c=>({id:c.id,sid:c.sid,title:c.title||'',project:c.project||'general',model:c.model||null,
     cwd:null,ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false}));
   S.active=saved.active&&S.chats.some(c=>c.id===saved.active)?saved.active:S.chats[0].id;
   return true;
@@ -566,7 +661,7 @@ const sameOrigin=location.protocol==='http:'||location.protocol==='https:';
 let cfg={
   orch:sameOrigin?location.origin+'/orch':'http://127.9.12.22:9000',
   api:sameOrigin?location.origin:'http://127.9.12.22:9001',
-  token:'',demo:false,theme:'auto'};
+  token:'',demo:false,theme:'auto',effort:''};
 try{Object.assign(cfg,JSON.parse(localStorage.getItem('ava-web')||'{}'))}catch{}
 /* Migração: localStorage de uma sessão anterior pode ter os defaults
    absolutos. Só reescreve se ainda forem exatamente os defaults — configs
@@ -661,12 +756,16 @@ function toolHtml(s){
 }
 function statsHtml(m){
   const u=m.usage||{};
-  if(!m.usage&&m.latency==null)return '';
+  const hasTok=(Number(u.input_tokens)||0)>0||(Number(u.output_tokens)||0)>0;
+  if(!hasTok&&m.latency==null)return '';
+  const approx=u.estimated?'≈ ':'';
   const parts=[];
-  if(u.input_tokens!=null)parts.push(`<span>↑ <b>${nf(u.input_tokens)}</b> tokens in</span>`);
-  if(u.output_tokens!=null)parts.push(`<span>↓ <b>${nf(u.output_tokens)}</b> out</span>`);
-  if(u.cache_read!=null)parts.push(`<span title="cache read: ${nf(u.cache_read)} · write: ${nf(u.cache_write)}">cache <b>${((u.cache_read_ratio||0)*100).toFixed(1)}%</b></span>`);
-  if(u.cost!=null)parts.push(`<span><b>$${Number(u.cost).toFixed(4)}</b></span>`);
+  if(hasTok){
+    parts.push(`<span>${approx}↑ <b>${nf(u.input_tokens)}</b> tokens in</span>`);
+    parts.push(`<span>${approx}↓ <b>${nf(u.output_tokens)}</b> out</span>`);
+  }
+  if(hasTok&&u.cache_read!=null)parts.push(`<span title="cache read: ${nf(u.cache_read)} · write: ${nf(u.cache_write)}">cache <b>${((u.cache_read_ratio||0)*100).toFixed(1)}%</b></span>`);
+  if(hasTok&&u.cost!=null)parts.push(`<span><b>$${Number(u.cost).toFixed(4)}</b></span>`);
   if(m.latency!=null)parts.push(`<span><b>${Math.round(m.latency)}</b> ms</span>`);
   return parts.length?`<div class="stats">${parts.join('')}</div>`:'';
 }
@@ -717,6 +816,7 @@ function ui(){
   }
   renderSbar();
   renderChats();
+  renderModelBar();
 }
 
 /* ---------- CWD por projeto (WebUI → tray → MCPs stdio) ---------- */
@@ -764,6 +864,11 @@ async function send(text){
   if(l==='/projects'){document.body.classList.remove('nosb');return $('#addp').focus()}
   if(l==='/clear'||l==='/new')return clear();
   if(c.streaming)return;
+  // Modelo por chat: sem modelo escolhido (provider personalizado/novo) abre
+  // o seletor em vez de mandar um ID vazio ao runtime.
+  const mkey=cfg.demo?null:ensureChatModel(c);
+  if(!cfg.demo&&!mkey){toast('Escolha um modelo para este chat.');openModels();return}
+  const mInfo=mkey?modelInfo(mkey):null;
   // Guarda de recurso: N chats streamando ao mesmo tempo; o resto espera o
   // término de um deles (o usuário pode parar qualquer chat pelo mismo botão).
   if(S.chats.filter(x=>x.streaming).length>=MAX_STREAMING)return toast(`Máximo de ${MAX_STREAMING} chats simultâneos — pare um para continuar.`);
@@ -775,6 +880,7 @@ async function send(text){
   c.ctl=new AbortController();
   ensureDocker();
   const body={input:text,session_id:c.sid,project:c.project,voice:'M1',lang:'pt',tts:false,tts_output:'client',
+    model:mInfo?mInfo.id:null,
     image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,
     search_pdfs:false,stream:true,cwd:c.cwd||null};
   try{
@@ -1131,6 +1237,7 @@ const note=t=>$('#sn').textContent=t;
 async function openSet(){
   $('#c-orch').value=cfg.orch;$('#c-api').value=cfg.api;$('#c-tok').value=cfg.token;$('#c-demo').checked=cfg.demo;$('#c-th').value=cfg.theme;
   $('#ds').showModal();note('');
+  void loadProviderInfo();
   if(cfg.demo){
     $('#plans').innerHTML='<div class="empty">Indisponível no modo demonstração.</div>';
     $('#mcps').innerHTML='<div class="empty">Indisponível no modo demonstração.</div>';
@@ -1139,7 +1246,7 @@ async function openSet(){
   }
   const r=await Promise.allSettled([jf('orch','/persona'),jf('orch','/settings/reasoning-effort'),jf('orch','/settings/watch-confidence')]);
   if(r[0].value)$('#c-per').value=r[0].value.persona||'';
-  if(r[1].value)$('#c-eff').value=r[1].value.effort||'auto';
+  if(r[1].value){$('#c-eff').value=r[1].value.effort||'auto';cfg.effort=(r[1].value.effort||'').toLowerCase();keep();renderModelBar()}
   if(r[2].value)$('#c-w').checked=!!r[2].value.enabled;
   if(r.every(x=>x.status==='rejected'))note('Não foi possível ler as preferências: orchestrator offline.');
   void loadPlans();void loadMcps();void loadVoices();
@@ -1149,9 +1256,247 @@ for(const [id,k] of [['c-orch','orch'],['c-api','api'],['c-tok','token']])$('#'+
 $('#c-demo').onchange=e=>{cfg.demo=e.target.checked;keep();poll();loadProj()};
 $('#c-th').onchange=e=>{cfg.theme=e.target.value;keep();theme()};
 $('#sp').onclick=async()=>{try{await jf('orch','/persona','PUT',{persona:$('#c-per').value});note('Persona salva. Vale a partir do próximo turno.')}catch(e){note('Falha: '+e.message)}};
-$('#c-eff').onchange=async e=>{try{await jf('orch','/settings/reasoning-effort','PUT',{effort:e.target.value==='auto'?null:e.target.value});note('Esforço atualizado.')}catch(x){note('Falha: '+x.message)}};
+$('#c-eff').onchange=async e=>{cfg.effort=e.target.value==='auto'?'':e.target.value;keep();renderModelBar();try{await jf('orch','/settings/reasoning-effort','PUT',{effort:e.target.value==='auto'?null:e.target.value});note('Esforço atualizado.')}catch(x){note('Falha: '+x.message)}};
 $('#c-w').onchange=async e=>{try{await jf('orch','/settings/watch-confidence','PUT',{enabled:e.target.checked});note('Memory Watch '+(e.target.checked?'ligado':'desligado')+'.')}catch(x){note('Falha: '+x.message)}};
 $('#cs').onclick=()=>{$('#ds').close();loadProj();poll()};
+
+/* ---------- Provedores e modelos ---------- */
+const MODEL={catalog:null,config:null,favorites:new Set(),byKey:new Map(),default:''};
+const FAV_KEY='ava-model-favorites';
+const DEFAULT_MODEL_KEY='ava-model-default';
+try{MODEL.favorites=new Set(JSON.parse(localStorage.getItem(FAV_KEY)||'[]'))}catch{}
+try{MODEL.default=localStorage.getItem(DEFAULT_MODEL_KEY)||''}catch{}
+const SP={pid:null,defaultModel:''};
+async function loadProviderCatalog(){
+  if(MODEL.catalog)return MODEL.catalog;
+  const d=await jf('api','/providers');
+  MODEL.catalog=d||{providers:{}};
+  MODEL.byKey.clear();
+  for(const p of Object.values(MODEL.catalog.providers||{})){
+    for(const m of (p.models||[])){
+      const key=`${p.id}:${m.id}`;
+      MODEL.byKey.set(key,{key,id:m.id,name:m.name||m.id,providerId:p.id,providerName:p.name||p.id});
+    }
+  }
+  return MODEL.catalog;
+}
+function providerInitial(name){
+  return String(name||'?').trim().split(/\s+/).slice(0,2).map(w=>w[0]||'').join('').toUpperCase()||'?';
+}
+function providerByBase(base){
+  const b=String(base||'').replace(/\/+$/,'');
+  if(!b)return null;
+  return Object.values(MODEL.catalog?.providers||{}).find(p=>String(p.base_url||'').replace(/\/+$/,'')===b)||null;
+}
+function activeProviderId(){
+  const saved=String(MODEL.config?.provider_id||'').trim();
+  if(saved)return saved;
+  const byBase=providerByBase(MODEL.config?.base_url);
+  if(byBase)return byBase.id;
+  return MODEL.config?.configured?'custom':null;
+}
+function activeProvider(){
+  const pid=activeProviderId();
+  return pid?(MODEL.catalog?.providers||{})[pid]||null:null;
+}
+function modelInfo(key){
+  if(!key)return null;
+  if(MODEL.byKey.has(key))return MODEL.byKey.get(key);
+  const i=String(key).indexOf(':');
+  const pid=i>=0?key.slice(0,i):(activeProviderId()||'custom');
+  const mid=i>=0?key.slice(i+1):String(key);
+  const p=(MODEL.catalog?.providers||{})[pid];
+  return {key,id:mid,name:mid,providerId:pid,providerName:p?.name||(pid==='custom'?'Personalizado':pid)};
+}
+function defaultModelKey(){
+  const pid=activeProviderId();
+  if(!pid)return null;
+  const fallback=String(MODEL.config?.model||'').trim();
+  if(fallback)return `${pid}:${fallback}`;
+  const p=(MODEL.catalog?.providers||{})[pid];
+  return p&&(p.models||[]).length?`${pid}:${p.models[0].id}`:null;
+}
+function ensureChatModel(c){
+  c=c||chat();if(!c)return null;
+  if(c.model&&modelInfo(c.model))return c.model;
+  const preferred=MODEL.default&&modelInfo(MODEL.default)?.providerId===activeProviderId()?MODEL.default:null;
+  const def=preferred||defaultModelKey();
+  if(def){c.model=def;saveChats()}
+  return c.model||null;
+}
+function renderModelBar(){
+  const info=modelInfo(ensureChatModel(chat()));
+  const modelEl=$('#mb-model'),provEl=$('#mb-prov');
+  if(!modelEl||!provEl)return;
+  modelEl.textContent=info?info.name:'Escolha um modelo';
+  provEl.textContent=info?' '+info.providerName:'';
+  const eff=String(cfg.effort||'').trim();
+  $('#mb-effsep').hidden=!eff;$('#mb-eff').hidden=!eff;$('#mb-eff').textContent=eff;
+}
+function spIsLocal(base){
+  return /^https?:\/\/(localhost|127\.|\[::1\]|[^/]+\.local)([:/]|$)/i.test(String(base||''));
+}
+function spRender(q){
+  const cat=MODEL.catalog;if(!cat)return;
+  const list=Object.values(cat.providers||{});
+  const qu=String(q||'').trim().toLowerCase();
+  const filtered=qu?list.filter(p=>p.name.toLowerCase().includes(qu)
+    ||p.id.toLowerCase().includes(qu)
+    ||(p.env||[]).join(' ').toLowerCase().includes(qu)):list;
+  const box=$('#sp-grid');
+  box.innerHTML=filtered.slice(0,150).map(p=>`<button class="sp-card${SP.pid===p.id?' on':''}" data-pid="${esc(p.id)}"><span class="sp-avatar">${esc(providerInitial(p.name))}</span><span><b>${esc(p.name)}</b><small>${esc((p.env||[])[0]||p.id)}</small></span></button>`).join('')
+    ||'<div class="empty">Nenhum provedor encontrado.</div>';
+}
+function spShowForm(p){
+  SP.pid=p?p.id:'custom';
+  SP.defaultModel=p&&(p.models||[]).length?p.models[0].id:'';
+  $('#sp-list').hidden=true;$('#sp-form').hidden=false;
+  $('#sp-note').textContent='';
+  $('#sp-avatar').textContent=providerInitial(p?p.name:'Custom');
+  $('#sp-name').textContent=p?p.name:'Provider OpenAI-compatible';
+  const doc=p&&/^https?:\/\//i.test(p.doc||'')?`<a href="${esc(p.doc)}" target="_blank" rel="noopener">documentação ↗</a>`:'';
+  $('#sp-doc').innerHTML=doc;
+  $('#sp-env').textContent=p&&(p.env||[]).length?`(${p.env.join(' ou ')})`:'';
+  const base=p?p.base_url:($('#sp-base').value||'http://127.0.0.1:11434/v1');
+  $('#sp-base').value=base;
+  $('#sp-local').checked=spIsLocal(base);
+  $('#sp-key').value='';
+  $('#sp-key').placeholder=p&&(p.env||[]).length?`cole a chave (${p.env[0]})`:'cole a chave do provedor';
+  $('#sp-key').focus();
+}
+function renderProviderInfo(c){
+  const box=$('#provider-info');if(!box||!c)return;
+  const badge=c.configured?'conectado':'pendente';
+  box.innerHTML=`<div class="nm"><b>${esc(c.provider_id||'Provedor ativo')}</b><span class="badge" style="display:inline-block">${badge}</span></div>
+    <div class="sub">${esc(c.base_url||'nenhum provedor configurado')}</div>
+    <div class="sub">fallback: ${esc(c.model||'primeiro modelo do provedor')} · chave: ${c.key_set?esc(c.key_hint||'configurada'):'não configurada'}${c.local?' · local':''}</div>`;
+}
+async function loadProviderInfo(){
+  try{const c=await jf('api','/providers/config');MODEL.config=c;renderProviderInfo(c);renderModelBar();return c}
+  catch{return null}
+}
+async function openSetup(){
+  $('#sp-list').hidden=false;$('#sp-form').hidden=true;
+  $('#sp-search').value='';SP.pid=null;SP.defaultModel='';
+  if(!$('#setup').open)$('#setup').showModal();
+  try{await loadProviderCatalog();spRender('')}
+  catch(e){$('#sp-grid').innerHTML=`<div class="empty">Falha ao carregar o catálogo: ${esc(e.message)}</div>`}
+  void loadProviderInfo();
+}
+async function restartStack(){
+  if(cfg.demo)return;
+  try{await jf('api','/docker/stop','POST')}catch{}
+  try{await jf('api','/docker/start','POST')}catch(e){toast('Falha ao reiniciar o ambiente: '+e.message)}
+}
+$('#sp-open').onclick=openSetup;
+$('#setup-close').onclick=()=>$('#setup').close();
+$('#sp-search').oninput=e=>spRender(e.target.value);
+$('#sp-grid').onclick=e=>{
+  const card=e.target.closest('[data-pid]');if(!card)return;
+  const p=MODEL.catalog&&MODEL.catalog.providers?MODEL.catalog.providers[card.dataset.pid]:null;
+  if(p)spShowForm(p);
+};
+$('#sp-custom').onclick=()=>spShowForm(null);
+$('#sp-back').onclick=()=>{$('#sp-form').hidden=true;$('#sp-list').hidden=false;$('#sp-search').focus()};
+$('#sp-base').oninput=e=>{if(!SP.pid||SP.pid==='custom')$('#sp-local').checked=spIsLocal(e.target.value)};
+$('#sp-save').onclick=async()=>{
+  const btn=$('#sp-save');
+  const body={provider_id:SP.pid==='custom'?null:SP.pid,base_url:$('#sp-base').value.trim(),
+    api_key:$('#sp-key').value.trim(),model:SP.defaultModel||'',local:$('#sp-local').checked};
+  btn.disabled=true;$('#sp-note').textContent='Salvando…';
+  try{
+    const prevPid=activeProviderId();
+    const c=await jf('api','/providers/config','PUT',body);
+    MODEL.config=c;renderProviderInfo(c);
+    if(prevPid!==activeProviderId())S.chats.forEach(x=>{x.model=null});
+    saveChats();
+    try{const e=await jf('orch','/settings/reasoning-effort');if(e&&e.effort){cfg.effort=String(e.effort).toLowerCase();keep()}}catch{}
+    ensureChatModel(chat());renderModelBar();
+    $('#sp-note').textContent='Provedor salvo. Reiniciando o ambiente para aplicar…';
+    await restartStack();
+    $('#setup').close();
+    toast('Provedor configurado.');
+    loadProj();poll();
+    if(!SP.defaultModel)setTimeout(openModels,350);
+  }catch(e){$('#sp-note').textContent='✗ '+e.message}
+  finally{btn.disabled=false}
+};
+
+/* ---------- Seletor de modelo ---------- */
+function saveFavorites(){try{localStorage.setItem(FAV_KEY,JSON.stringify([...MODEL.favorites]))}catch{}}
+function modelRowsHtml(list,current){
+  return list.map(x=>{
+    const fav=MODEL.favorites.has(x.key),cur=x.key===current;
+    return `<div class="mdl-row${cur?' on':''}"><button class="mdl-pick" data-pick="${esc(x.key)}"><span class="mdl-name">${esc(x.name)}</span><span class="mdl-prov">- ${esc(x.providerName)}</span></button><button class="mdl-fav${fav?' on':''}" data-fav="${esc(x.key)}" title="${fav?'Desafixar':'Fixar no topo'}" aria-label="${fav?'Desafixar':'Fixar no topo'}">${fav?'★':'☆'}</button>${cur?'<span class="mdl-check">✓</span>':''}</div>`;
+  }).join('');
+}
+function renderModels(){
+  const box=$('#mdl-list');if(!box)return;
+  if(!MODEL.config?.configured){
+    box.innerHTML='<div class="mdl-empty">Nenhum provedor cadastrado. Use “Cadastrar / trocar provedor”.</div>';
+    return;
+  }
+  const p=activeProvider();
+  const cur=ensureChatModel(chat());
+  if(!p){
+    box.innerHTML='<div class="mdl-empty">Provedor personalizado — digite o ID do modelo abaixo.</div>';
+    return;
+  }
+  const q=$('#mdl-search').value.trim().toLowerCase();
+  const all=(p.models||[]).map(m=>modelInfo(`${p.id}:${m.id}`)).filter(Boolean);
+  // Favoritos/modelo atual podem ter saído da lista de 30 mais recentes do
+  // catálogo; mantém ambos visíveis para não "sumirem" do seletor.
+  for(const key of MODEL.favorites){
+    const info=modelInfo(key);
+    if(info&&info.providerId===p.id&&!all.some(x=>x.key===key))all.unshift(info);
+  }
+  if(cur&&!all.some(x=>x.key===cur)){const info=modelInfo(cur);if(info)all.unshift(info)}
+  const match=x=>!q||x.name.toLowerCase().includes(q)||x.id.toLowerCase().includes(q)||x.providerName.toLowerCase().includes(q);
+  const fav=all.filter(x=>MODEL.favorites.has(x.key)&&match(x));
+  const rest=all.filter(x=>!MODEL.favorites.has(x.key)&&match(x));
+  let html='';
+  if(fav.length)html+=`<div class="mdl-group"><div class="mdl-gh">Favoritos</div>${modelRowsHtml(fav,cur)}</div>`;
+  html+=`<div class="mdl-group"><div class="mdl-gh">${esc(p.name)}</div>${rest.length?modelRowsHtml(rest,cur):'<div class="mdl-empty">Nenhum modelo encontrado.</div>'}</div>`;
+  box.innerHTML=html;
+}
+async function openModels(){
+  try{await loadProviderCatalog()}catch{}
+  if(!MODEL.config)await loadProviderInfo();
+  if(!MODEL.config?.configured){openSetup();return}
+  $('#mdl-search').value='';$('#mdl-custom').value='';$('#mdl-note').textContent='';
+  renderModels();
+  if(!$('#mdl').open)$('#mdl').showModal();
+  $('#mdl-search').focus();
+}
+function pickModel(key){
+  const c=chat();if(!c)return;
+  c.model=key;MODEL.default=key;
+  try{localStorage.setItem(DEFAULT_MODEL_KEY,key)}catch{}
+  saveChats();renderModelBar();
+  $('#mdl').close();
+  const info=modelInfo(key);
+  if(info)toast('Modelo: '+info.name+' · '+info.providerName);
+}
+$('#mbtn').onclick=openModels;
+$('#mdl-close').onclick=()=>$('#mdl').close();
+$('#mdl-search').oninput=renderModels;
+$('#mdl-list').onclick=e=>{
+  const fav=e.target.closest('[data-fav]');
+  if(fav){
+    const key=fav.dataset.fav;
+    MODEL.favorites.has(key)?MODEL.favorites.delete(key):MODEL.favorites.add(key);
+    saveFavorites();renderModels();return;
+  }
+  const pick=e.target.closest('[data-pick]');
+  if(pick)pickModel(pick.dataset.pick);
+};
+$('#mdl-use').onclick=()=>{
+  const id=$('#mdl-custom').value.trim();
+  if(!id)return;
+  pickModel(`${activeProviderId()||'custom'}:${id}`);
+};
+$('#mdl-custom').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('#mdl-use').click()}};
+$('#mdl-provider').onclick=()=>{$('#mdl').close();openSetup()};
 
 /* ---------- Ações: planos / MCP / pessoas ---------- */
 $('#plans').onclick=async e=>{
@@ -1346,6 +1691,13 @@ else{
   if(c){void hydrate(c);void loadCwd(c)}
 }
 theme();ui();draw(true);renderChats();loadProj();poll();
+(async()=>{
+  try{await loadProviderCatalog()}catch{}
+  const c=await loadProviderInfo();
+  if(c&&!c.configured){openSetup();return}
+  try{const e=await jf('orch','/settings/reasoning-effort');if(e&&e.effort){cfg.effort=String(e.effort).toLowerCase();keep();renderModelBar()}}catch{}
+  S.chats.forEach(x=>ensureChatModel(x));saveChats();renderModelBar();
+})();
 void syncChats();
 setInterval(()=>{if(!document.hidden)poll()},5000);
 setInterval(()=>{if(!document.hidden)void syncChats()},30000);

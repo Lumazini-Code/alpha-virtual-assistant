@@ -26,9 +26,9 @@
 #   3c. OfficeCLI: npm install -g @officecli/officecli + skill
 #       officecli.ai/SKILL.md → .agents/skills/officecli (falha = aviso)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
-#   5. Pede o provider de inferência: LLM_BASE_URL (Enter = OpenRouter) e, se
-#      o provider NÃO for local, a LLM_API_KEY — grava em Modules/.env
-#      (chmod 600) ANTES do up, porque Modules/LLM.py lê no import
+#   5. Deixa o Modules/.env sem provedor de IA: o cadastro (catálogo models.dev)
+#      acontece na primeira execução da WebUI e grava LLM_* em Modules/.env
+#      (chmod 600) antes de reiniciar o ambiente
 #   6. Build das imagens; inicia o Manager (ava-tray, API :9001) e pede a ele o
 #      start do Docker (POST /docker/start) + garante o mcp_manager (/mcp/start);
 #      registra os MCPs e espera o /status do orchestrator responder
@@ -37,8 +37,8 @@
 #   8. Auto-start do ava-tray via XDG autostart (+ inicia agora se ainda não estiver no ar)
 #   9. Inicia o WebUI (Manager/ava-web) se o terminal for interativo
 #
-# Reinstalação é idempotente: sobrescreve arquivos, preserva Modules/.env com
-# chave válida e `up -d` não derruba containers já sadios.
+# Reinstalação é idempotente: sobrescreve arquivos, preserva Modules/.env
+# (incluindo o provedor já cadastrado) e `up -d` não derruba containers sadios.
 
 set -euo pipefail
 
@@ -491,165 +491,12 @@ unset_env_var() {
   chmod 600 "$ENV_FILE"
 }
 
-existing_key() {
-  # Aceita a key nova (LLM_API_KEY) ou a de instalações antigas (OPENROUTER_API_KEY)
-  [ -f "$ENV_FILE" ] && grep -qE '^(LLM_API_KEY|OPENROUTER_API_KEY)=.+' "$ENV_FILE" 2>/dev/null
-}
-
-# ── Provider de inferência genérico (LLM_*) ───────────────────────────────────
-# Qualquer API OpenAI-compatible é configurada em Modules/.env
-# (LLM_BASE_URL/LLM_API_KEY/LLM_MODEL; default = OpenRouter). Fluxo do install:
-#   (1) pede o LLM_BASE_URL (Enter = OpenRouter);
-#   (2) pede a LLM_API_KEY SÓ se o provider NÃO for local
-#       (localhost/127.0.0.1/127.9.12.22/*.local);
-#   (3) os dois são escritos no .env só DEPOIS de coletados.
-
-llm_base_url() {
-  [ -f "$ENV_FILE" ] || return 0
-  grep -E '^LLM_BASE_URL=' "$ENV_FILE" 2>/dev/null | tail -1 \
-    | cut -d= -f2- | tr -d "\"'"
-}
-
-# LLM_PROVIDER_LOCAL=1 aceita qualquer url como "local" (ex.: IP na LAN).
-llm_local_flag() {
-  [ "${LLM_PROVIDER_LOCAL:-0}" = "1" ] && return 0
-  [ -f "$ENV_FILE" ] && grep -qE '^LLM_PROVIDER_LOCAL=1' "$ENV_FILE" 2>/dev/null
-}
-
-# Local para uma url JÁ DIGITADA (avaliada antes de gravar no .env).
-# Nota: `\[` é obrigatório — sem o escape, `[::1]` vira classe de caracteres
-# no glob do case e casaria qualquer url começando com "1" (ex.: 192.168...).
-llm_url_is_local() {
-  llm_local_flag && return 0
-  case "$1" in
-    http://localhost*|https://localhost*|\
-    http://127.0.0.1*|https://127.0.0.1*|\
-    http://127.9.12.22*|https://127.9.12.22*|\
-    http://\[::1\]*|https://\[::1\]*|\
-    http://*.local*|https://*.local*) return 0 ;;
-  esac
-  return 1
-}
-
-# Local segundo o .env (usado no health check). Sem LLM_BASE_URL no .env o
-# LLM.py usa OpenRouter → key p/ valer.
-llm_is_local() {
-  llm_local_flag && return 0
-  local base
-  base="$(llm_base_url)"
-  [ -n "$base" ] || return 1
-  llm_url_is_local "$base"
-}
-
-# Pede a API key do provider ($1 = base url) e devolve em $LLM_PROMPT_KEY.
-# Nada é gravado aqui — o caller escreve no .env depois de coletar tudo.
-prompt_key() {
-  local base="$1" key is_or=""
-  case "$base" in *openrouter.ai*) is_or=1 ;; esac
-  LLM_PROMPT_KEY=""
-  while :; do
-    if [ -n "$is_or" ]; then
-      printf 'Cole sua OPENROUTER_API_KEY (https://openrouter.ai/keys): '
-    else
-      printf 'Cole a API key do provider (%s) — Enter = sem key: ' "$base"
-    fi
-    if ! read -rs key; then
-      die "Entrada encerrada (EOF) — instalação abortada na etapa da API key."
-    fi
-    printf '\n'
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    if [ -n "$key" ]; then
-      if [ -n "$is_or" ]; then
-        case "$key" in
-          sk-or-*) ;;
-          *) warn "Chaves do OpenRouter normalmente começam com 'sk-or-'. Prosseguindo mesmo assim." ;;
-        esac
-      fi
-      LLM_PROMPT_KEY="$key"
-      return 0
-    fi
-    # Enter vazio: OpenRouter exige key; provider genérico aceita sem key
-    # (o caller oferece marcar como local / segue e o health check avisa).
-    if [ -n "$is_or" ]; then
-      warn "Chave vazia — tente de novo."
-      continue
-    fi
-    return 0
-  done
-}
-
-prompt_llm_config() {
-  local base="" key="" local_flag="" ans
-
-  # ── (1) endereço base da API ──
-  while :; do
-    printf 'Endereço base da API de inferência (LLM_BASE_URL) [Enter = OpenRouter]: '
-    if ! read -r base; then
-      die "Entrada encerrada (EOF) — instalação abortada na etapa do provider de inferência."
-    fi
-    base="$(printf '%s' "$base" | tr -d '[:space:]')"
-    [ -z "$base" ] && base="https://openrouter.ai/api/v1"
-    base="${base%/}"
-    case "$base" in
-      http://*|https://*) break ;;
-      *) warn "O endereço deve começar com http:// ou https:// — tente de novo." ;;
-    esac
-  done
-
-  # ── (2) API key — só quando o provider NÃO é local ──
-  if llm_url_is_local "$base"; then
-    ok "Provider local detectado ($base) — API key não é necessária."
-  else
-    while :; do
-      prompt_key "$base"
-      key="$LLM_PROMPT_KEY"
-      [ -n "$key" ] && break
-      printf 'Sem API key — em provider remoto a inferência vai falhar no runtime.\n'
-      printf 'Marcar como LOCAL (LLM_PROVIDER_LOCAL=1 — ex.: servidor na LAN) e seguir sem key? [S/n] '
-      read -r ans || ans=""
-      case "$ans" in
-        n|N*) ;;                      # não: pede a key de novo
-        *) local_flag=1; break ;;     # sim: segue sem key, marcado como local
-      esac
-    done
-  fi
-
-  # ── (3) coletado → "ai sim" escritos no .env ──
-  set_env_var LLM_BASE_URL "$base"
-  [ -n "$key" ] && set_env_var LLM_API_KEY "$key"
-  [ -n "$local_flag" ] && set_env_var LLM_PROVIDER_LOCAL 1
-  ok "LLM_BASE_URL=$base gravada em $ENV_FILE (chmod 600)."
-  [ -n "$key" ] && ok "LLM_API_KEY gravada em $ENV_FILE (chmod 600)."
-  # Última linha da função NÃO pode ser um `[ ... ] && ...` com o lado
-  # esquerdo podendo falhar: com set -euo pipefail, `[ -n "" ]` devolve 1 e
-  # o return da função vira 1 — o script MORRE silenciosamente logo após
-  # imprimir "(chmod 600)" (exatamente o relato: colar a API key fechava o
-  # instalador). No meio da função o compound é protegido do set -e; como
-  # ÚLTIMO comando da função, não.
-  if [ -n "$local_flag" ]; then
-    ok "LLM_PROVIDER_LOCAL=1 — provider marcado como local, sem key."
-  fi
-  return 0
-}
-
-# Já existe configuração de provider (base e/ou key) → manter ou reconfigurar.
-# Instalação antiga só com OPENROUTER_API_KEY e sem LLM_BASE_URL mantém o
-# comportamento original (default = OpenRouter + aquela key).
-if [ -n "$(get_env_var LLM_BASE_URL)" ] || existing_key; then
-  printf 'Já existe configuração de provider em Modules/.env (LLM_BASE_URL=%s).\n' "$(get_env_var LLM_BASE_URL)"
-  printf 'Manter a configuração existente? [S/n] '
-  read -r ans || ans=""
-  case "$ans" in
-    n|N*)
-      prompt_llm_config
-      ;;
-    *)
-      ok "Configuração de provider mantida em $ENV_FILE."
-      ;;
-  esac
-else
-  prompt_llm_config
-fi
+# ── Provider de inferência (LLM_*) ───────────────────────────────────────────
+# O cadastro do provedor de IA acontece na primeira execução da WebUI
+# (Manager/index.html → /providers/config), que grava LLM_BASE_URL,
+# LLM_API_KEY, LLM_MODEL e AVA_LLM_PROVIDER em Modules/.env. O instalador não
+# pergunta mais nada: OpenRouter deixou de ser o default e o cadastro
+# deprecated (OPENROUTER_API_KEY) não é mais gerado aqui.
 
 # ── 5a. Token de autenticação interna (AVA_INTERNAL_TOKEN) ───────────────────
 # Todos os serviços internos (orchestrator, LLM, TTS, vision, memory, mcp_manager, Manager)
@@ -1285,22 +1132,11 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     warn "Orchestrator não respondeu em 20 min. Veja os logs: ./docker-start.sh logs -f ava"
   fi
 
-  # Detecta API key ausente no /health do LLM.py (llm_key: "missing" =
-  # provider remoto sem key; "not-required" = provider local, ok — não reclama)
-  if ! llm_is_local && curl -fsS --max-time 5 "http://127.9.12.22:4003/health" 2>/dev/null \
+  # O provedor de IA é cadastrado na primeira execução da WebUI; aqui só
+  # reportamos se o runtime subiu sem credencial, sem interromper o fluxo.
+  if curl -fsS --max-time 5 "http://127.9.12.22:4003/health" 2>/dev/null \
        | grep -q '"llm_key": *"missing"'; then
-    warn "O LLM.py reportou llm_key: missing (provider remoto sem API key)."
-    printf 'Deseja re-informar a chave agora? [S/n] '
-    read -r ans || ans=""
-    case "$ans" in
-      n|N*) ;;
-      *)
-        prompt_key "$(llm_base_url)"
-        [ -n "$LLM_PROMPT_KEY" ] && set_env_var LLM_API_KEY "$LLM_PROMPT_KEY"
-        info "Reiniciando container ava para reler a chave..."
-        ./docker-start.sh restart ava || warn "restart falhou — rode manualmente: ./docker-start.sh restart ava"
-        ;;
-    esac
+    warn "Nenhum provedor de IA configurado ainda — abra o Alpha AI e conclua o cadastro na primeira execução."
   fi
 else
   info "--skip-build: pulei o build/up do Docker."

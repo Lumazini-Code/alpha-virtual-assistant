@@ -135,8 +135,9 @@ LLM_MODEL    = os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017:floor")
 
 # Host do provider — decide se API key é exigida (local: nunca é) e alimenta
 # o /health (llm_key: "ok" | "not-required" | "missing"). LLM_PROVIDER_LOCAL=1
-# aceita qualquer url como local (ex.: servidor de inferência na LAN) — a
-# mesma env que o install.sh usa p/ pular o prompt de OPENROUTER_API_KEY.
+# aceita qualquer url como local (ex.: servidor de inferência na LAN).
+# O cadastro da WebUI grava LLM_PROVIDER_LOCAL quando o usuário deixa a key
+# em branco em um provider local.
 _LLM_HOST = (urlparse(LLM_BASE_URL).hostname or "").lower()
 LLM_LOCAL_PROVIDER = (
     _LLM_HOST in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
@@ -713,7 +714,55 @@ OPENROUTER_RETRY_BACKOFF = LLM_RETRY_BACKOFF
 # tools/tool_choice NUNCA entram aqui — sem tool calling o request perde o
 # sentido; nesse caso o 400 original sobe para o caller.
 _LLM_STRIP_CANDIDATES = ("logprobs", "top_logprobs", "reasoning",
-                         "response_format", "provider")
+                         "response_format", "provider", "stream_options")
+
+# Pedir o bloco de `usage` no stream (OpenAI/OpenRouter honram
+# `stream_options.include_usage`; backends locais que recusam caem no strip de
+# capability acima). Sem isso o provider não manda tokens no streaming e a UI
+# mostraria 0 tokens/custo.
+STREAM_INCLUDE_USAGE = os.getenv("AVA_STREAM_USAGE", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+def _normalize_usage(usage: Optional[dict]) -> dict:
+    """Normaliza o bloco `usage` do provider para o contrato interno.
+
+    Diferentes provedores usam nomes distintos (`prompt_tokens` vs
+    `input_tokens`, `cached_tokens` no topo vs em `prompt_tokens_details`,
+    `cost` vs `total_cost`). O dict original é preservado; os campos
+    canônicos são garantidos para o orchestrator gravar tokens/custo.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return {}
+    out = dict(usage)
+    details = usage.get("prompt_tokens_details") or {}
+    cached = (
+        usage.get("prompt_tokens_cached")
+        or usage.get("cached_tokens")
+        or details.get("cached_tokens")
+        or 0
+    )
+    out["prompt_tokens"] = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    out["completion_tokens"] = int(
+        usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    )
+    out["prompt_tokens_cached"] = int(cached or 0)
+    out["cost"] = float(usage.get("cost") or usage.get("total_cost") or 0.0)
+    return out
+
+
+def _approx_usage(messages: list[dict], response_text: str) -> dict:
+    """Estimativa grosseira (4 chars/token) para quando o provider não reporta
+    usage no stream. Marcada como `estimated` — a UI sinaliza com `≈`."""
+    prompt_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    return {
+        "prompt_tokens": prompt_chars // 4,
+        "completion_tokens": len(response_text or "") // 4,
+        "prompt_tokens_cached": 0,
+        "cost": 0.0,
+        "estimated": True,
+    }
 
 # Campos já rejeitados por este backend nesta sessão (400 com campo citado).
 _LLM_UNSUPPORTED: set[str] = set()
@@ -2319,7 +2368,7 @@ class ChatRequest(BaseModel):
             "rotulando-as como esquecíveis/permanentes e episódicas/semânticas."
         ),
     )
-    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
+    model: Optional[str] = Field(default=None, description="Override do modelo para esta chamada (WebUI). None = MAIN_MODEL (LLM_MODEL).")
 
     # ── NEW (projetos): escopo ativo de memória (slug ou None/"general").
     # Repassado pelo orchestrator (re-afirmado a cada turno — a memory pode
@@ -2401,7 +2450,7 @@ class ToolUseRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Sessão do AVA para afinidade de cache.")
     affinity: Optional[str] = Field(default=None, description="Chave de afinidade de cache (filho/fork usa a do pai).")
     grammar: Optional[str] = Field(default=None, description="Mantido por compatibilidade com chamadores antigos do llama-server. No OpenRouter, quando presente, ativamos response_format=json_object (equivalente aproximado de GBNF). A resposta vem em message.content e o caller é responsável por parsear.")
-    model: Optional[str] = Field(default=None, description="Ignorado — mantido por compatibilidade. Sempre usa o modelo principal fixo (z-ai/glm-5.3-flash).")
+    model: Optional[str] = Field(default=None, description="Override do modelo para esta chamada (WebUI). None = MAIN_MODEL (LLM_MODEL).")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=32000)
     reasoning_effort: Optional[str] = Field(
@@ -2549,7 +2598,7 @@ async def chat(req: ChatRequest):
                 **_reasoning_payload_extra(req.thinking_depth),
             },
             stream=False,
-            model=MAIN_MODEL,
+            model=req.model or MAIN_MODEL,
             headers=_cache_headers(req.affinity or req.session_id),
         )
         r.raise_for_status()
@@ -2568,8 +2617,8 @@ async def chat(req: ChatRequest):
     elapsed = time.perf_counter() - t0
 
     # Log cache stats (quando o provedor reportar)
-    usage = resp_data.get("usage", {})
-    cached = usage.get("prompt_tokens_cached", 0) or usage.get("cached_tokens", 0)
+    usage = _normalize_usage(resp_data.get("usage") or {})
+    cached = usage.get("prompt_tokens_cached", 0)
     total_prompt = usage.get("prompt_tokens", 0)
     log.info(
         f"[CHAT] {elapsed:.2f}s | {len(response_text)} chars | "
@@ -2606,6 +2655,7 @@ async def chat(req: ChatRequest):
         "lang":     lang,
         "elapsed":  round(elapsed, 3),
         "prompt_cached_tokens": cached,
+        "usage":    usage,
     }
 
 
@@ -2787,6 +2837,9 @@ async def chat_stream(req: ChatRequest):
             payload["tool_choice"] = req.tool_choice or "auto"
         if watch_confidence:
             payload["logprobs"] = True
+        # Pede o bloco de usage no fim do stream (tokens + cache + custo).
+        if STREAM_INCLUDE_USAGE:
+            payload["stream_options"] = {"include_usage": True}
 
         # ── FASE 4: t0 marca o início da INFERÊNCIA — o `elapsed` do log
         # final e do evento done EXCLUI o tempo de prep (reportado à parte).
@@ -2796,6 +2849,8 @@ async def chat_stream(req: ChatRequest):
         finish_reason: Optional[str] = None
         t0 = time.perf_counter()
         cached_tokens = 0
+        # Bloco de usage acumulado do provider (stream_options.include_usage).
+        usage_acc: dict = {}
 
         # ── Confidence-watch: estado entre passes ──────────────────────────
         window = _ConfidenceWindow() if watch_confidence else None
@@ -2817,7 +2872,7 @@ async def chat_stream(req: ChatRequest):
                 client_used, model_used, r_ctx = await _execute_inference(
                     json_payload={**payload, "messages": current_messages},
                     stream=True,
-                    model=MAIN_MODEL,
+                    model=req.model or MAIN_MODEL,
                     headers=_cache_headers(req.affinity or req.session_id),
                 )
 
@@ -2868,10 +2923,10 @@ async def chat_stream(req: ChatRequest):
                                 choices = chunk.get("choices") or []
                                 if not choices:
                                     # Chunk final só com usage (sem choices)
-                                    usage = chunk.get("usage", {})
+                                    usage = _normalize_usage(chunk.get("usage") or {})
                                     if usage:
-                                        cached_tokens = usage.get("prompt_tokens_cached", 0) or \
-                                                         usage.get("cached_tokens", 0)
+                                        usage_acc.update(usage)
+                                        cached_tokens = usage.get("prompt_tokens_cached", 0)
                                     continue
                                 delta_obj = choices[0].get("delta", {}) or {}
                                 finish = choices[0].get("finish_reason")
@@ -2907,10 +2962,10 @@ async def chat_stream(req: ChatRequest):
                                 content = delta_obj.get("content", "") or ""
                                 if not content:
                                     # Alguns provedores enviam usage na última chunk
-                                    usage = chunk.get("usage", {})
+                                    usage = _normalize_usage(chunk.get("usage") or {})
                                     if usage:
-                                        cached_tokens = usage.get("prompt_tokens_cached", 0) or \
-                                                         usage.get("cached_tokens", 0)
+                                        usage_acc.update(usage)
+                                        cached_tokens = usage.get("prompt_tokens_cached", 0)
                                     continue
 
                                 full_response += content
@@ -3102,7 +3157,13 @@ async def chat_stream(req: ChatRequest):
             # responder com role="tool".
             yield f"data: {json.dumps({'tool_calls': tool_calls_final})}\n\n"
 
-        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prep_ms': round(prep_elapsed * 1000), 'prompt_cached_tokens': cached_tokens, 'finish_reason': finish_reason, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
+        # Usage: o bloco do provider quando veio; senão uma estimativa
+        # (4 chars/token) marcada com `estimated` — nunca 0/0 silencioso.
+        usage_out = dict(usage_acc)
+        if not usage_out or (not usage_out.get("prompt_tokens") and not usage_out.get("completion_tokens")):
+            usage_out = _approx_usage(current_messages, full_response)
+        cached_tokens = usage_out.get("prompt_tokens_cached", cached_tokens) or 0
+        yield f"data: {json.dumps({'done': True, 'elapsed': round(elapsed, 3), 'prep_ms': round(prep_elapsed * 1000), 'prompt_cached_tokens': cached_tokens, 'usage': usage_out, 'finish_reason': finish_reason, 'had_tool_calls': bool(tool_calls_final)})}\n\n"
 
         # Persistência pós-stream — apenas turno FINAL do modo chat
         if turno_final and (not tool_mode) and full_response:
@@ -3241,6 +3302,7 @@ async def _openrouter_tool_call(
     grammar: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     affinity: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> tuple[dict, str, dict, bool]:
     """
     Executa tool call no provider configurado (LLM_BASE_URL).
@@ -3267,7 +3329,7 @@ async def _openrouter_tool_call(
     único provider configurado, sem fallback entre provedores).
     """
     payload: dict = {
-        "model":       MAIN_MODEL,
+        "model":       (model or "").strip() or MAIN_MODEL,
         "messages":    messages,
         "temperature": temperature,
     }
@@ -3297,7 +3359,7 @@ async def _openrouter_tool_call(
         message = choice["message"]
         if isinstance(message, dict):
             message["_finish_reason"] = choice.get("finish_reason")
-        return message, MAIN_MODEL, data.get("usage") or {}, False
+        return message, (model or "").strip() or MAIN_MODEL, _normalize_usage(data.get("usage") or {}), False
 
     # Erro de contexto grande demais: não faz sentido retentar
     try:
@@ -3361,12 +3423,13 @@ async def chat_tools(req: ToolUseRequest):
             grammar=req.grammar,
             reasoning_effort=req.reasoning_effort,
             affinity=req.affinity or req.session_id,
+            model=req.model,
         )
     except RequestTooLargeError as e:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return ToolUseResponse(
             message={"role": "assistant", "content": "", "tool_calls": None},
-            model=MAIN_MODEL,
+            model=(req.model or "").strip() or MAIN_MODEL,
             usage={"error": "request_too_large", "detail": str(e)[:500]},
             elapsed_ms=round(elapsed_ms, 1),
             fallback_used=False,

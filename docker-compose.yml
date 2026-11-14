@@ -44,9 +44,9 @@ services:
       # escreve; bind mount = as skills aparecem no host também.
       - ./.agents/skills-created:/app/.agents/skills-created:rw
 
-    # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, OPENROUTER_API_KEY,
-    # CRAWL4AI_API_TOKEN...) + o provider de inferência (LLM_BASE_URL/
-    # LLM_API_KEY/LLM_MODEL — qualquer API OpenAI-compatible; vão todos
+    # Tokens gerados pelo install.sh (AVA_INTERNAL_TOKEN, CRAWL4AI_API_TOKEN...)
+    # + o provider de inferência (LLM_BASE_URL/LLM_API_KEY/LLM_MODEL, cadastrado
+    # na primeira execução da WebUI — qualquer API OpenAI-compatible; vão todos
     # juntos no env_file). Carregados DIRETO pelo compose — sem depender
     # do --env-file do docker-start.sh. O env_file injeta as variáveis NO
     # container (visíveis no `docker exec ava env`), ao contrário da

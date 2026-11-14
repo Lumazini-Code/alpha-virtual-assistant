@@ -16,6 +16,8 @@
 //!
 //! Endpoints:
 //!   GET  /status          -> status atual do docker
+//!   GET  /providers       -> catálogo models.dev (OpenAI-compatible, sem Zen)
+//!   GET/PUT /providers/config -> provedor ativo em Modules/.env (loopback)
 //!   POST /docker/start    -> inicia o ambiente docker
 //!   POST /docker/stop     -> encerra o ambiente docker
 //!   POST /browser/start   -> abre o Chrome NORMAL do usuário (perfil
@@ -167,6 +169,11 @@ pub async fn serve(
         .route("/mcpapi", any(proxy_mcp))
         .route("/mcpapi/{*path}", any(proxy_mcp))
         .route("/status", get(get_status))
+        .route("/providers", get(get_providers))
+        .route(
+            "/providers/config",
+            get(get_providers_config).put(put_providers_config),
+        )
         .route("/docker/start", post(post_docker_start))
         .route("/docker/stop", post(post_docker_stop))
         .route("/browser/start", post(post_browser_start))
@@ -392,6 +399,50 @@ fn validate_host_cwd(raw: &str) -> Result<String, String> {
 // ════════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════════
+
+/// Catálogo estático (models.dev → providers.json). A WebUI usa na primeira
+/// execução e em Configurações para listar/cadastrar provedores.
+async fn get_providers() -> Response {
+    let mut response = Response::new(Body::from(crate::providers::CATALOG));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Configuração ativa, lida de `Modules/.env` a cada request (o arquivo é a
+/// fonte de verdade — o processo do tray pode ter env antigo no boot).
+async fn get_providers_config(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(resp) = require_loopback(addr) {
+        return resp;
+    }
+    Json(crate::providers::read_config(&state)).into_response()
+}
+
+async fn put_providers_config(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::providers::ConfigInput>,
+) -> Response {
+    if let Err(resp) = require_loopback(addr) {
+        return resp;
+    }
+    match crate::providers::write_config(&state, input) {
+        Ok(config) => Json(config).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
 
 async fn get_status(State(state): State<SharedState>) -> impl IntoResponse {
     // try_lock: o /status é polado pela TUI e pelo health check — se o

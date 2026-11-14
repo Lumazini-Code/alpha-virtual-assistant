@@ -38,6 +38,7 @@ mod idle_watcher;
 mod mcp_server;
 mod platform;
 mod process_manager;
+mod providers;
 mod state;
 mod stats;
 mod transcript;

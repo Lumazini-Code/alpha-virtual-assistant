@@ -245,7 +245,7 @@ curl -fsSL -o /tmp/alpha-install.sh \
 curl -fsSL -o "%TEMP%\install.bat" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.bat -o "%TEMP%\install.ps1" https://raw.githubusercontent.com/Lumazini-Code/alpha-virtual-assistant/main/install.ps1 && call "%TEMP%\install.bat"
 ```
 
-O instalador pede o provider de inferência (`LLM_BASE_URL` — Enter = OpenRouter; `LLM_API_KEY` só se o provider não for local) e gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles. No Linux ele cria o comando `alpha-ai` apontando para `Manager/ava-web`; no Windows, um wrapper `alpha-ai.cmd` que abre `Manager\ava-web.exe`.
+O instalador gera os tokens internos (`AVA_INTERNAL_TOKEN`, `CRAWL4AI_API_TOKEN`) em `Modules/.env` — o stack não sobe sem eles. O **provider de inferência é cadastrado na primeira execução da WebUI**: um catálogo baseado no models.dev (sem o OpenCode Zen) lista os provedores OpenAI-compatible, e a escolha grava `LLM_BASE_URL`/`LLM_API_KEY`/`AVA_LLM_PROVIDER` no `.env` antes de reiniciar o ambiente. O **modelo é escolhido na tela de chat**, no seletor sob a caixa de escrita (favoritos fixados no topo; lista agrupada por provedor no formato “Modelo - Provedor”), e é enviado por turno como override — trocar de modelo não reinicia o stack. O cadastro deprecated do OpenRouter saiu dos instaladores. No Linux o instalador cria o comando `alpha-ai` apontando para `Manager/ava-web`; no Windows, um wrapper `alpha-ai.cmd` que abre `Manager\ava-web.exe`.
 
 **Modo teste (antes do release oficial)**: com a env var `ALPHA_RELEASE_ZIP` apontando para um zip local, o instalador pula o GitHub inteiro e instala desse zip — mesmo fluxo, mesma validação:
 
@@ -278,10 +278,11 @@ curl -s localhost:9001/browser/status   # Chrome do host
 
 | Variável | Onde | Default | O que faz |
 |---|---|---|---|
-| `OPENROUTER_API_KEY` | `Modules/.env` | — | Chave do OpenRouter (gerada pelo install.sh; fallback de `LLM_API_KEY`) |
-| `LLM_BASE_URL` | `Modules/.env` | OpenRouter | Provider de inferência — qualquer API OpenAI-compatible (tabela abaixo) |
-| `LLM_API_KEY` | `Modules/.env` | `OPENROUTER_API_KEY` | API key do provider (opcional em provider local: localhost/127.0.0.1) |
-| `LLM_MODEL` | `Modules/.env` | `z-ai/glm-5.3-flash:floor` | Modelo principal do provider ativo |
+| `OPENROUTER_API_KEY` | `Modules/.env` | — | **Deprecated**: removida no próximo salvamento do cadastro; use `LLM_API_KEY` |
+| `LLM_BASE_URL` | `Modules/.env` | runtime: OpenRouter | Provider cadastrado na WebUI (qualquer API OpenAI-compatible — tabela abaixo) |
+| `LLM_API_KEY` | `Modules/.env` | — | API key do provider (opcional em provider local: localhost/127.0.0.1) |
+| `LLM_MODEL` | `Modules/.env` | `z-ai/glm-5.3-flash:floor` | Modelo fallback (a WebUI envia o modelo escolhido por chat como override) |
+| `AVA_LLM_PROVIDER` | `Modules/.env` | — | ID do provedor escolhido no catálogo (exibição na WebUI) |
 | `AVA_INTERNAL_TOKEN` | `Modules/.env` | — | Bearer token interno (memory/orchestrator/mcp_manager/TUI) |
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
 | `AVA_DOCKER_IDLE_MINUTES` | tray | 15 | Minutos de inatividade antes do `docker down` (a pergunta seguinte reergue o stack sozinho) |
@@ -337,13 +338,21 @@ curl -s localhost:9001/browser/status   # Chrome do host
 
 Todos os endpoints que requisitam LLM diretamente (`/chat`, `/chat/stream`,
 `/chat/tools`, `/memories/extract` + extrator pós-turno e classificador do
-confidence-watch) falam com **um provider ativo por vez**, escolhido por env
-em `Modules/.env` — trocar de provider = mudar a env e reiniciar (sem rebuild,
-sem código). Qualquer API que implemente `POST /v1/chat/completions` serve:
+confidence-watch) falam com **um provider ativo por vez**, escolhido no
+cadastro da WebUI e persistido em `Modules/.env` — trocar de provider =
+Configurações → *Provedor de IA* (ou a tela de primeira execução), que salva a
+env e reinicia o ambiente (sem rebuild, sem código). O catálogo
+(`Manager/assets/providers.json`) é gerado do models.dev por
+`scripts/build_provider_catalog.py` e só lista endpoints `chat-completions`.
+O **modelo** é independente do provider: a WebUI mantém um seletor por chat
+(barra sob a caixa de escrita, com favoritos e agrupamento por provedor) e
+envia `model` em cada `/execute`; `Modules/LLM.py` aceita esse override sem
+alterar `LLM_MODEL`. Qualquer API que implemente `POST /v1/chat/completions`
+também serve via "Outro provedor OpenAI-compatible":
 
 | Provider | `LLM_BASE_URL` | `LLM_API_KEY` | Exemplo de `LLM_MODEL` |
 |---|---|---|---|
-| OpenRouter (default) | `https://openrouter.ai/api/v1` | obrigatória (`OPENROUTER_API_KEY` funciona como fallback) | `z-ai/glm-5.3-flash:floor` |
+| OpenRouter | `https://openrouter.ai/api/v1` | obrigatória | `z-ai/glm-5.3-flash:floor` |
 | Ollama | `http://localhost:11434/v1` | não precisa | `llama3.1:8b-instruct` |
 | vLLM | `http://localhost:8000/v1` | opcional | nome do modelo servido |
 | llama.cpp server | `http://localhost:8080/v1` | não precisa | nome do modelo servido |
@@ -359,11 +368,11 @@ sem código). Qualquer API que implemente `POST /v1/chat/completions` serve:
 - **Modelos extras**: `MEMORY_EXTRACTOR_MODEL`/`MEMORY_EXTRACTOR_FALLBACK_MODEL`
   já são env; em provider ≠ OpenRouter o default do extrator vira o próprio
   `LLM_MODEL`.
-- **Key opcional**: provider local não exige key (o `install.sh`/`install.ps1`
-  pedem o `LLM_BASE_URL` primeiro e só cobram a key se o provider não for
-  local; `/health` reporta `llm_key: "not-required"`). `LLM_PROVIDER_LOCAL=1`
-  marca como local qualquer outra url (ex.: servidor de inferência na LAN —
-  o próprio instalador oferece a opção quando a key é deixada em branco).
+- **Key opcional**: provider local não exige key (o cadastro da WebUI pergunta
+  a base URL primeiro e só cobra a key se o provider não for local; `/health`
+  reporta `llm_key: "not-required"`). `LLM_PROVIDER_LOCAL=1` marca como local
+  qualquer outra url (ex.: servidor de inferência na LAN — a WebUI oferece a
+  opção quando a key é deixada em branco).
 
 ## Roadmap
 

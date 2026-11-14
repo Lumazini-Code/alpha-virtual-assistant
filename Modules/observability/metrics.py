@@ -101,6 +101,11 @@ def inc(name: str, key: str | None = None, n: int = 1) -> None:
     METRICS.inc(name, key, n)
 
 
+def gauge(name: str, value: float, key: str | None = None) -> None:
+    """Define um gauge (valor absoluto) — ex.: turnos ativos por projeto."""
+    METRICS.set(name, value, key)
+
+
 def snapshot() -> dict[str, Any]:
     return METRICS.snapshot()
 
