@@ -28,6 +28,11 @@ from memory_config import (
     CHUNK_SIZE,
     CONTEXT_MAX_CHARS,
     CONTEXT_TURNS_FETCH,
+    BLOCK_CONSOLIDATE_INTERVAL_S,
+    BLOCK_GUIDE_MAX_CHARS,
+    BLOCK_MIN_MEMBERS,
+    BLOCK_PRUNE_THRESHOLD,
+    BLOCK_TOP_K,
     DECAY_HALF_LIFE_DAYS,
     DEDUP_THRESHOLD,
     DUAL_CONTEXT_WEIGHT,
@@ -36,6 +41,8 @@ from memory_config import (
     EDGE_MIN_SCORE_TO_LINK,
     EDGE_PRUNE_THRESHOLD,
     EDGE_TYPES,
+    EPISODES_ENABLED,
+    EPISODE_TOP_K,
     FD_AMBIGUOUS_MARGIN,
     FD_EMBED_DIM,
     FD_MIN_SCORE,
@@ -47,6 +54,7 @@ from memory_config import (
     IF_MIN_SCORE_READ,
     LANCE_DIR,
     LTP_ACCESS_BOOST,
+    MEMORY_BLOCKS_ENABLED,
     MMR_COSINE_FLOOR,
     MMR_LAMBDA,
     ONNX_SERVING_URL,
@@ -142,6 +150,77 @@ def _gather_status_sync() -> dict:
             "ppr_expand_min_path_w":    PPR_EXPAND_MIN_PATH_WEIGHT,
             "mmr_cosine_floor":         MMR_COSINE_FLOOR,
             "edge_types":               list(EDGE_TYPES),
+        },
+        # ── NEW: Blocos de memória (ponteiros para conjuntos de átomos) ──
+        "memory_blocks": {
+            "enabled":              MEMORY_BLOCKS_ENABLED,
+            "blocks_total":         safe("memory_blocks", state.lt_db.block_count),
+            "guide_blocks_total":   safe(
+                "memory_blocks",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_blocks WHERE guide != ''"
+                ).fetchone()[0],
+            ),
+            "manual_guides_total":  safe(
+                "memory_blocks",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_blocks WHERE guide_source = 'manual'"
+                ).fetchone()[0],
+            ),
+            "stale_guides_total":   safe(
+                "memory_blocks",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_blocks WHERE guide_source = 'stale'"
+                ).fetchone()[0],
+            ),
+            "orphan_facts_total":   safe(
+                "memory_blocks",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memories m WHERE NOT EXISTS "
+                    "(SELECT 1 FROM memory_block_member bm WHERE bm.memory_id = m.id)"
+                ).fetchone()[0],
+            ),
+            "min_members":          BLOCK_MIN_MEMBERS,
+            "top_k":                BLOCK_TOP_K,
+            "prune_threshold":      BLOCK_PRUNE_THRESHOLD,
+            "guide_max_chars":      BLOCK_GUIDE_MAX_CHARS,
+            "consolidate_interval_s": BLOCK_CONSOLIDATE_INTERVAL_S,
+            "consolidations_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("consolidations_total", 0),
+            ),
+            "consolidation_failures_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("consolidation_failures_total", 0),
+            ),
+            "prunes_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("prunes_total", 0),
+            ),
+            "guide_regenerations_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("guide_regenerations_total", 0),
+            ),
+            "guide_stale_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("guide_stale_total", 0),
+            ),
+            "guide_manual_total": safe(
+                "memory_blocks",
+                lambda: __import__("memory_blocks")._STATS.get("guide_manual_total", 0),
+            ),
+        },
+        # ── Episódios (memória autobiográfica por turno) ──
+        "memory_episodes": {
+            "enabled":       EPISODES_ENABLED,
+            "episodes_total": safe(
+                "memory_episodes",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_episodes"
+                ).fetchone()[0],
+            ),
+            "top_k":         EPISODE_TOP_K,
+            "vectors_total": safe("memory_episodes", lambda: state.ep_index.total),
         },
         # ── NEW: LanceDB ──
         "vector_store": {

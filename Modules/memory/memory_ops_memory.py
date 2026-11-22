@@ -38,6 +38,10 @@ from memory_config import (
     AUTO_LINK_MIN_COSINE,
     AUTO_LINK_MIN_CROSS,
     AUTO_LINK_TOP_K,
+    BLOCK_MIN_SCORE,
+    BLOCK_SEED_WEIGHT,
+    BLOCK_TOP_K,
+    MEMORY_BLOCKS_ENABLED,
     DEDUP_THRESHOLD,
     EDGE_CO_ACTIVATION,
     EDGE_LEARNING_RATE,
@@ -59,12 +63,15 @@ from memory_config import (
     ST_READ_DEFAULT_PAIRS,
     UPDATE_SIM_THRESHOLD,
     VS_MIN_SCORE,
+    block_node_id,
     encode_ref,
     is_general_ref,
     log,
     ref_real_id,
 )
 from memory_models import (
+    BlockMember,
+    BlockWriteRequest,
     MemoryEntry,
     MemoryToolError,
     ReadRequest,
@@ -81,6 +88,7 @@ from memory_models import (
 )
 from memory_search import (
     _apply_token_budget,
+    _build_block_entries,
     _build_context_block,
     _build_if_entries,
     _build_lt_entries,
@@ -562,6 +570,41 @@ async def _process_write_request(req: WriteRequest) -> WriteResponse:
     # → warning e grava sem vínculo, sem bloquear.
     if req.person_id is not None and stored and reason == "ok" and memory_id is not None:
         await _link_memory_to_person(memory_id, req.person_id)
+    # ── NEW (blocos): o extrator pode propor um bloco novo ou associar o
+    # átomo a um bloco existente. O bloco é ponteiro: nunca substitui o fato.
+    if req.block is not None and MEMORY_BLOCKS_ENABLED and stored and reason == "ok" and memory_id is not None:
+        try:
+            from memory_blocks import attach_memory_to_block, block_write, _sanitize_guide, _guide_hash
+            b = req.block
+            target_id = b.block_id
+            if target_id is None:
+                row = state.lt_db.block_get_by_name(b.name)
+                target_id = row["id"] if row else None
+            if target_id is None:
+                res = await block_write(BlockWriteRequest(
+                    name=b.name, kind=b.kind, gist=b.gist or b.name,
+                    cues=b.cues, guide=b.guide,
+                    members=[BlockMember(memory_id=memory_id, role="core")],
+                    confidence=b.confidence, source="extractor",
+                ))
+                target_id = res.block_id if res.stored else None
+            else:
+                await attach_memory_to_block(memory_id, target_id)
+                # O extrator pode propor gist/guia novos para um bloco
+                # existente. O guia manual nunca é sobrescrito.
+                if b.gist or b.guide:
+                    row = state.lt_db.block_get(target_id)
+                    if row is not None and row["guide_source"] != "manual":
+                        if b.gist and b.gist != row["gist"]:
+                            state.lt_db.block_update(target_id, gist=b.gist)
+                        guide = _sanitize_guide(b.guide)
+                        if guide and guide != row["guide"]:
+                            state.lt_db.block_set_guide(
+                                target_id, guide, "extractor",
+                                _guide_hash(guide, row["summary_hash"]),
+                            )
+        except Exception as e:
+            log.warning(f"blocos: falha ao associar memória #{memory_id} ao bloco: {e}")
     resp = WriteResponse(stored=stored, reason=reason, memory_id=memory_id)
     if candidate is not None:
         resp.candidate_id    = candidate["id"]
@@ -818,6 +861,34 @@ async def read_memory(req: ReadRequest):
         st_raw = _fuse_max(st_raw, st_seg)
         log.info(f"/read query segmentada em {len(query_segments)} partes: {query_segments}")
 
+    # ── NEW (blocos): semeia blocos ANTES dos átomos. O bloco entra como 1
+    # semente no PPR e desce para os membros via contains/part_of. A busca
+    # semântica do bloco usa gist+cues; o bloco pode ser acertado mesmo que
+    # nenhum átomo seja hit direto.
+    block_seeds_by_view: dict[str, list[tuple[int, float]]] = {v.name: [] for v in views}
+    if req.include_blocks and MEMORY_BLOCKS_ENABLED:
+        for v in views:
+            if v.blk_index is None or v.blk_index.total == 0:
+                continue
+            try:
+                hits = await loop.run_in_executor(None, v.blk_index.search, query_emb, BLOCK_TOP_K)
+                if len(query_segments) > 1:
+                    for seg in query_segments:
+                        seg_e = await state.embed_engine.embed_query_one(seg)
+                        seg_hits = await loop.run_in_executor(None, v.blk_index.search, seg_e, BLOCK_TOP_K)
+                        hits = _fuse_max(hits, seg_hits)
+                for block_id, score in hits:
+                    if score >= BLOCK_MIN_SCORE:
+                        block_seeds_by_view[v.name].append((block_node_id(int(block_id)), BLOCK_SEED_WEIGHT))
+                if block_seeds_by_view[v.name]:
+                    lt_raw_by_view[v.name].extend(block_seeds_by_view[v.name])
+                    log.info(
+                        f"/read blocos semeados [{v.name}]: "
+                        f"{len(block_seeds_by_view[v.name])} bloco(s)"
+                    )
+            except Exception as e:
+                log.warning(f"/read busca de blocos falhou [{v.name}]: {e}")
+
     # ── NEW (people cards): leitura centrada em uma pessoa. O nó de identidade
     # do card (memory_id) é injetado como semente extra no PPR — memórias
     # relacionadas à pessoa vêm como "related" mesmo sem match semântico.
@@ -877,6 +948,7 @@ async def read_memory(req: ReadRequest):
     # ── Build POR ESCOPO: ids compostas + tag `scope` só na leitura mesclada ──
     # ST é global — entra uma vez (i == 0, escopo ativo).
     results: list[MemoryEntry] = []
+    blocks_out = []
     for i, v in enumerate(views):
         vctx = per_view_ctx[v.name]
         scope_tag = v.name if merged else None     # None = compatibilidade (modo geral)
@@ -894,6 +966,14 @@ async def read_memory(req: ReadRequest):
             related_raw, 0.0, loop, related_ids=related_ids,
             lt_db=v.db, encode=v.encode, scope=scope_tag,
         )
+        # ── NEW (blocos): o bloco é 1 item; membros entram só se expandir.
+        if req.include_blocks and MEMORY_BLOCKS_ENABLED:
+            vblocks, vmembers = _build_block_entries(
+                vctx["ppr_rank"], v.db, min_score=BLOCK_MIN_SCORE,
+                expand=req.expand_blocks, encode=v.encode, scope=scope_tag,
+            )
+            blocks_out += vblocks
+            results += vmembers
         if i == 0:
             results += _build_st_entries(st_raw, strict_min_score, loop)
         vs_results = []
@@ -987,7 +1067,8 @@ async def read_memory(req: ReadRequest):
         f"ppr_ms={ppr_ms:.1f} views={view_names}"
     )
 
-    response = ReadResponse(results=results, query=query, strategy=effective_strategy)
+    response = ReadResponse(results=results, query=query, strategy=effective_strategy,
+                            blocks=blocks_out)
 
     # ── NEW (Step 4, background): criação de arestas hebbianas entre as
     # memórias LT FINAIS com score >= EDGE_MIN_SCORE_TO_LINK. Fire-and-forget

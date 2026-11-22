@@ -139,6 +139,14 @@ class SessionDatabase:
                     ON session_job(parent_id, time_created);
                 CREATE INDEX IF NOT EXISTS idx_job_status
                     ON session_job(status);
+
+                CREATE TABLE IF NOT EXISTS session_task_state (
+                    session_id    TEXT PRIMARY KEY,
+                    task_id       TEXT NOT NULL,
+                    data          TEXT NOT NULL,
+                    time_created  REAL NOT NULL,
+                    time_updated  REAL NOT NULL
+                );
                 """
             )
 

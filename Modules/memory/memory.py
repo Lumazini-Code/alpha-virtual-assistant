@@ -48,7 +48,7 @@ Regras de ouro:
 
 # Submódulos importados explicitamente: ficam acessíveis como atributos
 # da fachada (ex.: memory.memory_search.state) para depuração/patches.
-import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_tips, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_status  # noqa: F401
+import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_tips, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_blocks, memory_episodes, memory_status  # noqa: F401
 
 from memory_config import *  # noqa: F401,F403
 from memory_models import *  # noqa: F401,F403
@@ -66,9 +66,29 @@ from memory_ops_tips import *  # noqa: F401,F403
 from memory_ops_agent_skills import *  # noqa: F401,F403
 from memory_ops_plans import *  # noqa: F401,F403
 from memory_ops_scope import *  # noqa: F401,F403
+from memory_blocks import *  # noqa: F401,F403
+from memory_episodes import *  # noqa: F401,F403
 from memory_status import *  # noqa: F401,F403
 
 __all__ = [
+    'BlockConsolidateRequest',
+    'BlockConsolidateResponse',
+    'BlockGuideRequest',
+    'BlockGuideResponse',
+    'BlockListResponse',
+    'BlockMember',
+    'BlockProposal',
+    'BlockWriteRequest',
+    'BlockWriteResponse',
+    'MemoryBlock',
+    'block_write',
+    'block_list',
+    'block_get',
+    'block_set_guide',
+    'block_delete',
+    'consolidate_blocks',
+    'attach_memory_to_block',
+    'propose_block_from_memories',
     'ACTIVATION_LOG_MAX_IDS',
     'ACTIVATION_LOG_PATH',
     'AppState',
@@ -84,6 +104,8 @@ __all__ = [
     'DUAL_CONTEXT_WEIGHT',
     'EDGE_CONTRADICTS',
     'EDGE_CO_ACTIVATION',
+    'EDGE_CONTAINS',
+    'EDGE_PART_OF',
     'EDGE_DECAY_HALF_LIFE_DAYS',
     'EDGE_DIRECTED_TYPES',
     'EDGE_EXPLICIT_LINK_WEIGHT',
@@ -149,12 +171,14 @@ __all__ = [
     'MT_FACE_DICT',
     'MT_INDEXED_FILE',
     'MT_LONG_TERM',
+    'MT_MEMORY_BLOCK',
     'MT_SHORT_TERM',
     'MT_TOOL',
     'MT_VISUAL_DICT',
     'MT_VOICE_DICT',
     'MemoryDB',
     'MemoryEntry',
+    'MemoryBlock',
     'MemoryIndex',
     'MemoryToolError',
     'ONNX_SERVING_URL',
@@ -228,6 +252,29 @@ __all__ = [
     'ScopePaths',
     'ScopeState',
     'ScopeSwitchRequest',
+    'MEMORY_BLOCKS_ENABLED',
+    'BLOCK_MIN_MEMBERS',
+    'BLOCK_MIN_DENSITY',
+    'BLOCK_MIN_AVG_WEIGHT',
+    'BLOCK_MIN_EVOCATIONS',
+    'BLOCK_TOP_K',
+    'BLOCK_MIN_SCORE',
+    'BLOCK_SEED_WEIGHT',
+    'BLOCK_EXPAND_MAX_MEMBERS',
+    'BLOCK_EXPAND_MAX_CHARS',
+    'BLOCK_MEMBER_DECAY_FACTOR',
+    'BLOCK_PRUNE_THRESHOLD',
+    'BLOCK_CONSOLIDATE_INTERVAL_S',
+    'BLOCK_PARENT_MIN_CHILDREN',
+    'BLOCK_PARENT_OVERLAP',
+    'BLOCK_GUIDE_MAX_CHARS',
+    'BLOCK_GUIDE_MAX_BULLETS',
+    'BLOCK_GUIDE_INJECT_MIN_LEVEL',
+    'BLOCK_CONSOLIDATE_MAX_CANDIDATES',
+    'BLOCK_EPISODE_GAP_S',
+    'block_node_id',
+    'is_block_node',
+    'block_real_id',
     '_plans_write_lock',
     '_row_to_entry',
     '_resolve_row',

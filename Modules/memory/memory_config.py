@@ -142,6 +142,22 @@ def encode_ref(scope: str, real_id: int) -> int:
     return real_id + GENERAL_ID_OFFSET if scope == GENERAL_SCOPE else real_id
 
 
+# ── Blocos de memória: nós do grafo com id NEGATIVO ───────────────────────────
+# Memórias reais usam ids positivos; ids compostos do escopo geral usam
+# +GENERAL_ID_OFFSET. Blocos usam -block_id: sem colisão com nenhum dos dois e
+# trivial de detectar no PPR/expansão (basta id < 0).
+def block_node_id(block_id: int) -> int:
+    return -int(block_id)
+
+
+def is_block_node(node_id: int) -> bool:
+    return int(node_id) < 0
+
+
+def block_real_id(node_id: int) -> int:
+    return -int(node_id)
+
+
 # ── NEW: Planos de execução híbridos (macro + modelo) ──────────────────────────
 PLANS_DB_PATH           = str(_DB_DIR / "ava_plans.db")
 PLANS_MAX_STEPS         = 50       # teto de passos por plano (validação Pydantic)
@@ -279,6 +295,8 @@ MT_VISUAL_DICT  = "visual_dict"
 MT_FACE_DICT    = "face_dict"
 MT_VOICE_DICT   = "voice_dict"
 MT_TOOL         = "tool"
+# Blocos de memória: nós que agrupam átomos e ocupam 1 slot no recall.
+MT_MEMORY_BLOCK = "memory_block"
 
 # ── NEW: retrieval de tools (RAG de tool selection) ───────────────────────────
 # Recall é mais crítico que precisão aqui: uma tool que não aparece não pode ser
@@ -415,8 +433,12 @@ EDGE_CO_ACTIVATION = "co_activation"
 EDGE_TEMPORAL      = "temporal_precedence"
 EDGE_CONTRADICTS   = "contradicts"
 EDGE_UPDATES       = "updates"
-EDGE_TYPES          = (EDGE_CO_ACTIVATION, EDGE_TEMPORAL, EDGE_CONTRADICTS, EDGE_UPDATES)
-EDGE_DIRECTED_TYPES = frozenset({EDGE_TEMPORAL, EDGE_UPDATES})
+# Blocos: contains = bloco → membro; part_of = membro → bloco. Estruturais.
+EDGE_CONTAINS      = "contains"
+EDGE_PART_OF       = "part_of"
+EDGE_TYPES          = (EDGE_CO_ACTIVATION, EDGE_TEMPORAL, EDGE_CONTRADICTS, EDGE_UPDATES,
+                       EDGE_CONTAINS, EDGE_PART_OF)
+EDGE_DIRECTED_TYPES = frozenset({EDGE_TEMPORAL, EDGE_UPDATES, EDGE_CONTAINS, EDGE_PART_OF})
 # Fator aplicado ao peso da aresta ao PROPAGAR no PPR: (a→b, b→a).
 #   contradicts: (0,0) — não propaga ativação por contradição (o MMR ainda a usa);
 #   updates: de a memória ANTIGA pra NOVA propaga forte (1.0), da nova pra antiga quase nada.
@@ -425,6 +447,10 @@ EDGE_PPR_FACTORS = {
     EDGE_TEMPORAL:      (0.6, 0.3),
     EDGE_CONTRADICTS:   (0.0, 0.0),
     EDGE_UPDATES:       (0.1, 1.0),
+    # Bloco → membro propaga forte; membro → bloco quase nada (evita o bloco
+    # "engolir" a leitura a partir de um único átomo).
+    EDGE_CONTAINS:      (1.0, 0.2),
+    EDGE_PART_OF:       (0.2, 1.0),
 }
 # Fator do peso da aresta como "similaridade" no MMR (redundância entre candidatos).
 EDGE_MMR_FACTORS = {
@@ -432,13 +458,63 @@ EDGE_MMR_FACTORS = {
     EDGE_TEMPORAL:      0.3,
     EDGE_CONTRADICTS:   1.0,   # mesmo assunto, versões conflitantes → não mostrar as duas
     EDGE_UPDATES:       1.0,
+    EDGE_CONTAINS:      0.0,   # bloco e membro não são redundantes no MMR
+    EDGE_PART_OF:       0.0,
 }
-# Arestas estruturais (correção/contradição) não sofrem decay nem poda por inatividade.
-EDGE_TYPES_NO_DECAY    = frozenset({EDGE_CONTRADICTS, EDGE_UPDATES})
+# Arestas estruturais (correção/contradição/blocos) não sofrem decay nem poda por inatividade.
+EDGE_TYPES_NO_DECAY    = frozenset({EDGE_CONTRADICTS, EDGE_UPDATES,
+                                    EDGE_CONTAINS, EDGE_PART_OF})
 # Peso inicial de arestas criadas de forma EXPLÍCITA (link_to no /write) — o
 # lr hebbiano (0.15) é fraco demais pra um vínculo declarado.
 EDGE_EXPLICIT_LINK_WEIGHT = 0.8
 EDGE_EXPLICIT_TYPES       = frozenset({EDGE_CONTRADICTS, EDGE_UPDATES})
+
+# ── Blocos de memória (agrupamento de átomos em 1 item de recall) ─────────────
+# Flag ativa por padrão (opt-out AVA_MEMORY_BLOCKS=0), conforme regra do projeto.
+MEMORY_BLOCKS_ENABLED        = os.getenv("AVA_MEMORY_BLOCKS", "1") != "0"
+BLOCK_MIN_MEMBERS            = int(os.getenv("BLOCK_MIN_MEMBERS", "3"))
+BLOCK_MIN_DENSITY            = float(os.getenv("BLOCK_MIN_DENSITY", "0.5"))
+BLOCK_MIN_AVG_WEIGHT         = float(os.getenv("BLOCK_MIN_AVG_WEIGHT", "0.25"))
+BLOCK_MIN_EVOCATIONS         = int(os.getenv("BLOCK_MIN_EVOCATIONS", "2"))
+BLOCK_TOP_K                  = int(os.getenv("BLOCK_TOP_K", "4"))
+BLOCK_MIN_SCORE              = float(os.getenv("BLOCK_MIN_SCORE", "0.78"))
+BLOCK_SEED_WEIGHT            = float(os.getenv("BLOCK_SEED_WEIGHT", "0.9"))
+BLOCK_EXPAND_MAX_MEMBERS     = int(os.getenv("BLOCK_EXPAND_MAX_MEMBERS", "3"))
+BLOCK_EXPAND_MAX_CHARS       = int(os.getenv("BLOCK_EXPAND_MAX_CHARS", "1200"))
+BLOCK_MEMBER_DECAY_FACTOR    = float(os.getenv("BLOCK_MEMBER_DECAY_FACTOR", "0.5"))
+BLOCK_PRUNE_THRESHOLD        = float(os.getenv("BLOCK_PRUNE_THRESHOLD", "0.15"))
+BLOCK_CONSOLIDATE_INTERVAL_S = int(os.getenv("BLOCK_CONSOLIDATE_INTERVAL_S", "900"))
+BLOCK_PARENT_MIN_CHILDREN    = int(os.getenv("BLOCK_PARENT_MIN_CHILDREN", "3"))
+BLOCK_PARENT_OVERLAP         = float(os.getenv("BLOCK_PARENT_OVERLAP", "0.3"))
+BLOCK_GUIDE_MAX_CHARS        = int(os.getenv("BLOCK_GUIDE_MAX_CHARS", "1200"))
+BLOCK_GUIDE_MAX_BULLETS      = int(os.getenv("BLOCK_GUIDE_MAX_BULLETS", "6"))
+BLOCK_GUIDE_INJECT_MIN_LEVEL = int(os.getenv("BLOCK_GUIDE_INJECT_MIN_LEVEL", "2"))
+BLOCK_CONSOLIDATE_MAX_CANDIDATES = int(os.getenv("BLOCK_CONSOLIDATE_MAX_CANDIDATES", "8"))
+BLOCK_EPISODE_GAP_S          = float(os.getenv("BLOCK_EPISODE_GAP_S", "21600"))
+
+# ── Episódios (memória autobiográfica por turno) ──────────────────────────────
+# Um episódio é o resumo de UM turno (pergunta + resposta + ferramentas úteis).
+# É gravado SEMPRE e recuperado por recall no modo conversacional. Blocos
+# kind=episode consolidam arcos de vários episódios.
+EPISODES_ENABLED             = os.getenv("AVA_EPISODES", "1") != "0"
+EPISODE_TOP_K                = int(os.getenv("EPISODE_TOP_K", "4"))
+EPISODE_MIN_SCORE            = float(os.getenv("EPISODE_MIN_SCORE", "0.35"))
+EPISODE_MAX_CHARS            = int(os.getenv("EPISODE_MAX_CHARS", "1200"))
+EPISODE_MAX_SUMMARY_CHARS    = int(os.getenv("EPISODE_MAX_SUMMARY_CHARS", "900"))
+EPISODE_MAX_TOOL_RESULTS     = int(os.getenv("EPISODE_MAX_TOOL_RESULTS", "4"))
+EPISODE_RECENT_TURNS_BOOST   = int(os.getenv("EPISODE_RECENT_TURNS_BOOST", "3"))
+
+# ── Contexto de trabalho (modo conversacional × execução) ──────────────────────
+# O modo é escolhido pelo usuário na WebUI (Shift+Tab ou clique no composer).
+# "conversational" = janela ST + episódios + fatos + task state.
+# "execution"      = histórico completo durável (comportamento antigo).
+CONTEXT_MODE_DEFAULT         = os.getenv("AVA_CONTEXT_MODE", "conversational").strip().lower()
+ST_WINDOW_TURNS              = int(os.getenv("AVA_ST_WINDOW_TURNS", "6"))
+ST_WINDOW_MAX_TOKENS         = int(os.getenv("AVA_ST_WINDOW_MAX_TOKENS", "12000"))
+ST_KEEP_PRIOR_TOOLS          = os.getenv("AVA_ST_KEEP_PRIOR_TOOLS", "0") != "0"
+TASK_STATE_ENABLED           = os.getenv("AVA_TASK_STATE", "1") != "0"
+TASK_STATE_MAX_CHARS         = int(os.getenv("TASK_STATE_MAX_CHARS", "1200"))
+MT_EPISODE                   = "memory_episode"
 
 # ── Auto-link na ESCRITA (grafo Hebbiano) ─────────────────────────────────────
 # Antes, arestas entre memórias só nasciam de co-ativação em LEITURAS (Step 4)
@@ -636,6 +712,8 @@ __all__ = [
     'DUAL_CONTEXT_WEIGHT',
     'EDGE_CONTRADICTS',
     'EDGE_CO_ACTIVATION',
+    'EDGE_CONTAINS',
+    'EDGE_PART_OF',
     'EDGE_DECAY_HALF_LIFE_DAYS',
     'EDGE_DIRECTED_TYPES',
     'EDGE_EXPLICIT_LINK_WEIGHT',
@@ -690,6 +768,7 @@ __all__ = [
     'MT_FACE_DICT',
     'MT_INDEXED_FILE',
     'MT_LONG_TERM',
+    'MT_MEMORY_BLOCK',
     'MT_SHORT_TERM',
     'MT_TOOL',
     'MT_VISUAL_DICT',
@@ -770,6 +849,43 @@ __all__ = [
     'VS_FAISS_ID_MAP_PATH',
     'VS_FAISS_INDEX_PATH',
     'VS_MIN_SCORE',
+    'MEMORY_BLOCKS_ENABLED',
+    'BLOCK_MIN_MEMBERS',
+    'BLOCK_MIN_DENSITY',
+    'BLOCK_MIN_AVG_WEIGHT',
+    'BLOCK_MIN_EVOCATIONS',
+    'BLOCK_TOP_K',
+    'BLOCK_MIN_SCORE',
+    'BLOCK_SEED_WEIGHT',
+    'BLOCK_EXPAND_MAX_MEMBERS',
+    'BLOCK_EXPAND_MAX_CHARS',
+    'BLOCK_MEMBER_DECAY_FACTOR',
+    'BLOCK_PRUNE_THRESHOLD',
+    'BLOCK_CONSOLIDATE_INTERVAL_S',
+    'BLOCK_PARENT_MIN_CHILDREN',
+    'BLOCK_PARENT_OVERLAP',
+    'BLOCK_GUIDE_MAX_CHARS',
+    'BLOCK_GUIDE_MAX_BULLETS',
+    'BLOCK_GUIDE_INJECT_MIN_LEVEL',
+    'BLOCK_CONSOLIDATE_MAX_CANDIDATES',
+    'BLOCK_EPISODE_GAP_S',
+    'EPISODES_ENABLED',
+    'EPISODE_TOP_K',
+    'EPISODE_MIN_SCORE',
+    'EPISODE_MAX_CHARS',
+    'EPISODE_MAX_SUMMARY_CHARS',
+    'EPISODE_MAX_TOOL_RESULTS',
+    'EPISODE_RECENT_TURNS_BOOST',
+    'CONTEXT_MODE_DEFAULT',
+    'ST_WINDOW_TURNS',
+    'ST_WINDOW_MAX_TOKENS',
+    'ST_KEEP_PRIOR_TOOLS',
+    'TASK_STATE_ENABLED',
+    'TASK_STATE_MAX_CHARS',
+    'MT_EPISODE',
+    'block_node_id',
+    'is_block_node',
+    'block_real_id',
     'ScopePaths',
     '_STOP_WORDS',
     'encode_ref',

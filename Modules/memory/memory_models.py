@@ -51,6 +51,148 @@ class Turn(BaseModel):
     role:    Literal["user", "assistant"]
     content: str
 
+# ── Blocos de memória (ponteiros para conjuntos de átomos) ────────────────────
+class BlockMember(BaseModel):
+    memory_id: int
+    role:      str = "core"      # core|example|exception|history
+    weight:    float = 1.0
+    text:      Optional[str] = None
+    score:     Optional[float] = None
+
+class BlockProposal(BaseModel):
+    """Bloco proposto pelo extrator ou pela consolidação."""
+    block_id:    Optional[int] = None
+    name:        str
+    kind:        str = "topic"   # topic|pattern|behavior|person|project|episode
+    gist:        str
+    cues:        list[str] = []
+    guide:       str = ""
+    members:     list[BlockMember] = []
+    parent_block_id: Optional[int] = None
+    level:       int = 1
+    confidence:  float = 0.5
+
+class MemoryBlock(BaseModel):
+    block_id:       int
+    name:           str
+    kind:           str = "topic"
+    gist:           str
+    cues:           list[str] = []
+    guide:          str = ""
+    guide_version:  int = 1
+    guide_source:   str = "consolidation"
+    parent_block_id: Optional[int] = None
+    level:          int = 1
+    confidence:     float = 1.0
+    member_count:   int = 0
+    members:        list[BlockMember] = []
+    created_at:     Optional[float] = None
+    updated_at:     Optional[float] = None
+    last_accessed:  Optional[float] = None
+    access_count:   int = 0
+    scope:          Optional[str] = None
+    score:          float = 0.0
+    match_type:     str = "block"   # block|block_expanded
+
+class BlockWriteRequest(BaseModel):
+    name:        str
+    kind:        str = "topic"
+    gist:        str
+    cues:        list[str] = []
+    guide:       str = ""
+    members:     list[BlockMember]
+    parent_block_id: Optional[int] = None
+    level:       int = 1
+    confidence:  float = 1.0
+    source:      str = "consolidation"
+    scope:       Optional[str] = None
+
+class BlockConsolidateRequest(BaseModel):
+    scope:        Optional[str] = None
+    min_members:  Optional[int] = None
+    min_avg_weight: Optional[float] = None
+    max_candidates: Optional[int] = None
+    dry_run:      bool = False
+
+# ── Episódios (memória autobiográfica por turno) ──────────────────────────────
+class EpisodeWriteRequest(BaseModel):
+    session_id: str
+    turn_id: str
+    summary: str
+    intent: str = ""
+    outcome: str = ""
+    tools: list[str] = []
+    tool_results: list[dict] = []
+    entities: list[str] = []
+    decisions: list[str] = []
+    open_questions: list[str] = []
+    message_ids: list[str] = []
+    importance: float = 0.5
+    parent_episode_id: Optional[int] = None
+    scope: Optional[str] = None
+
+class EpisodeSearchRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    scope: Optional[str] = None
+    top_k: int = 4
+
+class EpisodeResponse(BaseModel):
+    episode_id: int
+    session_id: str
+    turn_id: str
+    summary: str
+    intent: str = ""
+    outcome: str = ""
+    tools: list[str] = []
+    tool_results: list[dict] = []
+    entities: list[str] = []
+    decisions: list[str] = []
+    open_questions: list[str] = []
+    message_ids: list[str] = []
+    importance: float = 0.5
+    created_at: Optional[float] = None
+    last_accessed: Optional[float] = None
+    access_count: int = 0
+    parent_episode_id: Optional[int] = None
+    score: Optional[float] = None
+    scope: Optional[str] = None
+
+class EpisodeWriteResponse(BaseModel):
+    stored: bool
+    episode_id: Optional[int] = None
+    reason: str = ""
+
+class EpisodeSearchResponse(BaseModel):
+    episodes: list[EpisodeResponse] = []
+
+class BlockGuideRequest(BaseModel):
+    guide:  str
+    scope:  Optional[str] = None
+
+class BlockListResponse(BaseModel):
+    blocks: list[MemoryBlock]
+    total:  int
+
+class BlockWriteResponse(BaseModel):
+    stored:   bool
+    reason:   str
+    block_id: Optional[int] = None
+    created:  bool = False
+
+class BlockConsolidateResponse(BaseModel):
+    candidates: int
+    created:    int
+    updated:    int
+    skipped:    int
+    dry_run:    bool = False
+    blocks:     list[MemoryBlock] = []
+
+class BlockGuideResponse(BaseModel):
+    stored: bool
+    reason: str
+    block: Optional[MemoryBlock] = None
+
 class WriteRequest(BaseModel):
     text:        str
     source:      str   = "chat"
@@ -92,6 +234,9 @@ class WriteRequest(BaseModel):
     # card no grafo Hebbiano — o PPR espalha ativação entre a pessoa e as
     # memórias sobre ela. person_id inválido → warning e grava sem vínculo.
     person_id:   Optional[int] = None
+    # ── NEW (blocos): bloco ao qual este átomo pertence. `block` pode criar
+    # um bloco novo (block_new=True) ou apenas associar a um existente.
+    block:       Optional[BlockProposal] = None
     # ── NEW (multi-chat): escopo da escrita. None = escopo ativo do processo.
     scope:       Optional[str] = None
 
@@ -141,6 +286,10 @@ class ReadRequest(BaseModel):
     # leitura não depende de /project/switch e turnos em projetos diferentes
     # podem rodar concorrentes.
     scope:       Optional[str] = None
+    # ── NEW (blocos): incluir blocos no resultado e desdobrar membros.
+    include_blocks: bool = True
+    expand_blocks:  bool = False
+    expand_max_members: Optional[int] = None
 
 class WriteResponse(BaseModel):
     stored:    bool
@@ -210,6 +359,10 @@ class MemoryEntry(BaseModel):
     # "general" (vem com id composta, offset +10^12) ou o slug do projeto
     # ativo. None = modo geral puro (compatibilidade) ou entrada global (ST).
     scope:        Optional[str]        = None
+    # ── NEW (blocos): quando o átomo foi desdobrado de um bloco ──
+    block_id:     Optional[int]        = None
+    block_name:   Optional[str]        = None
+    block_role:   Optional[str]        = None
     # ── NEW: Indexed file metadata ──
     file_path:    Optional[str]        = None
     file_name:    Optional[str]        = None
@@ -221,6 +374,9 @@ class ReadResponse(BaseModel):
     results:  list[MemoryEntry]
     query:    str
     strategy: str
+    # ── NEW (blocos): blocos recallados (ponteiros) e membros desdobrados.
+    blocks:   list[MemoryBlock] = []
+    block_members: list[MemoryEntry] = []
 
 
 # ── NEW: memória alcançada pelo grafo a partir de um hit de dicionário ────────
@@ -882,6 +1038,15 @@ class FaceDictUpdateRequest(BaseModel):
 
 
 __all__ = [
+    'BlockConsolidateRequest',
+    'BlockConsolidateResponse',
+    'BlockGuideRequest',
+    'BlockGuideResponse',
+    'BlockListResponse',
+    'BlockMember',
+    'BlockProposal',
+    'BlockWriteRequest',
+    'BlockWriteResponse',
     'FaceCandidate',
     'FaceDictEntry',
     'FaceDictReadRequest',
@@ -898,6 +1063,7 @@ __all__ = [
     'IndexedFileWriteRequest',
     'IndexedFileWriteResponse',
     'MemoryEntry',
+    'MemoryBlock',
     'MemoryToolError',
     'PlanCreateRequest',
     'PlanCreateResponse',

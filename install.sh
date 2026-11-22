@@ -25,6 +25,8 @@
 #       (gitignored; flags -a universal -y; falha = aviso, não morte)
 #   3c. OfficeCLI: npm install -g @officecli/officecli + skill
 #       officecli.ai/SKILL.md → .agents/skills/officecli (falha = aviso)
+#   3d. Boardview MCP: venv .venv-boardview + boardview/ (mcp + pillow) e
+#       SKILL.md → .agents/skills/boardview (falha = aviso)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
 #   5. Deixa o Modules/.env sem provedor de IA: o cadastro (catálogo models.dev)
 #      acontece na primeira execução da WebUI e grava LLM_* em Modules/.env
@@ -426,6 +428,63 @@ if curl -fsSL https://officecli.ai/SKILL.md -o .agents/skills/officecli/.SKILL.m
 else
   rm -f .agents/skills/officecli/.SKILL.md.tmp
   warn "curl https://officecli.ai/SKILL.md falhou — skill ausente (o CLI, se instalado, funciona)."
+fi
+
+# ── 3d. Boardview MCP (GenCAD .cad) + skill ───────────────────────────────────
+# `boardview/` traz um servidor MCP em Python (mcp + pillow) e a SKILL.md de
+# reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
+# stdio; instalamos o pacote num venv dedicado (.venv-boardview) para não
+# depender do Python do sistema. Sem python3/venv ou sem rede, o cadastro é
+# pulado com aviso — o restante da instalação segue.
+BOARDVIEW_DIR="$INSTALL_DIR/boardview"
+BOARDVIEW_VENV="$INSTALL_DIR/.venv-boardview"
+BOARDVIEW_PY="$BOARDVIEW_VENV/bin/python"
+BOARDVIEW_OK=0
+
+if [ ! -d "$BOARDVIEW_DIR" ]; then
+  warn "Boardview MCP: pasta $BOARDVIEW_DIR ausente — pulei o servidor."
+elif ! command -v python3 >/dev/null 2>&1 && ! command -v uv >/dev/null 2>&1; then
+  warn "Boardview MCP: python3/uv ausentes no host — instale python3 + python3-venv e rode o instalador de novo."
+else
+  info "Boardview MCP: criando venv e instalando boardview-mcp..."
+  command -v python3 >/dev/null 2>&1 && python3 -m venv "$BOARDVIEW_VENV" >/dev/null 2>&1 || true
+  if [ ! -x "$BOARDVIEW_PY" ]; then
+    # Debian/Ubuntu separam o venv em python3-venv; instala e tenta de novo.
+    case "$PKG" in
+      apt-get) as_root apt-get install -y python3-venv >/dev/null 2>&1 || true ;;
+      dnf|dnf5) as_root "$PKG" install -y python3-pip >/dev/null 2>&1 || true ;;
+      yum) as_root yum install -y python3-pip >/dev/null 2>&1 || true ;;
+      pacman) as_root pacman -S --noconfirm --needed python >/dev/null 2>&1 || true ;;
+    esac
+    python3 -m venv "$BOARDVIEW_VENV" >/dev/null 2>&1 || true
+  fi
+  if [ ! -x "$BOARDVIEW_PY" ] && command -v uv >/dev/null 2>&1; then
+    # uv dispensa python3-venv e baixa um Python se o host não tiver um válido.
+    info "Boardview MCP: python3 -m venv indisponível — usando uv."
+    uv venv --seed --python 3.12 "$BOARDVIEW_VENV" >/dev/null 2>&1 || true
+  fi
+  if [ ! -x "$BOARDVIEW_PY" ]; then
+    warn "Boardview MCP: não consegui criar $BOARDVIEW_VENV — instale python3-venv (Debian/Ubuntu) e rode de novo."
+  elif "$BOARDVIEW_PY" -m pip install --quiet --disable-pip-version-check -e "$BOARDVIEW_DIR"; then
+    BOARDVIEW_OK=1
+    ok "Boardview MCP instalado ($BOARDVIEW_PY)."
+  elif "$BOARDVIEW_PY" -c 'import boardview_mcp' >/dev/null 2>&1; then
+    # Reinstalação sem rede: o venv anterior continua válido.
+    BOARDVIEW_OK=1
+    warn "Boardview MCP: pip install falhou, mantendo a versão já instalada no venv."
+  else
+    warn "Boardview MCP: pip install falhou (sem rede?) — instale depois com: $BOARDVIEW_PY -m pip install -e \"$BOARDVIEW_DIR\""
+  fi
+fi
+
+# A SKILL.md vai para o store canônico (gitignored) que o scanner do
+# orchestrator lê; a tool `skill` carrega o playbook sem restart.
+if [ -f "$BOARDVIEW_DIR/SKILL.md" ]; then
+  mkdir -p .agents/skills/boardview
+  cp -f "$BOARDVIEW_DIR/SKILL.md" .agents/skills/boardview/SKILL.md
+  ok "Skill boardview instalada (.agents/skills/boardview/SKILL.md)."
+else
+  warn "Boardview: SKILL.md ausente em $BOARDVIEW_DIR — skill não instalada."
 fi
 
 # ── 4. Modelos ────────────────────────────────────────────────────────────────
@@ -957,6 +1016,9 @@ EOF
 
 register_desktop_commander_mcp() {
   local payload
+  # Os exemplos em português são vetores de busca no ToolsDB: sem eles o
+  # seletor semântico (descrições em inglês) não casa "liste os arquivos da
+  # pasta" com `list_directory` e o servidor fica fora da rodada.
   payload='{
   "name": "desktop-commander",
   "skill_summary": "Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)",
@@ -964,7 +1026,18 @@ register_desktop_commander_mcp() {
   "command": "npx",
   "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
   "enabled": true,
-  "always_on": false
+  "always_on": false,
+  "examples": {
+    "list_directory": ["liste os arquivos da pasta", "listar arquivos do diretório", "quais arquivos tem nessa pasta", "mostre o conteúdo da pasta", "encontre o arquivo nessa pasta"],
+    "read_file": ["leia o arquivo", "abra o conteúdo desse arquivo", "mostre o texto do arquivo"],
+    "read_multiple_files": ["leia esses arquivos", "mostre o conteúdo de vários arquivos"],
+    "write_file": ["crie um arquivo", "escreva no arquivo", "salve esse texto em um arquivo"],
+    "edit_block": ["edite o arquivo", "altere esse trecho do arquivo", "faça uma correção no arquivo"],
+    "start_search": ["busque dentro dos arquivos", "procure esse texto nos arquivos da pasta"],
+    "get_file_info": ["informações do arquivo", "tamanho e data do arquivo", "detalhes do arquivo"],
+    "start_process": ["execute um comando no terminal", "rode esse comando"],
+    "list_processes": ["liste os processos", "quais processos estão rodando"]
+  }
 }'
 
   info "Registrando Desktop Commander MCP no mcp_manager ($MCP_MANAGER_URL)..."
@@ -1002,6 +1075,85 @@ register_desktop_commander_mcp() {
     return 1
   fi
   ok "Desktop Commander MCP registrado e sincronizado."
+}
+
+register_boardview_mcp() {
+  # O servidor foi instalado no venv da etapa 3d; sem ele não há o que cadastrar.
+  if [ "${BOARDVIEW_OK:-0}" -ne 1 ] || [ ! -x "${BOARDVIEW_PY:-}" ]; then
+    warn "Boardview MCP não instalado — cadastro no mcp_manager pulado."
+    return 1
+  fi
+
+  local payload
+  payload="$("$BOARDVIEW_PY" - "$BOARDVIEW_PY" <<'PY'
+import json, sys
+py = sys.argv[1]
+print(json.dumps({
+    "name": "boardview",
+    "skill_summary": (
+        "Boardview GenCAD (.cad): conectividade e geometria da placa para reparo "
+        "(rails, curtos, caminhos de alimentação, vizinhança e medições do técnico)"
+    ),
+    "transport": "stdio",
+    "command": py,
+    "args": ["-m", "boardview_mcp"],
+    "env": {"PYTHONUNBUFFERED": "1"},
+    "enabled": True,
+    "always_on": False,
+    "examples": {
+        "load_board": [
+            "analise esse boardview",
+            "abre essa placa no boardview",
+            "diagnostica essa placa pelo .cad",
+            "carregue o .cad da pasta",
+            "analise o boardview da pasta selecionada",
+        ],
+        "power_rail_analysis": [
+            "esse rail está sem tensão",
+            "a placa não liga",
+            "tem um curto nessa linha de alimentação",
+        ],
+    },
+}))
+PY
+)"
+
+  info "Registrando Boardview MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  local registered=0 i
+  for i in $(seq 1 24); do
+    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
+         -H 'Content-Type: application/json' \
+         -H "Authorization: Bearer $AVA_TOKEN" -d "$payload" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$registered" -ne 1 ]; then
+    warn "Não consegui cadastrar o Boardview MCP — manager não respondeu em 2 min."
+    warn "Cadastre manualmente depois (dois comandos):"
+    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -H "Authorization: Bearer $AVA_INTERNAL_TOKEN" -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
+    printf '  curl -X POST %s/servers/boardview/sync -H "Authorization: Bearer $AVA_INTERNAL_TOKEN"\n' "$MCP_MANAGER_URL"
+    return 1
+  fi
+
+  # /sync indexa as tools no grafo (memory_api :3000). O spawn é local e não
+  # baixa pacote, então o primeiro sync é rápido.
+  local synced=0
+  for i in $(seq 1 12); do
+    if curl -fsS --max-time 120 -X POST "$MCP_MANAGER_URL/servers/boardview/sync" \
+         -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
+      synced=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$synced" -ne 1 ]; then
+    warn "Boardview MCP cadastrado, mas o sync falhou (memory_api ainda bootando?)."
+    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/boardview/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
+    return 1
+  fi
+  ok "Boardview MCP registrado e sincronizado."
 }
 
 
@@ -1108,6 +1260,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   register_playwright_mcp || true
   register_alpha_mcp || true
   register_desktop_commander_mcp || true
+  register_boardview_mcp || true
 
 
 

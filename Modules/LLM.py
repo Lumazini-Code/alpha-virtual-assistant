@@ -43,6 +43,7 @@ Porta: localhost:4003
 """
 import sys
 import json
+import hashlib
 import datetime
 import asyncio
 import time
@@ -508,6 +509,14 @@ _MEMORY_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "memory_write":               ("POST",   "/write"),
     "memory_write_batch":        ("POST",   "/write/batch"),
     "memory_status":             ("GET",    "/status"),
+    "memory_blocks_list":        ("GET",    "/blocks"),
+    "memory_block_get":          ("GET",    "/blocks/{block_id}"),
+    "memory_block_write":        ("POST",   "/blocks/write"),
+    "memory_block_consolidate":  ("POST",   "/blocks/consolidate"),
+    "memory_block_guide":        ("PUT",    "/blocks/{block_id}/guide"),
+    "memory_episode_write":      ("POST",   "/episodes/write"),
+    "memory_episode_search":     ("POST",   "/episodes/search"),
+    "memory_episodes_list":      ("GET",    "/episodes"),
     "memory_clear_session":      ("DELETE", "/session/{session_id}"),
 }
 
@@ -1026,6 +1035,19 @@ async def memory_read(
         return []
 
 
+async def memory_list_blocks(scope: Optional[str] = None, limit: int = 12) -> list[dict]:
+    """Lista blocos do escopo (ponteiros de memória) para o extrator saber
+    onde encaixar fatos novos. Nunca levanta: retorna [] em falha."""
+    try:
+        payload = {"scope": scope} if scope else {}
+        data = await _call_memory_tool("memory_blocks_list", payload)
+        blocks = data.get("blocks") or []
+        return blocks[:limit]
+    except Exception as e:
+        log.debug(f"[MEMORY] listar blocos falhou (ignorado): {type(e).__name__}: {e}")
+        return []
+
+
 async def memory_read_st(session_id: Optional[str], n_pairs: int = ST_CONTEXT_PAIRS) -> list[dict]:
     """
     Lê o histórico conversacional do session store (ou do ST legado).
@@ -1329,16 +1351,149 @@ _MEMORY_EXTRACTION_SCHEMA: dict = {
                         "type": "string",
                         "enum": ["permanent", "temporal"],
                     },
+                    "block": {
+                        "type": "string",
+                        "description": (
+                            "Name of an EXISTING block this fact belongs to, or empty "
+                            "string. Do not invent a name here; new blocks go in the "
+                            "top-level blocks array."
+                        ),
+                    },
                 },
                 "required": [
                     "evidence", "text", "type", "related", "rationale",
-                    "action", "target", "validity",
+                    "action", "target", "validity", "block",
                 ],
                 "additionalProperties": False,
             },
         },
+        "blocks": {
+            "type": "array",
+            "description": (
+                "New blocks to create, only when 3+ facts in this exchange form a "
+                "coherent topic/behavior/project. Empty array otherwise."
+            ),
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["topic", "pattern", "behavior", "person", "project", "episode"],
+                    },
+                    "gist": {"type": "string"},
+                    "cues": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 6,
+                    },
+                    "guide": {
+                        "type": "string",
+                        "description": (
+                            "Advisory mini-AGENTS.md: how to use these memories. "
+                            "Max 6 bullets, derived only from the facts."
+                        ),
+                    },
+                },
+                "required": ["name", "kind", "gist", "cues", "guide"],
+                "additionalProperties": False,
+            },
+        },
+        "episode": {
+            "type": "object",
+            "description": (
+                "Resumo narrativo deste turno. Gravado SEMPRE, mesmo quando "
+                "nada merece virar fato. É a memória autobiográfica do turno."
+            ),
+            "properties": {
+                "summary": {"type": "string"},
+                "intent": {"type": "string"},
+                "outcome": {"type": "string"},
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+                "tool_results": {
+                    "type": "array",
+                    "description": "Resultados ÚTEIS das ferramentas (não o dump bruto).",
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "outcome": {"type": "string"},
+                        },
+                        "required": ["tool", "summary", "outcome"],
+                        "additionalProperties": False,
+                    },
+                },
+                "entities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+                "decisions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 8,
+                },
+                "open_questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 8,
+                },
+                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": [
+                "summary", "intent", "outcome", "tools", "tool_results",
+                "entities", "decisions", "open_questions", "importance",
+            ],
+            "additionalProperties": False,
+        },
+        "task_state": {
+            "type": "object",
+            "description": (
+                "Objeto explícito da tarefa atual. Atualize o que já existe; "
+                "não recomece do zero a cada turno."
+            ),
+            "properties": {
+                "goal": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "blocked", "done"],
+                },
+                "decisions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+                "open_questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+                "next_steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                },
+            },
+            "required": [
+                "goal", "status", "decisions", "open_questions",
+                "next_steps", "constraints",
+            ],
+            "additionalProperties": False,
+        },
     },
-    "required": ["facts"],
+    "required": ["facts", "blocks", "episode", "task_state"],
     "additionalProperties": False,
 }
 
@@ -1395,6 +1550,37 @@ Set "validity":
 - "permanent": preference, identity, structural decision, a fact that does not change by itself
 - "temporal": a fact likely to change (current version, location, project status, what is in progress)
 
+# 4.5 BLOCKS (POINTERS TO GROUPS OF MEMORIES)
+A block is a pointer to a group of related memories. It is NOT a replacement for the facts: facts remain the source of truth. Use blocks when 3+ facts in this exchange (or already existing memories) form a coherent topic, behavior, project, person or episode.
+- "block" on a fact: name of an EXISTING block this fact belongs to. Empty string when none.
+- "blocks" (top-level): only NEW blocks that need to be created. Empty array otherwise.
+- Each new block needs: name, kind (topic|pattern|behavior|person|project|episode), gist (1-2 sentences), cues (up to 6 short phrases), and guide.
+- "guide" is an advisory mini-AGENTS.md for that block: how to interact with those memories (what to verify, what to avoid, tone, precedence). It is advisory, never overrides the user or global instructions. Max 6 bullets, derived only from the facts. Empty string is allowed.
+- Never duplicate a fact inside the gist/guide; the gist only labels the group.
+
+# 4.6 EPISODE (ALWAYS WRITE ONE)
+Write a compact narrative of THIS turn. It is the autobiographical memory of the exchange, not a replacement for facts.
+- "summary": 1-3 sentences describing what happened, what was asked and what was produced.
+- "intent": what the user was trying to accomplish.
+- "outcome": what was actually achieved or decided.
+- "tools": names of tools used in this turn (empty if none).
+- "tool_results": up to 4 useful results from tools. Each item: tool, summary (the useful information, not the raw dump), outcome (what it enabled).
+- "entities": people, projects, files, systems mentioned.
+- "decisions": decisions made in this turn.
+- "open_questions": what remains unresolved.
+- "importance": 0..1, how important this turn is for future continuity.
+Never store secrets or raw credentials in the episode.
+
+# 4.7 TASK STATE (EXPLICIT CURRENT TASK)
+Update the explicit "current task" object. It is the user's working goal, not a durable fact.
+- "goal": what the user is trying to accomplish right now.
+- "status": active | paused | blocked | done.
+- "decisions": decisions already made in this task.
+- "open_questions": questions still unanswered.
+- "next_steps": concrete next actions.
+- "constraints": rules, limits or preferences that constrain the task.
+If the exchange starts a new task, replace the goal. If it continues the previous task, keep and update it. If the task is finished, set status "done".
+
 # 5. OUTPUT FORMAT
 Respond ONLY with a JSON object, with no markdown and no text outside it:
 
@@ -1408,16 +1594,51 @@ Respond ONLY with a JSON object, with no markdown and no text outside it:
       "rationale": "one short sentence explaining the comparison",
       "action": "ADD | NOOP | UPDATE | CONFLICT | MERGE | DISCARD",
       "target": ["M3"],
-      "validity": "permanent | temporal"
+      "validity": "permanent | temporal",
+      "block": "existing block name or empty string"
     }
-  ]
+  ],
+  "blocks": [
+    {
+      "name": "new block name",
+      "kind": "topic | pattern | behavior | person | project | episode",
+      "gist": "1-2 sentence label",
+      "cues": ["short trigger phrase"],
+      "guide": "advisory guidance, max 6 bullets"
+    }
+  ],
+  "episode": {
+    "summary": "1-3 sentences describing this turn",
+    "intent": "what the user wanted",
+    "outcome": "what was achieved or decided",
+    "tools": ["tool_name"],
+    "tool_results": [
+      {"tool": "tool_name", "summary": "useful result", "outcome": "what it enabled"}
+    ],
+    "entities": ["project or file"],
+    "decisions": ["decision made"],
+    "open_questions": ["still unresolved"],
+    "importance": 0.5
+  },
+  "task_state": {
+    "goal": "the user's current goal",
+    "status": "active | paused | blocked | done",
+    "decisions": ["decision already made"],
+    "open_questions": ["question still open"],
+    "next_steps": ["concrete next action"],
+    "constraints": ["rule or limit"]
+  }
 }
 
 Format rules:
-- Keep exactly this field order: evidence, text, type, related, rationale, action, target, validity.
+- Keep exactly this field order: evidence, text, type, related, rationale, action, target, validity, block.
 - "related": IDs of the existing memories you compared against, even if the action is ADD or DISCARD ([] if none).
 - "target": [] for ADD and DISCARD; one ID for NOOP, UPDATE and CONFLICT; one or more IDs for MERGE.
-- If there is nothing to extract, respond {"facts": []}.
+- "block": an EXISTING block name, or "" — new blocks go in the top-level "blocks" array.
+- "blocks": [] when no new block is needed.
+- "episode" is ALWAYS present, even when "facts" is empty. Write a faithful summary of the turn.
+- "task_state" is ALWAYS present. Update the current task; do not restart it unless the goal changed.
+- If there is nothing to extract, respond {"facts": [], "blocks": [], "episode": {...}, "task_state": {...}}.
 - Maximum of 8 facts per response. Prioritize the most useful ones.
 
 # 6. EXAMPLES
@@ -1428,7 +1649,7 @@ EXISTING MEMORIES: (none)
 USER: I'm porting orchestrator.py to Rust. It runs on port 4008.
 ASSISTANT: Sure, I can suggest a crate structure.
 Output:
-{"facts":[{"evidence":"porting orchestrator.py to Rust","text":"The user is porting orchestrator.py to Rust.","type":"decision","related":[],"rationale":"No memory about this port.","action":"ADD","target":[],"validity":"temporal"},{"evidence":"It runs on port 4008","text":"The user's orchestrator.py runs on port 4008.","type":"fact","related":[],"rationale":"New technical configuration.","action":"ADD","target":[],"validity":"permanent"}]}
+{"facts":[{"evidence":"porting orchestrator.py to Rust","text":"The user is porting orchestrator.py to Rust.","type":"decision","related":[],"rationale":"No memory about this port.","action":"ADD","target":[],"validity":"temporal"},{"evidence":"It runs on port 4008","text":"The user's orchestrator.py runs on port 4008.","type":"fact","related":[],"rationale":"New technical configuration.","action":"ADD","target":[],"validity":"permanent"}],"blocks":[],"episode":{"summary":"The user said they are porting orchestrator.py to Rust and that it runs on port 4008. The assistant offered to suggest a crate structure.","intent":"Port the orchestrator to Rust.","outcome":"The port was confirmed and the port number recorded; no code was produced yet.","tools":[],"tool_results":[],"entities":["orchestrator.py","Rust","port 4008"],"decisions":["Port orchestrator.py to Rust"],"open_questions":["Which crate structure to use"],"importance":0.6},"task_state":{"goal":"Port orchestrator.py to Rust","status":"active","decisions":["Use Rust for the port"],"open_questions":["Which crate structure to use"],"next_steps":["Choose a crate structure","Start the port"],"constraints":["Keep port 4008"]}}
 
 ## Example B: NOOP and UPDATE due to change
 CURRENT DATE: 2026-10-24
@@ -1437,7 +1658,7 @@ EXISTING MEMORIES:
 [M2] (created 2026-09-10, source user) The user runs the embeddings server on port 2002.
 USER: I switched the main LLM to LFM2.5-8B-A1B. The embeddings server is still on 2002.
 Output:
-{"facts":[{"evidence":"I switched the main LLM to LFM2.5-8B-A1B","text":"The user uses the LFM2.5-8B-A1B model as the main LLM (previously used Qwen3-8B).","type":"decision","related":["M1"],"rationale":"The user explicitly states a switch; the new fact replaces M1.","action":"UPDATE","target":["M1"],"validity":"temporal"},{"evidence":"The embeddings server is still on 2002","text":"The user runs the embeddings server on port 2002.","type":"fact","related":["M2"],"rationale":"Already recorded in M2.","action":"NOOP","target":["M2"],"validity":"permanent"}]}
+{"facts":[{"evidence":"I switched the main LLM to LFM2.5-8B-A1B","text":"The user uses the LFM2.5-8B-A1B model as the main LLM (previously used Qwen3-8B).","type":"decision","related":["M1"],"rationale":"The user explicitly states a switch; the new fact replaces M1.","action":"UPDATE","target":["M1"],"validity":"temporal"},{"evidence":"The embeddings server is still on 2002","text":"The user runs the embeddings server on port 2002.","type":"fact","related":["M2"],"rationale":"Already recorded in M2.","action":"NOOP","target":["M2"],"validity":"permanent"}],"blocks":[],"episode":{"summary":"The user switched the main LLM to LFM2.5-8B-A1B and confirmed the embeddings server remains on port 2002.","intent":"Update the assistant on the current model setup.","outcome":"The model change was recorded; the embeddings configuration was confirmed unchanged.","tools":[],"tool_results":[],"entities":["LFM2.5-8B-A1B","Qwen3-8B","embeddings server","port 2002"],"decisions":["Switch the main LLM to LFM2.5-8B-A1B"],"open_questions":[],"importance":0.7},"task_state":{"goal":"Update the LLM configuration","status":"done","decisions":["Main LLM is now LFM2.5-8B-A1B","Embeddings server stays on port 2002"],"open_questions":[],"next_steps":[],"constraints":[]}}
 
 ## Example C: MERGE
 CURRENT DATE: 2026-10-24
@@ -1445,7 +1666,7 @@ EXISTING MEMORIES:
 [M4] (created 2026-09-01, source user) The user has a 1TB hard drive with errors.
 USER: That 1TB drive only shows up as /dev/sdd. I'll try to fix it from the terminal before throwing it away.
 Output:
-{"facts":[{"evidence":"only shows up as /dev/sdd. I'll try to fix it from the terminal before throwing it away","text":"The user's faulty 1TB hard drive shows up as /dev/sdd; they will try to fix it from the terminal before discarding it.","type":"decision","related":["M4"],"rationale":"Complements M4 and only makes sense together with it.","action":"MERGE","target":["M4"],"validity":"temporal"}]}
+{"facts":[{"evidence":"only shows up as /dev/sdd. I'll try to fix it from the terminal before throwing it away","text":"The user's faulty 1TB hard drive shows up as /dev/sdd; they will try to fix it from the terminal before discarding it.","type":"decision","related":["M4"],"rationale":"Complements M4 and only makes sense together with it.","action":"MERGE","target":["M4"],"validity":"temporal"}],"blocks":[],"episode":{"summary":"The user reported that the faulty 1TB drive appears as /dev/sdd and plans to try repairing it from the terminal before discarding it.","intent":"Diagnose and possibly repair the faulty drive.","outcome":"The device path was identified and a repair attempt was decided.","tools":[],"tool_results":[],"entities":["1TB hard drive","/dev/sdd"],"decisions":["Try to fix the drive from the terminal before discarding it"],"open_questions":["Whether the drive can be repaired"],"importance":0.6},"task_state":{"goal":"Repair or discard the faulty 1TB hard drive","status":"active","decisions":["Try a terminal repair first"],"open_questions":["Can the drive be repaired?"],"next_steps":["Run diagnostics on /dev/sdd","Attempt the repair"],"constraints":["Discard only after the repair attempt"]}}
 
 ## Example D: DISCARD
 CURRENT DATE: 2026-10-24
@@ -1454,7 +1675,7 @@ EXISTING MEMORIES:
 USER: Explain in more detail how PPR works. I'm tired today.
 ASSISTANT: PPR (Personalized PageRank) is...
 Output:
-{"facts":[{"evidence":"Explain in more detail how PPR works","text":"The user asked for a detailed explanation of PPR.","type":"preference","related":["M7"],"rationale":"One-off request; it does not indicate a change to the preference for short answers (M7).","action":"DISCARD","target":[],"validity":"temporal"},{"evidence":"I'm tired today","text":"The user is tired today.","type":"fact","related":[],"rationale":"Momentary state.","action":"DISCARD","target":[],"validity":"temporal"}]}
+{"facts":[{"evidence":"Explain in more detail how PPR works","text":"The user asked for a detailed explanation of PPR.","type":"preference","related":["M7"],"rationale":"One-off request; it does not indicate a change to the preference for short answers (M7).","action":"DISCARD","target":[],"validity":"temporal"},{"evidence":"I'm tired today","text":"The user is tired today.","type":"fact","related":[],"rationale":"Momentary state.","action":"DISCARD","target":[],"validity":"temporal"}],"blocks":[],"episode":{"summary":"The user asked for a detailed explanation of PPR and mentioned being tired. The assistant began explaining PPR.","intent":"Understand how PPR works in more detail.","outcome":"The explanation was started; the user's fatigue was noted but not stored as a lasting fact.","tools":[],"tool_results":[],"entities":["PPR"],"decisions":[],"open_questions":[],"importance":0.3},"task_state":{"goal":"Understand PPR in more detail","status":"active","decisions":[],"open_questions":["How does PPR work?"],"next_steps":["Finish the PPR explanation"],"constraints":["User prefers short answers normally, but asked for detail here"]}}
 """
 
 
@@ -1638,6 +1859,9 @@ def _build_extraction_user_prompt(
     assistant_response: str,
     candidates: list[dict],
     previous_context: Optional[list[dict]],
+    blocks: Optional[list[dict]] = None,
+    task_state: Optional[dict] = None,
+    tool_context: Optional[list[str]] = None,
 ) -> tuple[str, dict[int, int]]:
     """
     Renderiza o prompt do extractor (template do protocolo): CURRENT DATE,
@@ -1646,6 +1870,21 @@ def _build_extraction_user_prompt(
     """
     iso_date = datetime.date.today().isoformat()
     memories_block, m_map = _format_existing_memories(candidates)
+
+    block_lines: list[str] = []
+    for b in (blocks or [])[:12]:
+        try:
+            bid = int(b.get("block_id"))
+        except (TypeError, ValueError):
+            continue
+        name = str(b.get("name") or "").strip()
+        gist = str(b.get("gist") or "").strip()
+        guide = str(b.get("guide") or "").strip()
+        line = f"[B{bid}] {name} ({b.get('kind') or 'topic'}) — {gist}"
+        if guide:
+            line += f" | guide: {guide[:300]}"
+        block_lines.append(line)
+    blocks_block = "\n".join(block_lines) if block_lines else "(none)"
 
     prev_lines: list[str] = []
     if previous_context:
@@ -1656,6 +1895,23 @@ def _build_extraction_user_prompt(
                 prev_lines.append(f"{role}: {content[:300]}")
     prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
 
+    task_lines: list[str] = []
+    if isinstance(task_state, dict):
+        for key in ("goal", "status", "decisions", "open_questions", "next_steps", "constraints"):
+            value = task_state.get(key)
+            if isinstance(value, list):
+                value = "; ".join(str(v) for v in value if str(v).strip())
+            if value:
+                task_lines.append(f"{key}: {value}")
+    task_block = "\n".join(task_lines) if task_lines else "(none)"
+
+    tool_lines: list[str] = []
+    for item in (tool_context or [])[:8]:
+        text = str(item or "").strip()
+        if text:
+            tool_lines.append(f"- {text[:800]}")
+    tool_block = "\n".join(tool_lines) if tool_lines else "(none)"
+
     prompt = (
         f"CURRENT DATE: {iso_date}\n\n"
         "CANONICAL ENTITIES (use these names when writing facts):\n"
@@ -1663,6 +1919,16 @@ def _build_extraction_user_prompt(
         'EXISTING MEMORIES (sorted by relevance; "used_in_answer" indicates it '
         "was sent to the assistant to produce its answer):\n"
         f"{memories_block}\n\n"
+        "EXISTING BLOCKS (pointers to groups of memories; use the block name in "
+        "each fact's \"block\" field when the fact belongs to one):\n"
+        f"{blocks_block}\n\n"
+        "CURRENT TASK STATE (continue and update it; do not restart unless the "
+        "goal changed):\n"
+        f"{task_block}\n\n"
+        "TOOL RESULTS (useful outputs from this turn; use them to write the "
+        "episode's tool_results and to extract facts that only the tool output "
+        "reveals. Do not copy raw dumps):\n"
+        f"{tool_block}\n\n"
         "PREVIOUS CONTEXT (only to resolve references; do NOT extract facts from "
         "here):\n"
         f"{prev_block}\n\n"
@@ -1708,7 +1974,9 @@ async def _extract_and_save_memories(
     session_id: Optional[str] = None,
     recall_memories: Optional[list[dict]] = None,
     scope: Optional[str] = None,
-) -> list[dict]:
+    task_state: Optional[dict] = None,
+    tool_context: Optional[list[str]] = None,
+) -> dict:
     """
     Roda o modelo extractor (MEMORY_EXTRACTOR_MODEL) sobre a dupla
     pergunta-resposta e roteia cada fato extraído para a LT:
@@ -1763,9 +2031,11 @@ async def _extract_and_save_memories(
     candidates = await _collect_extraction_candidates(
         user_input, assistant_response, recall_memories, session_id, scope=scope,
     )
+    blocks = await memory_list_blocks(scope=scope)
 
     prompt_user, m_map = _build_extraction_user_prompt(
         user_input, assistant_response, candidates, previous_context,
+        blocks=blocks, task_state=task_state, tool_context=tool_context,
     )
 
     messages_base = [
@@ -1800,11 +2070,22 @@ async def _extract_and_save_memories(
         '"type": "fact"|"preference"|"decision"|"instruction", '
         '"related": [], "rationale": "<uma frase curta>", '
         '"action": "ADD"|"NOOP"|"UPDATE"|"CONFLICT"|"MERGE"|"DISCARD", '
-        '"target": [], "validity": "permanent"|"temporal"}]}\n'
+        '"target": [], "validity": "permanent"|"temporal", '
+        '"block": "<nome do bloco existente ou vazio>"}], '
+        '"blocks": [{"name": "<bloco novo>", "kind": "topic", "gist": "...", '
+        '"cues": ["..."], "guide": "<até 6 bullets advisory>"}], '
+        '"episode": {"summary": "...", "intent": "...", "outcome": "...", '
+        '"tools": [], "tool_results": [{"tool": "...", "summary": "...", '
+        '"outcome": "..."}], "entities": [], "decisions": [], '
+        '"open_questions": [], "importance": 0.5}, '
+        '"task_state": {"goal": "...", "status": "active", "decisions": [], '
+        '"open_questions": [], "next_steps": [], "constraints": []}}\n'
         "Regras: target=[] para ADD e DISCARD; 1 ID (M<n>) para NOOP, UPDATE e "
         "CONFLICT; 1 ou mais para MERGE. Máximo de 8 fatos. "
+        "blocks só quando 3+ fatos formarem um tópico coerente; senão []. "
+        "episode e task_state são SEMPRE obrigatórios. "
         "Se nada merecer ser gravado, responda exatamente: "
-        '{"facts": []}'
+        '{"facts": [], "blocks": [], "episode": {...}, "task_state": {...}}'
     )
     fallback_model = MEMORY_EXTRACTOR_FALLBACK_MODEL or MAIN_MODEL
     # Bloco de roteamento de provider (curl `provider.only`) — só acompanha as
@@ -1910,6 +2191,32 @@ async def _extract_and_save_memories(
 
     facts_raw = parsed.get("facts", []) if isinstance(parsed, dict) else []
 
+    # ── Blocos: o extrator pode associar fatos a blocos existentes ou propor
+    # blocos novos. O bloco é PONTEIRO: o fato continua sendo a verdade.
+    block_map: dict[str, dict] = {}
+    for b in blocks or []:
+        nm = str(b.get("name") or "").strip().lower()
+        if nm:
+            block_map[nm] = {
+                "block_id": b.get("block_id"),
+                "name": b.get("name"),
+                "kind": b.get("kind") or "topic",
+                "gist": b.get("gist") or "",
+                "cues": b.get("cues") or [],
+                "guide": b.get("guide") or "",
+            }
+    for b in (parsed.get("blocks", []) if isinstance(parsed, dict) else []) or []:
+        nm = str(b.get("name") or "").strip().lower()
+        if nm and nm not in block_map:
+            block_map[nm] = {
+                "block_id": None,
+                "name": b.get("name"),
+                "kind": b.get("kind") or "topic",
+                "gist": b.get("gist") or "",
+                "cues": b.get("cues") or [],
+                "guide": b.get("guide") or "",
+            }
+
     # ── Pós-validação + roteamento ──────────────────────────────────────────
     # Qualquer ID fora do padrão ^M\d+$ ou fora do mapa M→id real é
     # DESCARTADO — modelos pequenos alucinam IDs; um id que não corresponde a
@@ -1933,7 +2240,7 @@ async def _extract_and_save_memories(
             resolved.append(real_id)
         return resolved
 
-    def _lt_payload(text: str, validity: str) -> dict:
+    def _lt_payload(text: str, validity: str, block: Optional[dict] = None) -> dict:
         # permanent → fato estável (preferência, identidade, decisão estrutural):
         #             não decai, confidence alta.
         # temporal  → fato que pode mudar sozinho (versão, local, projeto): decai.
@@ -1944,6 +2251,8 @@ async def _extract_and_save_memories(
             "forgettable": validity != "permanent",
             "ttl_days":    None,
         }
+        if block:
+            payload["block"] = block
         # Escopo do turno: a memória extraída nasce no projeto do chat, não no
         # escopo ativo do processo (que é compartilhado entre chats).
         if scope:
@@ -1972,6 +2281,8 @@ async def _extract_and_save_memories(
             validity = "temporal"
         targets = _resolve_ids(fact.get("target"))
         related_ids = _resolve_ids(fact.get("related"))
+        block_name = str(fact.get("block") or "").strip().lower()
+        block = block_map.get(block_name) if block_name else None
         evidence = (fact.get("evidence") or "").strip()[:200]
         rationale = (fact.get("rationale") or "").strip()[:200]
 
@@ -1991,7 +2302,7 @@ async def _extract_and_save_memories(
             entry["rationale"] = rationale
 
         if action == "ADD":
-            add_payloads.append(_lt_payload(text, validity))
+            add_payloads.append(_lt_payload(text, validity, block))
         elif action in ("UPDATE", "MERGE"):
             if not targets:
                 # UPDATE/MERGE alegado mas alvo inválido → downgrade para ADD
@@ -2000,7 +2311,7 @@ async def _extract_and_save_memories(
                     f"[MEMORY-EXTRACT] {action} sem alvo válido — downgrade para ADD. "
                     f"rationale={rationale!r}"
                 )
-                add_payloads.append(_lt_payload(text, validity))
+                add_payloads.append(_lt_payload(text, validity, block))
                 entry["action"] = "ADD"
                 entry["target_ids"] = []
             else:
@@ -2016,13 +2327,13 @@ async def _extract_and_save_memories(
                     )
                 # O "text" do fato já deve conter TODA a informação relevante
                 # das fontes (regra do prompt) — o update sobrescreve com ele.
-                update_ops.append((_lt_payload(text, validity), target_id))
+                update_ops.append((_lt_payload(text, validity, block), target_id))
                 entry["target_ids"] = [target_id]
         elif action == "CONFLICT":
             # Cria o fato novo E marca a memória antiga preservando o texto
             # original com um prefixo de conflito (não há flag de conflito no
             # DB — assim nada é destruído).
-            add_payloads.append(_lt_payload(text, validity))
+            add_payloads.append(_lt_payload(text, validity, block))
             if targets:
                 old = next((c for c in candidates if c.get("id") == targets[0]), None)
                 old_text = (old.get("text") or "").strip() if old else ""
@@ -2053,13 +2364,60 @@ async def _extract_and_save_memories(
     for upd_payload, upd_target in update_ops:
         asyncio.create_task(_memory_write_update(upd_payload, upd_target, scope=scope))
 
+    episode = parsed.get("episode") if isinstance(parsed, dict) else None
+    task_state = parsed.get("task_state") if isinstance(parsed, dict) else None
+
+    # Fallback: se o modelo não preencheu tool_results, usa o contexto de
+    # ferramentas do turno (o dump bruto continua no ledger; aqui vai o resumo).
+    if isinstance(episode, dict) and tool_context and not episode.get("tool_results"):
+        episode["tool_results"] = []
+        for item in tool_context[:4]:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            name, _, summary = text.partition(":")
+            episode["tool_results"].append({
+                "tool": (name or "tool").strip()[:60],
+                "summary": (summary or text).strip()[:300],
+                "outcome": "used in this turn",
+            })
+
+    # Episódio: gravado sempre (mesmo quando nada vira fato). O turn_id é
+    # estável pelo conteúdo, então uma repetição do extrator não duplica.
+    if isinstance(episode, dict) and session_id:
+        turn_id = hashlib.sha1(
+            f"{session_id}\n{user_input}\n{assistant_response}".encode()
+        ).hexdigest()[:20]
+        try:
+            await _call_memory_tool("memory_episode_write", {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "summary": episode.get("summary") or "",
+                "intent": episode.get("intent") or "",
+                "outcome": episode.get("outcome") or "",
+                "tools": episode.get("tools") or [],
+                "tool_results": episode.get("tool_results") or [],
+                "entities": episode.get("entities") or [],
+                "decisions": episode.get("decisions") or [],
+                "open_questions": episode.get("open_questions") or [],
+                "importance": float(episode.get("importance") or 0.5),
+                **({"scope": scope} if scope else {}),
+            })
+        except Exception as e:
+            log.info(f"[MEMORY-EXTRACT] falha ao gravar episódio (não-bloqueante): {e}")
+
     log.info(
         f"[MEMORY-EXTRACT] {len(saved)} fato(s) processado(s) "
         f"(adds={len(add_payloads)}, updates={len(update_ops)}, "
         f"discards={sum(1 for s in saved if s['action'] == 'DISCARD')}, "
+        f"episode={'yes' if episode else 'no'}, "
         f"session={session_id}, modelo={model})."
     )
-    return saved
+    return {
+        "facts": saved,
+        "episode": episode,
+        "task_state": task_state,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3233,6 +3591,10 @@ class MemoryExtractionRequest(BaseModel):
     session_id: Optional[str] = Field(default=None)
     # Escopo de memória do turno (projeto do chat). None = escopo ativo.
     scope: Optional[str] = Field(default=None)
+    # Objeto explícito da tarefa atual (continuidade entre turnos).
+    task_state: Optional[dict] = Field(default=None)
+    # Resultados úteis de ferramentas do turno (para o episódio).
+    tool_context: Optional[list[str]] = Field(default=None)
 
 
 @app.post("/memories/extract")
@@ -3245,17 +3607,22 @@ async def memories_extract(req: MemoryExtractionRequest):
     Em condições normais, o /chat e /chat/stream já disparam o extractor
     automaticamente em background (quando extract_memories=true).
     """
-    saved = await _extract_and_save_memories(
+    result = await _extract_and_save_memories(
         req.user_input,
         req.assistant_response,
         session_id=req.session_id,
         scope=req.scope,
+        task_state=req.task_state,
+        tool_context=req.tool_context,
     )
+    saved = result.get("facts") or []
     return {
         "extractor_model": MEMORY_EXTRACTOR_MODEL,
         "session_id":      req.session_id,
         "memories":        saved,
         "count":           len(saved),
+        "episode":         result.get("episode"),
+        "task_state":      result.get("task_state"),
     }
 
 

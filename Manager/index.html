@@ -57,6 +57,12 @@ header{display:flex;align-items:center;gap:8px;padding:10px 16px;min-height:52px
 .txt h2{font-size:1.25em}.txt ul,.txt ol{padding-left:1.4em;margin:0 0 .8em}.txt li{margin:.2em 0}
 .txt code{font:500 .82em 'JetBrains Mono',monospace;background:var(--sb);border:1px solid var(--ln);padding:1px 5px;border-radius:5px}
 .txt blockquote{margin:0 0 .8em;padding-left:14px;border-left:3px solid var(--ln);color:var(--mu)}.txt a{color:var(--ac)}
+.txt .tbl{margin:0 0 .9em;border:1px solid var(--ln);border-radius:12px;overflow:auto;background:var(--sf)}
+.txt table{width:100%;border-collapse:collapse;font:14px/1.5 Geist,sans-serif}
+.txt thead{background:var(--sb)}
+.txt th,.txt td{padding:8px 12px;border-bottom:1px solid var(--ln);text-align:left;vertical-align:top}
+.txt th{font-weight:600;white-space:nowrap}
+.txt tbody tr:last-child td{border-bottom:0}.txt tbody tr:hover{background:var(--sb)}
 .cbw{margin:.4em 0 1em;border:1px solid var(--ln);border-radius:12px;overflow:hidden;background:var(--sf)}
 .cb{display:flex;justify-content:space-between;align-items:center;padding:5px 12px;background:var(--sb);font:12.5px Geist,sans-serif;color:var(--mu)}
 .cb button{color:var(--mu);padding:2px 6px;border-radius:6px}.cb button:hover{background:var(--ln)}
@@ -461,7 +467,7 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     </div>
     <input type="file" id="fi" hidden>
   </div>
-  <div class="modelbar"><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-mode">Chat</span><span class="mb-sep">·</span><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
+  <div class="modelbar"><button id="modebtn" title="Modo de contexto (Shift+Tab alterna)" aria-label="Modo de contexto"><span class="mb-mode" id="mb-mode">Conversacional</span></button><span class="mb-sep">·</span><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
   </div>
 </main>
 
@@ -588,6 +594,7 @@ const newSid=()=>'ses_'+Date.now().toString(36)+Math.random().toString(36).slice
 function newChat(project){
   const c={id:'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
     sid:newSid(),title:'',project:project||S.act||'general',cwd:null,model:null,
+    mode:'conversational',
     ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:true,streaming:false,err:false};
   S.chats.unshift(c);S.active=c.id;ensureChatModel(c);saveChats();return c;
 }
@@ -595,7 +602,7 @@ function saveChats(){
   try{
     localStorage.setItem(CHAT_KEY,JSON.stringify({
       active:S.active,
-      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null})),
+      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null,mode:c.mode||'conversational'})),
     }));
   }catch{}
 }
@@ -603,6 +610,7 @@ function restoreChats(){
   let saved=null;try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'null')}catch{}
   if(!saved||!Array.isArray(saved.chats)||!saved.chats.length)return false;
   S.chats=saved.chats.map(c=>({id:c.id,sid:c.sid,title:c.title||'',project:c.project||'general',model:c.model||null,
+    mode:c.mode||'conversational',
     cwd:null,ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false}));
   S.active=saved.active&&S.chats.some(c=>c.id===saved.active)?saved.active:S.chats[0].id;
   return true;
@@ -730,15 +738,50 @@ async function*demo(q){
 /* ---------- Markdown ---------- */
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const inl=s=>esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+/* Tabelas GFM: `| a | b |` + linha separadora `|---|:---:|`. As células
+   aceitam o mesmo markdown inline do resto (negrito, código, links). Escapas
+   (`\|`) e pipes dentro de `código` não dividem a coluna. */
+const tblCells=ln=>{
+  let s=ln.trim();
+  if(s.startsWith('|'))s=s.slice(1);
+  if(s.endsWith('|')&&!s.endsWith('\\|'))s=s.slice(0,-1);
+  const out=[];let cur='',code=false;
+  for(let i=0;i<s.length;i++){const c=s[i];
+    if(c==='\\'&&s[i+1]==='|'){cur+='|';i++;continue}
+    if(c==='`'){code=!code;cur+=c;continue}
+    if(c==='|'&&!code){out.push(cur.trim());cur='';continue}
+    cur+=c}
+  out.push(cur.trim());return out;
+};
+const tblDelim=ln=>{
+  const c=tblCells(ln);
+  return c.length>0&&c.every(x=>/^:?-{3,}:?$/.test(x))?c:null;
+};
+const tblAlign=cells=>cells.map(c=>{
+  const l=c.startsWith(':'),r=c.endsWith(':');
+  return l&&r?'center':r?'right':l?'left':'';
+});
+function tblHtml(head,aligns,rows){
+  const cell=(tag,i,text)=>`<${tag}${aligns[i]?` style="text-align:${aligns[i]}"`:''}>${inl(text||'')}</${tag}>`;
+  const th=`<tr>${head.map((t,i)=>cell('th',i,t)).join('')}</tr>`;
+  const tb=rows.map(r=>`<tr>${head.map((_,i)=>cell('td',i,r[i])).join('')}</tr>`).join('');
+  return `<div class="tbl"><table><thead>${th}</thead><tbody>${tb}</tbody></table></div>`;
+}
 function md(src){
   const bl=[];
   src=src.replace(/```([\w+-]*)\n?([\s\S]*?)(?:```|$)/g,(_,l,c)=>{bl.push(`<div class="cbw"><div class="cb"><span>${esc(l||'código')}</span><button data-copy>Copiar</button></div><pre><code>${esc(c.replace(/\n$/,''))}</code></pre></div>`);return`\n@@${bl.length-1}@@\n`});
   let out='',list=null;const end=()=>{if(list){out+=`</${list}>`;list=null}};
-  for(const ln of src.split('\n')){let m;
+  const lines=src.split('\n');
+  for(let i=0;i<lines.length;i++){const ln=lines[i];let m;
     if(m=ln.match(/^@@(\d+)@@$/)){end();out+=bl[m[1]]}
     else if(m=ln.match(/^(#{1,6})\s+(.*)/)){end();const n=Math.min(m[1].length+1,5);out+=`<h${n}>${inl(m[2])}</h${n}>`}
     else if(m=ln.match(/^\s*([-*+]|\d+\.)\s+(.*)/)){const t=/\d/.test(m[1])?'ol':'ul';if(list!==t){end();out+=`<${t}>`;list=t}out+=`<li>${inl(m[2])}</li>`}
     else if(m=ln.match(/^>\s?(.*)/)){end();out+=`<blockquote>${inl(m[1])}</blockquote>`}
+    else if(ln.includes('|')&&i+1<lines.length&&(m=tblDelim(lines[i+1]))&&m.length===tblCells(ln).length){
+      end();const head=tblCells(ln),aligns=tblAlign(m),rows=[];i+=2;
+      while(i<lines.length&&lines[i].trim()&&lines[i].includes('|')){rows.push(tblCells(lines[i]));i++}
+      i--;out+=tblHtml(head,aligns,rows);
+    }
     else if(!ln.trim())end();
     else{end();out+=`<p>${inl(ln)}</p>`}
   }
@@ -880,7 +923,7 @@ async function send(text){
   c.ctl=new AbortController();
   ensureDocker();
   const body={input:text,session_id:c.sid,project:c.project,voice:'M1',lang:'pt',tts:false,tts_output:'client',
-    model:mInfo?mInfo.id:null,
+    model:mInfo?mInfo.id:null,context_mode:c.mode||'conversational',
     image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,
     search_pdfs:false,stream:true,cwd:c.cwd||null};
   try{
@@ -1324,6 +1367,20 @@ function ensureChatModel(c){
   if(def){c.model=def;saveChats()}
   return c.model||null;
 }
+function contextModeLabel(mode){
+  return mode==='execution'?'Execução':'Conversacional';
+}
+function renderModeBar(){
+  const c=chat();
+  const el=$('#mb-mode');
+  if(el)el.textContent=contextModeLabel(c?.mode||'conversational');
+}
+function toggleContextMode(){
+  const c=chat();if(!c)return;
+  c.mode=c.mode==='execution'?'conversational':'execution';
+  saveChats();renderModeBar();
+  toast('Modo: '+contextModeLabel(c.mode));
+}
 function renderModelBar(){
   const info=modelInfo(ensureChatModel(chat()));
   const modelEl=$('#mb-model'),provEl=$('#mb-prov');
@@ -1332,6 +1389,7 @@ function renderModelBar(){
   provEl.textContent=info?' '+info.providerName:'';
   const eff=String(cfg.effort||'').trim();
   $('#mb-effsep').hidden=!eff;$('#mb-eff').hidden=!eff;$('#mb-eff').textContent=eff;
+  renderModeBar();
 }
 function spIsLocal(base){
   return /^https?:\/\/(localhost|127\.|\[::1\]|[^/]+\.local)([:/]|$)/i.test(String(base||''));
@@ -1478,6 +1536,14 @@ function pickModel(key){
   if(info)toast('Modelo: '+info.name+' · '+info.providerName);
 }
 $('#mbtn').onclick=openModels;
+$('#modebtn').onclick=toggleContextMode;
+document.addEventListener('keydown',e=>{
+  if(e.key==='Tab'&&e.shiftKey&&!e.ctrlKey&&!e.metaKey&&!e.altKey){
+    const openDialog=document.querySelector('dialog[open]');
+    if(openDialog)return;
+    e.preventDefault();toggleContextMode();
+  }
+});
 $('#mdl-close').onclick=()=>$('#mdl').close();
 $('#mdl-search').oninput=renderModels;
 $('#mdl-list').onclick=e=>{

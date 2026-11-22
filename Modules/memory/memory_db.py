@@ -31,7 +31,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from memory_config import LTP_ACCESS_BOOST, log
+from memory_config import (
+    BLOCK_MEMBER_DECAY_FACTOR,
+    BLOCK_MIN_MEMBERS,
+    LTP_ACCESS_BOOST,
+    log,
+)
 from memory_graph import EdgeGraphMixin
 from memory_models import Turn
 
@@ -79,6 +84,80 @@ class MemoryDB(EdgeGraphMixin):
         """)
         # ── NEW: grafo Hebbiano com arestas tipadas (cria/migra memory_edges)
         self._create_edge_table()
+        # ── NEW (blocos): ponteiros que agrupam átomos em 1 item de recall.
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_blocks (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT    NOT NULL,
+                kind             TEXT    NOT NULL DEFAULT 'topic',
+                gist             TEXT    NOT NULL,
+                cues             TEXT    NOT NULL DEFAULT '[]',
+                summary_hash     TEXT    NOT NULL UNIQUE,
+                parent_block_id  INTEGER DEFAULT NULL,
+                level            INTEGER NOT NULL DEFAULT 1,
+                confidence       REAL    NOT NULL DEFAULT 1.0,
+                created_at       REAL    NOT NULL,
+                updated_at       REAL    NOT NULL,
+                last_accessed    REAL    NOT NULL,
+                access_count     INTEGER NOT NULL DEFAULT 0,
+                member_count     INTEGER NOT NULL DEFAULT 0,
+                source           TEXT    NOT NULL DEFAULT 'consolidation',
+                guide            TEXT    NOT NULL DEFAULT '',
+                guide_version    INTEGER NOT NULL DEFAULT 1,
+                guide_source     TEXT    NOT NULL DEFAULT 'consolidation',
+                guide_hash       TEXT    NOT NULL DEFAULT '',
+                guide_updated_at REAL    DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_block_parent ON memory_blocks(parent_block_id);
+            CREATE INDEX IF NOT EXISTS idx_block_kind   ON memory_blocks(kind);
+
+            CREATE TABLE IF NOT EXISTS memory_block_member (
+                block_id   INTEGER NOT NULL,
+                memory_id  INTEGER NOT NULL,
+                role       TEXT    NOT NULL DEFAULT 'core',
+                weight     REAL    NOT NULL DEFAULT 1.0,
+                created_at REAL    NOT NULL,
+                PRIMARY KEY (block_id, memory_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bm_memory ON memory_block_member(memory_id);
+
+            CREATE TABLE IF NOT EXISTS memory_block_guide_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id   INTEGER NOT NULL,
+                version    INTEGER NOT NULL,
+                guide      TEXT    NOT NULL,
+                source     TEXT    NOT NULL,
+                created_at REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bgh_block ON memory_block_guide_history(block_id);
+
+            -- Episódios: resumo de UM turno. É um átomo narrativo (o ledger
+            -- guarda o texto bruto); o vetor vive no índice memory_episode.
+            CREATE TABLE IF NOT EXISTS memory_episodes (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id       TEXT    NOT NULL,
+                turn_id          TEXT    NOT NULL,
+                scope            TEXT    NOT NULL DEFAULT '',
+                summary          TEXT    NOT NULL,
+                intent           TEXT    NOT NULL DEFAULT '',
+                outcome          TEXT    NOT NULL DEFAULT '',
+                tools            TEXT    NOT NULL DEFAULT '[]',
+                tool_results     TEXT    NOT NULL DEFAULT '[]',
+                entities         TEXT    NOT NULL DEFAULT '[]',
+                decisions        TEXT    NOT NULL DEFAULT '[]',
+                open_questions   TEXT    NOT NULL DEFAULT '[]',
+                message_ids      TEXT    NOT NULL DEFAULT '[]',
+                importance       REAL    NOT NULL DEFAULT 0.5,
+                created_at       REAL    NOT NULL,
+                last_accessed    REAL    NOT NULL,
+                access_count     INTEGER NOT NULL DEFAULT 0,
+                parent_episode_id INTEGER DEFAULT NULL,
+                UNIQUE(session_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ep_session ON memory_episodes(session_id);
+            CREATE INDEX IF NOT EXISTS idx_ep_created ON memory_episodes(created_at);
+            CREATE INDEX IF NOT EXISTS idx_ep_parent  ON memory_episodes(parent_episode_id);
+        """)
         # Migração leve: bancos criados antes do campo "esquecível?" existir
         # não têm a coluna — adiciona com default 1 (esquecível, comportamento
         # anterior) sem quebrar instalações já em uso.
@@ -132,6 +211,94 @@ class MemoryDB(EdgeGraphMixin):
         return self._conn.execute(
             f"SELECT * FROM memories WHERE id IN ({ph})", ids
         ).fetchall()
+
+    # ── Episódios ─────────────────────────────────────────────────────────────
+    def episode_insert(self, data: dict) -> int:
+        """Insere/atualiza por (session_id, turn_id). Devolve o id."""
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO memory_episodes
+                    (session_id, turn_id, scope, summary, intent, outcome, tools,
+                     tool_results, entities, decisions, open_questions, message_ids,
+                     importance, created_at, last_accessed, parent_episode_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                    summary=excluded.summary,
+                    intent=excluded.intent,
+                    outcome=excluded.outcome,
+                    tools=excluded.tools,
+                    tool_results=excluded.tool_results,
+                    entities=excluded.entities,
+                    decisions=excluded.decisions,
+                    open_questions=excluded.open_questions,
+                    message_ids=excluded.message_ids,
+                    importance=excluded.importance,
+                    last_accessed=excluded.last_accessed
+                """,
+                (
+                    data.get("session_id", ""),
+                    data.get("turn_id", ""),
+                    data.get("scope", "") or "",
+                    data.get("summary", ""),
+                    data.get("intent", ""),
+                    data.get("outcome", ""),
+                    json.dumps(data.get("tools") or [], ensure_ascii=False),
+                    json.dumps(data.get("tool_results") or [], ensure_ascii=False),
+                    json.dumps(data.get("entities") or [], ensure_ascii=False),
+                    json.dumps(data.get("decisions") or [], ensure_ascii=False),
+                    json.dumps(data.get("open_questions") or [], ensure_ascii=False),
+                    json.dumps(data.get("message_ids") or [], ensure_ascii=False),
+                    float(data.get("importance") or 0.5),
+                    now,
+                    now,
+                    data.get("parent_episode_id"),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM memory_episodes WHERE session_id=? AND turn_id=?",
+                (data.get("session_id", ""), data.get("turn_id", "")),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+    def episode_get(self, episode_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_episodes WHERE id = ?", (episode_id,)
+        ).fetchone()
+
+    def episode_get_by_turn(self, session_id: str, turn_id: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_episodes WHERE session_id=? AND turn_id=?",
+            (session_id, turn_id),
+        ).fetchone()
+
+    def episode_list(self, session_id: Optional[str] = None, limit: int = 50) -> list[sqlite3.Row]:
+        if session_id:
+            return self._conn.execute(
+                "SELECT * FROM memory_episodes WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return self._conn.execute(
+            "SELECT * FROM memory_episodes ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def episode_recent(self, session_id: str, limit: int = 6) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_episodes WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+
+    def episode_update_access(self, episode_id: int) -> None:
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE memory_episodes SET access_count = access_count + 1, "
+                    "last_accessed = ? WHERE id = ?",
+                    (time.time(), episode_id),
+                )
+        except sqlite3.OperationalError:
+            pass
 
     def update_access(self, memory_id: int):
         try:
@@ -231,6 +398,13 @@ class MemoryDB(EdgeGraphMixin):
             # forgettable = 0 → memória marcada como "não esquecível":
             # fica de fora do decay por completo, mesmo que fique muito
             # tempo sem ser acessada.
+            # Membros de um bloco vivo decaem mais devagar: o detalhe é
+            # recuperável pelo bloco, então não precisa ficar "quente".
+            block_members = {
+                int(r["memory_id"]) for r in self._conn.execute(
+                    "SELECT memory_id FROM memory_block_member"
+                ).fetchall()
+            }
             rows = self._conn.execute(
                 "SELECT id, confidence, last_accessed, ttl_days FROM memories "
                 "WHERE confidence > 0.01 AND forgettable = 1"
@@ -242,6 +416,8 @@ class MemoryDB(EdgeGraphMixin):
                 # cai para o default global quando ausente/NULL.
                 row_ttl = row["ttl_days"]
                 effective_half_life = row_ttl if (row_ttl is not None and row_ttl > 0) else half_life_days
+                if int(row["id"]) in block_members and BLOCK_MEMBER_DECAY_FACTOR > 0:
+                    effective_half_life = effective_half_life / BLOCK_MEMBER_DECAY_FACTOR
                 days_idle    = (now - row["last_accessed"]) / 86400.0
                 decay_factor = 0.5 ** (days_idle / effective_half_life)
                 updates.append((row["confidence"] * decay_factor, row["id"]))
@@ -263,11 +439,239 @@ class MemoryDB(EdgeGraphMixin):
                         f"memory_id_a IN ({ph}) OR memory_id_b IN ({ph})",
                         [*expired, *expired],
                     )
+                    # Remove os átomos dos blocos e recalcula member_count.
+                    affected = [r["block_id"] for r in self._conn.execute(
+                        f"SELECT DISTINCT block_id FROM memory_block_member "
+                        f"WHERE memory_id IN ({ph})",
+                        expired,
+                    ).fetchall()]
+                    self._conn.execute(
+                        f"DELETE FROM memory_block_member WHERE memory_id IN ({ph})",
+                        expired,
+                    )
+                    for bid in affected:
+                        self._conn.execute(
+                            "UPDATE memory_blocks SET member_count = "
+                            "(SELECT COUNT(*) FROM memory_block_member WHERE block_id = ?) "
+                            "WHERE id = ?",
+                            (bid, bid),
+                        )
+                    # Dissolve blocos que ficaram pequenos demais; blocos-pai
+                    # (com filhos) são estruturais e permanecem.
+                    for row in self._conn.execute(
+                        "SELECT id, member_count FROM memory_blocks"
+                    ).fetchall():
+                        if int(row["member_count"] or 0) >= BLOCK_MIN_MEMBERS:
+                            continue
+                        has_children = self._conn.execute(
+                            "SELECT COUNT(*) FROM memory_blocks WHERE parent_block_id = ?",
+                            (row["id"],),
+                        ).fetchone()[0]
+                        if has_children:
+                            continue
+                        self._conn.execute(
+                            "DELETE FROM memory_block_member WHERE block_id = ?", (row["id"],)
+                        )
+                        self._conn.execute(
+                            "DELETE FROM memory_block_guide_history WHERE block_id = ?", (row["id"],)
+                        )
+                        self._conn.execute(
+                            "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
+                            (-int(row["id"]), -int(row["id"])),
+                        )
+                        self._conn.execute("DELETE FROM memory_blocks WHERE id = ?", (row["id"],))
                 self._conn.execute("DELETE FROM memories WHERE confidence < 0.01")
                 log.info(f"Decay aplicado em {len(updates)} memórias de longo prazo")
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    # ── Blocos de memória (ponteiros para conjuntos de átomos) ────────────────
+    def block_insert(
+        self,
+        name: str,
+        kind: str,
+        gist: str,
+        cues: list[str],
+        summary_hash: str,
+        parent_block_id: Optional[int] = None,
+        level: int = 1,
+        confidence: float = 1.0,
+        source: str = "consolidation",
+        guide: str = "",
+        guide_source: str = "consolidation",
+        guide_hash: str = "",
+    ) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO memory_blocks (name, kind, gist, cues, summary_hash, "
+                "parent_block_id, level, confidence, created_at, updated_at, "
+                "last_accessed, access_count, member_count, source, guide, "
+                "guide_version, guide_source, guide_hash, guide_updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, ?, ?, ?)",
+                (name, kind, gist, json.dumps(cues, ensure_ascii=False), summary_hash,
+                 parent_block_id, level, confidence, now, now, now, source,
+                 guide, guide_source, guide_hash, now if guide else None),
+            )
+            return cur.lastrowid
+
+    def block_update(self, block_id: int, **fields) -> bool:
+        allowed = {
+            "name", "kind", "gist", "cues", "summary_hash", "parent_block_id",
+            "level", "confidence", "member_count", "source", "guide",
+            "guide_version", "guide_source", "guide_hash", "guide_updated_at",
+            "last_accessed", "access_count",
+        }
+        sets, vals = [], []
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == "cues" and not isinstance(v, str):
+                v = json.dumps(v, ensure_ascii=False)
+            sets.append(f"{k} = ?")
+            vals.append(v)
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        vals.append(time.time())
+        vals.append(block_id)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE memory_blocks SET {', '.join(sets)} WHERE id = ?", vals
+            )
+            return cur.rowcount > 0
+
+    def block_get(self, block_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_blocks WHERE id = ?", (block_id,)
+        ).fetchone()
+
+    def block_get_by_hash(self, summary_hash: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_blocks WHERE summary_hash = ?", (summary_hash,)
+        ).fetchone()
+
+    def block_get_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_blocks WHERE name = ? COLLATE NOCASE ORDER BY id LIMIT 1",
+            (name,),
+        ).fetchone()
+
+    def block_list(
+        self, kind: Optional[str] = None, parent_block_id: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM memory_blocks"
+        where, params = [], []
+        if kind:
+            where.append("kind = ?"); params.append(kind)
+        if parent_block_id is not None:
+            where.append("parent_block_id = ?"); params.append(parent_block_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY confidence DESC, last_accessed DESC"
+        if limit:
+            sql += " LIMIT ?"; params.append(limit)
+        return self._conn.execute(sql, params).fetchall()
+
+    def block_members(self, block_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_block_member WHERE block_id = ? ORDER BY weight DESC",
+            (block_id,),
+        ).fetchall()
+
+    def block_member_ids(self, block_id: int) -> list[int]:
+        return [r["memory_id"] for r in self.block_members(block_id)]
+
+    def block_add_member(
+        self, block_id: int, memory_id: int, role: str = "core", weight: float = 1.0,
+    ) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO memory_block_member (block_id, memory_id, role, weight, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(block_id, memory_id) DO UPDATE SET role=excluded.role, weight=excluded.weight",
+                (block_id, memory_id, role, weight, time.time()),
+            )
+            self._conn.execute(
+                "UPDATE memory_blocks SET member_count = "
+                "(SELECT COUNT(*) FROM memory_block_member WHERE block_id = ?) WHERE id = ?",
+                (block_id, block_id),
+            )
+            return cur.rowcount > 0
+
+    def block_remove_member(self, block_id: int, memory_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM memory_block_member WHERE block_id = ? AND memory_id = ?",
+                (block_id, memory_id),
+            )
+            self._conn.execute(
+                "UPDATE memory_blocks SET member_count = "
+                "(SELECT COUNT(*) FROM memory_block_member WHERE block_id = ?) WHERE id = ?",
+                (block_id, block_id),
+            )
+            return cur.rowcount > 0
+
+    def block_memberships_for_memory(self, memory_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_block_member WHERE memory_id = ?", (memory_id,)
+        ).fetchall()
+
+    def block_delete(self, block_id: int) -> bool:
+        with self._lock:
+            self._conn.execute("DELETE FROM memory_block_member WHERE block_id = ?", (block_id,))
+            self._conn.execute("DELETE FROM memory_block_guide_history WHERE block_id = ?", (block_id,))
+            self._conn.execute(
+                "DELETE FROM memory_edges WHERE memory_id_a = ? OR memory_id_b = ?",
+                (-block_id, -block_id),
+            )
+            cur = self._conn.execute("DELETE FROM memory_blocks WHERE id = ?", (block_id,))
+            return cur.rowcount > 0
+
+    def block_set_guide(
+        self, block_id: int, guide: str, source: str = "manual", guide_hash: str = "",
+    ) -> bool:
+        row = self.block_get(block_id)
+        if row is None:
+            return False
+        version = int(row["guide_version"] or 1) + 1
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO memory_block_guide_history (block_id, version, guide, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (block_id, version, guide, source, now),
+            )
+            self._conn.execute(
+                "UPDATE memory_blocks SET guide = ?, guide_version = ?, guide_source = ?, "
+                "guide_hash = ?, guide_updated_at = ?, updated_at = ? WHERE id = ?",
+                (guide, version, source, guide_hash, now, now, block_id),
+            )
+        return True
+
+    def block_guide_history(self, block_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM memory_block_guide_history WHERE block_id = ? ORDER BY version DESC",
+            (block_id,),
+        ).fetchall()
+
+    def block_update_access(self, block_id: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE memory_blocks SET last_accessed = ?, access_count = access_count + 1 "
+                "WHERE id = ?",
+                (time.time(), block_id),
+            )
+
+    def block_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM memory_blocks").fetchone()[0]
+
+    def block_member_count(self, block_id: int) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM memory_block_member WHERE block_id = ?", (block_id,)
+        ).fetchone()[0]
 
 
 # ── Banco de dados de curto prazo ──────────────────────────────────────────────

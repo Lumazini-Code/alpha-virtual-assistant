@@ -127,6 +127,60 @@ async def read(req: mem.ReadRequest):
     return await mem.read_memory(req)
 
 
+# ── Blocos de memória (ponteiros para conjuntos de átomos) ────────────────────
+
+@app.post("/blocks/write", response_model=mem.BlockWriteResponse)
+async def blocks_write(req: mem.BlockWriteRequest):
+    return await mem.block_write(req)
+
+
+@app.post("/blocks/consolidate", response_model=mem.BlockConsolidateResponse)
+async def blocks_consolidate(req: mem.BlockConsolidateRequest):
+    return await mem.consolidate_blocks(req)
+
+
+@app.get("/blocks", response_model=mem.BlockListResponse)
+async def blocks_list(kind: Optional[str] = None, scope: Optional[str] = None):
+    return await mem.block_list(kind=kind, scope=scope)
+
+
+@app.get("/blocks/{block_id}", response_model=mem.MemoryBlock)
+async def blocks_get(block_id: int, scope: Optional[str] = None):
+    block = await mem.block_get(block_id, scope=scope)
+    if block is None:
+        raise HTTPException(status_code=404, detail="block not found")
+    return block
+
+
+@app.put("/blocks/{block_id}/guide", response_model=mem.BlockGuideResponse)
+async def blocks_set_guide(block_id: int, req: mem.BlockGuideRequest):
+    return await mem.block_set_guide(block_id, req.guide, "manual", scope=req.scope)
+
+
+@app.delete("/blocks/{block_id}")
+async def blocks_delete(block_id: int, scope: Optional[str] = None):
+    ok = await mem.block_delete(block_id, scope=scope)
+    return {"deleted": bool(ok)}
+
+
+# ── Episódios ─────────────────────────────────────────────────────────────────
+@app.post("/episodes/write", response_model=mem.EpisodeWriteResponse)
+async def episodes_write(req: mem.EpisodeWriteRequest):
+    return await mem.episode_write(req)
+
+
+@app.post("/episodes/search", response_model=mem.EpisodeSearchResponse)
+async def episodes_search(req: mem.EpisodeSearchRequest):
+    return await mem.episode_search(req)
+
+
+@app.get("/episodes")
+async def episodes_list(session_id: Optional[str] = None, scope: Optional[str] = None,
+                        limit: int = 50):
+    return {"episodes": [e.model_dump() for e in mem.episode_list(
+        session_id=session_id, scope=scope, limit=limit)]}
+
+
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     return await mem.clear_session(session_id)

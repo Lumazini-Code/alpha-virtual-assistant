@@ -10,6 +10,8 @@
 #       (gitignored; flags -a universal -y; falha = aviso, nao morte)
 #   3c. OfficeCLI: npm install -g @officecli/officecli + skill
 #       officecli.ai/SKILL.md -> .agents\skills\officecli (falha = aviso)
+#   3d. Boardview MCP: venv .venv-boardview + boardview\ (mcp + pillow) e
+#       SKILL.md -> .agents\skills\boardview (falha = aviso)
 #   4. Extrai Modules/Models.zip em Modules/Models
 #   5. Deixa o Modules\.env sem provedor de IA: o cadastro (catalogo models.dev)
 #      acontece na primeira execucao da WebUI e grava LLM_* no Modules\.env
@@ -673,6 +675,65 @@ try {
   Write-Warn2 "Download do SKILL.md (officecli.ai) falhou ($($_.Exception.Message)) - skill ausente (o CLI, se instalado, funciona)."
 }
 
+# -- 3d. Boardview MCP (GenCAD .cad) + skill -----------------------------------
+# boardview\traz um servidor MCP em Python (mcp + pillow) e a SKILL.md de
+# reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
+# stdio; instalamos o pacote num venv dedicado (.venv-boardview) para nao
+# depender do Python do sistema. Sem python/venv ou sem rede, o cadastro e
+# pulado com aviso - o restante da instalacao segue.
+$BoardviewDir = Join-Path $InstallDir 'boardview'
+$BoardviewVenv = Join-Path $InstallDir '.venv-boardview'
+$BoardviewPy = Join-Path $BoardviewVenv 'Scripts\python.exe'
+$script:BoardviewOk = $false
+
+$BvPython = Get-Command python -ErrorAction SilentlyContinue
+if (-not $BvPython) { $BvPython = Get-Command python3 -ErrorAction SilentlyContinue }
+if (-not (Test-Path $BoardviewDir)) {
+  Write-Warn2 "Boardview MCP: pasta $BoardviewDir ausente - pulei o servidor."
+} elseif (-not $BvPython -and -not (Get-Command uv -ErrorAction SilentlyContinue)) {
+  Write-Warn2 'Boardview MCP: python/uv ausentes no host - instale Python 3.10+ (python.org) e rode o instalador de novo.'
+} else {
+  Write-Info 'Boardview MCP: criando venv e instalando boardview-mcp...'
+  if (-not (Test-Path $BoardviewPy) -and $BvPython) {
+    & $BvPython.Source -m venv $BoardviewVenv
+  }
+  if (-not (Test-Path $BoardviewPy) -and (Get-Command uv -ErrorAction SilentlyContinue)) {
+    # uv dispensa o venv do Python e baixa um interpretador valido se preciso.
+    Write-Info 'Boardview MCP: usando uv para criar o venv.'
+    & uv venv --seed --python 3.12 $BoardviewVenv
+  }
+  if (-not (Test-Path $BoardviewPy)) {
+    Write-Warn2 "Boardview MCP: nao consegui criar $BoardviewVenv (verifique o Python/venv)."
+  } else {
+    & $BoardviewPy -m pip install --quiet --disable-pip-version-check -e $BoardviewDir
+    if ($LASTEXITCODE -eq 0) {
+      $script:BoardviewOk = $true
+      Write-Ok "Boardview MCP instalado ($BoardviewPy)."
+    } else {
+      # Reinstalacao sem rede: o venv anterior continua valido.
+      & $BoardviewPy -c 'import boardview_mcp' 2>$null
+      if ($LASTEXITCODE -eq 0) {
+        $script:BoardviewOk = $true
+        Write-Warn2 'Boardview MCP: pip install falhou, mantendo a versao ja instalada no venv.'
+      } else {
+        Write-Warn2 "Boardview MCP: pip install falhou (sem rede?) - instale depois com: `"$BoardviewPy`" -m pip install -e `"$BoardviewDir`""
+      }
+    }
+  }
+}
+
+# A SKILL.md vai para o store canonico (gitignored) que o scanner do
+# orchestrator le; a tool `skill` carrega o playbook sem restart.
+$BoardviewSkill = Join-Path $BoardviewDir 'SKILL.md'
+if (Test-Path $BoardviewSkill) {
+  $BoardviewSkillDir = Join-Path $InstallDir '.agents\skills\boardview'
+  New-Item -ItemType Directory -Force -Path $BoardviewSkillDir | Out-Null
+  Copy-Item -Force $BoardviewSkill (Join-Path $BoardviewSkillDir 'SKILL.md')
+  Write-Ok 'Skill boardview instalada (.agents\skills\boardview\SKILL.md).'
+} else {
+  Write-Warn2 "Boardview: SKILL.md ausente em $BoardviewDir - skill nao instalada."
+}
+
 # -- 4. Modelos ----------------------------------------------------------------
 Write-Info 'Extraindo Models.zip (~1,4 GB) para Modules/Models...'
 Expand-Archive -Path $ModelsZip -DestinationPath (Join-Path $InstallDir 'Modules\Models') -Force
@@ -1145,6 +1206,9 @@ function Register-AlphaMcp {
 }
 
 function Register-DesktopCommanderMcp {
+  # Exemplos em português são vetores de busca no ToolsDB: sem eles o seletor
+  # semântico (descrições em inglês) não casa "liste os arquivos da pasta"
+  # com `list_directory` e o servidor fica fora da rodada.
   return (Register-McpServer -Label 'Desktop Commander' -Name 'desktop-commander' -SyncTimeoutSec 240 -Spec @{
     name          = 'desktop-commander'
     skill_summary = 'Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)'
@@ -1153,6 +1217,55 @@ function Register-DesktopCommanderMcp {
     args          = @('-y', '@wonderwhy-er/desktop-commander@latest')
     enabled       = $true
     always_on     = $false
+    examples      = @{
+      list_directory = @(
+        'liste os arquivos da pasta',
+        'listar arquivos do diretório',
+        'quais arquivos tem nessa pasta',
+        'mostre o conteúdo da pasta',
+        'encontre o arquivo nessa pasta'
+      )
+      read_file = @('leia o arquivo', 'abra o conteúdo desse arquivo', 'mostre o texto do arquivo')
+      read_multiple_files = @('leia esses arquivos', 'mostre o conteúdo de vários arquivos')
+      write_file = @('crie um arquivo', 'escreva no arquivo', 'salve esse texto em um arquivo')
+      edit_block = @('edite o arquivo', 'altere esse trecho do arquivo', 'faça uma correção no arquivo')
+      start_search = @('busque dentro dos arquivos', 'procure esse texto nos arquivos da pasta')
+      get_file_info = @('informações do arquivo', 'tamanho e data do arquivo', 'detalhes do arquivo')
+      start_process = @('execute um comando no terminal', 'rode esse comando')
+      list_processes = @('liste os processos', 'quais processos estão rodando')
+    }
+  })
+}
+
+function Register-BoardviewMcp {
+  # O servidor foi instalado no venv da etapa 3d; sem ele nao ha o que cadastrar.
+  if (-not $script:BoardviewOk -or -not (Test-Path $BoardviewPy)) {
+    Write-Warn2 'Boardview MCP nao instalado - cadastro no mcp_manager pulado.'
+    return $false
+  }
+  return (Register-McpServer -Label 'Boardview' -Name 'boardview' -SyncTimeoutSec 120 -Spec @{
+    name          = 'boardview'
+    skill_summary = 'Boardview GenCAD (.cad): conectividade e geometria da placa para reparo (rails, curtos, caminhos de alimentação, vizinhança e medições do técnico)'
+    transport     = 'stdio'
+    command       = $BoardviewPy
+    args          = @('-m', 'boardview_mcp')
+    env           = @{ PYTHONUNBUFFERED = '1' }
+    enabled       = $true
+    always_on     = $false
+    examples      = @{
+      load_board = @(
+        'analise esse boardview',
+        'abre essa placa no boardview',
+        'diagnostica essa placa pelo .cad',
+        'carregue o .cad da pasta',
+        'analise o boardview da pasta selecionada'
+      )
+      power_rail_analysis = @(
+        'esse rail esta sem tensao',
+        'a placa nao liga',
+        'tem um curto nessa linha de alimentacao'
+      )
+    }
   })
 }
 
@@ -1452,6 +1565,7 @@ if (-not $SkipBuild) {
   Register-PlaywrightMcp | Out-Null
   Register-AlphaMcp | Out-Null
   Register-DesktopCommanderMcp | Out-Null
+  Register-BoardviewMcp | Out-Null
 
   $StatusUrl = 'http://127.9.12.22:9000/status'
   $MaxWait = 1200  # 20 min

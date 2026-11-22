@@ -32,6 +32,7 @@ from typing import Optional
 
 from memory_config import (
     AUTO_LINK_ENABLED,
+    BLOCK_CONSOLIDATE_INTERVAL_S,
     DB_PATH,
     DECAY_HALF_LIFE_DAYS,
     DECAY_JOB_INTERVAL_S,
@@ -49,9 +50,12 @@ from memory_config import (
     IF_FAISS_INDEX_PATH,
     INDEX_FLUSH_INTERVAL_S,
     LANCE_DIR,
+    MEMORY_BLOCKS_ENABLED,
     MT_FACE_DICT,
+    MT_EPISODE,
     MT_INDEXED_FILE,
     MT_LONG_TERM,
+    MT_MEMORY_BLOCK,
     MT_SHORT_TERM,
     MT_TOOL,
     MT_VOICE_DICT,
@@ -122,6 +126,8 @@ class ScopeState:
     lance:     LanceStore          = field(default=None)   # store DO escopo (o geral compartilha state.lance)
     lt_db:     MemoryDB            = field(default=None)
     lt_index:  MemoryIndex         = field(default=None)
+    blk_index: MemoryIndex         = field(default=None)   # blocos (MT_MEMORY_BLOCK)
+    ep_index:  MemoryIndex         = field(default=None)   # episódios (MT_EPISODE)
     if_db:     IndexedFilesDB      = field(default=None)
     if_index:  MemoryIndex         = field(default=None)
     plans_db:  PlansDB             = field(default=None)
@@ -130,7 +136,7 @@ class ScopeState:
     def close(self):
         """Flush dos índices + fechamento das conexões SQLite. Chamado ao
         remover um escopo (delete_scope) — silencioso por design."""
-        for idx in (self.lt_index, self.if_index):
+        for idx in (self.lt_index, self.blk_index, self.ep_index, self.if_index):
             if idx is not None:
                 try:
                     idx.flush()
@@ -168,6 +174,7 @@ class AppState:
     decay_task:   asyncio.Task    = field(default=None)
     cleanup_task: asyncio.Task    = field(default=None)
     flush_task:   asyncio.Task    = field(default=None)
+    block_task:   asyncio.Task    = field(default=None)
     # Auto-heal do seed de identidade (pode falhar no boot se o ONNX serving
     # subir depois da memory — re-tenta em background até o vínculo nascer).
     identity_seed_task: asyncio.Task = field(default=None)
@@ -195,6 +202,10 @@ class AppState:
     @property
     def lt_index(self) -> MemoryIndex:
         return self.scope.lt_index
+
+    @property
+    def ep_index(self) -> MemoryIndex:
+        return self.scope.ep_index
 
     @property
     def if_db(self) -> IndexedFilesDB:
@@ -231,6 +242,8 @@ def _open_scope(name: str, shared_lance: Optional[LanceStore] = None) -> ScopeSt
     sc.lt_db    = MemoryDB(paths.LT_DB_PATH)
     sc.lt_index = MemoryIndex(sc.lance, MT_LONG_TERM, EMBED_DIM,
                               paths.LT_FAISS_INDEX_PATH, paths.LT_FAISS_ID_MAP_PATH)
+    sc.blk_index = MemoryIndex(sc.lance, MT_MEMORY_BLOCK, EMBED_DIM)
+    sc.ep_index  = MemoryIndex(sc.lance, MT_EPISODE, EMBED_DIM)
     # Log de ativação do grafo por escopo (memory_graph lê via getattr).
     sc.lt_db._activation_log_path = paths.ACTIVATION_LOG_PATH
     sc.if_db    = IndexedFilesDB(paths.IF_DB_PATH)
@@ -369,7 +382,7 @@ def _all_indices() -> list["MemoryIndex"]:
         if idx is not None
     ]
     for sc in state.scopes.values():
-        idxs.extend(idx for idx in (sc.lt_index, sc.if_index) if idx is not None)
+        idxs.extend(idx for idx in (sc.lt_index, sc.blk_index, sc.ep_index, sc.if_index) if idx is not None)
     return idxs
 
 
@@ -426,6 +439,24 @@ async def st_cleanup_job():
                 await loop.run_in_executor(None, state.st_index.remove_ids, expired_ids)
         except Exception as e:
             log.error(f"Erro no cleanup de curto prazo: {e}")
+
+
+async def block_consolidate_job():
+    """Consolida blocos periodicamente. Roda fora do caminho do turno."""
+    if not MEMORY_BLOCKS_ENABLED:
+        return
+    while True:
+        await asyncio.sleep(BLOCK_CONSOLIDATE_INTERVAL_S)
+        try:
+            from memory_blocks import consolidate_blocks
+            await consolidate_blocks()
+        except Exception as e:
+            try:
+                from memory_blocks import _STATS
+                _STATS["consolidation_failures_total"] += 1
+            except Exception:
+                pass
+            log.error(f"Erro na consolidação de blocos: {e}")
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -504,6 +535,7 @@ async def startup():
     state.decay_task   = asyncio.create_task(decay_job())
     state.cleanup_task = asyncio.create_task(st_cleanup_job())
     state.flush_task   = asyncio.create_task(index_flush_job())
+    state.block_task   = asyncio.create_task(block_consolidate_job())
 
     log.info(
         f"Pronto — {state.lt_db.count()} memórias LT | "
@@ -567,6 +599,8 @@ async def shutdown():
         state.cleanup_task.cancel()
     if state.flush_task is not None:
         state.flush_task.cancel()
+    if state.block_task is not None:
+        state.block_task.cancel()
     if state.identity_seed_task is not None:
         state.identity_seed_task.cancel()
 
@@ -587,6 +621,7 @@ __all__ = [
     'ScopeState',
     '_all_indices',
     '_open_scope',
+    'block_consolidate_job',
     'decay_job',
     'delete_scope',
     'index_flush_job',

@@ -38,6 +38,7 @@ Modules/llama-cpp
 graphify-out
 
 .venv/**
+.venv-boardview/**
 
 .env
 
@@ -89,3 +90,7 @@ resource/projects.json
 
 Manager/vendor
 .grepai/
+
+boardview/.pytest_cache
+boardview/boardview_mcp.egg-info
+boardview/build

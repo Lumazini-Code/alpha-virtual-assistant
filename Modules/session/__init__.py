@@ -11,6 +11,14 @@ validada.
 
 from .db import SessionDatabase, default_db_path
 from .compaction import CompactionManager, Settings as CompactionSettings, estimate_tokens
+from .context import (
+    MODE_CONVERSATIONAL,
+    MODE_EXECUTION,
+    build_recall_turns,
+    build_working_context,
+    normalize_mode,
+    split_turns,
+)
 from .events import Event
 from .history import History, SessionHistory, message_text, sanitize_for_model
 from .ids import new_message_id, new_part_id, new_session_id, now
@@ -30,6 +38,12 @@ from .runner import (
     retry,
 )
 from .store import SessionStore
+from .task_state import (
+    format_task_state,
+    get_task_state,
+    merge_task_state,
+    set_task_state,
+)
 
 __all__ = [
     "CONTINUE_AFTER_OUTPUT_LIMIT",
@@ -61,4 +75,14 @@ __all__ = [
     "output_limit",
     "retry",
     "sanitize_for_model",
+    "MODE_CONVERSATIONAL",
+    "MODE_EXECUTION",
+    "build_recall_turns",
+    "build_working_context",
+    "normalize_mode",
+    "split_turns",
+    "format_task_state",
+    "get_task_state",
+    "merge_task_state",
+    "set_task_state",
 ]

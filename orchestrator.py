@@ -245,9 +245,15 @@ try:
         JobStore,
         OutputLimitTracker,
         SessionStore,
+        build_recall_turns,
+        build_working_context,
         estimate_tokens,
+        format_task_state,
+        get_task_state,
         is_output_limit,
         message_text,
+        merge_task_state,
+        normalize_mode,
         sanitize_for_model,
     )
 except ImportError:  # execução fora da raiz do projeto (CWD diferente)
@@ -257,9 +263,15 @@ except ImportError:  # execução fora da raiz do projeto (CWD diferente)
         JobStore,
         OutputLimitTracker,
         SessionStore,
+        build_recall_turns,
+        build_working_context,
         estimate_tokens,
+        format_task_state,
+        get_task_state,
         is_output_limit,
         message_text,
+        merge_task_state,
+        normalize_mode,
         sanitize_for_model,
     )
 
@@ -355,6 +367,11 @@ _INSTRUCTIONS_HOST_DISABLED_UNTIL = 0.0
 # mecanismo principal; 0 (padrão) desliga o corte. Use um valor positivo apenas
 # como fallback quando a compactação estiver desabilitada.
 HISTORY_MAX_CHARS = max(0, int(os.getenv("AVA_HISTORY_MAX_CHARS", "0")))
+CONTEXT_MODE_DEFAULT = os.getenv("AVA_CONTEXT_MODE", "conversational").strip().lower()
+ST_WINDOW_TURNS = max(1, int(os.getenv("AVA_ST_WINDOW_TURNS", "6")))
+ST_WINDOW_MAX_TOKENS = max(0, int(os.getenv("AVA_ST_WINDOW_MAX_TOKENS", "12000")))
+ST_KEEP_PRIOR_TOOLS = os.getenv("AVA_ST_KEEP_PRIOR_TOOLS", "0") != "0"
+TASK_STATE_ENABLED = os.getenv("AVA_TASK_STATE", "1") != "0"
 
 # ── Multi-chat: serialização e cancelamento por sessão ────────────────────────
 # Um turno por sessão por vez: dois envios no MESMO chat esperam na fila em
@@ -696,16 +713,29 @@ async def _load_nearby_agents_md(sid: str, path: str) -> None:
         log.debug(f"[instructions] descoberta próxima falhou ({type(e).__name__}: {e})")
 
 
-def _session_history(sid: str, *, keep_trailing_tools: bool = False) -> Optional[list[dict[str, Any]]]:
-    """Histórico durável sanitizado para o chat template."""
+def _session_history(
+    sid: str,
+    *,
+    keep_trailing_tools: bool = False,
+    mode: Optional[str] = None,
+) -> Optional[list[dict[str, Any]]]:
+    """Histórico durável preparado para o chat template.
+
+    ``mode`` escolhe o recorte: ``execution`` usa o histórico completo;
+    ``conversational`` usa a janela ST (N turnos + orçamento de tokens).
+    """
     store = _session_store()
     if store is None or not sid:
         return None
     try:
-        return sanitize_for_model(
+        return build_working_context(
             store.load_messages(sid),
-            max_chars=HISTORY_MAX_CHARS,
+            mode=normalize_mode(mode, CONTEXT_MODE_DEFAULT),
+            max_turns=ST_WINDOW_TURNS,
+            max_tokens=ST_WINDOW_MAX_TOKENS,
+            keep_prior_tools=ST_KEEP_PRIOR_TOOLS,
             keep_trailing_tools=keep_trailing_tools,
+            max_chars=HISTORY_MAX_CHARS,
         )
     except Exception as e:
         log.warning(f"[session] falha ao ler histórico ({sid[:8]}): {type(e).__name__}: {e}")
@@ -1451,6 +1481,17 @@ class ExecuteRequest(BaseModel):
     # O provider (base URL/key) continua sendo o do Modules/.env; só o ID do
     # modelo muda por turno, então trocar de modelo não reinicia o stack.
     model:         Optional[str]  = Field(None, max_length=200)
+    # Modo de contexto escolhido pelo usuário na WebUI (Shift+Tab/clique).
+    # "conversational" = janela ST + episódios; "execution" = histórico completo.
+    context_mode:  Optional[Literal["conversational", "execution"]] = None
+
+class TaskStateRequest(BaseModel):
+    goal:           Optional[str] = None
+    status:         Optional[str] = None
+    decisions:      Optional[list[str]] = None
+    open_questions: Optional[list[str]] = None
+    next_steps:     Optional[list[str]] = None
+    constraints:    Optional[list[str]] = None
 
 class StepResult(BaseModel):
     step: int; executor: str; action: str; success: bool
@@ -2104,6 +2145,8 @@ async def _memory_read_semantic(query: str, sid: str,
         "strategy": "auto",
         "top_k_final": top_k_final,
         "total_max_chars": max_chars,
+        "include_blocks": True,
+        "expand_blocks": True,
     }
     if scope:
         body["scope"] = scope
@@ -2289,6 +2332,29 @@ def _build_recall_query(user_input: str, sid: str) -> str:
     return _clip_with_marker(query, RECALL_QUERY_MAX_CHARS, 200)
 
 
+def _format_episodes_block(episodes: Optional[list[dict]]) -> str:
+    """Formata episódios recuperados como memória autobiográfica."""
+    if not episodes:
+        return ""
+    lines: list[str] = []
+    for ep in episodes[:4]:
+        summary = (ep.get("summary") or "").strip()
+        if not summary:
+            continue
+        outcome = (ep.get("outcome") or "").strip()
+        line = f"- {summary}"
+        if outcome:
+            line += f" → {outcome}"
+        open_q = ep.get("open_questions") or []
+        if open_q:
+            line += " (open: " + "; ".join(str(q) for q in open_q[:2]) + ")"
+        lines.append(line)
+    if not lines:
+        return ""
+    _metric_inc("episode_recalls_total", n=len(lines))
+    return "Relevant episodes (your own past turns — may be partial):\n" + "\n".join(lines)
+
+
 def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]] = None) -> str:
     """Formata os resultados do /read como bloco de contexto type-aware.
 
@@ -2319,10 +2385,16 @@ def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]
     references: list[str] = []
     primary_norms: list[str] = []
     seen: set[str] = set()
+    blocks = read_res.get("blocks") or []
+    block_members: dict[int, list[dict]] = {}
 
     for m in results:
         text = (m.get("text") or m.get("content") or "").strip()
         if not text:
+            continue
+        bid = m.get("block_id")
+        if bid:
+            block_members.setdefault(int(bid), []).append(m)
             continue
         norm = _norm_dedup_text(text)
         if not norm or norm in seen:
@@ -2366,6 +2438,35 @@ def _format_recall_block(read_res: Optional[dict], st_turns: Optional[list[dict]
         lt_related.append(_memory_line(m, weak=True, now=now))
 
     sections: list[str] = []
+    if blocks:
+        _metric_inc("memory_block_recalls_total", n=len(blocks))
+        block_lines: list[str] = []
+        for b in blocks:
+            name = b.get("name") or "block"
+            gist = (b.get("gist") or "").strip()
+            kind = b.get("kind") or "topic"
+            count = b.get("member_count") or len(b.get("members") or [])
+            conf = b.get("confidence")
+            conf_s = f", conf {float(conf):.2f}" if conf is not None else ""
+            line = f"- [Block: {name}] {gist} ({kind}, {count} facts{conf_s})"
+            # O guia é advisory e escopado: só entra quando o bloco foi
+            # desdobrado ou quando o kind pede orientação de uso. Blocos
+            # topic com orçamento apertado entram só com o gist.
+            expanded = b.get("match_type") == "block_expanded"
+            guide_allowed = expanded or kind in ("behavior", "project", "person")
+            guide = (b.get("guide") or "").strip()
+            if guide and guide_allowed:
+                guide_lines = [ln.strip() for ln in guide.splitlines() if ln.strip()]
+                for gl in guide_lines[:6]:
+                    line += f"\n    Guidance (advisory): {gl}"
+            members = block_members.get(int(b.get("block_id") or 0), [])[:3]
+            if members:
+                _metric_inc("memory_block_expansions_total", n=len(members))
+            for mem in members:
+                line += "\n    - " + _memory_line(mem, now=now)
+            block_lines.append(line)
+        sections.append("Known blocks (long-term memory pointers; expand with memory_search if needed):\n"
+                        + "\n".join(block_lines))
     if lt_primary:
         sections.append("Known facts and episodes (long-term memory):\n"
                         + "\n".join(lt_primary))
@@ -2409,29 +2510,76 @@ async def _recall_plans(user_input: str, scope: Optional[str] = None) -> Optiona
         plans = data.get("plans") or []
     except Exception as e:
         log.debug(f"[_recall_plans] /plans/list falhou (ignorado): {type(e).__name__}: {e}")
+        plans = []
+
+    behavior_blocks = []
+    try:
+        block_params = {"kind": "behavior"}
+        if scope:
+            block_params["scope"] = scope
+        block_data = await _memory_request("GET", "/blocks", params=block_params)
+        behavior_blocks = block_data.get("blocks") or []
+    except Exception as e:
+        log.debug(f"[_recall_plans] /blocks?kind=behavior falhou (ignorado): {type(e).__name__}: {e}")
+
+    if not plans and not behavior_blocks:
         return None
-    if not plans:
-        return None
-    scored = sorted(
-        ((_plan_match_score(user_input, p), p) for p in plans),
-        key=lambda kv: kv[0], reverse=True,
-    )
-    top_score, top_plan = scored[0]
-    if top_score < 0.4:
-        return None
-    lines = [
-        "## Saved plan matching this request (consider using it)",
-        f"- Plan \"{top_plan['name']}\" (v{top_plan['version']}, id={top_plan['plan_id']})"
-        f" — {top_plan.get('description') or 'no description'},"
-        f" {len(top_plan.get('steps') or [])} steps.",
-        f"- STRONGLY prefer run_plan(plan_name=\"{top_plan['name']}\") for this request"
-        " unless the user explicitly asked for a fresh manual browser session.",
-    ]
-    others = [(s, p) for s, p in scored[1:] if s >= 0.4][:3]
-    if others:
-        lines.append("- Other saved plans: "
-                     + ", ".join(f"\"{p['name']}\" (id={p['plan_id']})" for _, p in others))
-    return "\n".join(lines)
+
+    behavior_lines: list[str] = []
+    if behavior_blocks:
+        def _block_ref(block: dict) -> str:
+            return " ".join(str(block.get(k) or "") for k in ("name", "gist", "guide"))
+
+        scored_blocks = sorted(
+            ((_plan_match_score(user_input, {
+                "name": b.get("name"),
+                "description": _block_ref(b),
+            }), b) for b in behavior_blocks),
+            key=lambda kv: kv[0], reverse=True,
+        )
+        top_block_score, top_block = scored_blocks[0]
+        if top_block_score >= 0.4:
+            _metric_inc("memory_block_recalls_total")
+            behavior_lines.extend([
+                "## Behavior block matching this request (apply its guidance)",
+                f"- Block \"{top_block['name']}\" (kind=behavior, id={top_block['block_id']},"
+                f" {top_block.get('member_count', 0)} memories).",
+                f"- Gist: {top_block.get('gist') or 'no gist'}",
+            ])
+            guide = (top_block.get("guide") or "").strip()
+            if guide:
+                behavior_lines.append("- Guidance (advisory — facts in the block take precedence):")
+                behavior_lines.extend(f"  {line}" for line in guide.splitlines())
+            behavior_lines.append("- If the task needs the underlying detail, use memory_search with"
+                                  f" this block's name or expand block id={top_block['block_id']}.")
+
+    # O bloco de comportamento substitui a lista de planos no prompt (1
+    # linha em vez de N listas separadas).
+    if behavior_lines:
+        return "\n".join(behavior_lines)
+
+    lines: list[str] = []
+    if plans:
+        scored = sorted(
+            ((_plan_match_score(user_input, p), p) for p in plans),
+            key=lambda kv: kv[0], reverse=True,
+        )
+        top_score, top_plan = scored[0]
+        if top_score >= 0.4:
+            lines.extend([
+                "## Saved plan matching this request (consider using it)",
+                f"- Plan \"{top_plan['name']}\" (v{top_plan['version']}, id={top_plan['plan_id']})"
+                f" — {top_plan.get('description') or 'no description'},"
+                f" {len(top_plan.get('steps') or [])} steps.",
+                f"- STRONGLY prefer run_plan(plan_name=\"{top_plan['name']}\") for this request"
+                " unless the user explicitly asked for a fresh manual browser session.",
+            ])
+            others = [(s, p) for s, p in scored[1:] if s >= 0.4][:3]
+            if others:
+                lines.append("- Other saved plans: "
+                             + ", ".join(f"\"{p['name']}\" (id={p['plan_id']})" for _, p in others))
+
+    return "\n".join(lines) if lines else None
 
 
 # ── Voice memory context (Fase 1 — cache de ingestão) ────────────────────────
@@ -2546,7 +2694,8 @@ def _format_voice_context_block(voice_res: Optional[dict],
 
 
 async def _recall_for_turn(query: str, sid: str,
-                           scope: Optional[str] = None) -> tuple[str, list[dict]]:
+                           scope: Optional[str] = None,
+                           mode: Optional[str] = None) -> tuple[str, list[dict]]:
     """Recall pré-loop: memória de longo prazo + histórico durável.
 
     O histórico conversacional vem do ``SessionStore`` (mensagens completas,
@@ -2560,13 +2709,30 @@ async def _recall_for_turn(query: str, sid: str,
     /voice/ingest (disparado pelo main.cpp no endpoint do VAD, em paralelo
     com o ASR) e está no cache — o consumo aqui é O(1), custo 0ms."""
     contextual_query = _build_recall_query(query, sid)
-    stored = _session_history(sid) or []
+    stored = _session_history(sid, mode=mode) or []
     text_turns = [m for m in stored if m.get("role") in ("user", "assistant")]
     read_res = await _memory_read_semantic(
         contextual_query, sid, ORCH_RECALL_TOP_K, ORCH_RECALL_TOP_K_FINAL, ORCH_RECALL_MAX_CHARS,
         scope=scope,
     )
     recall_block = _format_recall_block(read_res, text_turns)
+
+    # Episódios: recuperação paralela por similaridade + continuidade da sessão.
+    if normalize_mode(mode, CONTEXT_MODE_DEFAULT) == "conversational":
+        try:
+            params = {"scope": scope} if scope else None
+            ep_data = await _memory_request(
+                "POST", "/episodes/search",
+                {"query": contextual_query, "session_id": sid, "top_k": 4,
+                 **({"scope": scope} if scope else {})},
+                params=params,
+            )
+            episodes = ep_data.get("episodes") or []
+            ep_block = _format_episodes_block(episodes)
+            if ep_block:
+                recall_block = (ep_block + "\n\n" + recall_block) if recall_block else ep_block
+        except Exception as e:
+            log.debug(f"[_recall_for_turn] episódios indisponíveis ({type(e).__name__}: {e})")
 
     # Injeção do contexto de voz — custo O(1), se existir. Os fatos do falante
     # que já aparecem no recall/histórico são omitidos (dedup voz × memória).
@@ -2586,11 +2752,41 @@ async def _extract_memories_via_llm(u: str, a: str, sid: str,
     poluindo exatamente o recall que agora roda pré-loop. O extrator classifica
     semantic (→ LT, com dedup/possible_update do memory.py) vs episodic
     (→ ST) e só grava o que merece. Fire-and-forget."""
+    task_state = None
+    tool_context: list[str] = []
+    try:
+        store = _session_store()
+        if store is not None:
+            if TASK_STATE_ENABLED:
+                task_state = get_task_state(store, sid)
+            # Resultados úteis de ferramentas do turno: o extrator os usa para
+            # escrever o episódio (o dump bruto fica no ledger). Limitamos ao
+            # turno corrente (mensagens após o último user) para não misturar
+            # ferramentas de turnos anteriores.
+            messages = store.load_messages(sid) or []
+            last_user = -1
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "user":
+                    last_user = i
+            turn_messages = messages[last_user + 1:] if last_user >= 0 else messages[-40:]
+            for msg in turn_messages:
+                if msg.get("role") != "tool":
+                    continue
+                text = str(msg.get("content") or "").strip()
+                if not text:
+                    continue
+                name = msg.get("name") or msg.get("tool_name") or "tool"
+                tool_context.append(f"{name}: {text[:800]}")
+            tool_context = tool_context[-8:]
+    except Exception:
+        task_state = None
     try:
         r = await state.llm_client.post(
             "/memories/extract",
             json={"user_input": u, "assistant_response": a, "session_id": sid,
-                  **({"scope": scope} if scope else {})},
+                  **({"scope": scope} if scope else {}),
+                  **({"task_state": task_state} if task_state else {}),
+                  **({"tool_context": tool_context} if tool_context else {})},
             timeout=httpx.Timeout(120.0, connect=10.0),
         )
         if r.status_code == 200:
@@ -2607,6 +2803,17 @@ async def _extract_memories_via_llm(u: str, a: str, sid: str,
                 f"Extração de memórias pós-turno: {len(saved)} gravada(s) "
                 f"{by_type or '(nada a gravar)'} (session={sid})"
             )
+            # Task state: o extrator devolve o objeto atualizado; preservamos
+            # o que ele não repetiu (decisões/pendências antigas).
+            task_update = data.get("task_state")
+            if isinstance(task_update, dict):
+                try:
+                    store = _session_store()
+                    if store is not None:
+                        merge_task_state(store, sid, task_update)
+                        _metric_inc("task_state_updates_total")
+                except Exception as e:
+                    log.debug(f"[task_state] falha ao atualizar ({type(e).__name__}: {e})")
             _clear_memory_failure(sid, "extract")
             return True
         log.warning(
@@ -2914,6 +3121,32 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest, sid: str = ""):
 # devolvendo o bloco type-aware já formatado — o resultado vira mensagem
 # role="tool" no histórico via _result_to_text (str passa direto).
 async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
+    block_arg = args.get("block")
+    if block_arg:
+        try:
+            blk = None
+            scope = (_CURRENT_SCOPE.get() or "").strip() or None
+            params = {"scope": scope} if scope else None
+            try:
+                blk = await _memory_request("GET", f"/blocks/{int(block_arg)}", params=params)
+            except (TypeError, ValueError):
+                pass
+            if blk is None:
+                data = await _memory_request("GET", "/blocks", params=params)
+                for cand in data.get("blocks") or []:
+                    if str(cand.get("name") or "").lower() == str(block_arg).lower():
+                        blk = cand
+                        break
+            if blk:
+                lines = [f"[Block: {blk.get('name')}] {blk.get('gist')}"]
+                guide = (blk.get("guide") or "").strip()
+                if guide:
+                    lines.append("Guidance (advisory): " + guide)
+                for mem in blk.get("members") or []:
+                    lines.append(f"- ({mem.get('role') or 'core'}) {mem.get('text') or ''}")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"ERROR: block lookup failed: {type(e).__name__}: {e}"
     query = str(args.get("query") or "").strip()
     if not query:
         return ("[memory_search: empty query — pass a focused natural-language "
@@ -2932,6 +3165,8 @@ async def _tool_memory_search(args: dict, req: ExecuteRequest, sid: str = ""):
             "strategy": "auto",
             "top_k_final": ORCH_RECALL_TOP_K_FINAL,
             "total_max_chars": ORCH_RECALL_MAX_CHARS,
+            "include_blocks": True,
+            "expand_blocks": bool(args.get("expand")),
         }))
     except Exception as e:
         return f"ERROR: memory_search failed: {type(e).__name__}: {e}"
@@ -3705,9 +3940,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "(long-term facts, preferences, past events), plus your indexed knowledge "
             "base and files. Use it BEFORE claiming you don't know something about the "
             "user or inventing personal details — this is your own recollection. Pass a "
-            "focused natural-language `query` (optionally `top_k`, default 6)."
+            "focused natural-language `query` (optionally `top_k`, default 6). "
+            "To read a known block, pass `block` (name or id) and `expand=true`."
         ),
-        "fields": [("query", "string", True), ("top_k", "number", False)],
+        "fields": [("query", "string", False), ("top_k", "number", False),
+                   ("block", "string", False), ("expand", "boolean", False)],
         "executor": _tool_memory_search,
     },
     "vision_objects": {
@@ -4014,12 +4251,14 @@ def _mcp_tool_to_openai_schema(tool: dict) -> dict:
 # Descoberta em duas etapas via mcp_manager (registry dinâmico do usuário)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _select_skills(user_input: str) -> tuple[list[str], dict[str, Any]]:
+async def _select_skills(user_input: str) -> tuple[list[str], dict[str, list[str]], dict[str, Any]]:
     """ETAPA 1 (grafo de tools): pergunta ao ToolsDB (via mcp_manager →
     memory /tools/select) quais servidores MCP têm tools relevantes pro
     pedido do usuário. Barato: kNN semântico + PPR no grafo de co-uso,
     NENHUMA conexão MCP. Retorna nomes de servidores — pode ser vazia
-    (pedido não precisa de nenhuma tool MCP, só vision/memory_search).
+    (pedido não precisa de nenhuma tool MCP, só vision/memory_search) — e o
+    `tool_priority` por servidor (as tools que o grafo casou), usado na etapa 2
+    para que o teto de tools nunca descarte justamente as tools relevantes.
 
     Também devolve um status da descoberta (degraded/reason/fallback) para o
     loop informar o MODELO quando o toolset foi reduzido — antes a falha só
@@ -4037,17 +4276,22 @@ async def _select_skills(user_input: str) -> tuple[list[str], dict[str, Any]]:
     except Exception as e:
         log.warning(f"[_select_skills] mcp_manager offline ({type(e).__name__}: {e}) — seguindo sem tools MCP nesta rodada")
         _metric_inc("degraded", "mcp_manager_offline")
-        return [], {
+        return [], {}, {
             "degraded": True, "reason": "mcp_manager_offline",
             "fallback": False, "failed_servers": [],
         }
     if not enabled:
-        return [], {"degraded": False, "reason": "no_servers", "fallback": False, "failed_servers": []}
+        return [], {}, {"degraded": False, "reason": "no_servers", "fallback": False, "failed_servers": []}
     always_on = [s["name"] for s in enabled if s["name"] in ALWAYS_ON_MCP_SERVERS]
     try:
         r = await state.mcp_client.post("/skills/select", json={"query": user_input}, timeout=90.0)
         r.raise_for_status()
-        chosen = [s["name"] for s in r.json()["skills"]]
+        selected = r.json()["skills"]
+        chosen = [s["name"] for s in selected]
+        tool_priority = {
+            s["name"]: [str(t) for t in (s.get("tools") or [])]
+            for s in selected
+        }
         log.info(f"[_select_skills] grafo de tools escolheu: {chosen}")
     except Exception as e:
         fallback_all = os.getenv("AVA_MCP_SELECTOR_FALLBACK_ALL", "0").strip().lower() in (
@@ -4061,7 +4305,7 @@ async def _select_skills(user_input: str) -> tuple[list[str], dict[str, Any]]:
         missing = [n for n in always_on if n not in chosen]
         if missing:
             chosen = chosen + missing
-        return chosen, {
+        return chosen, {}, {
             "degraded": True, "reason": "selector_failed",
             "fallback": True, "fallback_all": fallback_all,
             "failed_servers": [],
@@ -4074,10 +4318,13 @@ async def _select_skills(user_input: str) -> tuple[list[str], dict[str, Any]]:
     if missing:
         log.info(f"[_select_skills] always-on injetado sem seletor: {missing}")
         chosen = chosen + missing
-    return chosen, {"degraded": False, "reason": "ok", "fallback": False, "failed_servers": []}
+    return chosen, tool_priority, {"degraded": False, "reason": "ok", "fallback": False, "failed_servers": []}
 
 
-async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str, tuple[str, str]], list[str], dict[str, str]]:
+async def _load_mcp_tools(
+    skill_names: list[str],
+    tool_priority: dict[str, list[str]] | None = None,
+) -> tuple[list[dict], dict[str, tuple[str, str]], list[str], dict[str, str]]:
     """ETAPA 2: carrega do mcp_manager (cache local dele — SEM conexão MCP)
     o schema real das tools dos servidores escolhidos, com as descrições
     reais devolvidas pelo servidor MCP. Devolve:
@@ -4092,10 +4339,14 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
         foram renomeadas com o prefixo `mcp__`. As Tool Tips continuam sendo
         buscadas/gravadas pelo nome original."""
     schema: list[dict] = []
+    priority_schema: list[dict] = []
     dispatch: dict[str, tuple[str, str]] = {}
     failed_servers: list[str] = []
     tip_name_map: dict[str, str] = {}
     used_names: set[str] = set(TOOLS.keys())
+    priority_names = {
+        name for names in (tool_priority or {}).values() for name in names
+    }
     log.debug(f"[_load_mcp_tools] carregando tools dos servidores: {skill_names}")
 
     async def _load_server(server: str) -> tuple[str, list[dict] | None]:
@@ -4119,6 +4370,19 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
         if tools is None:
             failed_servers.append(server)
             continue
+        # Tools que o grafo casou vêm primeiro: o teto de `_cap_mcp_tools`
+        # corta o fim da lista, então a relevância precisa estar na frente.
+        priority = {
+            name: i for i, name in enumerate((tool_priority or {}).get(server, []))
+        }
+        if priority:
+            tools = sorted(
+                tools,
+                key=lambda t: (
+                    priority.get(str(t.get("graph_name")), len(priority)),
+                    str(t.get("graph_name")),
+                ),
+            )
         for tool in tools:
             original_name = str(tool["graph_name"])
             final_name = original_name
@@ -4135,10 +4399,17 @@ async def _load_mcp_tools(skill_names: list[str]) -> tuple[list[dict], dict[str,
             used_names.add(final_name)
             spec = _mcp_tool_to_openai_schema(tool)
             spec["function"]["name"] = final_name
-            schema.append(spec)
+            if str(tool.get("graph_name")) in priority_names:
+                priority_schema.append(spec)
+            else:
+                schema.append(spec)
             dispatch[final_name] = (server, tool["name"])
         log.debug(f"[_load_mcp_tools] '{server}': {len(tools)} tool(s) -> {[t['graph_name'] for t in tools]}")
 
+    # As tools que o grafo casou vêm de TODOS os servidores escolhidos antes de
+    # qualquer tool não casada: o teto corta o fim e não pode descartar
+    # justamente `list_directory`/`load_board` por causa de um vizinho grande.
+    schema = priority_schema + schema
     log.debug(f"[_load_mcp_tools] tools MCP disponíveis nesta rodada: {list(dispatch.keys())}")
     return schema, dispatch, failed_servers, tip_name_map
 
@@ -5273,6 +5544,9 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     # muda, então chats em projetos diferentes rodam concorrentes.
     active_project = await _ensure_memory_scope(_resolve_turn_project(req, sid))
     _CURRENT_SCOPE.set(active_project)
+    context_mode = normalize_mode(req.context_mode, CONTEXT_MODE_DEFAULT)
+    _metric_inc("context_mode_turns_total")
+    _metric_inc("context_mode_turns_total", key=context_mode)
 
     # ── Session store durável (dual-write) ──────────────────────────────────
     # Cria a sessão antes de qualquer mensagem. A leitura ainda é do ST antigo;
@@ -5284,7 +5558,9 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     # (2 round-trips HTTP para a memory_api) fica escondido atrás do handshake
     # MCP. Antes deste bloco o loop montava o histórico do zero e nunca lia
     # memória (só escrevia pós-turno) — a memória gravada nunca voltava.
-    recall_task = asyncio.ensure_future(_recall_for_turn(req.input, sid, scope=active_project)) if req.input else None
+    recall_task = asyncio.ensure_future(
+        _recall_for_turn(req.input, sid, scope=active_project, mode=context_mode)
+    ) if req.input else None
     # ── Recall de planos salvos (em paralelo) — orienta o modelo a preferir
     # run_plan quando existe plano compatível com o pedido (ver _recall_plans).
     plans_task = asyncio.ensure_future(_recall_plans(req.input, scope=active_project)) if req.input else None
@@ -5292,10 +5568,10 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     # ── Descoberta de tools em duas etapas ──
     # Etapa 1: escolhe as skills (servidores MCP) relevantes pra este pedido,
     # usando só os resumos leves — sem conectar em nada ainda.
-    chosen_skills, select_status = await _select_skills(req.input)
+    chosen_skills, chosen_tools, select_status = await _select_skills(req.input)
 
     # Etapa 2: conecta só nessas skills e carrega as tools reais delas.
-    mcp_schema, mcp_dispatch, failed_mcp_servers, mcp_tip_name_map = await _load_mcp_tools(chosen_skills)
+    mcp_schema, mcp_dispatch, failed_mcp_servers, mcp_tip_name_map = await _load_mcp_tools(chosen_skills, chosen_tools)
     # Tool Tips (best-effort): notas de execução gravadas pelo próprio modelo
     # em turnos passados — MCP + nativas carregadas NESTA rodada. As nativas
     # são registradas no ToolsDB (idempotente) para o tool_tip_add aceitá-las.
@@ -5468,14 +5744,31 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
         system_prompt += "\n\n" + memory_warning
         log.warning(f"[{eid[:8]}] aviso de falha de memória do turno anterior injetado")
 
+    # ── Task state explícito ────────────────────────────────────────────────
+    # O objeto "tarefa atual" é estado de trabalho, não memória: entra no
+    # system prompt em ambos os modos de contexto e é atualizado pelo extrator.
+    try:
+        _store = _session_store()
+        _task = get_task_state(_store, sid) if (_store is not None and TASK_STATE_ENABLED) else None
+        _task_text = format_task_state(_task)
+        if _task_text:
+            system_prompt += (
+                "\n\n## Current task (explicit working state)\n"
+                "This is the task the user is working on right now. Use it to "
+                "stay oriented; update it when the goal changes.\n"
+                + _task_text
+            )
+    except Exception as e:
+        log.debug(f"[{eid[:8]}] task state indisponível ({type(e).__name__}: {e})")
+
     # ── Compactação antes do primeiro request ───────────────────────────────
-    # Estima system + tools + histórico durável. Se passar do limiar, resume o
-    # passado e mantém a cauda recente verbatim. Depois recarrega o histórico
-    # e anexa o resumo ao system prompt.
-    if _session_store() is not None:
+    # No modo execução o histórico é completo e a compactação é o mecanismo
+    # normal de controle. No modo conversacional a janela ST já é pequena:
+    # a compactação fica só como fallback de overflow (dentro do loop).
+    if _session_store() is not None and context_mode == "execution":
         if await _maybe_compact(sid, system_prompt, tools_schema, eid=eid, extra_text=req.input,
                                 model=(req.model or "").strip() or None):
-            st_turns = _session_history(sid) or []
+            st_turns = _session_history(sid, mode=context_mode) or []
         system_prompt = _with_compaction_summary(system_prompt, sid)
 
     # Hora exata vive aqui (mensagem user), não no system prompt — o prefixo
@@ -5706,7 +5999,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
             ):
                 raise
             system_prompt = _with_compaction_summary(system_prompt, sid)
-            recovered = _session_history(sid, keep_trailing_tools=True) or []
+            recovered = _session_history(sid, keep_trailing_tools=True, mode=context_mode) or []
             history = [{"role": "system", "content": system_prompt}, *recovered]
             if not recovered or recovered[-1].get("role") not in ("user", "tool"):
                 history.append({"role": "user", "content": user_content})
@@ -6100,7 +6393,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
         if finished:
             break
         if SESSION_RUNNER_ENABLED and _session_store() is not None:
-            reloaded = _session_history(sid, keep_trailing_tools=True) or []
+            reloaded = _session_history(sid, keep_trailing_tools=True, mode=context_mode) or []
             if reloaded:
                 history = [{"role": "system", "content": system_prompt}, *reloaded]
         turn += 1
@@ -6777,6 +7070,16 @@ async def metrics():
     cached = int(usage.get("cache_read") or 0)
     ratio = (cached / prompt) if prompt > 0 else 0.0
     lines.append(f"ava_cache_read_ratio {ratio:.6f}")
+    try:
+        mem_status = await _memory_request("GET", "/status")
+        mb = (mem_status or {}).get("memory_blocks") or {}
+        for key in (
+            "blocks_total", "guide_blocks_total", "manual_guides_total",
+            "stale_guides_total", "orphan_facts_total",
+        ):
+            lines.append(f"ava_memory_{key} {int(mb.get(key) or 0)}")
+    except Exception as e:
+        log.debug(f"/metrics: blocos de memória indisponíveis ({type(e).__name__}: {e})")
     return "\n".join(lines) + "\n"
 
 
@@ -6886,6 +7189,23 @@ async def session_messages(session_id: str, limit: int = 200):
         "session": store.get(session_id),
         "messages": messages[-limit:] if limit > 0 else [],
     }
+
+
+@app.get("/session/{session_id}/task-state")
+async def get_session_task_state(session_id: str):
+    store = _session_store()
+    if store is None:
+        return {"task_state": None}
+    return {"task_state": get_task_state(store, session_id)}
+
+
+@app.put("/session/{session_id}/task-state")
+async def put_session_task_state(session_id: str, req: TaskStateRequest):
+    store = _session_store()
+    if store is None:
+        return {"task_state": None}
+    data = {k: v for k, v in req.model_dump().items() if v is not None}
+    return {"task_state": set_task_state(store, session_id, data)}
 
 
 @app.get("/session/{session_id}/usage")

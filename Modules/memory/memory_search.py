@@ -34,6 +34,12 @@ from typing import Optional
 import numpy as np
 
 from memory_config import (
+    BLOCK_EXPAND_MAX_CHARS,
+    BLOCK_EXPAND_MAX_MEMBERS,
+    BLOCK_MIN_SCORE,
+    BLOCK_SEED_WEIGHT,
+    BLOCK_TOP_K,
+    MEMORY_BLOCKS_ENABLED,
     CONTEXT_MAX_CHARS,
     CONTEXT_TURNS_FETCH,
     DICT_GRAPH_MAX_RELATED,
@@ -64,7 +70,9 @@ from memory_config import (
     SEGMENT_MIN_WORDS,
     SEGMENT_TRIGGER_WORDS,
     _STOP_WORDS,
+    block_node_id,
     encode_ref,
+    is_block_node,
     log,
 )
 from memory_graph import (
@@ -75,7 +83,7 @@ from memory_graph import (
     _log_activation_sync,
     personalized_pagerank,
 )
-from memory_models import MemoryEntry, RelatedMemory, Turn
+from memory_models import MemoryBlock, MemoryEntry, RelatedMemory, Turn
 from memory_state import state
 
 
@@ -91,7 +99,8 @@ class LTView:
     name:   str   # "general" ou slug do projeto
     db:     object  # MemoryDB do escopo
     index:  object  # MemoryIndex do escopo
-    encode: bool
+    blk_index: object = None  # MemoryIndex de blocos do escopo
+    encode: bool = False
 
 
 def lt_views(scope: Optional[str] = None) -> list[LTView]:
@@ -104,11 +113,13 @@ def lt_views(scope: Optional[str] = None) -> list[LTView]:
     permite leituras concorrentes em projetos diferentes."""
     name = (scope or "").strip() or state.active_scope
     active = state.scopes.get(name) or state.scopes[GENERAL_SCOPE]
-    views = [LTView(name=active.name, db=active.lt_db, index=active.lt_index, encode=False)]
+    views = [LTView(name=active.name, db=active.lt_db, index=active.lt_index,
+                    blk_index=active.blk_index, encode=False)]
     if active.name != GENERAL_SCOPE:
         gen = state.scopes.get(GENERAL_SCOPE)
         if gen is not None:
-            views.append(LTView(name=GENERAL_SCOPE, db=gen.lt_db, index=gen.lt_index, encode=True))
+            views.append(LTView(name=GENERAL_SCOPE, db=gen.lt_db, index=gen.lt_index,
+                                blk_index=gen.blk_index, encode=True))
     return views
 
 
@@ -810,6 +821,77 @@ def _build_lt_entries(
     return entries
 
 
+def _build_block_entries(
+    rank: dict[int, float],
+    lt_db,
+    min_score: float = BLOCK_MIN_SCORE,
+    expand: bool = False,
+    max_members: int = BLOCK_EXPAND_MAX_MEMBERS,
+    max_chars: int = BLOCK_EXPAND_MAX_CHARS,
+    encode: bool = False,
+    scope: Optional[str] = None,
+) -> tuple[list[MemoryBlock], list[MemoryEntry]]:
+    """Converte nós de bloco (ids negativos) do PPR em MemoryBlock + membros
+    desdobrados. Blocos são ponteiros: o gist vai no bloco; os átomos só
+    entram quando `expand=True` (ou sob demanda via memory_search)."""
+    blocks: list[MemoryBlock] = []
+    members_out: list[MemoryEntry] = []
+    # O rank do PPR é massa de probabilidade (soma ~1), não similaridade
+    # semântica. Aplicar BLOCK_MIN_SCORE (0.78) direto no rank descartaria
+    # blocos legítimos. Normaliza pelo maior rank de bloco: o piso vira
+    # relativo ao bloco mais forte da leitura.
+    block_ranks = {int(n): float(s) for n, s in rank.items() if is_block_node(n) and s > 0}
+    max_block_rank = max(block_ranks.values(), default=0.0)
+    effective_min = max_block_rank * min_score if max_block_rank > 0 else min_score
+    for node_id, score in rank.items():
+        if not is_block_node(node_id) or score < effective_min:
+            continue
+        block_id = -int(node_id)
+        row = lt_db.block_get(block_id)
+        if row is None:
+            continue
+        lt_db.block_update_access(block_id)
+        from memory_blocks import _parse_cues, _row_to_model  # import local: evita ciclo
+        # Blocos de comportamento/projeto/pessoa são desdobrados mesmo sem
+        # expand explícito: o guia e os átomos são o que o modelo precisa.
+        expand_block = expand or (row["kind"] or "") in ("behavior", "project", "person")
+        block = _row_to_model(row, lt_db, scope=scope, include_members=expand_block)
+        block.score = round(float(score), 4)
+        block.match_type = "block_expanded" if expand_block else "block"
+        blocks.append(block)
+        if not expand_block:
+            continue
+        used = 0
+        budget = max_chars
+        for mem in block.members:
+            if used >= max_members or budget <= 0:
+                break
+            mem_row = lt_db.get_by_id(mem.memory_id)
+            if mem_row is None:
+                continue
+            text = _truncate_text(mem_row["text"], min(budget, READ_LT_MAX_CHARS))
+            if not text:
+                continue
+            members_out.append(MemoryEntry(
+                id=encode_ref(scope, mem_row["id"]) if encode else mem_row["id"],
+                text=text,
+                score=round(float(score), 4),
+                confidence=round(mem_row["confidence"], 4),
+                created_at=mem_row["created_at"],
+                access_count=mem_row["access_count"],
+                memory_type="long_term",
+                source=mem_row["source"],
+                match_type="related",
+                scope=scope,
+                block_id=block_id,
+                block_name=block.name,
+                block_role=mem.role,
+            ))
+            used += 1
+            budget -= len(text)
+    return blocks, members_out
+
+
 def _build_st_entries(
     st_raw: list[tuple[int, float]],
     min_score: float,
@@ -983,6 +1065,7 @@ __all__ = [
     '_GERUND_BOUNDARY_RE',
     '_PURPOSE_BOUNDARY_RE',
     '_apply_token_budget',
+    '_build_block_entries',
     '_build_context_block',
     '_build_if_entries',
     '_build_lt_entries',
