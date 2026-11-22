@@ -34,9 +34,9 @@ mod chat;
 mod docker_logs;
 mod docker_cli;
 mod graph;
-mod idle_watcher;
 mod mcp_server;
 mod platform;
+mod preview;
 mod process_manager;
 mod providers;
 mod state;
@@ -199,11 +199,56 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Sobe o watcher de inatividade em background.
+    // Inicialização automática do Docker no boot do tray. Só age quando o
+    // estado descoberto é Stopped — se o stack já está de pé (reinício do
+    // tray) ou subindo, start_docker é idempotente e retorna na hora.
+    //
+    // Roda DEPOIS de a API/WebUI subir: a janela ava-web pode abrir durante
+    // o compose up e mostra o popup de inicialização consultando /status.
+    // O encerramento continua sendo APENAS manual (/docker/stop ou UI).
     {
         let state = shared_state.clone();
         rt.spawn(async move {
-            idle_watcher::run(state).await;
+            // Pequeno atraso para o listener :9001 estar aceitando conexões
+            // antes de o compose começar a consumir CPU/IO.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let should_start = {
+                let docker = state.docker.lock().await;
+                docker.status == state::ProcStatus::Stopped
+            };
+            if should_start {
+                tracing::info!("Auto-start: Docker parado no boot — iniciando o ambiente.");
+                if let Err(e) = process_manager::start_docker(&state).await {
+                    tracing::error!("Auto-start: falha ao iniciar o Docker: {e}");
+                }
+            } else {
+                tracing::info!("Auto-start: Docker já está ativo ou subindo — nada a fazer.");
+            }
+
+            // Pré-aquece o worker do grafo (opcional, default ligado):
+            // quando o usuário abre a aba Grafo o snapshot já está em cache.
+            // AVA_GRAPH_PREWARM=0 desliga.
+            let prewarm = std::env::var("AVA_GRAPH_PREWARM")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+                .unwrap_or(true);
+            if prewarm {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let running = {
+                        let docker = state.docker.lock().await;
+                        docker.status == state::ProcStatus::Running
+                    };
+                    if !running {
+                        tracing::debug!("Graph prewarm: Docker não está Running — ignorado.");
+                        return;
+                    }
+                    match state.graph.snapshot().await {
+                        Ok(_) => tracing::info!("Graph prewarm: snapshot pronto."),
+                        Err(e) => tracing::debug!("Graph prewarm falhou (será refeito ao abrir): {e}"),
+                    }
+                });
+            }
         });
     }
 

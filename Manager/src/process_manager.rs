@@ -157,8 +157,8 @@ pub async fn discover_running_processes(state: &SharedState) {
 // ════════════════════════════════════════════════════════════════════════
 
 pub async fn start_docker(state: &SharedState) -> Result<()> {
-    // Status "Running" (já estava de pé) → só toca o timer de inatividade
-    // e retorna. UM ÚNICO lock: a versão antiga re-lockava o Mutex com o
+    // Status "Running" (já estava de pé) → só atualiza o timestamp de
+    // atividade e retorna. UM ÚNICO lock: a versão antiga re-lockava o Mutex com o
     // guard da checagem ainda vivo → self-deadlock no tokio::sync::Mutex;
     // o handler do /docker/start travava pra sempre RETENDO o lock e o
     // tray inteiro congelava (/status, stop, tudo). "Running" stale é
@@ -167,13 +167,11 @@ pub async fn start_docker(state: &SharedState) -> Result<()> {
     // travar nunca.
     let mut docker = state.docker.lock().await;
     if docker.status == ProcStatus::Running {
-        // JÁ estava rodando: apenas resetamos o timer de inatividade.
-        // A TUI chama /docker/start a cada pergunta — é exatamente isso
-        // que "atividade" significa. Sem este touch, o idle_watcher
-        // matava o docker 45 min após o START mesmo em uso contínuo
-        // (touch_docker_activity existia mas nunca era chamado).
+        // JÁ estava rodando: apenas atualizamos o timestamp de atividade
+        // (exposto como idle_seconds no /status). O Docker não é mais
+        // encerrado por inatividade — só por /docker/stop ou pela UI.
         docker.last_activity = Some(Instant::now());
-        tracing::info!("Docker já estava em execução — timer de inatividade resetado.");
+        tracing::info!("Docker já estava em execução — timestamp de atividade atualizado.");
         return Ok(());
     }
     if docker.status == ProcStatus::Starting {
@@ -437,7 +435,7 @@ async fn voice_enabled(state: &SharedState) -> bool {
 /// manager (tools sem o backend) têm propósito: de pé, só viram ruído.
 ///
 /// Chamado sempre que o container SAI de Running:
-///   - stop_docker() (manual ou idle watcher dos 45 min);
+///   - stop_docker() (encerramento manual pela UI ou /docker/stop);
 ///   - health check detectando containers mortos / compose sem resposta.
 ///
 /// Só encerra quem está de fato ativo (Running/Starting/Crashed):

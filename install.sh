@@ -487,6 +487,15 @@ else
   warn "Boardview: SKILL.md ausente em $BOARDVIEW_DIR — skill não instalada."
 fi
 
+# Skill de frontend/HTML (Preview da WebUI): a fonte fica na raiz do projeto.
+if [ -f SKILL.md ]; then
+  mkdir -p .agents/skills/frontend-design
+  cp -f SKILL.md .agents/skills/frontend-design/SKILL.md
+  ok "Skill frontend-design instalada (.agents/skills/frontend-design/SKILL.md)."
+else
+  warn "SKILL.md não encontrado na raiz — skill de preview não instalada."
+fi
+
 # ── 4. Modelos ────────────────────────────────────────────────────────────────
 info "Extraindo Models.zip (~1,4 GB) para Modules/Models ..."
 unzip -oq Modules/Models.zip -d Modules/Models && \
@@ -601,8 +610,8 @@ fi
 # Escreve as flags de consumo no Modules/.env. Econômico (default): TTS
 # (~470MB) e voz do host (~600MB) desligados —
 # tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
-# AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
-# pergunta seguinte o reergue sozinho.
+# O Docker é auto-iniciado no boot do tray e só desliga quando o usuário
+# pede (/docker/stop ou UI).
 printf 'Perfil de recursos? [1]=Econômico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS, ~1.3GB) [1/2, default 1] '
 read -r ans || ans=""
 case "$ans" in
@@ -617,8 +626,8 @@ case "$ans" in
     ok "Perfil econômico: TTS e voz desligados (ligue as flags em Modules/.env quando quiser)."
     ;;
 esac
-set_env_var AVA_DOCKER_IDLE_MINUTES 15
-ok "Docker dorme após 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15)."
+# O Docker sobe automaticamente no boot do tray e só é encerrado quando o
+# usuário pede (UI ou /docker/stop).
 
 # ── 5b-2. Extensão do Playwright + token ─────────────────────────────────────
 # @playwright/mcp roda com --extension. No Linux, o instalador agora empacota

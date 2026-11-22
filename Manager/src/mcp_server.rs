@@ -2807,6 +2807,41 @@ pub async fn init(project_root: &std::path::Path) -> anyhow::Result<Arc<AppState
         // watchdog re-sincroniza os servidores assim que ela responder.
         let h = tokio::spawn(memory_watchdog(st.clone(), 10.0));
         st.rt().memory_watchdog_task = Some(h);
+    } else {
+        // Memory já está de pé. Se o ToolsDB foi recriado/limpo (reset de
+        // memória, reinstalação, migração), o mcp_manager não tem como saber
+        // que os servidores MCP sumiram do grafo sem re-sincronizar. Faz um
+        // sync único em background no boot; é idempotente (doc_hash no
+        // /sync) e não bloqueia a API/UI. AVA_MCP_STARTUP_SYNC=0 desliga.
+        let startup_sync = std::env::var("AVA_MCP_STARTUP_SYNC")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+        if startup_sync {
+            let sync_state = st.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !matches!(sync_state.mem_get_status(5.0).await, Ok(200)) {
+                    return;
+                }
+                let servers: Vec<String> = match sync_state.db_list_servers(true) {
+                    Ok(rows) => rows.into_iter().map(|r| r.name).collect(),
+                    Err(e) => {
+                        warn!("MCP startup sync: falha ao listar servidores: {e}");
+                        return;
+                    }
+                };
+                info!("MCP startup sync: re-sincronizando {}", py_list(&servers));
+                for name in &servers {
+                    match sync_server_inner(&sync_state, name).await {
+                        Ok(summary) => info!(
+                            "MCP startup sync: '{name}' ok — {} tool(s)",
+                            summary["synced"].as_i64().unwrap_or(0)
+                        ),
+                        Err(e) => warn!("MCP startup sync: '{name}' falhou: {e}"),
+                    }
+                }
+            });
+        }
     }
     let names: Vec<String> = st
         .db_list_servers(false)

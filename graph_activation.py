@@ -118,6 +118,7 @@ Rodar:
 
 import argparse
 import html
+import hashlib
 import json
 import os
 import queue
@@ -233,6 +234,51 @@ def _mcp_tool_node_public(graph_name: str, srow: sqlite3.Row | None,
         "enabled":     bool(srow["enabled"]) if srow is not None else True,
         "always_on":   bool(srow["always_on"]) if srow is not None else False,
         "scope":       None,   # registry MCP é GLOBAL (host, fora dos escopos)
+    }
+
+
+def _block_node_public(row: sqlite3.Row, scope: str | None = None) -> dict:
+    """Nó público de um bloco de memória (ponteiro para átomos).
+
+    IDs de bloco usam o sinal NEGATIVO (`-block_id`) — mesma convenção do
+    grafo Hebbiano em `memory_config.block_node_id`, sem colidir com ids
+    positivos de memória. As arestas `contains`/`part_of` já apontam para
+    esses ids; sem este nó o cliente recebia arestas órfãs.
+    """
+    block_id = int(row["id"])
+    name = (row["name"] or "").strip()
+    gist = (row["gist"] or "").strip()
+    extra = gist or name
+    try:
+        cues = json.loads(row["cues"] or "[]")
+        if not isinstance(cues, list):
+            cues = []
+    except Exception:
+        cues = []
+    guide = (row["guide"] or "").strip()
+    return {
+        "id":          f"{scope}:{-block_id}" if scope else -block_id,
+        "kind":        "block",
+        "block_id":    block_id,
+        "block_kind":  row["kind"] or "topic",
+        "label":       (name or gist)[:40] + ("…" if len(name or gist) > 40 else ""),
+        "title":       html.escape((gist or name)[:400]),
+        "name":        name,
+        "gist":        gist,
+        "cues":        [str(c) for c in cues[:12]],
+        "guide":       guide,
+        "guide_version": int(row["guide_version"] or 1),
+        "guide_source":  row["guide_source"] or "consolidation",
+        "level":       int(row["level"] or 1),
+        "parent_block_id": row["parent_block_id"],
+        "confidence":  float(row["confidence"] or 0.0),
+        "member_count": int(row["member_count"] or 0),
+        "source":      row["source"] or "consolidation",
+        "created_at":  row["created_at"],
+        "updated_at":  row["updated_at"],
+        "last_accessed": row["last_accessed"],
+        "access_count": int(row["access_count"] or 0),
+        "scope":       scope,
     }
 
 
@@ -497,6 +543,20 @@ class GraphState:
                             "access_count, forgettable FROM memories"
                         )
                     }
+                    # Blocos são ponteiros para átomos e usam ids negativos.
+                    # DBs antigos podem não ter a tabela — não derruba o escopo.
+                    try:
+                        bnodes = {
+                            f"{scope}:{-int(r['id'])}": _block_node_public(r, scope)
+                            for r in conn.execute(
+                                "SELECT id, name, kind, gist, cues, confidence, "
+                                "parent_block_id, level, member_count, source, "
+                                "created_at, updated_at, last_accessed, access_count, "
+                                "guide, guide_version, guide_source FROM memory_blocks"
+                            )
+                        }
+                    except sqlite3.Error:
+                        bnodes = {}
                     sedges = {
                         _edge_public(r, scope)["key"]: _edge_public(r, scope)
                         for r in conn.execute(
@@ -511,6 +571,7 @@ class GraphState:
                 continue
             mem_ids[scope] = {int(nid.split(":", 1)[1]) for nid in snodes}
             nodes.update(snodes)
+            nodes.update(bnodes)
             edges.update(sedges)
 
             # Planos do escopo (opcional — DB pode não existir ainda)
@@ -714,6 +775,14 @@ class GraphState:
                             "scope": pscope,
                         }
         edges.update(virtual)
+        # Nós filhos podem ter sido podados/deletados, e blocos podem existir
+        # em DBs antigos sem a tabela `memory_blocks`: nunca entregar aresta
+        # apontando para um nó que o cliente não recebeu (vis-network aceita,
+        # mas desperdiça física/render e gera avisos).
+        edges = {
+            key: edge for key, edge in edges.items()
+            if edge.get("from") in nodes and edge.get("to") in nodes
+        }
         return nodes, edges, failed_scopes
 
     def scope_log_paths(self) -> dict[str, str]:
@@ -784,6 +853,15 @@ class GraphState:
                     # cobrem o vínculo auto-curativo e a edição do card.
                     sig = (node["name"], node["text"], node.get("memory_id"),
                            node.get("roles"), node.get("updated_at"))
+                elif node["kind"] == "block":
+                    # Bloco muda por edição de gist/nome/membros/hierarquia/
+                    # guia — sem `text`/`forgettable` (não são memórias).
+                    sig = (node.get("name"), node.get("gist"),
+                           tuple(node.get("cues") or []),
+                           node.get("member_count"), node.get("level"),
+                           node.get("parent_block_id"), node.get("confidence"),
+                           node.get("guide"), node.get("guide_version"),
+                           node.get("guide_source"))
                 else:
                     sig = (node["text"], node["source"], node["confidence"], node["forgettable"])
                 old_sig = self.nodes_sig.get(nid)
@@ -833,6 +911,16 @@ class GraphState:
 
     def snapshot(self) -> dict:
         with self.lock:
+            node_sig = sorted(
+                f"{key}:{repr(value)}" for key, value in self.nodes_sig.items()
+            )
+            edge_sig = sorted(
+                f"{key}:{value.get('weight')}:{value.get('count')}"
+                for key, value in self.edges.items()
+            )
+            rev = hashlib.sha1(
+                ("|".join(node_sig) + "||" + "|".join(edge_sig)).encode("utf-8")
+            ).hexdigest()[:16]
             return {
                 "nodes": list(self.nodes.values()),
                 "edges": list(self.edges.values()),
@@ -840,6 +928,9 @@ class GraphState:
                 # cores/setores na ordem do servidor + escopo ativo (badge).
                 "scopes": [s for s, _, _ in self._discover_scopes()],
                 "active_scope": self.active_scope,
+                # Assinatura do conteúdo: o cliente usa para ignorar o snapshot
+                # duplicado que chega no 1º frame do SSE depois do /graph/snapshot.
+                "rev": rev,
                 "ts": time.time(),
             }
 

@@ -3,11 +3,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from ..tools.registry import ToolResult, ToolSnapshot, ToolSpec
 from .catalog import Catalog
 from .runtime import CodeModeRuntime
+
+# Callback opcional após CADA tool executada dentro do Code Mode. O orchestrator
+# usa isso para detectar resultados que precisam virar evento de UI (ex.:
+# html_preview) mesmo quando a chamada MCP acontece dentro de `execute`.
+ToolResultHook = Callable[[str, ToolResult], Awaitable[None]]
 
 DESCRIPTION = """Run JavaScript in a confined Code Mode runtime to compose MCP tool calls.
 MCP tools are listed in the Code Mode catalog in the system prompt; call them through the
@@ -35,6 +40,7 @@ def make_execute_spec(
     timeout_ms: int = 30_000,
     max_tool_calls: int = 50,
     max_output_chars: int = 200_000,
+    on_tool_result: Optional[ToolResultHook] = None,
 ) -> ToolSpec:
     async def execute(args: dict[str, Any], context: Any) -> ToolResult:
         code = str(args.get("code") or "")
@@ -53,7 +59,14 @@ def make_execute_spec(
                 )
             if resolved == "execute":
                 return ToolResult(content="ERROR: execute cannot call itself", is_error=True)
-            return await snapshot.execute(resolved, payload, context)
+            result = await snapshot.execute(resolved, payload, context)
+            if on_tool_result is not None:
+                try:
+                    await on_tool_result(resolved, result)
+                except Exception:
+                    # Observabilidade nunca pode derrubar a tool chamada pelo modelo.
+                    pass
+            return result
 
         result = await runtime.run(
             code,

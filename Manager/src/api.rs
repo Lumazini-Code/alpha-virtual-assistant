@@ -136,8 +136,8 @@ pub async fn serve(
                 None
             }
         };
-    // Guarda o handle da runtime no estado: /mcp/stop e o auto-stop do
-    // container precisam dele para derrubar as sessões MCP (shutdown_all).
+    // Guarda o handle da runtime no estado: /mcp/stop e o stop do container
+    // precisam dele para derrubar as sessões MCP (shutdown_all).
     if let Some(ref st) = mcp_state {
         let _ = state.mcp_server.set(st.clone());
     }
@@ -145,6 +145,9 @@ pub async fn serve(
         Some(st) => crate::mcp_server::app(st),
         None => axum::Router::new(),
     };
+
+    // Estado do preview de HTML (registro por sessão; arquivos lidos do disco).
+    let preview_state = crate::preview::new_state();
 
     let app = Router::new()
         // ── WebUI local (janela ava-web) ───────────────────────────────────
@@ -162,6 +165,23 @@ pub async fn serve(
         .route("/graph/replay", get(get_graph_replay))
         .route("/assets/vis-network.min.js", get(get_vis_network))
         .route("/docker/logs", get(get_docker_logs))
+        // Preview de HTML gerado pelo modelo. O Manager lê o arquivo do host
+        // (mesma validação de cwd dos MCPs) e serve HTML + assets irmãos.
+        .route("/preview/register", post(crate::preview::register))
+        .route(
+            "/preview/{session}",
+            get(crate::preview::list).delete(crate::preview::clear_session),
+        )
+        .route("/preview/{session}/{id}", get(crate::preview::get_document))
+        .route("/preview/{session}/{id}/", get(crate::preview::get_document))
+        .route(
+            "/preview-stat/{session}/{id}",
+            get(crate::preview::get_stat),
+        )
+        .route(
+            "/preview/{session}/{id}/{*asset}",
+            get(crate::preview::get_asset),
+        )
         .route("/orch", any(proxy_orchestrator))
         .route("/orch/{*path}", any(proxy_orchestrator))
         .route("/memory", any(proxy_memory))
@@ -198,7 +218,8 @@ pub async fn serve(
         .merge(mcp_router)
         // Sender da UI para o /ui/chat-open (não vai no AppState — o canal
         // nasce no main e é clonado aqui; Extension evita mudar o AppState).
-        .layer(axum::Extension(ui_tx));
+        .layer(axum::Extension(ui_tx))
+        .layer(axum::Extension(preview_state));
 
     let addr = format!("{}:{API_PORT}", bind_host());
     tracing::info!("API REST escutando em http://{addr}");
@@ -315,7 +336,7 @@ struct FsCwdUpdate {
 }
 
 /// Guard das rotas que expõem caminhos do host. Só aceita loopback.
-fn require_loopback(addr: SocketAddr) -> Result<(), Response> {
+pub(crate) fn require_loopback(addr: SocketAddr) -> Result<(), Response> {
     if addr.ip().is_loopback() {
         return Ok(());
     }
@@ -349,7 +370,7 @@ fn normalize_project(raw: Option<&str>) -> Result<String, Response> {
     Ok(project.to_string())
 }
 
-fn host_home_dir() -> PathBuf {
+pub(crate) fn host_home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)

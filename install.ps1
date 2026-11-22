@@ -734,6 +734,17 @@ if (Test-Path $BoardviewSkill) {
   Write-Warn2 "Boardview: SKILL.md ausente em $BoardviewDir - skill nao instalada."
 }
 
+# Skill de frontend/HTML (Preview da WebUI): a fonte fica na raiz do projeto.
+$FrontendSkill = Join-Path $InstallDir 'SKILL.md'
+if (Test-Path $FrontendSkill) {
+  $FrontendSkillDir = Join-Path $InstallDir '.agents\skills\frontend-design'
+  New-Item -ItemType Directory -Force -Path $FrontendSkillDir | Out-Null
+  Copy-Item -Force $FrontendSkill (Join-Path $FrontendSkillDir 'SKILL.md')
+  Write-Ok 'Skill frontend-design instalada (.agents\skills\frontend-design\SKILL.md).'
+} else {
+  Write-Warn2 'SKILL.md nao encontrado na raiz - skill de preview nao instalada.'
+}
+
 # -- 4. Modelos ----------------------------------------------------------------
 Write-Info 'Extraindo Models.zip (~1,4 GB) para Modules/Models...'
 Expand-Archive -Path $ModelsZip -DestinationPath (Join-Path $InstallDir 'Modules\Models') -Force
@@ -979,8 +990,8 @@ if (-not (Get-EnvVar 'CRAWL4AI_API_TOKEN')) {
 # Escreve as flags de consumo no Modules\.env. Economico (default): TTS
 # (~470MB) e voz do host (~600MB) desligados —
 # tudo sobe on-demand conforme o uso. Completo: tudo ligado desde o boot.
-# AVA_DOCKER_IDLE_MINUTES=15 vale para os dois: o stack dorme cedo e a
-# pergunta seguinte o reergue sozinho.
+# O Docker sobe automaticamente no boot do tray e so desliga quando o
+# usuario pede (UI ou /docker/stop).
 $ans = Read-Host 'Perfil de recursos? [1]=Economico (~500MB, recomendado p/ PC com outras apps) [2]=Completo (voz+TTS, ~1.3GB) [1/2, default 1]'
 if ($ans -match '^[2]') {
   Set-EnvVar 'AVA_TTS_ENABLED' '1'
@@ -991,8 +1002,8 @@ if ($ans -match '^[2]') {
   Set-EnvVar 'AVA_VOICE' '0'
   Write-Ok 'Perfil economico: TTS e voz desligados (ligue flags em Modules\.env quando quiser).'
 }
-Set-EnvVar 'AVA_DOCKER_IDLE_MINUTES' '15'
-Write-Ok 'Docker dorme apos 15 min de inatividade (AVA_DOCKER_IDLE_MINUTES=15).'
+# O Docker sobe automaticamente no boot do tray e so e encerrado quando o
+# usuario pede (UI ou /docker/stop).
 
 # -- 5b. Registro do Playwright MCP (dependencia direta do sistema) -----------
 # Cadastra o @playwright/mcp no mcp_manager (:9001) logo apos o `up` do stack.

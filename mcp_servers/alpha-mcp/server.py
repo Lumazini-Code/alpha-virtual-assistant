@@ -48,6 +48,10 @@ Tools MCP expostas:
     pergunta. Via orchestrator (POST /skills/create).
   - `skill_list()` → catálogo de TODAS as skills (CLI do projeto, globais e
     criadas pelo agente) com nome, descrição, origem e status de índice.
+  - `html_preview(path, title?, description?)` → publica na aba Preview da
+    WebUI um HTML já gravado em disco (path dentro do cwd da sessão). O
+    Manager valida e serve o arquivo + assets irmãos; o preview recarrega
+    quando o arquivo muda. Não copia o HTML para o histórico do LLM.
 
 Fluxo da busca web:
   1. Cache de busca no Valkey (hash da query, TTL de horas) → hit retorna direto
@@ -1248,6 +1252,36 @@ async def memory_identity_edit(
         return f"Erro ao editar card de identidade: {e}"
     log.info(f"[identity] card editado: campos={sorted(payload)}")
     return f"Card de identidade atualizado: {_format_identity(c)}"
+
+
+@mcp.tool()
+async def html_preview(path: str, title: str = "", description: str = "") -> str:
+    """Publica na aba Preview da WebUI um arquivo HTML já gravado em disco.
+    Use SEMPRE depois de escrever/atualizar um HTML com as tools de arquivo:
+    o preview lê o arquivo do disco e atualiza sozinho quando ele muda.
+
+    `path` é o caminho do HTML no cwd da sessão (relativo ou absoluto DENTRO
+    do cwd) — o Manager valida e serve o arquivo, sem copiar o conteúdo para
+    o histórico do LLM. `title` é o nome mostrado na lista da sessão (vazio
+    usa o nome do arquivo). Assets irmãos (CSS/JS/imagens) são servidos
+    automaticamente; use caminhos relativos a partir do HTML.
+
+    Retorne ao usuário que a página está na aba Preview. NÃO cole o HTML no
+    chat como resposta final."""
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return "Erro: `path` vazio."
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        clean_title = Path(raw_path).stem or "Preview"
+    payload = {
+        "kind": "ava_html_preview",
+        "path": raw_path,
+        "title": clean_title,
+        "description": str(description or "").strip(),
+    }
+    log.info(f"[html_preview] publicado para a WebUI: {raw_path!r} ({clean_title!r})")
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

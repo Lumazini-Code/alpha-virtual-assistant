@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Alpha AI</title>
 <link rel="icon" href="/favicon.ico" sizes="any">
-<script src="/assets/vis-network.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
@@ -148,6 +147,21 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 .row{display:flex;align-items:center;gap:10px;justify-content:space-between;margin:10px 0}.row small{display:block;color:var(--mu)}
 .btn{background:var(--ink);color:var(--bg);border-radius:10px;padding:7px 14px;font-weight:500;margin-top:8px}
 .note{font-size:13px;color:var(--mu);margin-top:8px;min-height:1.2em}
+/* ══ popup de inicialização do Docker (WebUI) ══ */
+#dockerboot{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+  background:rgba(15,14,12,.42);backdrop-filter:blur(2px)}
+#dockerboot[hidden]{display:none}
+#dockerboot .bootcard{display:flex;align-items:center;gap:14px;max-width:min(440px,92vw);
+  padding:16px 20px;border:1px solid var(--ln);border-radius:16px;background:var(--sf);
+  box-shadow:var(--sh);color:var(--ink)}
+#dockerboot .bootspin{width:26px;height:26px;flex:none;border-radius:50%;
+  border:3px solid var(--ln);border-top-color:var(--ac);animation:bootspin .8s linear infinite}
+#dockerboot.failed .bootspin{animation:none;border-color:var(--rd)}
+#dockerboot b{display:block;font-weight:600;font-size:14.5px}
+#dockerboot small{display:block;color:var(--mu);font-size:12.5px;margin-top:3px}
+#dockerboot .bootacts{display:flex;gap:8px;margin-left:auto}
+#dockerboot .btn{margin:0;white-space:nowrap}
+@keyframes bootspin{to{transform:rotate(360deg)}}
 /* ══ cadastro de provedores (primeira execução + Configurações) ══ */
 #setup{width:min(820px,96vw)}
 #setup .db{max-height:78vh}
@@ -175,8 +189,11 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 .sp-conf small{display:block;color:var(--mu);font-size:12px;word-break:break-all}
 #setup .dh .ib:only-child{}
 /* ══ seletor de modelo (barra sob a caixa + diálogo) ══ */
-.modelbar{max-width:760px;margin:6px auto 0;padding:0 4px;font:12.5px Geist,sans-serif}
-.modelbar button{display:flex;align-items:center;gap:6px;padding:3px 7px;border-radius:8px;color:var(--mu);max-width:100%;overflow:hidden}
+.modelbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;max-width:100%;margin:5px 0 -2px;padding:0 4px;font:12.5px Geist,sans-serif;min-width:0}
+.modelbar button{display:inline-flex;align-items:center;gap:6px;padding:3px 7px;border-radius:8px;color:var(--mu);max-width:100%;overflow:hidden;min-width:0}
+.modelbar #modebtn{flex:none}
+.modelbar #mbtn{flex:0 1 auto}
+.mb-sep{flex:none}
 .modelbar button:hover{background:var(--ln)}
 .mb-mode{color:var(--ac);font-weight:500}
 .mb-sep{color:var(--mu)}
@@ -201,6 +218,36 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 .mdl-manual input{flex:1;border:1px solid var(--ln);border-radius:10px;padding:7px 9px;background:var(--bg)}
 .mdl-manual .btn{margin-top:0}
 .mdl-empty{color:var(--mu);font-size:13px;padding:12px 8px}
+/* ══ Preview de HTML (aba full-screen) ══ */
+#preview-view{position:relative;flex:1;min-height:0;margin:0 16px 16px;display:none;
+  flex-direction:column;border:1px solid var(--ln);border-radius:14px;overflow:hidden;background:var(--bg)}
+body.preview #preview-view{display:flex}
+body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{display:none}
+#pv-bar{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--ln);
+  background:var(--sf);flex:none;min-height:46px}
+#pv-listwrap{position:relative;flex:none;z-index:12}
+#pv-listbtn{display:flex;align-items:center;gap:6px;padding:5px 9px;border:1px solid var(--ln);
+  border-radius:9px;background:var(--bg);color:var(--mu);font-size:12.5px;white-space:nowrap}
+#pv-listbtn:hover{color:var(--ink);border-color:var(--ac)}
+#pv-count{background:var(--sb);border-radius:99px;padding:1px 7px;font-size:11px;color:var(--ink)}
+#pv-list{position:absolute;top:calc(100% + 6px);left:0;width:min(380px,82vw);max-height:min(360px,60vh);
+  overflow:auto;background:var(--sf);border:1px solid var(--ln);border-radius:12px;box-shadow:var(--sh);padding:4px}
+#pv-list[hidden]{display:none}
+.pv-item{display:block;width:100%;text-align:left;padding:8px 10px;border-radius:8px;color:var(--ink)}
+.pv-item:hover,.pv-item.on{background:var(--sb)}
+.pv-item b{display:block;font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv-item small{display:block;color:var(--mu);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+#pv-meta{min-width:0;overflow:hidden}
+#pv-meta b{display:block;font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pv-meta small{display:block;color:var(--mu);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pv-body{position:relative;flex:1;min-height:0;background:#fff}
+#pv-frame{width:100%;height:100%;border:0;background:#fff;display:block}
+#pv-frame[hidden]{display:none}
+#pv-empty{position:absolute;inset:0;display:grid;place-content:center;text-align:center;gap:6px;
+  padding:24px;color:var(--mu);background:var(--bg)}
+#pv-empty[hidden]{display:none}
+#pv-empty b{color:var(--ink);font-size:15px}
+#pv-empty p{margin:0;font-size:13px;max-width:420px}
 @media(max-width:760px){aside{position:fixed;inset:0 auto 0 0;z-index:9;margin-left:-264px}body:not(.nosb) aside{margin-left:0;box-shadow:var(--sh)}body.nosb aside{margin-left:-264px}#hero h1{font-size:30px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 /* ══ grafo embutido (estilos escopados por #graph-view) ══ */
@@ -220,6 +267,29 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   #graph-help[hidden] { display:none; }
   #graph-help b { color:#fff; font-size:15px; }
   #graph-help p { margin:0; max-width:440px; color:#9aa0b4; font-size:12.5px; }
+  /* Overlay de carregamento + revelação em onda do canvas */
+  #graph-loading {
+    position:absolute; inset:0; z-index:35; display:grid; place-content:center;
+    gap:8px; text-align:center; padding:24px; background:rgba(11,13,19,.94);
+    color:#cdd3e0;
+  }
+  #graph-loading[hidden] { display:none; }
+  #graph-loading b { color:#fff; font-size:15px; }
+  #graph-loading small { color:#9aa0b4; font-size:12.5px; }
+  #graph-loading .gspin {
+    width:28px; height:28px; margin:0 auto 2px; border-radius:50%;
+    border:3px solid #33384a; border-top-color:#4dabf7;
+    animation:gspin .85s linear infinite;
+  }
+  @keyframes gspin { to { transform:rotate(360deg); } }
+  #network.revealing {
+    -webkit-mask-image: radial-gradient(circle at 50% 50%,
+      #000 0%, #000 var(--reveal, 0vmax),
+      transparent calc(var(--reveal, 0vmax) + 18vmax));
+    mask-image: radial-gradient(circle at 50% 50%,
+      #000 0%, #000 var(--reveal, 0vmax),
+      transparent calc(var(--reveal, 0vmax) + 18vmax));
+  }
 
   /* ── HUD (topo-esquerda): contadores + log de eventos ── */
   #hud {
@@ -231,6 +301,8 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   #hud b { color:#fff; }
   #counts { font-size:12px; color:#aab; margin-top:2px; }
   #counts .t { padding:0 4px; border-radius:4px; margin-left:2px; }
+  #memstats { font-size:11.5px; color:#8a90a5; margin-top:3px; }
+  #memstats b { color:#d0bfff; font-weight:600; }
   #log { max-height:150px; overflow-y:auto; font-size:11px; color:#9aa; margin-top:6px;
          border-top:1px solid #232738; padding-top:6px; }
   #log .q { color:#cdd3e0; }
@@ -283,6 +355,7 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     padding:12px 14px; font-size:12.5px; display:none;
   }
   #controls.open { display:block; }
+  #controls select{width:100%;border:1px solid #33384a;border-radius:8px;padding:5px 7px;background:#141724;color:#cdd3e0;margin:4px 0 8px}
   #controls h4 { margin:8px 0 4px; font-size:11px; text-transform:uppercase;
                  letter-spacing:.08em; color:#7a819a; }
   #controls label { display:flex; align-items:center; gap:6px; margin:3px 0; cursor:pointer; }
@@ -385,7 +458,7 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     <button class="ib" id="tsb" title="Barra lateral" aria-label="Alternar barra lateral">☰</button>
     <span class="badge" id="bdg"></span>
     <span class="sp"></span>
-    <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Grafo</button></div>
+    <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Grafo</button><button id="m2">Preview</button></div>
     <button class="ib" id="thm" title="Tema" aria-label="Alternar tema">◐</button>
   </header>
   <div id="sbar">
@@ -410,9 +483,15 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
       <b>Grafo indisponível</b>
       <p>O ambiente Docker não respondeu. O grafo usa o mesmo container do restante do AVA.</p>
     </div>
+    <div id="graph-loading">
+      <div class="gspin"></div>
+      <b>Carregando grafo…</b>
+      <small id="graph-loading-msg">iniciando worker</small>
+    </div>
 <div id="hud">
   <b>Grafo Hebbiano</b> — memórias LT + tools + planos em tempo real
   <div id="counts">carregando…</div>
+  <div id="memstats"></div>
   <div id="log"></div>
 </div>
 
@@ -430,6 +509,24 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
     <input type="text" id="replayN" value="40" style="width:60px">
     <button id="replayBtn">▶ replay ativações</button>
   </div>
+  <h4>Arestas</h4>
+  <div class="row"><label style="margin:0"><input type="checkbox" id="weakEdges" checked> ocultar fracas (&lt; 0.2)</label></div>
+  <div class="row"><label style="margin:0"><input type="checkbox" id="partOfEdges" checked> ocultar part_of (inverso)</label></div>
+  <h4>Rótulos</h4>
+  <div class="row"><label style="margin:0"><input type="checkbox" id="memLabels"> rótulos de memória/bloco</label></div>
+  <h4>Nós</h4>
+  <select id="kindFilter" aria-label="Filtrar tipo de nó">
+    <option value="">todos os tipos</option>
+    <option value="memory">memórias</option>
+    <option value="block">blocos</option>
+    <option value="tool">tools</option>
+    <option value="plan">planos</option>
+    <option value="person">pessoas</option>
+    <option value="identity">identidade</option>
+  </select>
+  <h4>Memória</h4>
+  <div class="row"><button id="epBtn">▶ episódios recentes</button></div>
+  <div class="row"><button id="taskBtn">▶ tarefa atual (sessão)</button></div>
   <div class="row"><button id="resetBtn">reset view</button></div>
 </div>
 
@@ -443,16 +540,45 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   <span><i class="gchip" style="background:#4dabf7"></i>temporal</span>
   <span><i class="gchip" style="background:#ff922b"></i>updates →</span>
   <span><i class="gchip" style="background:#ff6b6b"></i>contradicts (⌇)</span>
+  <span><i class="gchip" style="background:#845ef7"></i>contém / parte de (bloco)</span>
   <span><i class="gchip node" style="background:#ff6b6b"></i>semente</span>
   <span><i class="gchip node" style="background:#ffd166"></i>PPR</span>
   <span><i class="gchip node" style="background:#51cf66"></i>novo</span>
   <span><i class="gchip node" style="background:#38d9a9"></i>tool (⬡ MCP/nativa)</span>
   <span><i class="gchip node" style="background:#b197fc"></i>plano (⬥ {escopo}:p{id})</span>
+  <span><i class="gchip node" style="background:#9775fa"></i>bloco de memória (▣)</span>
   <span><i class="gchip node" style="background:#4dabf7"></i>borda do nó = escopo (geral/projeto)</span>
   <span style="opacity:.65">espessura = peso da aresta · tamanho = grau + ativação</span>
 </div>
 
 <div id="panel"><span class="close" id="panelClose">✕</span><div id="panelBody"></div></div>
+  </div>
+
+  <!-- ══ Preview de HTML (full-screen) ══ -->
+  <div id="preview-view">
+    <div id="pv-bar">
+      <div id="pv-listwrap">
+        <button id="pv-listbtn" aria-haspopup="true" aria-expanded="false">
+          ☰ HTMLs desta sessão <span id="pv-count">0</span>
+        </button>
+        <div id="pv-list" hidden></div>
+      </div>
+      <div id="pv-meta"><b id="pv-title">Preview</b><small id="pv-file"></small></div>
+      <span class="sp"></span>
+      <button class="ib" id="pv-refresh" title="Recarregar do disco" aria-label="Recarregar">⟳</button>
+      <button class="ib" id="pv-open" title="Abrir em nova janela" aria-label="Abrir em nova janela">↗</button>
+      <button class="ib" id="pv-close" title="Voltar ao chat" aria-label="Voltar ao chat">✕</button>
+    </div>
+    <div id="pv-body">
+      <div id="pv-empty">
+        <b>Nenhum HTML publicado nesta sessão</b>
+        <p>Quando o modelo gerar uma página e chamar <code>html_preview</code>, ela aparece aqui.</p>
+      </div>
+      <iframe id="pv-frame" hidden
+        sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
+        referrerpolicy="no-referrer"
+        title="Preview do HTML gerado"></iframe>
+    </div>
   </div>
 
   <div id="cm"><div class="box">
@@ -465,9 +591,9 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
       <span class="sp"></span>
       <button class="go" id="go" aria-label="Enviar" disabled>↑</button>
     </div>
+    <div class="modelbar"><button id="modebtn" title="Modo de contexto (Shift+Tab alterna)" aria-label="Modo de contexto"><span class="mb-mode" id="mb-mode">Conversacional</span></button><span class="mb-sep">·</span><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
     <input type="file" id="fi" hidden>
   </div>
-  <div class="modelbar"><button id="modebtn" title="Modo de contexto (Shift+Tab alterna)" aria-label="Modo de contexto"><span class="mb-mode" id="mb-mode">Conversacional</span></button><span class="mb-sep">·</span><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
   </div>
 </main>
 
@@ -580,6 +706,20 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
   </div>
 </dialog>
 
+<div id="dockerboot" hidden role="status" aria-live="polite">
+  <div class="bootcard">
+    <span class="bootspin" aria-hidden="true"></span>
+    <div>
+      <b id="boottitle">Iniciando o Docker…</b>
+      <small id="bootmsg">Preparando o ambiente. Na primeira vez isso pode levar alguns instantes.</small>
+    </div>
+    <div class="bootacts">
+      <button class="btn" id="bootclose" hidden>Fechar</button>
+      <button class="btn" id="bootretry" hidden>Tentar novamente</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $=s=>document.querySelector(s);
 /* ══ multi-chat: cada chat é uma sessão raiz com projeto, histórico, uso e
@@ -594,7 +734,7 @@ const newSid=()=>'ses_'+Date.now().toString(36)+Math.random().toString(36).slice
 function newChat(project){
   const c={id:'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
     sid:newSid(),title:'',project:project||S.act||'general',cwd:null,model:null,
-    mode:'conversational',
+    mode:'conversational',previews:[],preview:null,
     ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:true,streaming:false,err:false};
   S.chats.unshift(c);S.active=c.id;ensureChatModel(c);saveChats();return c;
 }
@@ -602,7 +742,8 @@ function saveChats(){
   try{
     localStorage.setItem(CHAT_KEY,JSON.stringify({
       active:S.active,
-      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null,mode:c.mode||'conversational'})),
+      chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null,mode:c.mode||'conversational',
+        previews:Array.isArray(c.previews)?c.previews.map(p=>({id:p.id,title:p.title||'',description:p.description||'',path:p.path,cwd:p.cwd||null,url:p.url||'',created_ms:p.created_ms||0,mtime_ms:p.mtime_ms||null,size:p.size||null,missing:!!p.missing})):[],preview:c.preview||null})),
     }));
   }catch{}
 }
@@ -610,7 +751,7 @@ function restoreChats(){
   let saved=null;try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'null')}catch{}
   if(!saved||!Array.isArray(saved.chats)||!saved.chats.length)return false;
   S.chats=saved.chats.map(c=>({id:c.id,sid:c.sid,title:c.title||'',project:c.project||'general',model:c.model||null,
-    mode:c.mode||'conversational',
+    mode:c.mode||'conversational',previews:Array.isArray(c.previews)?c.previews:[],preview:c.preview||null,
     cwd:null,ms:[],busy:false,ctl:null,usage:null,jobs:[],unread:false,hydrated:false,streaming:false,err:false}));
   S.active=saved.active&&S.chats.some(c=>c.id===saved.active)?saved.active:S.chats[0].id;
   return true;
@@ -660,6 +801,7 @@ function openChat(id){
   const c=S.chats.find(x=>x.id===id);if(!c)return;
   S.active=id;c.unread=false;saveChats();
   draw(true);ui();renderChats();
+  if(S.view==='preview'){renderPreview(true);startPreviewPolling();}
   void hydrate(c);void loadCwd(c);void loadJobs(c);void loadUsage(c);
 }
 /* Servido pelo Manager (:9001) => tudo same-origin: a API é location.origin
@@ -715,7 +857,8 @@ function frame(m,{event:e,raw},ch){
   else if(e==='tool_call'&&o){const p=plan(true),n=+o.step||0;let s=p.steps.find(x=>x.n===n);if(!s)p.steps.push(s={n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'});const t={kind:'tool',id:o.tool_call_id,n,ex:o.tool,act:o.arguments?JSON.stringify(o.arguments).slice(0,90):'',st:'running'};tl().push(t)}
   else if(e==='step_start'&&o){const p=plan(true);let s=p.steps.find(x=>x.n===+o.step);if(!s)p.steps.push(s={n:+o.step,ex:o.executor});s.act=o.action;s.st='running';const t=lastTool();if(t&&t.n===+o.step){t.act=o.action}}
   else if(e==='tool_result'&&o){const list=tl();const t=list.find(x=>x.kind==='tool'&&x.id&&o.tool_call_id&&x.id===o.tool_call_id)||lastTool();if(t){t.st=o.success?'done':'error';if(o.latency_ms!=null)t.ms=o.latency_ms;t.res=o.success?o.result:o.error;t.er=o.error||''}}
-  else if(e==='step_done'&&o){const p=m.plan;if(p){const s=p.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}const t=lastTool();if(t&&t.n===+o.step){t.st=o.success?'done':'error';t.ms=o.latency_ms;t.er=o.error||''}}
+  else if(e==='step_done'&&o){const p=m.plan;if(p){const s=p.steps.find(x=>x.n===+o.step);if(s){s.st=o.success?'done':'error';s.ms=o.latency_ms;s.er=o.error||''}}const t=lastTool();if(t&&t.n===+o.step){t.st=o.success?'done':'error';t.ms=o.latency_ms;t.er=o.error||''}const pv=previewFromResult(o.result);if(pv)void addPreview(pv,ch)}
+  else if(e==='preview'&&o){void addPreview(o,ch)}
   else if(e==='reasoning'){m.reason=(m.reason||'')+raw;const list=tl(),last=list.at(-1);if(last&&last.kind==='reason')last.text+=raw;else list.push({kind:'reason',text:raw})}
   else if(e==='delta')m.text+=raw;
   else if(e==='usage'&&o)m.usage=o;
@@ -846,7 +989,9 @@ function ui(){
   const busy=!!(c&&c.busy);
   $('#go').className='go'+(busy?' stop':'');$('#go').textContent=busy?'■':'↑';$('#go').setAttribute('aria-label',busy?'Parar':'Enviar');
   $('#go').disabled=!busy&&!$('#in').value.trim();
-  const graphView=S.view==='graph';document.body.classList.toggle('graph',graphView);$('#m0').classList.toggle('on',!graphView);$('#m1').classList.toggle('on',graphView);
+  const graphView=S.view==='graph';const previewView=S.view==='preview';
+  document.body.classList.toggle('graph',graphView);document.body.classList.toggle('preview',previewView);
+  $('#m0').classList.toggle('on',!graphView&&!previewView);$('#m1').classList.toggle('on',graphView);$('#m2').classList.toggle('on',previewView);
   const proj=(c&&c.project)||S.act;
   const b=$('#bdg');b.style.display=proj&&proj!=='general'?'inline-block':'none';b.textContent='◆ '+proj;
   $('#att').style.display=S.att?'block':'none';
@@ -870,6 +1015,7 @@ async function loadCwd(c){
     const d=await jf('api','/fs/cwd?project='+encodeURIComponent(project));
     if(c)c.cwd=d.cwd||null;
   }catch(e){if(c)c.cwd=null}
+  if(c)void revalidatePreviews(c);
   ui();
 }
 function pickCwd(){
@@ -896,7 +1042,140 @@ function setView(view){
   S.view=view;
   ui();
   if(view==='graph'&&typeof window.initGraphView==='function')window.initGraphView();
+  if(view==='preview'){renderPreview(true);startPreviewPolling();}
+  else stopPreviewPolling();
 }
+
+/* ---------- Preview de HTML (arquivos do usuário via Manager) ---------- */
+const pvInflight=new Set();
+let pvTimer=null;
+function activePreview(c){
+  c=c||chat();
+  if(!c||!Array.isArray(c.previews)||!c.previews.length)return null;
+  return c.previews.find(p=>p.id===c.preview)||c.previews[c.previews.length-1];
+}
+function previewFromResult(res){
+  if(!res)return null;
+  let d=res;
+  if(typeof d==='string'){d=pj(d)}
+  if(!d||typeof d!=='object'||d.kind!=='ava_html_preview'||!d.path)return null;
+  return d;
+}
+function pvSrc(p){return sameOrigin?p.url:cfg.api+p.url}
+const pvBase=p=>String(p||'').replace(/\\/g,'/').split('/').filter(Boolean).pop()||String(p||'');
+function showPreviewEmpty(title,text){
+  const box=$('#pv-empty');if(!box)return;
+  box.hidden=false;
+  const b=box.querySelector('b'),p=box.querySelector('p');
+  if(b)b.textContent=title;
+  if(p)p.textContent=text;
+}
+function renderPreviewList(){
+  const c=chat(),list=(c&&c.previews)||[],active=activePreview(c);
+  $('#pv-count').textContent=String(list.length);
+  $('#pv-list').innerHTML=list.length?list.map(p=>
+    `<button class="pv-item${active&&p.id===active.id?' on':''}" data-pv="${esc(p.id)}">
+      <b>${esc(p.title||'Preview')}</b><small>${esc(pvBase(p.path))}${p.missing?' · arquivo ausente':''}</small>
+    </button>`).join(''):'<div class="empty">Nenhum HTML nesta sessão.</div>';
+}
+function renderPreview(force){
+  const c=chat(),list=(c&&c.previews)||[],p=activePreview(c),frame=$('#pv-frame');
+  renderPreviewList();
+  if(!p){
+    frame.hidden=true;$('#pv-title').textContent='Preview';$('#pv-file').textContent='';
+    showPreviewEmpty('Nenhum HTML publicado nesta sessão','Quando o modelo gerar uma página e chamar html_preview, ela aparece aqui.');
+    return;
+  }
+  $('#pv-title').textContent=p.title||'Preview';
+  $('#pv-file').textContent=p.path||'';
+  if(p.missing){
+    frame.hidden=true;
+    showPreviewEmpty('Arquivo não encontrado',`O HTML registrado não existe mais em ${p.path||'disco'}.`);
+    return;
+  }
+  frame.hidden=false;$('#pv-empty').hidden=true;
+  if(force||frame.dataset.pid!==p.id){
+    frame.dataset.pid=p.id;
+    frame.src=pvSrc(p)+'?v='+(force?Date.now():(p.mtime_ms||Date.now()));
+  }
+}
+function stopPreviewPolling(){if(pvTimer){clearInterval(pvTimer);pvTimer=null}}
+function startPreviewPolling(){
+  stopPreviewPolling();
+  if(S.view!=='preview')return;
+  pvTimer=setInterval(()=>{if(!document.hidden)void refreshPreviewStat(false)},1500);
+  void refreshPreviewStat(false);
+}
+async function refreshPreviewStat(force){
+  if(S.view!=='preview'||document.hidden)return;
+  const c=chat(),p=activePreview(c);
+  if(!c||!p||!c.sid)return;
+  try{
+    const st=await jf('api','/preview-stat/'+encodeURIComponent(c.sid)+'/'+encodeURIComponent(p.id));
+    if(!st||st.exists===false){
+      if(!p.missing){p.missing=true;saveChats();renderPreview(false);}
+      return;
+    }
+    if(p.missing){p.missing=false;p.mtime_ms=st.mtime_ms;p.size=st.size;saveChats();renderPreview(true);return;}
+    if(force||st.mtime_ms!==p.mtime_ms||st.size!==p.size){
+      p.mtime_ms=st.mtime_ms;p.size=st.size;p.missing=false;saveChats();
+      $('#pv-frame').dataset.pid=p.id;
+      $('#pv-frame').src=pvSrc(p)+'?v='+(st.mtime_ms||Date.now());
+    }
+  }catch(e){/* registro antigo após restart do tray — revalida ao reabrir */}
+}
+async function addPreview(data,ch){
+  ch=ch||chat();
+  if(!ch||!ch.sid||!data||!data.path)return;
+  const key=ch.id+'|'+data.path;
+  if(pvInflight.has(key))return;
+  pvInflight.add(key);
+  try{
+    const r=await jf('api','/preview/register','POST',{
+      session_id:ch.sid,cwd:ch.cwd||null,path:data.path,
+      title:data.title||'',description:data.description||'',
+    });
+    const list=ch.previews||(ch.previews=[]);
+    const item={id:r.id,title:r.title||data.title||'Preview',description:r.description||'',
+      path:r.path||data.path,cwd:r.cwd||ch.cwd||null,url:r.url||'',created_ms:r.created_ms||Date.now(),
+      mtime_ms:r.mtime_ms??null,size:r.size??null,missing:false};
+    const i=list.findIndex(p=>p.id===item.id||p.path===item.path);
+    if(i>=0)list[i]=item;else list.push(item);
+    ch.preview=item.id;saveChats();
+    if(ch.id===S.active){setView('preview');}
+    else{ch.unread=true;renderChats();}
+  }catch(e){toast('Preview: '+e.message)}
+  finally{pvInflight.delete(key)}
+}
+async function revalidatePreviews(c){
+  if(!c||!c.sid||!Array.isArray(c.previews)||!c.previews.length)return;
+  const out=[];
+  for(const p of c.previews){
+    try{
+      const r=await jf('api','/preview/register','POST',{
+        session_id:c.sid,cwd:p.cwd||c.cwd||null,path:p.path,title:p.title||'',description:p.description||'',
+      });
+      out.push({...p,id:r.id,url:r.url||p.url,title:r.title||p.title,cwd:r.cwd||p.cwd||null,
+        mtime_ms:r.mtime_ms??p.mtime_ms,size:r.size??p.size,missing:false});
+    }catch(e){out.push({...p,missing:true})}
+  }
+  c.previews=out;
+  if(!c.previews.some(p=>p.id===c.preview))c.preview=c.previews[0]?.id||null;
+  saveChats();
+  if(c.id===S.active&&S.view==='preview')renderPreview(false);
+}
+$('#m2').onclick=()=>setView('preview');
+$('#pv-close').onclick=()=>setView('chat');
+$('#pv-refresh').onclick=()=>renderPreview(true);
+$('#pv-open').onclick=()=>{const p=activePreview(chat());if(p&&!p.missing)window.open(pvSrc(p),'_blank','noopener')};
+$('#pv-listbtn').onclick=()=>{const box=$('#pv-list');box.hidden=!box.hidden;$('#pv-listbtn').setAttribute('aria-expanded',String(!box.hidden))};
+$('#pv-list').onclick=e=>{
+  const b=e.target.closest('[data-pv]');if(!b)return;
+  const c=chat();if(!c)return;
+  c.preview=b.dataset.pv;saveChats();
+  $('#pv-list').hidden=true;$('#pv-listbtn').setAttribute('aria-expanded','false');
+  renderPreview(true);startPreviewPolling();
+};
 
 /* ---------- Envio ---------- */
 async function send(text){
@@ -960,14 +1239,15 @@ function attach(f){
 }
 function toast(t){const n=$('#sdt');const o=n.textContent;n.textContent=t;setTimeout(()=>n.textContent=o,4000)}
 /** Sobe o container no máximo uma vez por minuto — vários chats enviando ao
- * mesmo tempo não disparam N requests de start. */
+ * mesmo tempo não disparam N requests de start. Reusa o fluxo do popup de
+ * inicialização para o usuário ver o que está acontecendo. */
 let _lastDockerStart=0;
 function ensureDocker(){
   if(cfg.demo)return;
   const now=Date.now();
   if(now-_lastDockerStart<60000)return;
   _lastDockerStart=now;
-  fetch(cfg.api+'/docker/start',{method:'POST',headers:H()}).catch(()=>{});
+  void autoStartDocker();
 }
 
 /* ---------- Projetos (escopos de memória) ---------- */
@@ -996,11 +1276,81 @@ async function pdel(slug){
 async function pnew(name){try{await jf('orch','/projects','POST',{name})}catch(e){toast(e.message)}loadProj()}
 
 /* ---------- Status do process manager ---------- */
+/* ══ inicialização automática do Docker ══
+   O tray já sobe o ambiente no boot; a WebUI acompanha pelo /status e
+   mostra o popup enquanto o compose sobe (inclusive quando a janela abre
+   no meio da inicialização). O popup só é fechado quando o Docker está
+   Ativo — o encerramento do stack continua exclusivamente manual. */
+const dockerState=s=>{
+  const st=String(s&&s.docker?s.docker.status:'').toLowerCase();
+  if(/ativo|run|ok/.test(st))return 'running';
+  if(/inici|start/.test(st))return 'starting';
+  return 'stopped';
+};
+const DB={watching:false,failed:false};
+function showDockerBoot(title,msg,failed){
+  const el=$('#dockerboot');if(!el)return;
+  DB.failed=!!failed;
+  el.hidden=false;el.classList.toggle('failed',!!failed);
+  $('#boottitle').textContent=title||'Iniciando o Docker…';
+  $('#bootmsg').textContent=msg||'Preparando o ambiente. Na primeira vez isso pode levar alguns instantes.';
+  $('#bootretry').hidden=!failed;
+  $('#bootclose').hidden=!failed;
+}
+function hideDockerBoot(){const el=$('#dockerboot');if(el)el.hidden=true}
+function dockerBootFailed(msg){
+  DB.watching=false;DB.failed=true;
+  showDockerBoot('Não foi possível iniciar o Docker',msg||'Verifique o Docker e tente novamente.',true);
+}
+async function waitDockerReady(){
+  // O POST /docker/start já aguarda o `compose up -d`; este laço cobre o
+  // caso de a janela abrir no meio de uma inicialização disparada pelo tray.
+  for(let i=0;i<90;i++){
+    await new Promise(r=>setTimeout(r,2000));
+    let s=null;
+    try{s=await jf('api','/status')}catch{continue}
+    if(dockerState(s)==='running'){DB.watching=false;DB.failed=false;hideDockerBoot();return true}
+  }
+  dockerBootFailed('O ambiente não respondeu a tempo. Confira os logs do Docker.');
+  return false;
+}
+async function autoStartDocker(){
+  if(cfg.demo)return true;
+  DB.watching=true;DB.failed=false;
+  try{
+    const s=await jf('api','/status');
+    const st=dockerState(s);
+    if(st==='running'){DB.watching=false;hideDockerBoot();return true}
+    showDockerBoot('Iniciando o Docker…',
+      st==='starting'?'O ambiente já está subindo. Aguarde…'
+        :'Preparando o ambiente. Na primeira vez isso pode levar alguns instantes.');
+    if(st!=='starting'){
+      let r;
+      try{r=await fetch(cfg.api+'/docker/start',{method:'POST',headers:H()})}
+      catch(e){dockerBootFailed('Process manager offline — '+e.message);return false}
+      let j={};try{j=await r.json()}catch{}
+      if(!r.ok||j.ok===false){dockerBootFailed(j.message||('HTTP '+r.status));return false}
+    }
+    return await waitDockerReady();
+  }catch(e){
+    dockerBootFailed('Process manager offline — '+e.message);
+    return false;
+  }
+}
+$('#bootretry').onclick=()=>void autoStartDocker();
+$('#bootclose').onclick=()=>{DB.watching=false;DB.failed=false;hideDockerBoot()};
+
 async function poll(){
   const i=$('#sd'),t=$('#sdt');
   if(cfg.demo){i.className='wa';t.textContent='modo demonstração';return}
-  try{const s=await jf('api','/status'),st=String(s.docker?.status||'?'),l=st.toLowerCase();
-    i.className=/run|ativo|ok/.test(l)?'ok':/start|inici/.test(l)?'wa':/err/.test(l)?'er':'';t.textContent='docker '+st}
+  try{const s=await jf('api','/status'),st=String(s.docker?.status||'?'),l=st.toLowerCase(),ds=dockerState(s);
+    i.className=/run|ativo|ok/.test(l)?'ok':/start|inici/.test(l)?'wa':/err/.test(l)?'er':'';t.textContent='docker '+st;
+    if(ds==='running'){
+      if(DB.watching||DB.failed||!$('#dockerboot').hidden){DB.watching=false;DB.failed=false;hideDockerBoot()}
+    }else if(ds==='starting'&&DB.watching&&!DB.failed&&$('#dockerboot').hidden){
+      showDockerBoot('Iniciando o Docker…','O ambiente já está subindo. Aguarde…');
+    }
+  }
   catch{i.className='er';t.textContent='process manager offline'}
   const c=chat();
   if(c){void loadJobs(c);void loadUsage(c);void refreshStreamingChats()}
@@ -1757,6 +2107,7 @@ else{
   if(c){void hydrate(c);void loadCwd(c)}
 }
 theme();ui();draw(true);renderChats();loadProj();poll();
+void autoStartDocker();
 (async()=>{
   try{await loadProviderCatalog()}catch{}
   const c=await loadProviderInfo();
@@ -1771,8 +2122,35 @@ if(innerWidth<=760)document.body.classList.add('nosb');
 </script>
 <script>
 /* ══ grafo embutido: renderização local, dados via /graph/* ══ */
+let visPromise=null;
+function ensureVis(){
+  if(window.vis)return Promise.resolve();
+  if(visPromise)return visPromise;
+  visPromise=new Promise((resolve,reject)=>{
+    const s=document.createElement('script');
+    s.src='/assets/vis-network.min.js';
+    s.async=true;
+    s.onload=()=>resolve();
+    s.onerror=()=>reject(new Error('falha ao carregar vis-network'));
+    document.head.appendChild(s);
+  });
+  return visPromise;
+}
 function initGraphView(){
-  if(window.__graphInited)return;
+  if(window.__graphInited||window.__graphLoading)return;
+  if(!window.vis){
+    window.__graphLoading=true;
+    const _m=document.getElementById('graph-loading-msg');
+    if(_m)_m.textContent='carregando biblioteca do grafo…';
+    ensureVis().then(()=>{window.__graphLoading=false;initGraphView();}).catch(err=>{
+      window.__graphLoading=false;
+      const el=document.getElementById('graph-loading');
+      const msg=document.getElementById('graph-loading-msg');
+      if(el)el.hidden=false;
+      if(msg)msg.textContent=String(err.message||err);
+    });
+    return;
+  }
   window.__graphInited=true;
   (function(){
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1783,6 +2161,8 @@ const TYPE_STYLE = {
   temporal_precedence: { color: '#4dabf7', directed: true,  dashes: false, name: 'temporal' },
   updates:             { color: '#ff922b', directed: true,  dashes: false, name: 'updates' },
   contradicts:         { color: '#ff6b6b', directed: false, dashes: [6, 4], name: 'contradicts' },
+  contains:            { color: '#9775fa', directed: true,  dashes: false, name: 'contém' },
+  part_of:             { color: '#845ef7', directed: true,  dashes: [3, 3], name: 'parte de' },
   // ── NEW (people cards / correlações entre grafos): arestas virtuais
   // derivadas dos metadados — tracejadas pra diferenciar das arestas
   // "reais" do banco Hebbiano/ToolsDB.
@@ -1800,6 +2180,9 @@ const PLAN_NODE_BG = '#2a2340', PLAN_NODE_BORDER = '#b197fc', PLAN_FONT_COLOR = 
 // People cards: triângulos rosados, id "u{id}" — a aresta "identidade" liga
 // o card à memória LT que representa a pessoa no grafo Hebbiano
 const PERSON_NODE_BG = '#40232a', PERSON_NODE_BORDER = '#f783ac', PERSON_FONT_COLOR = '#ffdeeb';
+// Blocos de memória: ponteiros para grupos de átomos (ids negativos). Caixa
+// roxa, borda na cor do escopo e contorno tracejado quando o guia é manual.
+const BLOCK_NODE_BG = '#2b2340', BLOCK_NODE_BORDER = '#9775fa', BLOCK_FONT_COLOR = '#d0bfff';
 // Identidade da Alpha: estrela dourada, id "a{id}" (singleton) — o ÚNICO nó
 // que representa a própria assistente; a aresta "identidade Alpha" liga o
 // card à memória LT que a representa no grafo Hebbiano
@@ -1863,6 +2246,10 @@ const bornEdges = new Map();   // key -> ts (pulso verde da aresta nova)
 const enabledTypes = new Set(Object.keys(TYPE_STYLE));
 let decayFactor = 0.93;
 let autoFollow = true;
+let showMemoryLabels = false;   // labels de memória/bloco só sob demanda
+let hideWeakEdges = true;       // co_activation/temporal abaixo de 0.2
+let hidePartOf = true;          // part_of duplica contains — oculto por padrão
+let kindFilter = '';            // '' = todos os kinds
 
 const adjByNode = new Map();   // id -> Set(edgeKey) — índice p/ acender arestas barato
 function reindexAdjacency() {
@@ -1892,7 +2279,7 @@ const network = new vis.Network(
       stabilization: { iterations: 200, fit: true },
     },
     interaction: { hover: true, tooltipDelay: 120 },
-    edges: { smooth: { enabled: true, type: 'continuous', roundness: 0.35 } },
+    edges: { smooth: false },
   }
 );
 
@@ -1902,25 +2289,55 @@ function baseNodeOptions(meta) {
   const isPlan = meta.kind === 'plan';
   const isPerson = meta.kind === 'person';
   const isIdentity = meta.kind === 'identity';
-  return {
-    id: meta.id, label: meta.label, title: nodeTitle(meta),
+  const isBlock = meta.kind === 'block';
+  const conf = Math.max(0, Math.min(1, Number(meta.confidence ?? 1)));
+  const label = (isTool || isPlan || isPerson || isIdentity || showMemoryLabels)
+    ? meta.label : undefined;
+  const sizeBase = isTool ? 9 : isPlan ? 8 : isPerson ? 10 : isIdentity ? 12
+                  : isBlock ? 10 : 5;
+  const sizeGrow = isBlock
+    ? Math.min(Number(meta.member_count || 0), 40) * 0.55
+    : Math.min(deg, 12) * 1.3;
+  const opts = {
+    id: meta.id, label, title: nodeTitle(meta),
+    hidden: !nodeVisible(meta),
     shape: isTool ? 'hexagon' : isPlan ? 'diamond' : isPerson ? 'triangle'
-                 : isIdentity ? 'star' : 'dot',
-    size: (isTool ? 9 : isPlan ? 8 : isPerson ? 10 : isIdentity ? 12 : 5) + Math.min(deg, 12) * 1.3,
+                 : isIdentity ? 'star' : isBlock ? 'box' : 'dot',
+    size: sizeBase + sizeGrow,
+    opacity: (meta.kind === 'memory' || isBlock) ? 0.45 + 0.55 * conf : 1,
     // NEW (multi-escopo): borda na COR DO ESCOPO (memórias e planos);
-    // tools/pessoas/identidade globais mantêm as cores próprias dos kinds.
+    // tools/pessoas/identidade/blocos mantêm as cores próprias dos kinds.
     color: isTool ? { background: TOOL_NODE_BG, border: TOOL_NODE_BORDER }
                   : isPlan ? { background: PLAN_NODE_BG, border: scopeColor(meta.scope) }
                   : isPerson ? { background: PERSON_NODE_BG, border: PERSON_NODE_BORDER }
                   : isIdentity ? { background: IDENTITY_NODE_BG, border: IDENTITY_NODE_BORDER }
+                  : isBlock ? { background: BLOCK_NODE_BG, border: scopeColor(meta.scope) }
                              : { background: BASE_NODE_BG, border: scopeColor(meta.scope) },
     borderWidth: (isTool || isPerson) ? 1 : 2,   // escopo precisa ficar legível
     font: { color: isTool ? TOOL_FONT_COLOR : isPlan ? PLAN_FONT_COLOR : isPerson ? PERSON_FONT_COLOR
-                  : isIdentity ? IDENTITY_FONT_COLOR : FONT_COLOR, size: 11 },
+                  : isIdentity ? IDENTITY_FONT_COLOR : isBlock ? BLOCK_FONT_COLOR : FONT_COLOR, size: 11 },
   };
+  // A chave precisa ser AUSENTE quando não há tracejado: o vis-network lê
+  // this.options.shapeProperties.borderDashes e quebra se receber undefined.
+  if (meta.forgettable) opts.shapeProperties = { borderDashes: [4, 3] };
+  return opts;
 }
 
 function nodeTitle(meta) {
+  if (meta.kind === 'block') {
+    const guide = (meta.guide || '').trim();
+    const cues = (meta.cues || []).slice(0, 5).map(escapeHtml).join(' · ');
+    return `<b>${escapeHtml(meta.name || meta.label)}</b> ` +
+           `<span style="color:${BLOCK_FONT_COLOR}">bloco ${escapeHtml(meta.block_kind || 'topic')}</span>` +
+           ` <span style="color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span><br>` +
+           `<i>${escapeHtml(meta.gist || '(sem gist)')}</i>` +
+           (cues ? `<br><small>${cues}</small>` : '') +
+           `<br>membros: ${meta.member_count ?? 0} · nível: ${meta.level ?? 1}` +
+           ` · confiança: ${Math.round((meta.confidence || 0) * 100)}%` +
+           (meta.parent_block_id != null ? ` · pai: #${meta.parent_block_id}` : '') +
+           (guide ? `<br><span style="color:${BLOCK_FONT_COLOR}">📘 guia v${meta.guide_version ?? 1}` +
+                    ` (${escapeHtml(meta.guide_source || '?')})</span>` : '');
+  }
   if (meta.kind === 'plan') {
     const fmt = (t) => {
       const d = new Date((t || 0) * 1000);
@@ -2027,24 +2444,46 @@ document.getElementById('scopeChips').onclick = (e) => {
 function applyScopeVisibility() {
   const nops = [];
   for (const [id, meta] of nodeMeta) {
-    nops.push({ id, hidden: hiddenScopes.has(meta.scope || '') });
+    nops.push({ id, hidden: !nodeVisible(meta) });
   }
-  nodes.update(nops);
-  const eops = [];
+  if (nops.length) nodes.update(nops);
+  const addOps = [], updateOps = [], removeIds = [];
   for (const [key, meta] of edgeMeta) {
     const vid = edgeKeyToId.get(key);
-    if (vid === undefined) continue;
-    eops.push({ id: vid, hidden: hiddenScopes.has(meta.scope || '') });
+    if (!edgeVisible(meta)) {
+      if (vid !== undefined && edges.get(vid)) removeIds.push(vid);
+      continue;
+    }
+    edgeKeyToId.set(key, vid ?? ++edgeSeq);
+    const opt = edgeOptions(meta, false);
+    (edges.get(opt.id) ? updateOps : addOps).push(opt);
   }
-  edges.update(eops);
+  if (removeIds.length) edges.remove(removeIds);
+  if (addOps.length) edges.add(addOps);
+  if (updateOps.length) edges.update(updateOps);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Aplicação de snapshot / delta
 // ═══════════════════════════════════════════════════════════════════════════
+function nodeVisible(meta) {
+  return !hiddenScopes.has(meta.scope || '') && (!kindFilter || meta.kind === kindFilter);
+}
+function edgeVisible(meta) {
+  if (!enabledTypes.has(meta.type)) return false;
+  if (hiddenScopes.has(meta.scope || '')) return false;
+  if (hidePartOf && meta.type === 'part_of') return false;
+  if (hideWeakEdges && (meta.type === 'co_activation' || meta.type === 'temporal_precedence')
+      && Number(meta.weight || 0) < 0.2) return false;
+  const a = nodeMeta.get(meta.from), b = nodeMeta.get(meta.to);
+  if ((a && !nodeVisible(a)) || (b && !nodeVisible(b))) return false;
+  return true;
+}
+
 function applyNodes(list, birth) {
   const now = Date.now();
   const updates = [];
+  const additions = [];
   for (const meta of list) {
     nodeMeta.set(meta.id, meta);
     if (birth) bornTs.set(meta.id, now);
@@ -2054,31 +2493,36 @@ function applyNodes(list, birth) {
       const pos = scopePos(meta);   // NEW (multi-escopo): nasce no setor do escopo
       opt.x = pos.x; opt.y = pos.y;
       if (birth) opt.color = { background: BASE_NODE_BG, border: '#51cf66' };
-      nodes.add(opt);
+      additions.push(opt);
     }
   }
+  // add/update em LOTE: um evento por item fazia o vis reprocessar a rede
+  // centenas de vezes durante o snapshot inicial.
+  if (additions.length) nodes.add(additions);
   if (updates.length) nodes.update(updates);
   updateCounts();
 }
 
 function applyEdges(list, birth, forceBase) {
   const now = Date.now();
-  const ops = [];
+  const addOps = [];
+  const updateOps = [];
   for (const meta of list) {
     edgeMeta.set(meta.key, meta);
     if (!edgeKeyToId.has(meta.key)) {
       edgeKeyToId.set(meta.key, ++edgeSeq);
     }
     if (birth) bornEdges.set(meta.key, now);
-    if (edges.get(edgeKeyToId.get(meta.key))) ops.push(edgeOptions(meta, birth && !forceBase));
-    else ops.push(edgeOptions(meta, birth));
-  }
-  if (ops.length) {
-    // add() e update() por id — vis aceita misturado via update? add para novos:
-    for (const op of ops) {
-      if (edges.get(op.id)) edges.update(op); else edges.add(op);
+    if (!edgeVisible(meta)) {
+      const id = edgeKeyToId.get(meta.key);
+      if (id !== undefined && edges.get(id)) edges.remove(id);
+      continue;
     }
+    const op = edgeOptions(meta, birth && !forceBase);
+    if (edges.get(op.id)) updateOps.push(op); else addOps.push(op);
   }
+  if (addOps.length) edges.add(addOps);
+  if (updateOps.length) edges.update(updateOps);
   reindexAdjacency();
   updateCounts();
 }
@@ -2158,9 +2602,11 @@ function nodeColor(act, seedRecent, born, meta) {
   const isTool = meta && meta.kind === 'tool';
   const isPlan = meta && meta.kind === 'plan';
   const isIdentity = meta && meta.kind === 'identity';
+  const isBlock = meta && meta.kind === 'block';
   if (born) return isTool ? { background: TOOL_NODE_BG, border: '#51cf66' }
                           : isPlan ? { background: PLAN_NODE_BG, border: '#51cf66' }
                           : isIdentity ? { background: IDENTITY_NODE_BG, border: '#51cf66' }
+                          : isBlock ? { background: BLOCK_NODE_BG, border: '#51cf66' }
                                        : { background: BASE_NODE_BG, border: '#51cf66' };
   if (seedRecent) {
     return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 107, act))}, ${Math.round(lerp(74, 107, act))})`,
@@ -2180,6 +2626,11 @@ function nodeColor(act, seedRecent, born, meta) {
     // ativação da identidade: dourado escuro → dourado aceso (a estrela da Alpha)
     return { background: `rgb(${Math.round(lerp(58, 255, act))}, ${Math.round(lerp(48, 212, act))}, ${Math.round(lerp(19, 59, act))})`,
              border: act > 0.05 ? '#ffd43b' : IDENTITY_NODE_BORDER };
+  }
+  if (isBlock) {
+    // ativação de bloco: roxo escuro → lilás claro
+    return { background: `rgb(${Math.round(lerp(43, 208, act))}, ${Math.round(lerp(35, 165, act))}, ${Math.round(lerp(64, 255, act))})`,
+             border: act > 0.05 ? '#e5dbff' : BLOCK_NODE_BORDER };
   }
   return { background: `rgb(${Math.round(lerp(51, 255, act))}, ${Math.round(lerp(56, 209, act))}, ${Math.round(lerp(74, 102, act))})`,
            border: act > 0.05 ? '#ffd166' : BASE_NODE_BORDER };
@@ -2254,15 +2705,16 @@ function updateCounts() {
   const parts = Object.keys(TYPE_STYLE).map(t =>
     `<span class="t" style="background:${TYPE_STYLE[t].color}22;color:${TYPE_STYLE[t].color}">${TYPE_STYLE[t].name}: ${byType[t] || 0}</span>`
   ).join(' ');
-  let tools = 0, plans = 0, people = 0, identity = 0;
+  let tools = 0, plans = 0, people = 0, identity = 0, blocks = 0;
   for (const m of nodeMeta.values()) {
     if (m.kind === 'tool') tools++;
     else if (m.kind === 'plan') plans++;
     else if (m.kind === 'person') people++;
     else if (m.kind === 'identity') identity++;
+    else if (m.kind === 'block') blocks++;
   }
   document.getElementById('counts').innerHTML =
-    `memórias: ${nodeMeta.size - tools - plans - people - identity} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · <span style="color:${IDENTITY_FONT_COLOR}">identidade: ${identity}</span> · ${parts}`;
+    `memórias: ${nodeMeta.size - tools - plans - people - identity - blocks} · <span style="color:${TOOL_FONT_COLOR}">tools: ${tools}</span> · <span style="color:${PLAN_FONT_COLOR}">planos: ${plans}</span> · <span style="color:${PERSON_FONT_COLOR}">pessoas: ${people}</span> · <span style="color:${IDENTITY_FONT_COLOR}">identidade: ${identity}</span> · <span style="color:${BLOCK_FONT_COLOR}">blocos: ${blocks}</span> · ${parts}`;
   renderScopeBar();   // NEW (multi-escopo): chips com contagem por escopo
 }
 
@@ -2296,9 +2748,26 @@ function showPanel(id) {
   const isPlan = meta.kind === 'plan';
   const isPerson = meta.kind === 'person';
   const isIdentity = meta.kind === 'identity';
+  const isBlock = meta.kind === 'block';
   const d = new Date((meta.created_at || 0) * 1000);
   let head = '', body = '';
-  if (isIdentity) {
+  if (isBlock) {
+    const fmt = isNaN(d) ? '?' : d.toLocaleString('pt-BR');
+    const conf = Math.round((meta.confidence || 0) * 100);
+    const cues = (meta.cues || []).map(c => `<span class="pill" style="background:#9775fa22;color:#d0bfff">${escapeHtml(String(c))}</span>`).join(' ');
+    const guide = (meta.guide || '').trim();
+    head = `<h3 style="color:${BLOCK_FONT_COLOR}">${escapeHtml(meta.name || meta.label)}</h3>
+      <div class="meta">bloco de memória (▣ ${escapeHtml(String(meta.id))}) · tipo: <b>${escapeHtml(meta.block_kind || 'topic')}</b> · grau: ${degreeOf(id)}</div>
+      <div class="meta">escopo: <span class="pill" style="background:${scopeColor(meta.scope)}22;color:${scopeColor(meta.scope)}">⬤ ${escapeHtml(meta.scope || 'global')}</span>
+        · membros: <b>${meta.member_count ?? 0}</b> · nível: ${meta.level ?? 1}
+        ${meta.parent_block_id != null ? ` · pai: #${meta.parent_block_id}` : ''}</div>
+      <div class="meta">confiança: <b>${conf}%</b> · acessos: ${meta.access_count ?? 0} · criado: ${fmt}</div>
+      <div class="meta">${guide ? `<span class="pill" style="background:#9775fa22;color:#d0bfff">📘 guia v${meta.guide_version ?? 1} (${escapeHtml(meta.guide_source || '?')})</span>` : '<span class="pill" style="background:#54607a22;color:#9aa0b4">sem guia</span>'}</div>`;
+    body = `<div class="text"><b>Gist:</b> ${escapeHtml(meta.gist || '(sem gist)')}</div>` +
+           (cues ? `<div class="text"><b>Cues:</b> ${cues}</div>` : '') +
+           (guide ? `<div class="text"><b>Guia:</b><br>${escapeHtml(guide)}</div>` : '') +
+           `<div class="meta">Os átomos membros são a fonte da verdade; este bloco é um ponteiro.</div>`;
+  } else if (isIdentity) {
     const fmt = isNaN(d) ? '?' : d.toLocaleString('pt-BR');
     const pills = meta.memory_id != null
       ? `<span class="pill" style="background:#ffd43b22;color:#ffd43b">memória #${meta.memory_id}</span>`
@@ -2410,22 +2879,42 @@ for (const [t, st] of Object.entries(TYPE_STYLE)) {
     <span class="chip" style="background:${st.color}"></span> ${st.name}${st.directed ? ' →' : ''}`;
   typeFilters.appendChild(label);
 }
+function refreshEdges() {
+  const addOps = [], updateOps = [], removeIds = [];
+  for (const [key, meta] of edgeMeta.entries()) {
+    const id = edgeKeyToId.get(key);
+    if (!edgeVisible(meta)) {
+      if (id !== undefined && edges.get(id)) removeIds.push(id);
+      continue;
+    }
+    edgeKeyToId.set(key, id ?? ++edgeSeq);
+    const opt = edgeOptions(meta, false);
+    (edges.get(opt.id) ? updateOps : addOps).push(opt);
+  }
+  if (removeIds.length) edges.remove(removeIds);
+  if (addOps.length) edges.add(addOps);
+  if (updateOps.length) edges.update(updateOps);
+}
 typeFilters.onchange = () => {
   for (const cb of typeFilters.querySelectorAll('input')) {
     cb.checked ? enabledTypes.add(cb.dataset.type) : enabledTypes.delete(cb.dataset.type);
   }
-  // reconstrói o DataSet de arestas respeitando os filtros
-  const ops = [];
-  for (const [key, meta] of edgeMeta.entries()) {
-    const id = edgeKeyToId.get(key);
-    const visible = enabledTypes.has(meta.type);
-    if (!visible && id !== undefined) { edges.remove(id); continue; }
-    if (visible) {
-      edgeKeyToId.set(key, id ?? ++edgeSeq);
-      const opt = edgeOptions(meta, false);
-      edges.get(opt.id) ? edges.update(opt) : edges.add(opt);
-    }
+  refreshEdges();
+};
+document.getElementById('weakEdges').onchange = (e) => { hideWeakEdges = e.target.checked; refreshEdges(); };
+document.getElementById('partOfEdges').onchange = (e) => { hidePartOf = e.target.checked; refreshEdges(); };
+document.getElementById('memLabels').onchange = (e) => {
+  showMemoryLabels = e.target.checked;
+  const updates = [];
+  for (const [id, meta] of nodeMeta.entries()) {
+    const base = baseNodeOptions(meta);
+    updates.push({ id, label: base.label, font: base.font });
   }
+  if (updates.length) nodes.update(updates);
+};
+document.getElementById('kindFilter').onchange = (e) => {
+  kindFilter = e.target.value || '';
+  applyScopeVisibility();
 };
 
 document.getElementById('decaySlider').oninput = (e) => {
@@ -2449,9 +2938,14 @@ document.getElementById('searchBox').onkeydown = (e) => {
   const q = e.target.value.trim().toLowerCase();
   if (!q) return;
   for (const [id, meta] of nodeMeta.entries()) {
-    if ((meta.text || '').toLowerCase().includes(q)) {
+    const hay = [meta.text, meta.label, meta.name, meta.gist, meta.guide, meta.description]
+      .filter(Boolean).join(' ').toLowerCase();
+    if (hay.includes(q)) {
       searchHighlight.push(id);
-      nodes.update({ id, color: { background: meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG : meta.kind === 'person' ? PERSON_NODE_BG : meta.kind === 'identity' ? IDENTITY_NODE_BG : BASE_NODE_BG, border: '#00e5ff' }, borderWidth: 2.5 });
+      const bg = meta.kind === 'tool' ? TOOL_NODE_BG : meta.kind === 'plan' ? PLAN_NODE_BG
+               : meta.kind === 'person' ? PERSON_NODE_BG : meta.kind === 'identity' ? IDENTITY_NODE_BG
+               : meta.kind === 'block' ? BLOCK_NODE_BG : BASE_NODE_BG;
+      nodes.update({ id, color: { background: bg, border: '#00e5ff' }, borderWidth: 2.5 });
     }
   }
   pushLog(`🔍 busca "${q}": ${searchHighlight.length} nó(s)`);
@@ -2462,6 +2956,54 @@ document.getElementById('searchBox').onkeydown = (e) => {
 };
 
 document.getElementById('resetBtn').onclick = () => network.fit({ animation: { duration: 600 } });
+
+async function showEpisodes(){
+  const body = document.getElementById('panelBody');
+  body.innerHTML = '<h3>Episódios recentes</h3><div class="meta">carregando…</div>';
+  panel.classList.add('open');
+  try{
+    const scope = activeScope && activeScope !== 'general' ? activeScope : '';
+    const d = await jf('mem', '/episodes?limit=20' + (scope ? '&scope=' + encodeURIComponent(scope) : ''));
+    const eps = d.episodes || [];
+    body.innerHTML = `<h3>Episódios recentes</h3>
+      <div class="meta">escopo: ${escapeHtml(scope || 'geral')} · ${eps.length} episódio(s)</div>` +
+      (eps.length ? eps.map(ep => `
+        <div class="nbr" style="align-items:flex-start;margin:6px 0">
+          <span class="t" style="background:#63e6be22;color:#63e6be">#${ep.episode_id}</span>
+          <span><b>${escapeHtml(ep.summary || '(sem resumo)')}</b>
+            ${ep.intent ? `<br><small>intenção: ${escapeHtml(ep.intent)}</small>` : ''}
+            ${ep.outcome ? `<br><small>resultado: ${escapeHtml(ep.outcome)}</small>` : ''}
+            ${ep.created_at ? `<br><small>${new Date(ep.created_at * 1000).toLocaleString('pt-BR')}</small>` : ''}
+          </span>
+        </div>`).join('') : '<div class="meta">Nenhum episódio neste escopo.</div>');
+  }catch(e){
+    body.innerHTML = `<h3>Episódios recentes</h3><div class="meta">falha: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+document.getElementById('epBtn').onclick = () => void showEpisodes();
+
+async function showTaskState(){
+  const body = document.getElementById('panelBody');
+  body.innerHTML = '<h3>Tarefa atual</h3><div class="meta">carregando…</div>';
+  panel.classList.add('open');
+  const c = chat();
+  if(!c || !c.sid){ body.innerHTML = '<h3>Tarefa atual</h3><div class="meta">Nenhuma sessão ativa.</div>'; return; }
+  try{
+    const d = await jf('orch', '/session/' + encodeURIComponent(c.sid) + '/task-state');
+    const t = d.task_state || d || {};
+    const list = (v) => Array.isArray(v) && v.length ? `<ul>${v.map(x => `<li>${escapeHtml(String(x))}</li>`).join('')}</ul>` : '<div class="meta">—</div>';
+    body.innerHTML = `<h3>Tarefa atual</h3>
+      <div class="meta">sessão: ${escapeHtml(c.sid)}</div>
+      <div class="text"><b>Objetivo:</b> ${escapeHtml(t.goal || '—')}</div>
+      <div class="text"><b>Status:</b> ${escapeHtml(t.status || '—')}</div>
+      <div class="text"><b>Decisões:</b>${list(t.decisions)}</div>
+      <div class="text"><b>Pendências:</b>${list(t.open_questions)}</div>
+      <div class="text"><b>Restrições:</b>${list(t.constraints)}</div>`;
+  }catch(e){
+    body.innerHTML = `<h3>Tarefa atual</h3><div class="meta">falha: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+document.getElementById('taskBtn').onclick = () => void showTaskState();
 
 document.getElementById('replayBtn').onclick = async () => {
   const n = parseInt(document.getElementById('replayN').value, 10) || 40;
@@ -2485,9 +3027,37 @@ document.getElementById('replayBtn').onclick = async () => {
 // ═══════════════════════════════════════════════════════════════════════════
 const statusEl = document.getElementById('status');
 const helpEl = document.getElementById('graph-help');
+const loadingEl = document.getElementById('graph-loading');
+const loadingMsgEl = document.getElementById('graph-loading-msg');
 function setHelp(show){ if(helpEl) helpEl.hidden = !show; }
+function setLoading(show, message){
+  if(!loadingEl) return;
+  loadingEl.hidden = !show;
+  if(message && loadingMsgEl) loadingMsgEl.textContent = message;
+}
+async function loadMemoryStats(){
+  const el = document.getElementById('memstats');
+  if(!el) return;
+  try{
+    const s = await jf('mem','/status');
+    const b = s.memory_blocks || {}, e = s.memory_episodes || {};
+    el.innerHTML =
+      `blocos: <b>${b.blocks_total ?? 0}</b> · guides: ${b.guide_blocks_total ?? 0}` +
+      ` (stale: ${b.stale_guides_total ?? 0}, manual: ${b.manual_guides_total ?? 0})` +
+      ` · episódios: <b>${e.episodes_total ?? 0}</b>`;
+  }catch(e){ el.textContent = ''; }
+}
 let lastSnapshotKey = '';
+let lastSnapshotRev = '';
 function applySnapshot(g){
+  // O 1º frame do SSE repete o snapshot que /graph/snapshot acabou de
+  // entregar. A revisão evita limpar/recriar a rede (e reestabilizar) duas
+  // vezes na abertura.
+  if (g && g.rev && g.rev === lastSnapshotRev) {
+    setLoading(false);
+    return;
+  }
+  if (g && g.rev) lastSnapshotRev = g.rev;
   nodes.clear(); edges.clear();
   nodeMeta.clear(); edgeMeta.clear(); edgeKeyToId.clear(); edgeSeq = 0;
   activation.clear(); isSeed.clear(); bornTs.clear();
@@ -2504,7 +3074,31 @@ function applySnapshot(g){
     pushLog(`snapshot: ${nodeMeta.size} nós, ${edgeMeta.size} arestas · ${scopeOrder.length} escopo(s)`);
   }
   tick();
+  setLoading(false);
+  if (!window.__graphRevealed) { window.__graphRevealed = true; playGraphReveal(); }
+  loadMemoryStats();
   setHelp(false);
+}
+let revealRaf = 0;
+function playGraphReveal(){
+  const el = document.getElementById('network');
+  if (!el) return;
+  cancelAnimationFrame(revealRaf);
+  el.classList.add('revealing');
+  el.style.setProperty('--reveal', '0vmax');
+  const started = performance.now();
+  const duration = 900;
+  const step = (now) => {
+    const p = Math.min(1, (now - started) / duration);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.style.setProperty('--reveal', `${(eased * 150).toFixed(1)}vmax`);
+    if (p < 1) revealRaf = requestAnimationFrame(step);
+    else {
+      el.classList.remove('revealing');
+      el.style.removeProperty('--reveal');
+    }
+  };
+  revealRaf = requestAnimationFrame(step);
 }
 let es = null;
 function startEvents(){
@@ -2531,6 +3125,7 @@ function startEvents(){
   };
 }
 async function loadSnapshot(){
+  setLoading(true, 'buscando snapshot do worker');
   try{
     const response = await fetch('/graph/snapshot');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -2539,6 +3134,7 @@ async function loadSnapshot(){
     applySnapshot(g);
     return true;
   }catch(err){
+    setLoading(false);
     setHelp(true);
     pushLog(`falha ao carregar snapshot: ${escapeHtml(String(err))}`);
     return false;

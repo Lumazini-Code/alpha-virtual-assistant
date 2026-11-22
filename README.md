@@ -317,7 +317,7 @@ O pipeline completo (**Depth Anything V2** → clusterização por camadas → *
 - **Cadastro de vozes pela WebUI/TUI** (Configurações → Vozes): gravação local de microfone, edição de descrição, listagem — tudo via `voice_dict` na memory API.
 
 ### Busca web (alpha-mcp)
-O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/alpha-mcp`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — falando direto com a memory API. E as tools de **criação duradoura** falam com o **orchestrator** (:9000, Bearer interno): `project_create` (cria e **ATIVA** um escopo de memória próprio — memórias LT, grafo e planos isolados; mesmo fluxo da WebUI/TUI: criou → entrou) + `project_list`; `skill_create` (cria skill SKILL.md em `.agents/skills-created/` com re-sync do índice na hora — ver **Agent Skills**) + `skill_list` (catálogo completo).
+O Deep Search standalone foi **removido** — a busca web agora é um **servidor MCP próprio** (`mcp_servers/alpha-mcp`, :4010). A tool `web_search` esconde o pipeline: **cache Valkey (TTL 6h) → SearXNG → dedup/blocklist SEO → BM25 → fetch em camadas (trafilatura estático, Crawl4AI com navegador para os difíceis) → chunking por headers markdown → BM25 final** — o modelo recebe só trechos com fontes `[n]`. O crawl4ai sobe **on-demand** via **docker-socket-proxy** com allowlist mínima (start/stop de container apenas) — sem socket do Docker exposto. Tools de memória completam o servidor: `memory_write_batch` (grava fatos permanentes com cadeia `temporal_precedence` p/ o grafo) e `memory_people_card_create/edit/list` (cards de pessoa) — falando direto com a memory API. E as tools de **criação duradoura** falam com o **orchestrator** (:9000, Bearer interno): `project_create` (cria e **ATIVA** um escopo de memória próprio — memórias LT, grafo e planos isolados; mesmo fluxo da WebUI/TUI: criou → entrou) + `project_list`; `skill_create` (cria skill SKILL.md em `.agents/skills-created/` com re-sync do índice na hora — ver **Agent Skills**) + `skill_list` (catálogo completo); `html_preview` (publica na aba Preview um HTML já gravado no cwd da sessão — o Manager valida e serve o arquivo + assets irmãos; nada de HTML no histórico do LLM).
 
 ### Tools MCP (extensibilidade)
 - **mcp_manager reescrito em Rust e EMBUTIDO no tray** (`Manager/src/mcp_server.rs`) rodando **NO HOST**, fora do container — para que os servidores MCP tenham acesso real à máquina do usuário (npx/node/uvx do host, filesystem, Chrome do usuário). Suas rotas são servidas no MESMO listener da API do tray (:9001) — não existe mais binário standalone nem processo supervisionado.
@@ -334,8 +334,9 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - Ícone na **bandeja do sistema** (GTK/Linux, tray nativo no Windows) + janela de status (egui) com start/stop do docker, status do mcp_manager e do transcript.
 - **Chat widget**: abre com a wake word "Alpha" (detectada pelo pipeline de voz) ou manualmente; envia turnos escritos ao orchestrator (`source="chat"`, sem TTS — a fala é papel da WebUI/TUI/voz) e consome o Conversation Hub (SSE) para renderizar a resposta em tempo real.
 - API REST (:9001): `/status`, `/docker/start`, `/docker/stop`, `/browser/start`, `/browser/stop`, `/browser/status`, `/mcp/*` (start/stop/status do mcp_manager), `/transcript/*` (start/stop/status do pipeline de voz), `/fs/cwd` (GET/PUT/DELETE do CWD por projeto, loopback-only) e `POST /ui/chat-open` (wake word do transcribe → abre o chat widget).
+- **Preview de HTML** (`/preview/*`, `/preview-stat/*`, loopback-only): registro por sessão do caminho de um `.html` no cwd; serve o documento e assets irmãos direto do disco, com `/preview-stat` (mtime/size) para a WebUI recarregar quando o arquivo muda. O Manager é o único que lê arquivos do host — orchestrator/alpha-mcp só transportam `{path,title}`.
 - **Supervisão de processos do host**: transcript (:9100) — discover → spawn → health check periódico → restart-on-fail. (O mcp_manager não é mais um processo: é embutido no tray.) Variáveis de auth/config lidas do `Modules/.env`.
-- **Timer de inatividade**: `docker down` após 45 min sem perguntas (configurável via `AVA_DOCKER_IDLE_MINUTES`).
+- **Inicialização automática**: o stack sobe no boot do tray; a WebUI exibe um popup enquanto o ambiente está subindo. O Docker só é encerrado quando o usuário pede (`/docker/stop` ou a UI).
 - **Chrome do usuário** sob demanda: aberto em **modo normal** (perfil padrão, sem `--remote-debugging-port`) apenas **se o Chrome não estiver aberto** — spawn detached, sem cópia de perfil e sem cache `chrome-profile-cdp`.
 
 ### WebUI (Manager/ava-web)
@@ -343,6 +344,8 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 - **Vários chats ao mesmo tempo**: cada chat é uma sessão raiz (projeto fixo, histórico, uso e subagentes próprios). A lista **Chats** fica abaixo de Projetos; chats que continuam respondendo em background mostram o ponto âmbar e o contador de subagentes. `Ctrl+T` abre um chat novo, `Ctrl+I` abre/fecha os detalhes.
 - **Faixa de sessão na tela do chat**: projeto, sessão, tokens de entrada/saída, cache hit, custo e subagentes ativos. O botão *Detalhes* (ou `Ctrl+I`) abre o drawer com a sessão completa, os subagentes (clicáveis para abrir o chat filho) e ações (`compactar contexto`, `fechar conversa`).
 - **Timeline do turno**: pensamento e execuções de tools intercalados; cada resposta mostra tokens de entrada/saída, cache hit, custo e latência.
+- **Grafo de memória**: nós de memória/tool/plano/pessoa/identidade **e blocos de memória** (ids negativos, `contains`/`part_of`, guia e hierarquia); revelação em onda no primeiro carregamento; filtros de arestas fracas/`part_of`, rótulos sob demanda e filtro por tipo. O worker é pré-aquecido no boot (`AVA_GRAPH_PREWARM`, default 1) e o snapshot traz `rev` para não ser aplicado duas vezes.
+- **Aba Preview (full-screen)**: a tool `html_preview` publica um HTML já gravado no cwd; a aba carrega o arquivo do disco num iframe sandboxed, lista os HTMLs daquela sessão num menu expansível no topo esquerdo e recarrega sozinha quando o arquivo muda (polling de `mtime`/`size` em `/preview-stat`) ou quando o usuário volta de Chat/Grafo. Assets irmãos são servidos pelo Manager.
 - **Seletor de pasta de trabalho dos MCPs**: o botão `📁`/chip de pasta abre o **diálogo nativo do sistema** (GTK na thread principal no Linux; `rfd` nativo no Windows/macOS). A escolha é enviada no `cwd` de cada `/execute`.
 - O CWD é **por projeto ativo** e persistido entre sessões em `cache/webui_cwd.json`. Ao trocar de projeto, a pasta salva daquele projeto é restaurada; sem pasta configurada, usa a base do usuário (`~`/`C:\Users\%USERNAME%`).
 - A seleção nativa existe apenas dentro do `ava-web`; não há fallback de navegador de pastas em HTML.
@@ -395,7 +398,7 @@ O Deep Search standalone foi **removido** — a busca web agora é um **servidor
 │   └── Models/              # Pesos ONNX/GGUF (gitignored; via Models.zip)
 ├── mcp_servers/alpha-mcp/   # alpha-mcp (SearXNG→BM25→Crawl4AI, :4010)
 ├── Manager/                 # ava-tray (Rust: axum + eframe + tray-icon, :9001) + ava-web (WebUI nativa)
-│   └── src/                 #   api, chat (widget), transcript, mcp_manager, idle_watcher…
+│   └── src/                 #   api, chat (widget), transcript, mcp_manager…
 ├── src/                     # TUI opcional (TypeScript/Ink; build Bun)
 │   └── lib/                 #   auth (Bearer), voiceRecorder, voices, mcpServers, plans…
 ├── resource/                # ícones, settings do SearXNG, config alpha-mcp
@@ -488,7 +491,7 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_LLM_PROVIDER` | `Modules/.env` | — | ID do provedor escolhido no catálogo (exibição na WebUI) |
 | `AVA_INTERNAL_TOKEN` | `Modules/.env` | — | Bearer token interno (memory/orchestrator/mcp_manager/TUI) |
 | `CRAWL4AI_API_TOKEN` | `Modules/.env` | — | Token do crawl4ai (falha de boot se ausente) |
-| `AVA_DOCKER_IDLE_MINUTES` | tray | 15 | Minutos de inatividade antes do `docker down` (a pergunta seguinte reergue o stack sozinho) |
+| ~~`AVA_DOCKER_IDLE_MINUTES`~~ | tray | — | Removido: o Docker não é mais encerrado por inatividade; só por `/docker/stop` ou pela UI |
 | `AVA_TTS_ENABLED` | `start.sh` | `0` | Liga o serviço de TTS (Supertonic, ~470 MB/worker na RAM). Desligado = fala não sintetiza |
 | `AVA_VOICE` | tray | `0` | Liga o pipeline de voz no host (wake word + ASR, ~600 MB). Desligado = transcript não sobe no auto-init; `POST /transcript/start` sobe à mão |
 | `AVA_MERGED_SERVICES` | orchestrator/start.sh | `1` | LLM (:4003) mesclado no processo do orchestrator (um interpreter Python). `0` volta ao modo standalone |
@@ -532,6 +535,8 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `AVA_TOOL_REGISTRY` | orchestrator | `1` | Registry unificado de tools (validação, permissões, hooks) |
 | `AVA_TOOL_ALLOW` / `AVA_TOOL_DENY` | orchestrator | — | Padrões glob de allow/deny de tools (ex.: `browser__*`) |
 | `AVA_ALWAYS_ON_MCP_SERVERS` | orchestrator | `alpha-mcp` | Servidores MCP sempre carregados e nunca descartados pelo teto de tools |
+| `AVA_GRAPH_PREWARM` | tray | `1` | Pré-aquece o worker do grafo no boot (snapshot em cache ao abrir a aba Grafo); `0` desliga |
+| `AVA_MCP_STARTUP_SYNC` | tray | `1` | Re-sincroniza as tools dos servidores MCP no boot quando a memory_api já está online (necessário após reset/recriação do ToolsDB); `0` desliga |
 | `AVA_CODEMODE` | orchestrator | `1` | Expõe a tool `execute` e move tools MCP para o catálogo JS |
 | `AVA_CODEMODE_TIMEOUT_MS` | orchestrator | `30000` | Timeout de uma execução Code Mode |
 | `AVA_CODEMODE_MAX_TOOL_CALLS` | orchestrator | `50` | Máximo de chamadas de tool dentro de um `execute` |

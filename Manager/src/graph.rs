@@ -209,6 +209,10 @@ impl GraphService {
         worker.stdin = None;
         worker.running = false;
         drop(worker);
+        // O snapshot em cache pertence à geração que morreu; sem limpar,
+        // /graph/snapshot devolveria o grafo antigo (memórias já apagadas)
+        // antes de ensure_started() ter chance de subir um worker novo.
+        *self.snapshot.write().await = None;
         let _ = self
             .events
             .send(json!({ "type": "worker_down" }).to_string());

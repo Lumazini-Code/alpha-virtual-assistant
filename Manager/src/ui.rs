@@ -756,7 +756,7 @@ impl TrayApp {
                 .small(),
         );
         ui.label(
-            egui::RichText::new("docker cai após 45 min sem uso")
+            egui::RichText::new("o docker só desliga quando você pedir")
                 .weak()
                 .small(),
         );

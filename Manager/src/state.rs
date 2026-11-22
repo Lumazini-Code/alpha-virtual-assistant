@@ -15,7 +15,7 @@
 //! Estado compartilhado da aplicação.
 //!
 //! Esse módulo guarda tudo que precisa ser visto tanto pela GUI (egui)
-//! quanto pelo servidor REST (axum) quanto pelos watchers de inatividade.
+//! quanto pelo servidor REST (axum).
 //! Como GUI e servidor rodam em threads/tasks diferentes, tudo é protegido
 //! por `Mutex` dentro de um `Arc` para podermos clonar referências livremente.
 
@@ -66,7 +66,7 @@ impl Default for DockerState {
 /// Informações sobre o Chrome do host.
 ///
 /// O Chrome é um processo DO HOST, spawnado detached — sobrevive ao
-/// stop do docker e ao timer de inatividade de propósito: a intenção
+/// stop do docker de propósito: a intenção
 /// é que a janela fique aberta para o usuário depois que o modelo
 /// terminar as ações (o Playwright MCP conecta via extensão no perfil
 /// padrão — sem CDP, sem modo depuração).
@@ -187,7 +187,7 @@ pub struct AppState {
     pub mcp: Arc<TokioMutex<McpManagerState>>,
     /// Runtime do mcp_server embutido — Some se o init do boot foi OK
     /// (OnceLock porque o SharedState é Arc: o set acontece UMA vez, no
-    /// boot da API; leitores (/mcp/stop, auto-stop, UI) consultam depois).
+    /// boot da API; leitores (/mcp/stop, UI) consultam depois).
     pub mcp_server: std::sync::OnceLock<Arc<crate::mcp_server::AppState>>,
     /// Transcript (voz): processo do HOST supervisionado pelo tray —
     /// auto-iniciado junto com o container (same lifecycle do mcp).

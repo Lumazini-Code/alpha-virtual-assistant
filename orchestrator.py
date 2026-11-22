@@ -4069,6 +4069,37 @@ def _detect_image_mime(b64: str) -> str:
     return "image/jpeg"
 
 
+def _preview_from_tool(tool_name: str, output: Any) -> Optional[dict[str, Any]]:
+    """Extrai o marcador de preview publicado pela tool html_preview.
+
+    A tool NÃO lê o arquivo: devolve só `{kind, path, title, description}`.
+    O caminho é resolvido e servido pelo Manager no host (mesma regra de cwd
+    dos MCPs), nunca pelo orchestrator/container.
+    """
+    if not str(tool_name or "").lower().endswith("__html_preview"):
+        return None
+    data: Any = output
+    if isinstance(data, str):
+        try:
+            data = json.loads(data.strip())
+        except Exception:
+            return None
+    if not isinstance(data, dict) or data.get("kind") != "ava_html_preview":
+        return None
+    path = str(data.get("path") or "").strip()
+    if not path:
+        return None
+    fallback_title = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if "." in fallback_title:
+        fallback_title = fallback_title.rsplit(".", 1)[0]
+    return {
+        "kind": "ava_html_preview",
+        "path": path,
+        "title": str(data.get("title") or fallback_title or "Preview"),
+        "description": str(data.get("description") or ""),
+    }
+
+
 def _native_input_schema(spec: dict[str, Any]) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -4169,6 +4200,7 @@ def _build_codemode_snapshot(
     native_schema: list[dict[str, Any]],
     mcp_schema: list[dict[str, Any]],
     mcp_dispatch: dict[str, tuple[str, str]],
+    on_event: Optional[Any] = None,
 ) -> tuple[ToolSnapshot, Optional[Catalog], Optional[ToolSpec]]:
     """Registry com a tool `execute` + catálogo MCP para o Code Mode."""
     base = _build_tool_snapshot(req, sid, eid, native_schema, mcp_schema, mcp_dispatch)
@@ -4178,6 +4210,19 @@ def _build_codemode_snapshot(
     catalog = Catalog.from_specs(
         [spec for spec in base.specs.values() if spec.source == "mcp"]
     )
+
+    async def _after_tool(name: str, result: Any) -> None:
+        """Repassa eventos de UI de tools chamadas DENTRO do execute (o
+        step_done do execute não carrega o resultado individual de cada MCP)."""
+        if on_event is None or getattr(result, "is_error", False):
+            return
+        output = getattr(result, "output", None)
+        if output is None:
+            output = getattr(result, "content", None)
+        preview = _preview_from_tool(name, output)
+        if preview:
+            await on_event("preview", preview)
+
     execute_spec = make_execute_spec(
         base,
         runtime,
@@ -4185,6 +4230,7 @@ def _build_codemode_snapshot(
         timeout_ms=CODEMODE_TIMEOUT_MS,
         max_tool_calls=CODEMODE_MAX_TOOL_CALLS,
         max_output_chars=CODEMODE_MAX_OUTPUT_CHARS,
+        on_tool_result=_after_tool,
     )
     registry = ToolRegistry(hooks=ToolHooks(), error_formatter=_format_tool_exception)
     for spec in base.specs.values():
@@ -5672,6 +5718,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
         if CODEMODE_ENABLED:
             tool_snapshot, codemode_catalog, codemode_execute_spec = _build_codemode_snapshot(
                 req, sid, eid, native_tools_schema, mcp_schema, mcp_dispatch,
+                on_event=on_event,
             )
             if codemode_catalog is not None and codemode_execute_spec is not None:
                 codemode_tool_names = {codemode_execute_spec.name}
@@ -6240,6 +6287,14 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                 _metric_inc("tool_failures_by_category", category)
             lat = round((time.perf_counter() - t0) * 1000, 2)
 
+            # Preview de HTML: evento próprio para a WebUI. No Code Mode as
+            # chamadas MCP acontecem dentro de `execute` e são repassadas pelo
+            # callback de make_execute_spec; aqui cobre a chamada MCP direta.
+            if success and tool_name != "execute":
+                preview = _preview_from_tool(tool_name, result)
+                if preview and on_event:
+                    await on_event("preview", preview)
+
             # ── Log bruto da resposta da tool (debug) ──
             if success:
                 log.info(
@@ -6576,6 +6631,10 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 result_text = _result_to_text(res)
                 await _mirror_conversation(CONVERSATION_HUB, "result", result_text)
                 yield _sse("result", result_text)
+        elif name == "preview":
+            # Tool html_preview publicou um arquivo HTML (já gravado em disco).
+            # A WebUI registra o caminho no Manager e abre a aba Preview.
+            yield _sse("preview", data)
         elif name == "skill_loaded":
             # Skills selecionadas para ESTE turno — a TUI/web UI mostra qual
             # playbook está ativo e correlaciona o comportamento do modelo.
