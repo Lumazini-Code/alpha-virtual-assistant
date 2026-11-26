@@ -48,7 +48,7 @@ Regras de ouro:
 
 # Submódulos importados explicitamente: ficam acessíveis como atributos
 # da fachada (ex.: memory.memory_search.state) para depuração/patches.
-import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_tips, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_blocks, memory_episodes, memory_status  # noqa: F401
+import memory_config, memory_models, memory_engines, memory_graph, memory_db, memory_vector, memory_state, memory_search, memory_ops_memory, memory_ops_files, memory_ops_dicts, memory_ops_tools, memory_ops_tips, memory_ops_agent_skills, memory_ops_plans, memory_ops_scope, memory_blocks, memory_episodes, memory_triage, memory_status  # noqa: F401
 
 from memory_config import *  # noqa: F401,F403
 from memory_models import *  # noqa: F401,F403
@@ -68,6 +68,7 @@ from memory_ops_plans import *  # noqa: F401,F403
 from memory_ops_scope import *  # noqa: F401,F403
 from memory_blocks import *  # noqa: F401,F403
 from memory_episodes import *  # noqa: F401,F403
+from memory_triage import *  # noqa: F401,F403
 from memory_status import *  # noqa: F401,F403
 
 __all__ = [
@@ -429,6 +430,17 @@ __all__ = [
     'startup',
     'state',
     'status',
+    'align_evidence',
+    'build_samples',
+    'split_segments',
+    'suppression_reason',
+    'triage_delete',
+    'triage_gold_candidates',
+    'triage_gold_list',
+    'triage_gold_write',
+    'triage_labels',
+    'triage_log',
+    'triage_stats',
     'tools_delete',
     'tool_tip_add',
     'tool_tip_remove',

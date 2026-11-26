@@ -174,6 +174,124 @@ class MemoryDB(EdgeGraphMixin):
             self._conn.execute(
                 "ALTER TABLE memories ADD COLUMN ttl_days REAL DEFAULT NULL"
             )
+        # ── Triagem de memória (Fase 1): log estruturado das decisões do
+        # extrator. Tabelas novas — CREATE IF NOT EXISTS já é a migração.
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_triage_turn (
+                turn_id           TEXT NOT NULL,
+                session_id        TEXT NOT NULL,
+                scope             TEXT NOT NULL DEFAULT '',
+                created_at        REAL NOT NULL,
+                extractor_model   TEXT NOT NULL,
+                fallback_model    TEXT NOT NULL DEFAULT '',
+                attempt_index     INTEGER NOT NULL DEFAULT 1,
+                prompt_version    TEXT NOT NULL DEFAULT '',
+                schema_version    TEXT NOT NULL DEFAULT '',
+                budget_variant    TEXT NOT NULL DEFAULT 'normal',
+                propensity        REAL NOT NULL DEFAULT 1.0,
+                latency_ms        REAL NOT NULL DEFAULT 0,
+                user_hash         TEXT NOT NULL DEFAULT '',
+                assistant_hash    TEXT NOT NULL DEFAULT '',
+                n_facts           INTEGER NOT NULL DEFAULT 0,
+                n_segments        INTEGER NOT NULL DEFAULT 0,
+                n_suppressed      INTEGER NOT NULL DEFAULT 0,
+                n_candidates      INTEGER NOT NULL DEFAULT 0,
+                status            TEXT NOT NULL DEFAULT 'ok',
+                episode_importance REAL DEFAULT NULL,
+                task_status       TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (session_id, turn_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_triage_sample (
+                sample_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                turn_id             TEXT NOT NULL,
+                session_id          TEXT NOT NULL,
+                scope               TEXT NOT NULL DEFAULT '',
+                segment_index       INTEGER NOT NULL,
+                segment_text        TEXT NOT NULL,
+                segment_hash        TEXT NOT NULL,
+                role                TEXT NOT NULL,
+                n_chars             INTEGER NOT NULL,
+                has_deictic         INTEGER NOT NULL DEFAULT 0,
+                candidate_id        INTEGER DEFAULT NULL,
+                candidate_text_snapshot TEXT NOT NULL DEFAULT '',
+                candidate_created_at   REAL DEFAULT NULL,
+                cosine              REAL DEFAULT NULL,
+                cross_encoder_score REAL DEFAULT NULL,
+                used_in_answer      INTEGER NOT NULL DEFAULT 0,
+                rank                INTEGER DEFAULT NULL,
+                teacher_variant     TEXT NOT NULL DEFAULT 'base',
+                teacher_emitted     INTEGER NOT NULL DEFAULT 0,
+                suppression_reason  TEXT NOT NULL DEFAULT '',
+                propensity          REAL NOT NULL DEFAULT 1.0,
+                proposed_label      TEXT NOT NULL DEFAULT '',
+                proposed_targets    TEXT NOT NULL DEFAULT '[]',
+                proposed_type       TEXT NOT NULL DEFAULT 'fact',
+                proposed_validity   TEXT NOT NULL DEFAULT 'temporal',
+                applied_label       TEXT NOT NULL DEFAULT 'unlabeled',
+                applied_reason      TEXT NOT NULL DEFAULT '',
+                frame_label         TEXT NOT NULL DEFAULT '',
+                fragment_index      INTEGER DEFAULT NULL,
+                slot_entity         TEXT NOT NULL DEFAULT '',
+                slot_value          TEXT NOT NULL DEFAULT '',
+                slot_date           TEXT NOT NULL DEFAULT '',
+                rendered_text       TEXT NOT NULL DEFAULT '',
+                render_source       TEXT NOT NULL DEFAULT '',
+                evidence_aligned    TEXT NOT NULL DEFAULT 'none',
+                origin              TEXT NOT NULL DEFAULT 'live',
+                weight              REAL NOT NULL DEFAULT 1.0,
+                embed_model_version TEXT NOT NULL DEFAULT '',
+                shadow_pred         TEXT NOT NULL DEFAULT '',
+                -- Gate cross-encoder (§5.2.4): rótulo LOCAL e barato. Não
+                -- sobrescreve applied_label — é sinal auxiliar com peso 0.6.
+                gate_label          TEXT NOT NULL DEFAULT '',
+                gate_reason         TEXT NOT NULL DEFAULT '',
+                gate_candidate_id   INTEGER DEFAULT NULL,
+                gate_score          REAL DEFAULT NULL,
+                created_at          REAL NOT NULL,
+                UNIQUE (turn_id, segment_hash, candidate_id, teacher_variant)
+            );
+            -- SQLite não considera NULL duplicado em UNIQUE: segmentos
+            -- suprimidos (candidate_id NULL) precisam de chave explícita.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tri_sample_uniq
+                ON memory_triage_sample(turn_id, segment_hash,
+                                        IFNULL(candidate_id, -1), teacher_variant);
+            CREATE INDEX IF NOT EXISTS idx_tri_sample_turn    ON memory_triage_sample(turn_id);
+            CREATE INDEX IF NOT EXISTS idx_tri_sample_label   ON memory_triage_sample(applied_label);
+            CREATE INDEX IF NOT EXISTS idx_tri_sample_origin  ON memory_triage_sample(origin);
+            CREATE INDEX IF NOT EXISTS idx_tri_sample_suppress ON memory_triage_sample(teacher_emitted);
+            CREATE INDEX IF NOT EXISTS idx_tri_sample_variant ON memory_triage_sample(teacher_variant);
+            CREATE INDEX IF NOT EXISTS idx_tri_turn_session ON memory_triage_turn(session_id);
+
+            -- Gold set imutável (§7): 200-300 exemplos revisados por humano.
+            -- É a única calibração independente do viés do teacher.
+            CREATE TABLE IF NOT EXISTS memory_triage_gold (
+                sample_id       INTEGER PRIMARY KEY,
+                reviewed_label  TEXT NOT NULL,
+                reviewed_by     TEXT NOT NULL DEFAULT '',
+                reviewed_at     REAL NOT NULL,
+                notes           TEXT NOT NULL DEFAULT '',
+                origin          TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(sample_id) REFERENCES memory_triage_sample(sample_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tri_gold_label ON memory_triage_gold(reviewed_label);
+        """)
+        # Migração leve para bancos que já tinham a tabela de triagem sem as
+        # colunas do gate cross-encoder (aditiva, mesma regra de L164-176).
+        tri_cols = {
+            row["name"] for row in
+            self._conn.execute("PRAGMA table_info(memory_triage_sample)")
+        }
+        for col, ddl in (
+            ("gate_label", "TEXT NOT NULL DEFAULT ''"),
+            ("gate_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("gate_candidate_id", "INTEGER DEFAULT NULL"),
+            ("gate_score", "REAL DEFAULT NULL"),
+        ):
+            if col not in tri_cols:
+                self._conn.execute(
+                    f"ALTER TABLE memory_triage_sample ADD COLUMN {col} {ddl}"
+                )
 
     def insert(
         self,

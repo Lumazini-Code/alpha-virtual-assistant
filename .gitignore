@@ -11,6 +11,7 @@ resource/Vosk_Model/*
 
 test/*
 tests/*
+!tests/test_memory_triage.py
 
 openclaude
 

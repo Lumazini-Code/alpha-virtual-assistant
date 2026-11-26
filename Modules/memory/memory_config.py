@@ -516,6 +516,38 @@ TASK_STATE_ENABLED           = os.getenv("AVA_TASK_STATE", "1") != "0"
 TASK_STATE_MAX_CHARS         = int(os.getenv("TASK_STATE_MAX_CHARS", "1200"))
 MT_EPISODE                   = "memory_episode"
 
+# ── Triagem de memória (Fase 1: instrumentação do extrator) ──────────────────
+# Flags opt-out: ligadas por padrão (regra do projeto). O log é best-effort e
+# nunca altera a decisão de escrita do extrator — ele só registra o que foi
+# proposto, o que o pipeline aplicou e o que ficou sem julgamento (suprimido).
+MEMORY_TRIAGE_LOG            = os.getenv("AVA_MEMORY_TRIAGE_LOG", "1") != "0"
+MEMORY_TRIAGE_LOG_TEXT       = os.getenv("AVA_MEMORY_TRIAGE_LOG_TEXT", "1") != "0"
+MEMORY_TRIAGE_PROBE          = os.getenv("AVA_MEMORY_TRIAGE_PROBE", "1") != "0"
+MEMORY_TRIAGE_PROBE_RATE     = float(os.getenv("AVA_MEMORY_TRIAGE_PROBE_RATE", "0.08"))
+MEMORY_TRIAGE_PROBE_MAX      = int(os.getenv("AVA_MEMORY_TRIAGE_PROBE_MAX", "3"))
+MEMORY_TRIAGE_PU             = os.getenv("AVA_MEMORY_TRIAGE_PU", "1") != "0"
+MEMORY_TRIAGE_RENDER_LABELS  = os.getenv("AVA_MEMORY_TRIAGE_RENDER_LABELS", "1") != "0"
+MEMORY_TRIAGE_RETENTION_DAYS = int(os.getenv("AVA_MEMORY_TRIAGE_RETENTION_DAYS", "90"))
+MEMORY_TRIAGE_SHADOW         = os.getenv("AVA_MEMORY_TRIAGE_SHADOW", "0") != "0"
+# Alvo de "dataset em tamanho adequado" para a Fase 2 (LightGBM/MLP): a few
+# thousand rótulos. A WebUI lê este número em /triage/stats para a barra.
+MEMORY_TRIAGE_TARGET_SAMPLES = max(1, int(os.getenv("AVA_MEMORY_TRIAGE_TARGET_SAMPLES", "2000")))
+MEMORY_TRIAGE_PROMPT_VERSION = os.getenv("AVA_MEMORY_TRIAGE_PROMPT_VERSION", "v1")
+MEMORY_TRIAGE_SCHEMA_VERSION = os.getenv("AVA_MEMORY_TRIAGE_SCHEMA_VERSION", "v1")
+MEMORY_TRIAGE_MAX_TEXT_CHARS = int(os.getenv("AVA_MEMORY_TRIAGE_MAX_TEXT_CHARS", "600"))
+# Fontes adicionais do dataset (§4/§5.2). Todas opt-out.
+MEMORY_TRIAGE_GATE            = os.getenv("AVA_MEMORY_TRIAGE_GATE", "1") != "0"
+MEMORY_TRIAGE_GATE_WEIGHT     = float(os.getenv("AVA_MEMORY_TRIAGE_GATE_WEIGHT", "0.6"))
+MEMORY_TRIAGE_SEGMENT_PROBE   = os.getenv("AVA_MEMORY_TRIAGE_SEGMENT_PROBE", "1") != "0"
+MEMORY_TRIAGE_SEGMENT_MIN_CHARS = int(os.getenv("AVA_MEMORY_TRIAGE_SEGMENT_MIN_CHARS", "20"))
+MEMORY_TRIAGE_CONTRASTIVE     = os.getenv("AVA_MEMORY_TRIAGE_CONTRASTIVE", "1") != "0"
+MEMORY_TRIAGE_SYNTHETIC       = os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC", "1") != "0"
+MEMORY_TRIAGE_SYNTHETIC_RATE  = float(os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC_RATE", "0.05"))
+MEMORY_TRIAGE_SYNTHETIC_MAX   = int(os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC_MAX", "2"))
+MEMORY_TRIAGE_THINKING        = os.getenv("AVA_MEMORY_TRIAGE_THINKING", "1") != "0"
+MEMORY_TRIAGE_PAIR_TOP_K      = max(1, int(os.getenv("AVA_MEMORY_TRIAGE_PAIR_TOP_K", "5")))
+MEMORY_TRIAGE_GOLD_TARGET     = max(1, int(os.getenv("AVA_MEMORY_TRIAGE_GOLD_TARGET", "200")))
+
 # ── Auto-link na ESCRITA (grafo Hebbiano) ─────────────────────────────────────
 # Antes, arestas entre memórias só nasciam de co-ativação em LEITURAS (Step 4)
 # ou de link_to explícito (que ninguém enviava) — uma memória gravada ficava
@@ -883,6 +915,30 @@ __all__ = [
     'TASK_STATE_ENABLED',
     'TASK_STATE_MAX_CHARS',
     'MT_EPISODE',
+    'MEMORY_TRIAGE_LOG',
+    'MEMORY_TRIAGE_LOG_TEXT',
+    'MEMORY_TRIAGE_PROBE',
+    'MEMORY_TRIAGE_PROBE_RATE',
+    'MEMORY_TRIAGE_PROBE_MAX',
+    'MEMORY_TRIAGE_PU',
+    'MEMORY_TRIAGE_RENDER_LABELS',
+    'MEMORY_TRIAGE_RETENTION_DAYS',
+    'MEMORY_TRIAGE_SHADOW',
+    'MEMORY_TRIAGE_TARGET_SAMPLES',
+    'MEMORY_TRIAGE_PROMPT_VERSION',
+    'MEMORY_TRIAGE_SCHEMA_VERSION',
+    'MEMORY_TRIAGE_MAX_TEXT_CHARS',
+    'MEMORY_TRIAGE_GATE',
+    'MEMORY_TRIAGE_GATE_WEIGHT',
+    'MEMORY_TRIAGE_SEGMENT_PROBE',
+    'MEMORY_TRIAGE_SEGMENT_MIN_CHARS',
+    'MEMORY_TRIAGE_CONTRASTIVE',
+    'MEMORY_TRIAGE_SYNTHETIC',
+    'MEMORY_TRIAGE_SYNTHETIC_RATE',
+    'MEMORY_TRIAGE_SYNTHETIC_MAX',
+    'MEMORY_TRIAGE_THINKING',
+    'MEMORY_TRIAGE_PAIR_TOP_K',
+    'MEMORY_TRIAGE_GOLD_TARGET',
     'block_node_id',
     'is_block_node',
     'block_real_id',

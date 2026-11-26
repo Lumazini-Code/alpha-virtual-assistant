@@ -48,6 +48,7 @@ import datetime
 import asyncio
 import time
 import math
+import random
 import difflib
 from pathlib import Path
 from typing import Optional
@@ -199,6 +200,37 @@ MEMORY_EXTRACTOR_PROVIDERS = os.getenv("MEMORY_EXTRACTOR_PROVIDERS", "coreweave/
 MEMORY_EXTRACTOR_CANDIDATES_MAX = min(
     max(int(os.getenv("MEMORY_EXTRACTOR_CANDIDATES_MAX", "24")), 15), 30
 )
+
+# ── Triagem de memória (Fase 1: instrumentação, sem mudar a decisão) ──────────
+# Opt-out (AVA_MEMORY_TRIAGE_LOG=0 desliga). O probe NUNCA grava memórias:
+# serve só para rotular segmentos que o orçamento de produção suprimiu.
+MEMORY_TRIAGE_LOG = os.getenv("AVA_MEMORY_TRIAGE_LOG", "1") != "0"
+MEMORY_TRIAGE_PROBE = os.getenv("AVA_MEMORY_TRIAGE_PROBE", "1") != "0"
+MEMORY_TRIAGE_PROBE_RATE = float(os.getenv("AVA_MEMORY_TRIAGE_PROBE_RATE", "0.08"))
+MEMORY_TRIAGE_PROBE_MAX = int(os.getenv("AVA_MEMORY_TRIAGE_PROBE_MAX", "3"))
+MEMORY_TRIAGE_PROMPT_VERSION = os.getenv("AVA_MEMORY_TRIAGE_PROMPT_VERSION", "v1")
+MEMORY_TRIAGE_SCHEMA_VERSION = os.getenv("AVA_MEMORY_TRIAGE_SCHEMA_VERSION", "v1")
+MEMORY_TRIAGE_EMBED_VERSION = os.getenv("AVA_MEMORY_TRIAGE_EMBED_VERSION", "e5-small:pt-v1")
+MEMORY_TRIAGE_LOG_TEXT = os.getenv("AVA_MEMORY_TRIAGE_LOG_TEXT", "1") != "0"
+MEMORY_TRIAGE_GATE = os.getenv("AVA_MEMORY_TRIAGE_GATE", "1") != "0"
+MEMORY_TRIAGE_SEGMENT_PROBE = os.getenv("AVA_MEMORY_TRIAGE_SEGMENT_PROBE", "1") != "0"
+MEMORY_TRIAGE_CONTRASTIVE = os.getenv("AVA_MEMORY_TRIAGE_CONTRASTIVE", "1") != "0"
+MEMORY_TRIAGE_SYNTHETIC = os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC", "1") != "0"
+MEMORY_TRIAGE_SYNTHETIC_RATE = float(os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC_RATE", "0.05"))
+MEMORY_TRIAGE_SYNTHETIC_MAX = int(os.getenv("AVA_MEMORY_TRIAGE_SYNTHETIC_MAX", "2"))
+MEMORY_TRIAGE_THINKING = os.getenv("AVA_MEMORY_TRIAGE_THINKING", "1") != "0"
+# Variants que só instrumentam: NUNCA gravam memórias nem episódio.
+_TRIAGE_PROBE_VARIANTS = frozenset({
+    "relaxed", "segment", "contrastive", "synthetic", "replay", "thinking",
+})
+_TRIAGE_VARIANT_NAME = {
+    "relaxed": "relaxed", "segment": "segment_probe",
+    "contrastive": "contrastive", "synthetic": "synthetic",
+    "replay": "replay", "thinking": "probe_thinking",
+}
+_TRIAGE_ORIGIN = {
+    "replay": "replay", "thinking": "probe_thinking", "synthetic": "synthetic",
+}
 
 # ─────────────────────────────────────────────────────────────
 #   RECUPERAÇÃO CONTÍNUA DE MEMÓRIA (confidence-watch + prefill)
@@ -517,8 +549,19 @@ _MEMORY_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "memory_episode_write":      ("POST",   "/episodes/write"),
     "memory_episode_search":     ("POST",   "/episodes/search"),
     "memory_episodes_list":      ("GET",    "/episodes"),
+    "memory_triage_log":         ("POST",   "/triage/log"),
     "memory_clear_session":      ("DELETE", "/session/{session_id}"),
 }
+
+
+async def _log_triage_best_effort(payload: dict) -> None:
+    """Grava o log de triagem sem nunca derrubar o extrator ou o turno.
+    Falha da API de memória aqui é ruído de observabilidade, não erro do
+    usuário — same convention dos writes de memória fire-and-forget."""
+    try:
+        await _call_memory_tool("memory_triage_log", payload)
+    except Exception as e:
+        log.info(f"[MEMORY-TRIAGE] log não-bloqueante falhou: {type(e).__name__}: {e}")
 
 
 async def _call_memory_tool(name: str, arguments: dict) -> dict:
@@ -1862,11 +1905,17 @@ def _build_extraction_user_prompt(
     blocks: Optional[list[dict]] = None,
     task_state: Optional[dict] = None,
     tool_context: Optional[list[str]] = None,
+    relaxed: bool = False,
 ) -> tuple[str, dict[int, int]]:
     """
     Renderiza o prompt do extractor (template do protocolo): CURRENT DATE,
     CANONICAL ENTITIES, EXISTING MEMORIES, PREVIOUS CONTEXT, CURRENT EXCHANGE.
     Retorna (prompt, mapa M{n} → id real).
+
+    `relaxed` é o variant de probe: mantém TODAS as regras de política, mas
+    tira blocks/episódio/task_state da competição por tokens e pede cobertura
+    dos segmentos com conteúdo memorável (até 20 fatos). Nunca é usado no
+    caminho de produção.
     """
     iso_date = datetime.date.today().isoformat()
     memories_block, m_map = _format_existing_memories(candidates)
@@ -1912,6 +1961,35 @@ def _build_extraction_user_prompt(
             tool_lines.append(f"- {text[:800]}")
     tool_block = "\n".join(tool_lines) if tool_lines else "(none)"
 
+    # O probe relaxado só remove o que compete por orçamento. As regras de
+    # política (o que NÃO é memória) continuam integralmente no system prompt.
+    blocks_section = (
+        "EXISTING BLOCKS (pointers to groups of memories; use the block name in "
+        "each fact's \"block\" field when the fact belongs to one):\n"
+        f"{blocks_block}\n\n"
+    ) if not relaxed else ""
+    task_section = (
+        "CURRENT TASK STATE (continue and update it; do not restart unless the "
+        "goal changed):\n"
+        f"{task_block}\n\n"
+    ) if not relaxed else ""
+    tool_section = (
+        "TOOL RESULTS (useful outputs from this turn; use them to write the "
+        "episode's tool_results and to extract facts that only the tool output "
+        "reveals. Do not copy raw dumps):\n"
+        f"{tool_block}\n\n"
+    ) if not relaxed else ""
+    task_instruction = (
+        "Task: this is a COVERAGE PROBE. Apply the same policy rules, but cover "
+        "every segment of the CURRENT EXCHANGE that contains memorable "
+        "information (up to 20 facts), especially the end of a long answer. "
+        "Respond only with the JSON in the defined format."
+        if relaxed else
+        "Task: extract the useful facts from the CURRENT EXCHANGE and decide the "
+        "action for each one by comparing it with the EXISTING MEMORIES. Respond "
+        "only with the JSON in the defined format."
+    )
+
     prompt = (
         f"CURRENT DATE: {iso_date}\n\n"
         "CANONICAL ENTITIES (use these names when writing facts):\n"
@@ -1919,25 +1997,16 @@ def _build_extraction_user_prompt(
         'EXISTING MEMORIES (sorted by relevance; "used_in_answer" indicates it '
         "was sent to the assistant to produce its answer):\n"
         f"{memories_block}\n\n"
-        "EXISTING BLOCKS (pointers to groups of memories; use the block name in "
-        "each fact's \"block\" field when the fact belongs to one):\n"
-        f"{blocks_block}\n\n"
-        "CURRENT TASK STATE (continue and update it; do not restart unless the "
-        "goal changed):\n"
-        f"{task_block}\n\n"
-        "TOOL RESULTS (useful outputs from this turn; use them to write the "
-        "episode's tool_results and to extract facts that only the tool output "
-        "reveals. Do not copy raw dumps):\n"
-        f"{tool_block}\n\n"
+        f"{blocks_section}"
+        f"{task_section}"
+        f"{tool_section}"
         "PREVIOUS CONTEXT (only to resolve references; do NOT extract facts from "
         "here):\n"
         f"{prev_block}\n\n"
         "CURRENT EXCHANGE (extract from here):\n"
         f"USER: {user_input}\n"
         f"ASSISTANT: {assistant_response}\n\n"
-        "Task: extract the useful facts from the CURRENT EXCHANGE and decide the "
-        "action for each one by comparing it with the EXISTING MEMORIES. Respond "
-        "only with the JSON in the defined format."
+        f"{task_instruction}"
     )
     return prompt, m_map
 
@@ -1967,6 +2036,142 @@ async def _memory_write_update(payload: dict, memory_id: int, scope: Optional[st
         log.info(f"[MEMORY-EXTRACT] falha no update LT (memory_id={memory_id}): {e}")
 
 
+# ── Probes de triagem (custo controlado, modelo extrator barato) ──────────────
+# São chamadas DIRETAS ao provider — não passam por /memories/extract, logo
+# não geram novo log nem gravam memórias. O resultado volta para o turno que
+# originou a triagem e é anexado ao mesmo log com teacher_variant distinto.
+_PROBE_SYSTEM_PROMPT = """You are the memory-writing policy checker of a personal assistant.
+You receive numbered text segments and a list of existing memories. For EACH segment decide whether it contains information worth storing according to the SAME policy of the production extractor:
+- stable facts about the user, their projects, tools and belongings
+- preferences, standing instructions and decisions
+- lasting technical configuration
+Do NOT store momentary state, questions with no fact, general knowledge, assistant suggestions the user did not confirm, or private chain-of-thought.
+Existing memories are given only to avoid storing a duplicate. Answer ONLY with JSON:
+{"results":[{"id":"S1","keep":true,"text":"<self-contained third-person fact or empty>","reason":"<short>"}]}
+One entry per segment, in order. `text` must be empty when keep=false."""
+
+_SYNTHETIC_SYSTEM_PROMPT = """You are the memory action classifier of a personal assistant.
+For each numbered statement choose ONE action by comparing it with the provided existing memory: ADD (new useful fact), NOOP (already stored), UPDATE (same subject, changed value), CONFLICT (contradicts and both may be true), MERGE (two pieces that only make sense together), DISCARD (ephemeral/irrelevant).
+Answer ONLY with JSON: {"results":[{"id":"S1","action":"ADD","text":"<self-contained fact or empty>"}]}
+One entry per statement, in order."""
+
+
+async def _triage_llm_json(system: str, user: str, max_tokens: int = 800) -> dict:
+    """Chamada mínima ao MODELO EXTRATOR — nunca ao modelo principal."""
+    try:
+        r = await _llm_post({
+            "model": MEMORY_EXTRACTOR_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }, max_retries=0, label="[MEMORY-TRIAGE-PROBE]")
+        if r.status_code != 200:
+            return {}
+        content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            m = re.search(r"\{[\s\S]*\}", content)
+            return json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        log.info(f"[MEMORY-TRIAGE] probe LLM falhou: {type(e).__name__}: {e}")
+        return {}
+
+
+def _probe_numbered(items: list[dict], candidates: list[dict], cue: bool = False) -> str:
+    lines: list[str] = []
+    for i, it in enumerate(items, start=1):
+        text = str(it.get("text") or "").strip()
+        if cue:
+            text = f"Lembre-se disso: {text}"
+        lines.append(f"S{i}: {text}")
+    cand = "\n".join(
+        f"[M{i}] {str(c.get('text') or '')[:300]}"
+        for i, c in enumerate(candidates[:3], start=1)
+    ) or "(none)"
+    return (
+        "EXISTING MEMORIES:\n" + cand + "\n\nSEGMENTS:\n" + "\n".join(lines) +
+        "\n\nRespond with the JSON only."
+    )
+
+
+async def _triage_segment_probe(segments: list[dict], candidates: list[dict],
+                                cue: bool = False) -> list[dict]:
+    """§5.2.3 / §5.2.7: um lote, no máximo AVA_MEMORY_TRIAGE_PROBE_MAX
+    segmentos. `cue=True` é o par contrastivo 'lembre-se disso'."""
+    items = segments[: max(1, int(MEMORY_TRIAGE_PROBE_MAX))]
+    data = await _triage_llm_json(
+        _PROBE_SYSTEM_PROMPT, _probe_numbered(items, candidates, cue=cue),
+    )
+    results = data.get("results") if isinstance(data, dict) else []
+    out: list[dict] = []
+    for r in (results or []):
+        if not isinstance(r, dict):
+            continue
+        m = re.match(r"^S(\d+)$", str(r.get("id") or "").strip())
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if idx < 0 or idx >= len(items):
+            continue
+        text = (r.get("text") or "").strip()
+        keep = bool(r.get("keep")) and bool(text)
+        out.append({
+            "segment_index": int(items[idx].get("index") or idx),
+            "text": text[:600],
+            "keep": keep,
+            "reason": (r.get("reason") or "probe_keep" if keep else "probe_reject"),
+        })
+    if results:
+        _STATS_PROBE_CALLS()
+    return out
+
+
+def _STATS_PROBE_CALLS() -> None:
+    """Contador local do processo LLM (exposto em /metrics do orquestrador)."""
+    try:
+        from Modules.observability import metrics as obs
+    except ImportError:
+        try:
+            from observability import metrics as obs  # type: ignore
+        except ImportError:
+            return
+    obs.inc("triage_probe_calls_total")
+
+
+async def _triage_synthetic_probe(items: list[dict], candidates: list[dict]) -> list[dict]:
+    """§4: o teacher rotula as perturbações; aceitar só se bater com o esperado."""
+    cap = max(1, int(MEMORY_TRIAGE_SYNTHETIC_MAX))
+    chosen = items[:cap]
+    data = await _triage_llm_json(
+        _SYNTHETIC_SYSTEM_PROMPT, _probe_numbered(chosen, candidates),
+    )
+    results = data.get("results") if isinstance(data, dict) else []
+    out: list[dict] = []
+    for r in (results or []):
+        if not isinstance(r, dict):
+            continue
+        m = re.match(r"^S(\d+)$", str(r.get("id") or "").strip())
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if idx < 0 or idx >= len(chosen):
+            continue
+        expected = str(chosen[idx].get("expected") or "")
+        actual = str(r.get("action") or "").strip().upper()
+        if actual != expected:
+            continue  # teacher discordou da perturbação esperada — descarta
+        out.append({
+            "kind": chosen[idx].get("kind") or "synthetic",
+            "text": (r.get("text") or chosen[idx].get("text") or "").strip()[:600],
+            "action": actual,
+        })
+    return out
+
+
 async def _extract_and_save_memories(
     user_input: str,
     assistant_response: str,
@@ -1976,6 +2181,9 @@ async def _extract_and_save_memories(
     scope: Optional[str] = None,
     task_state: Optional[dict] = None,
     tool_context: Optional[list[str]] = None,
+    turn_id: Optional[str] = None,
+    probe: Optional[str] = None,
+    propensity: float = 1.0,
 ) -> dict:
     """
     Roda o modelo extractor (MEMORY_EXTRACTOR_MODEL) sobre a dupla
@@ -2010,6 +2218,19 @@ async def _extract_and_save_memories(
         log.info("[MEMORY-EXTRACT] LLM_API_KEY ausente — extração pulada.")
         return []
 
+    # `probe="relaxed"` é uma chamada de DEBUG/instrumentação: aumenta só o
+    # orçamento, mantém a política, e NUNCA grava memórias. A extração de
+    # produção continua exatamente a mesma (8 fatos / 1500 tokens).
+    is_relaxed = probe == "relaxed" and MEMORY_TRIAGE_PROBE
+    # Todo variant de instrumentação é somente leitura: replay de turnos
+    # antigos nunca pode reescrever memórias já corrigidas (§4). Apenas o
+    # variant `relaxed` muda orçamento/prompt; os demais usam o fluxo normal.
+    is_probe_mode = probe in _TRIAGE_PROBE_VARIANTS
+    no_write = is_probe_mode or is_relaxed
+    effective_turn_id = (turn_id or "").strip() or hashlib.sha1(
+        f"{session_id or ''}\n{user_input}\n{assistant_response}".encode()
+    ).hexdigest()[:20]
+
     # ── Contexto anterior + candidatos ──────────────────────────────────────
     # O modelo só enxerga as memórias que enviamos: coletamos os melhores
     # candidatos (recall usado na resposta → embedding por sentença → grafo),
@@ -2036,12 +2257,58 @@ async def _extract_and_save_memories(
     prompt_user, m_map = _build_extraction_user_prompt(
         user_input, assistant_response, candidates, previous_context,
         blocks=blocks, task_state=task_state, tool_context=tool_context,
+        relaxed=is_relaxed,
     )
 
     messages_base = [
         {"role": "system", "content": _MEMORY_EXTRACTOR_SYSTEM_PROMPT},
         {"role": "user", "content": prompt_user},
     ]
+
+    # ── Instrumentação (Fase 1) ─────────────────────────────────────────────
+    # Nada aqui altera a decisão de escrita: registramos o que o LLM propôs,
+    # o que o pipeline aplicou e o que ficou sem julgamento. Tudo best-effort
+    # e em background — falha de log nunca vaza para o extrator.
+    def _triage_module():
+        # LLM.py roda a partir de Modules/: a pasta memory/ entra no path só
+        # aqui, para trazer os helpers puros sem importar o serviço inteiro.
+        mem_dir = str(Path(__file__).parent / "memory")
+        if mem_dir not in sys.path:
+            sys.path.append(mem_dir)
+        import memory_triage as tri  # type: ignore
+        return tri
+
+    def _triage_turn_row(status: str, n_facts: int = 0, n_segments: int = 0,
+                         n_suppressed: int = 0, episode_importance=None,
+                         task_status: str = "") -> dict:
+        return {
+            "turn_id": effective_turn_id,
+            "session_id": session_id or "",
+            "scope": scope or "",
+            "extractor_model": str(model),
+            "fallback_model": str(fallback_model) if attempt_i > 1 else "",
+            "attempt_index": int(attempt_i),
+            "prompt_version": MEMORY_TRIAGE_PROMPT_VERSION,
+            "schema_version": MEMORY_TRIAGE_SCHEMA_VERSION,
+            "budget_variant": "relaxed" if is_relaxed else "normal",
+            "propensity": float(propensity),
+            "user_hash": hashlib.sha1(user_input.strip().lower().encode()).hexdigest(),
+            "assistant_hash": hashlib.sha1(assistant_response.strip().lower().encode()).hexdigest(),
+            "n_facts": n_facts,
+            "n_segments": n_segments,
+            "n_suppressed": n_suppressed,
+            "n_candidates": len(candidates),
+            "status": status,
+            "episode_importance": episode_importance,
+            "task_status": task_status,
+        }
+
+    def _triage_failure(status: str) -> None:
+        if not MEMORY_TRIAGE_LOG or not session_id:
+            return
+        asyncio.create_task(_log_triage_best_effort({
+            "turn": _triage_turn_row(status), "samples": [],
+        }))
 
     # ── Cadeia de tentativas ────────────────────────────────────────────────
     # BUG corrigido: o fluxo antigo só caía para o fallback quando o status
@@ -2062,6 +2329,23 @@ async def _extract_and_save_memories(
             "schema": _MEMORY_EXTRACTION_SCHEMA,
         },
     }
+    if is_relaxed:
+        # Probe de cobertura: modulo SÓ o orçamento (teto de fatos + o que
+        # compete com eles no prompt). As regras de política do system prompt
+        # permanecem idênticas — relaxar política gravaria efêmero.
+        relaxed_schema = json.loads(json.dumps(_MEMORY_EXTRACTION_SCHEMA))
+        relaxed_schema["properties"]["facts"]["maxItems"] = 20
+        relaxed_schema["properties"]["facts"]["description"] = (
+            "Até 20 fatos: cubra TODOS os segmentos com informação memorável "
+            "da troca atual, inclusive o fim de respostas longas."
+        )
+        # strict=true exige que TODAS as properties estejam em `required`:
+        # remove as propriedades, não só os nomes de `required`, senão o
+        # provider recusa o schema com 400.
+        for key in ("blocks", "episode", "task_state"):
+            relaxed_schema["properties"].pop(key, None)
+        relaxed_schema["required"] = ["facts"]
+        json_schema_fmt["json_schema"]["schema"] = relaxed_schema
     _plain_json_instruction = (
         "\n\nFORMATO OBRIGATÓRIO — responda APENAS com um objeto JSON válido, "
         "sem texto antes ou depois e sem markdown:\n"
@@ -2087,6 +2371,12 @@ async def _extract_and_save_memories(
         "Se nada merecer ser gravado, responda exatamente: "
         '{"facts": [], "blocks": [], "episode": {...}, "task_state": {...}}'
     )
+    if is_relaxed:
+        _plain_json_instruction = (
+            _plain_json_instruction
+            .replace("Máximo de 8 fatos.", "Máximo de 20 fatos — cubra todos os segmentos memoráveis.")
+            .replace("episode e task_state são SEMPRE obrigatórios.", "Omita episode e task_state neste probe.")
+        )
     fallback_model = MEMORY_EXTRACTOR_FALLBACK_MODEL or MAIN_MODEL
     # Bloco de roteamento de provider (curl `provider.only`) — só acompanha as
     # tentativas com o MODELO EXTRATOR: o fallback pode rodar em outro modelo
@@ -2114,7 +2404,7 @@ async def _extract_and_save_memories(
             "model":       model,
             "messages":    messages_base[:-1] + [{"role": "user", "content": msg_user}],
             "temperature": MEMORY_EXTRACTOR_TEMPERATURE,
-            "max_tokens":  1500,
+            "max_tokens":  4000 if is_relaxed else 1500,
         }
         if fmt:
             payload["response_format"] = fmt
@@ -2173,6 +2463,7 @@ async def _extract_and_save_memories(
             f"(último erro: {last_err or 'desconhecido'}) — memórias deste turno "
             "NÃO gravadas."
         )
+        _triage_failure("all_attempts_failed")
         return []
 
     try:
@@ -2182,11 +2473,13 @@ async def _extract_and_save_memories(
         match = re.search(r"\{[\s\S]*\}", content)
         if not match:
             log.info(f"[MEMORY-EXTRACT] JSON inválido: {je}. Raw: {content[:200]}")
+            _triage_failure("no_output")
             return []
         try:
             parsed = json.loads(match.group(0))
         except json.JSONDecodeError:
             log.info(f"[MEMORY-EXTRACT] Recovery falhou. Raw: {content[:200]}")
+            _triage_failure("no_output")
             return []
 
     facts_raw = parsed.get("facts", []) if isinstance(parsed, dict) else []
@@ -2260,6 +2553,7 @@ async def _extract_and_save_memories(
         return payload
 
     saved: list[dict] = []
+    triage_facts: list[dict] = []
     add_payloads: list[dict] = []
     update_ops: list[tuple[dict, int]] = []
 
@@ -2357,12 +2651,211 @@ async def _extract_and_save_memories(
 
         saved.append(entry)
 
-    if add_payloads:
-        # fire-and-forget: o /chat não espera a gravação terminar para
-        # responder; os N fatos ADD viram 1 chamada MCP de batch.
-        asyncio.create_task(memory_write_facts_batch(add_payloads, scope=scope))
-    for upd_payload, upd_target in update_ops:
-        asyncio.create_task(_memory_write_update(upd_payload, upd_target, scope=scope))
+        if MEMORY_TRIAGE_LOG:
+            applied = entry["action"]
+            if applied != action:
+                reason = ("downgrade_no_target" if action in ("UPDATE", "MERGE")
+                          else "noop_without_target")
+            elif action == "CONFLICT":
+                reason = "conflict_add_plus_update"
+            else:
+                reason = "ok"
+            rec = {
+                "text": text,
+                "evidence": evidence,
+                "type": entry["type"],
+                "validity": validity,
+                "target_ids": targets,
+                "related_ids": related_ids,
+                "proposed_label": action,
+                # Thinkings nunca viram `applied` (§5.2.8): o CoT é só probe.
+                "applied_label": "unlabeled" if probe == "thinking" else applied,
+                "applied_reason": reason,
+                # Peso da fonte (§4) × penalidade do fallback (§7).
+                "weight": round(
+                    {"replay": 0.4, "thinking": 0.3, "synthetic": 0.3,
+                     "contrastive": 0.8}.get(probe or "", 1.0)
+                    / max(1, attempt_i), 4,
+                ),
+            }
+            if action in ("ADD", "CONFLICT") and add_payloads:
+                rec["_add_index"] = len(add_payloads) - 1
+            if action in ("UPDATE", "MERGE", "CONFLICT") and targets and update_ops:
+                rec["_update_index"] = len(update_ops) - 1
+            triage_facts.append(rec)
+
+    # Escritas continuam fire-and-forget e paralelas como antes. O task extra
+    # só observa os resultados para corrigir `ADD`→`UPDATE` (possible_update)
+    # e `ADD`→`NOOP` (duplicata exata) no log aplicado.
+    write_tasks: list[asyncio.Task] = []
+    if not no_write:
+        if add_payloads:
+            write_tasks.append(asyncio.create_task(
+                memory_write_facts_batch(add_payloads, scope=scope)
+            ))
+        for upd_payload, upd_target in update_ops:
+            write_tasks.append(asyncio.create_task(
+                _memory_write_update(upd_payload, upd_target, scope=scope)
+            ))
+
+    if MEMORY_TRIAGE_LOG and session_id:
+        async def _finish_triage() -> None:
+            try:
+                results = await asyncio.gather(*write_tasks, return_exceptions=True)
+                batch_results = results[0] if add_payloads and results and isinstance(results[0], list) else []
+                update_results = results[1:] if add_payloads else results
+                for rec in triage_facts:
+                    add_i = rec.pop("_add_index", None)
+                    if add_i is not None and add_i < len(batch_results):
+                        data = batch_results[add_i]
+                        if isinstance(data, dict):
+                            why = str(data.get("reason") or "")
+                            if why.startswith("possible_update:"):
+                                cid = data.get("candidate_id")
+                                rec["applied_label"] = "UPDATE"
+                                rec["applied_reason"] = why[:80]
+                                if cid is not None:
+                                    rec["target_ids"] = [int(cid)]
+                            elif "duplicate" in why.lower():
+                                rec["applied_label"] = "NOOP"
+                                rec["applied_reason"] = why[:80]
+                            elif data.get("stored"):
+                                rec["applied_label"] = "ADD"
+                                rec["applied_reason"] = "stored"
+                    upd_i = rec.pop("_update_index", None)
+                    if upd_i is not None and upd_i < len(update_results):
+                        data = update_results[upd_i]
+                        if isinstance(data, dict) and data.get("stored"):
+                            rec["applied_label"] = "UPDATE"
+                            rec["applied_reason"] = "update_stored"
+
+                tri = _triage_module()
+                segments = tri.split_segments(user_input, assistant_response)
+                variant = _TRIAGE_VARIANT_NAME.get(probe or "", "base")
+                origin = _TRIAGE_ORIGIN.get(probe or "", "live")
+                base_ctx = {
+                    "turn_id": effective_turn_id,
+                    "session_id": session_id,
+                    "scope": scope,
+                    "segments": segments,
+                    "facts": triage_facts,
+                    "candidates": candidates,
+                    "m_map": m_map,
+                    "teacher_variant": variant,
+                    "propensity": propensity,
+                    "origin": origin,
+                    "created_at": time.time(),
+                    "embed_model_version": MEMORY_TRIAGE_EMBED_VERSION,
+                }
+                samples = tri.build_samples(base_ctx)
+
+                # ── Gate cross-encoder (§5.2.4): zero custo de API. Usa o
+                # /write em dry-run — MESMA decisão de dedup/rerank, sem
+                # gravar. Só em segmentos suprimidos: em emitidos o
+                # applied_label já é ground truth e não deve ser mexido.
+                if MEMORY_TRIAGE_GATE and MEMORY_TRIAGE_LOG:
+                    seen_seg: set[str] = set()
+                    for s in list(samples):
+                        if s.get("teacher_emitted") or s.get("segment_hash") in seen_seg:
+                            continue
+                        seen_seg.add(s["segment_hash"])
+                        raw = (s.get("segment_text") or "").strip()
+                        if len(raw) < 10 or not MEMORY_TRIAGE_LOG_TEXT:
+                            continue  # o gate precisa do texto real
+                        try:
+                            data = await _call_memory_tool("memory_write", {
+                                "text": raw, "source": "triage:gate",
+                                "dry_run": True,
+                                **({"scope": scope} if scope else {}),
+                            })
+                            g = tri.gate_fields(data)
+                            for row in samples:
+                                if row.get("segment_hash") == s["segment_hash"]:
+                                    row.update(g)
+                        except Exception as e:
+                            log.debug(f"[MEMORY-TRIAGE] gate pulado: {type(e).__name__}: {e}")
+
+                # ── Probes por segmento e pares contrastivos (§5.2.3/§5.2.7)
+                # Só turnos de tráfego ao vivo — replay/probe já são variants.
+                if probe is None and MEMORY_TRIAGE_PROBE and MEMORY_TRIAGE_SEGMENT_PROBE:
+                    worthy = [
+                        s for s in segments
+                        if tri.is_probe_worthy(s)
+                        and (s.get("text") or "").strip()
+                    ][:max(1, MEMORY_TRIAGE_PROBE_MAX)]
+                    if worthy:
+                        plain = await _triage_segment_probe(worthy, candidates)
+                        samples.extend(tri.probe_samples({
+                            **base_ctx, "teacher_variant": "segment_probe",
+                            "origin": "probe",
+                        }, plain))
+                        if MEMORY_TRIAGE_CONTRASTIVE:
+                            samples.extend(tri.probe_samples({
+                                **base_ctx, "teacher_variant": "contrastive_no_cue",
+                                "origin": "probe", "weight": 0.8,
+                            }, plain))
+                            cued = await _triage_segment_probe(worthy, candidates, cue=True)
+                            samples.extend(tri.probe_samples({
+                                **base_ctx, "teacher_variant": "contrastive_cue",
+                                "origin": "probe", "weight": 0.8,
+                            }, cued))
+
+                # ── Sintético (§4): perturba um fato emitido, teacher rotula,
+                # aceita só se bater com o esperado. Teto de 25% do batch e
+                # fração pequena de turnos (limite de custo §5.5).
+                if (probe is None and MEMORY_TRIAGE_SYNTHETIC
+                        and random.random() < MEMORY_TRIAGE_SYNTHETIC_RATE
+                        and triage_facts):
+                    src = triage_facts[0]
+                    perturbations = tri.synthetic_perturbations(
+                        src.get("text") or "", src.get("evidence") or "",
+                    )[:max(1, MEMORY_TRIAGE_SYNTHETIC_MAX)]
+                    if perturbations:
+                        accepted = await _triage_synthetic_probe(perturbations, candidates)
+                        cap = max(1, int(len(samples) * 0.25))
+                        for i, item in enumerate(accepted[:cap]):
+                            hash_i = hashlib.sha1(
+                                (item.get("text") or f"syn-{i}").encode()
+                            ).hexdigest()
+                            fake_seg = {
+                                "index": 1000 + i, "text": item.get("text") or "",
+                                "role": "user", "n_chars": len(item.get("text") or ""),
+                                "has_deictic": 0, "hash": hash_i,
+                            }
+                            samples.extend(tri.build_samples({
+                                **base_ctx,
+                                "segments": [fake_seg],
+                                "facts": [{
+                                    "text": item.get("text") or "",
+                                    "evidence": "",
+                                    "type": "fact",
+                                    "proposed_label": item.get("action") or "",
+                                    "applied_label": item.get("action") or "",
+                                    "applied_reason": f"synthetic_{item.get('kind') or ''}",
+                                    "target_ids": [], "related_ids": [],
+                                    "weight": 0.3,
+                                }],
+                                "teacher_variant": "synthetic",
+                                "origin": "synthetic", "weight": 0.3,
+                            }))
+
+                episode_obj = parsed.get("episode") if isinstance(parsed, dict) else None
+                task_obj = parsed.get("task_state") if isinstance(parsed, dict) else None
+                await _log_triage_best_effort({
+                    "turn": _triage_turn_row(
+                        "ok", n_facts=len(saved), n_segments=len(samples),
+                        n_suppressed=sum(1 for s in samples if not s.get("teacher_emitted")),
+                        episode_importance=(float(episode_obj.get("importance") or 0.5)
+                                            if isinstance(episode_obj, dict) else None),
+                        task_status=(str(task_obj.get("status") or "")
+                                     if isinstance(task_obj, dict) else ""),
+                    ),
+                    "samples": samples,
+                })
+            except Exception as e:
+                log.info(f"[MEMORY-TRIAGE] finalize ignorado: {type(e).__name__}: {e}")
+
+        asyncio.create_task(_finish_triage())
 
     episode = parsed.get("episode") if isinstance(parsed, dict) else None
     task_state = parsed.get("task_state") if isinstance(parsed, dict) else None
@@ -2384,10 +2877,10 @@ async def _extract_and_save_memories(
 
     # Episódio: gravado sempre (mesmo quando nada vira fato). O turn_id é
     # estável pelo conteúdo, então uma repetição do extrator não duplica.
-    if isinstance(episode, dict) and session_id:
-        turn_id = hashlib.sha1(
-            f"{session_id}\n{user_input}\n{assistant_response}".encode()
-        ).hexdigest()[:20]
+    if isinstance(episode, dict) and session_id and not no_write:
+        # O turn_id do orchestrator (execution_id) é a chave comum entre log,
+        # episódio e fatos; sem ele usamos o hash estável pelo conteúdo.
+        turn_id = effective_turn_id
         try:
             await _call_memory_tool("memory_episode_write", {
                 "session_id": session_id,
@@ -3595,6 +4088,14 @@ class MemoryExtractionRequest(BaseModel):
     task_state: Optional[dict] = Field(default=None)
     # Resultados úteis de ferramentas do turno (para o episódio).
     tool_context: Optional[list[str]] = Field(default=None)
+    # execution_id do turno — chave comum entre log de triagem, episódio e
+    # fatos. Sem ele o extrator usa um hash estável do conteúdo.
+    turn_id: Optional[str] = Field(default=None)
+    # Variant de instrumentação. "relaxed" aumenta só o orçamento, mantém a
+    # política e NÃO grava memórias — usado para recuperar fatos suprimidos
+    # por token (Fase 1 §5.2). "replay" marca origem de reprocessamento.
+    probe: Optional[str] = Field(default=None)
+    propensity: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 @app.post("/memories/extract")
@@ -3614,6 +4115,9 @@ async def memories_extract(req: MemoryExtractionRequest):
         scope=req.scope,
         task_state=req.task_state,
         tool_context=req.tool_context,
+        turn_id=req.turn_id,
+        probe=req.probe,
+        propensity=req.propensity,
     )
     saved = result.get("facts") or []
     return {

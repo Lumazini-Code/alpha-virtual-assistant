@@ -15,6 +15,71 @@ os casos duvidosos. A Fase 1 é o pré-requisito: sem rótulos confiáveis e sem
 cobrir os segmentos que o extrator **suprimiu por economia de tokens**, a rede
 aprenderia o conservadorismo do teacher em vez do valor da informação (ver §5).
 
+## 0. Estado da implementação
+
+Implementado nesta rodada (início da Fase 1):
+
+- esquema `memory_triage_turn` / `memory_triage_sample` + índices em
+  `Modules/memory/memory_db.py` (idempotente por `CREATE IF NOT EXISTS`);
+  `candidate_id` sem candidato é gravado como `-1` para preservar a
+  idempotência também dos suprimidos;
+- domínio em `Modules/memory/memory_triage.py` (+ `README_TRIAGE.md`):
+  alinhamento exato/fuzzy, segmentação com `role`, rótulos fracos do
+  renderizador, `build_samples`, upsert, exportação PU, estatísticas e delete;
+- hook no `LLM.py` entre a validação de IDs e o roteamento: `proposed_label`
+  vem da `action` original, `applied_label` é corrigido com o resultado real
+  das escritas (`possible_update` → `UPDATE`, duplicata exata → `NOOP`);
+  falhas das três tentativas e JSON inválido também geram linha de turno;
+- `turn_id` = `execution_id` do orchestrator, compartilhado com o episódio;
+- probe `relaxed` (orçamento 20 fatos / 4000 tokens, sem blocks/episode/
+  task_state, **sem gravar memórias**), disparado em ~8% dos turnos como
+  chamada extra em background, com propensão registrada;
+- rotas `/triage/log|labels|stats` e `DELETE /triage/log`, `/status` com
+  `memory_triage`, métricas `ava_triage_*`;
+- WebUI: barra **Dados** na lateral com progresso até
+  `AVA_MEMORY_TRIAGE_TARGET_SAMPLES` e aviso one-shot quando o dataset fica
+  pronto;
+- `tests/test_memory_triage.py` (11 testes).
+
+Segunda rodada — Fase 1 **completa** (todas as fontes do §4 e o gold do §7):
+
+- **Gate cross-encoder** (§5.2.4): `dry_run` em `WriteRequest`/`WriteBatchRequest`
+  executa dedup exata + cross-encoder e devolve a mesma resposta sem gravar
+  nada (sem insert, vetor, arestas, blocos ou cards). Rótulo local em
+  `gate_label`/`gate_reason`/`gate_candidate_id`/`gate_score`, peso 0.6.
+  Os `reason` reais do código são `duplicate_exact`,
+  `duplicate_semantic:...:rerank=...`, `possible_update:...:rerank=...` e `ok`,
+  não os nomes simplificados do doc.
+- **Linhas de par** (§3): um fato gera uma linha por alvo/relacionado + top-5
+  por cosine; segmentos sem fato também geram linhas de par, todas com
+  `applied_label='unlabeled'`.
+- **Probes por segmento** (§5.2.3): segmentos suprimidos por orçamento,
+  do usuário, com ≥20 chars e não-déiticos, até 3 por turno, num único lote
+  no modelo extrator barato. `teacher_variant=segment_probe`.
+- **Pares contrastivos** (§5.2.7): o mesmo segmento com e sem o cue
+  "Lembre-se disso", em `contrastive_no_cue` / `contrastive_cue`, peso 0.8.
+- **Sintético** (§4): perturbações determinísticas (versão, "na verdade",
+  continuação, efêmero) rotuladas pelo teacher; só aceitas se baterem com o
+  esperado, teto de 25% do batch e `AVA_MEMORY_TRIAGE_SYNTHETIC_RATE=0.05`,
+  `origin=synthetic`, peso 0.3.
+- **Thinkings** (§5.2.8): `probe=thinking` usa um recorte mínimo do CoT,
+  `origin=probe_thinking`, `teacher_variant=probe_thinking`, peso 0.3 e
+  `applied_label='unlabeled'` — nunca `applied`.
+- **Replay** (§4): `scripts/triage_replay.py` reprocessa turnos do session
+  store com `probe=replay`/`thinking`. Todos os variants de instrumentação
+  são **somente leitura** — replay nunca reescreve memórias corrigidas.
+- **Gold set** (§7): tabela `memory_triage_gold` imutável, amostra
+  estratificada em `GET /triage/gold/candidates`, revisão via
+  `POST /triage/gold`, consulta em `GET /triage/gold`, alvo
+  `AVA_MEMORY_TRIAGE_GOLD_TARGET=200`. A calibração da Fase 2 deve usar
+  **somente** estes rótulos, nunca os do teacher (§5.4).
+- `/triage/stats` também expõe `emitted_rate_by_role`, `emitted_rate_by_size`,
+  `gate_label_counts`, `gold_total` e os pesos/flags de cada fonte.
+
+O job de retenção roda de forma lazy a cada `/triage/log` (não há scheduler
+dedicado). Aplicação offline dos pesos de treino (IPW, over/under-sample e
+Platt no gold) permanece na Fase 2 — aqui só coletamos os rótulos e a propensão.
+
 ## 1. Estado atual e pontos de captura
 
 O fluxo relevante hoje:

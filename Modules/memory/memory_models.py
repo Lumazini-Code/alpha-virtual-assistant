@@ -166,6 +166,147 @@ class EpisodeWriteResponse(BaseModel):
 class EpisodeSearchResponse(BaseModel):
     episodes: list[EpisodeResponse] = []
 
+# ── Triagem de memória (Fase 1: dataset de treino da rede local) ──────────────
+class TriageTurn(BaseModel):
+    turn_id: str
+    session_id: str
+    scope: str = ""
+    created_at: Optional[float] = None
+    extractor_model: str = ""
+    fallback_model: str = ""
+    attempt_index: int = 1
+    prompt_version: str = ""
+    schema_version: str = ""
+    budget_variant: str = "normal"
+    propensity: float = 1.0
+    latency_ms: float = 0.0
+    user_hash: str = ""
+    assistant_hash: str = ""
+    n_facts: int = 0
+    n_segments: int = 0
+    n_suppressed: int = 0
+    n_candidates: int = 0
+    status: str = "ok"
+    episode_importance: Optional[float] = None
+    task_status: str = ""
+
+
+class TriageSample(BaseModel):
+    segment_index: int
+    segment_text: str = ""
+    segment_hash: str
+    role: str = "user"
+    n_chars: int = 0
+    has_deictic: int = 0
+    candidate_id: Optional[int] = None
+    candidate_text_snapshot: str = ""
+    candidate_created_at: Optional[float] = None
+    cosine: Optional[float] = None
+    cross_encoder_score: Optional[float] = None
+    used_in_answer: int = 0
+    rank: Optional[int] = None
+    teacher_variant: str = "base"
+    teacher_emitted: int = 0
+    suppression_reason: str = ""
+    propensity: float = 1.0
+    proposed_label: str = ""
+    proposed_targets: list[int] = []
+    proposed_type: str = "fact"
+    proposed_validity: str = "temporal"
+    applied_label: str = "unlabeled"
+    applied_reason: str = ""
+    frame_label: str = ""
+    fragment_index: Optional[int] = None
+    slot_entity: str = ""
+    slot_value: str = ""
+    slot_date: str = ""
+    rendered_text: str = ""
+    render_source: str = ""
+    evidence_aligned: str = "none"
+    origin: str = "live"
+    weight: float = 1.0
+    embed_model_version: str = ""
+    shadow_pred: str = ""
+    gate_label: str = ""
+    gate_reason: str = ""
+    gate_candidate_id: Optional[int] = None
+    gate_score: Optional[float] = None
+    created_at: Optional[float] = None
+
+
+class TriageLogRequest(BaseModel):
+    turn: TriageTurn
+    samples: list[TriageSample] = []
+
+
+class TriageLogResponse(BaseModel):
+    stored: bool
+    turn_id: str = ""
+    samples_logged: int = 0
+    samples_updated: int = 0
+    reason: str = ""
+
+
+class TriageLabelsResponse(BaseModel):
+    samples: list[dict] = []
+    total: int = 0
+    has_more: bool = False
+
+
+class TriageReadiness(BaseModel):
+    target: int
+    labelled: int
+    progress: float = 0.0
+    ready: bool = False
+    missing: int = 0
+    reason: str = ""
+
+
+class TriageGoldRequest(BaseModel):
+    sample_id: int
+    reviewed_label: str
+    reviewed_by: str = ""
+    notes: str = ""
+    scope: Optional[str] = None
+
+
+class TriageGoldResponse(BaseModel):
+    stored: bool
+    sample_id: int = 0
+    reason: str = ""
+
+
+class TriageGoldListResponse(BaseModel):
+    entries: list[dict] = []
+    total: int = 0
+
+
+class TriageStatsResponse(BaseModel):
+    enabled: bool = True
+    turns_total: int = 0
+    samples_total: int = 0
+    labelled_total: int = 0
+    unlabeled_total: int = 0
+    teacher_emitted_total: int = 0
+    suppressed_total: int = 0
+    suppressed_by_reason: dict[str, int] = {}
+    alignment: dict[str, int] = {}
+    label_counts: dict[str, int] = {}
+    origin_counts: dict[str, int] = {}
+    variant_counts: dict[str, int] = {}
+    emitted_rate_by_position: dict[str, float] = {}
+    emitted_rate_by_role: dict[str, float] = {}
+    emitted_rate_by_size: dict[str, float] = {}
+    gate_label_counts: dict[str, int] = {}
+    render_labels_total: int = 0
+    recall_gap: float = 0.0
+    gold_total: int = 0
+    gold_target: int = 200
+    gold_candidates_total: int = 0
+    readiness: TriageReadiness
+    flags: dict[str, object] = {}
+    counters: dict[str, int] = {}
+
 class BlockGuideRequest(BaseModel):
     guide:  str
     scope:  Optional[str] = None
@@ -239,6 +380,9 @@ class WriteRequest(BaseModel):
     block:       Optional[BlockProposal] = None
     # ── NEW (multi-chat): escopo da escrita. None = escopo ativo do processo.
     scope:       Optional[str] = None
+    # dry_run roda dedup exata + cross-encoder e devolve a MESMA resposta, mas
+    # não grava nada — usado pelo gate da triagem como rotulador local (§5.2.4).
+    dry_run:     bool = False
 
 class WriteBatchRequest(BaseModel):
     # ── NEW (solução 1): grava várias memórias em uma única chamada,
@@ -252,6 +396,7 @@ class WriteBatchRequest(BaseModel):
     sequential: bool = False
     # ── NEW (multi-chat): escopo padrão do batch (itens podem sobrescrever).
     scope:      Optional[str] = None
+    dry_run:    bool = False
 
 class WriteSTRequest(BaseModel):
     # ── SESSÕES REMOVIDAS: session_id é só metadado de proveniência (fica na
@@ -1104,6 +1249,16 @@ __all__ = [
     'ToolTipRemoveRequest',
     'ToolTipsListResponse',
     'ToolUsageRequest',
+    'TriageGoldListResponse',
+    'TriageGoldRequest',
+    'TriageGoldResponse',
+    'TriageLabelsResponse',
+    'TriageLogRequest',
+    'TriageLogResponse',
+    'TriageReadiness',
+    'TriageSample',
+    'TriageStatsResponse',
+    'TriageTurn',
     'Turn',
     'VisualDictCandidate',
     'VisualDictEntry',

@@ -55,6 +55,12 @@ from memory_config import (
     LANCE_DIR,
     LTP_ACCESS_BOOST,
     MEMORY_BLOCKS_ENABLED,
+    MEMORY_TRIAGE_GATE,
+    MEMORY_TRIAGE_GOLD_TARGET,
+    MEMORY_TRIAGE_LOG,
+    MEMORY_TRIAGE_SEGMENT_PROBE,
+    MEMORY_TRIAGE_SYNTHETIC,
+    MEMORY_TRIAGE_TARGET_SAMPLES,
     MMR_COSINE_FLOOR,
     MMR_LAMBDA,
     ONNX_SERVING_URL,
@@ -221,6 +227,46 @@ def _gather_status_sync() -> dict:
             ),
             "top_k":         EPISODE_TOP_K,
             "vectors_total": safe("memory_episodes", lambda: state.ep_index.total),
+        },
+        # ── Triagem de memória (Fase 1: dataset de treino) ──
+        "memory_triage": {
+            "enabled": MEMORY_TRIAGE_LOG,
+            "turns_total": safe(
+                "memory_triage",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_triage_turn"
+                ).fetchone()[0],
+            ),
+            "samples_total": safe(
+                "memory_triage",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_triage_sample"
+                ).fetchone()[0],
+            ),
+            "labelled_total": safe(
+                "memory_triage",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_triage_sample WHERE applied_label != 'unlabeled'"
+                ).fetchone()[0],
+            ),
+            "target_samples": MEMORY_TRIAGE_TARGET_SAMPLES,
+            "gold_total": safe(
+                "memory_triage",
+                lambda: state.lt_db._conn.execute(
+                    "SELECT COUNT(*) FROM memory_triage_gold"
+                ).fetchone()[0],
+            ),
+            "gold_target": MEMORY_TRIAGE_GOLD_TARGET,
+            "flags": {
+                "gate": MEMORY_TRIAGE_GATE,
+                "segment_probe": MEMORY_TRIAGE_SEGMENT_PROBE,
+                "synthetic": MEMORY_TRIAGE_SYNTHETIC,
+            },
+            "counters": safe(
+                "memory_triage",
+                lambda: dict(__import__("memory_triage")._STATS),
+                fallback={},
+            ),
         },
         # ── NEW: LanceDB ──
         "vector_store": {

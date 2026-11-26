@@ -256,6 +256,9 @@ async def _store_long_term_text(
     # sondado cru). False (default) = caller externo (/write) recebe id de API
     # (composta com offset quando o alvo é do geral em leitura mesclada).
     internal: bool = False,
+    # ── Triagem: executa SÓ as checagens (dedup exata + cross-encoder) e
+    # devolve a decisão que SERIA aplicada, sem nenhuma mutação.
+    dry_run: bool = False,
 ) -> tuple[bool, str, Optional[int], Optional[dict]]:
     """
     Lógica compartilhada de gravação em memória de longo prazo — usada tanto
@@ -344,6 +347,11 @@ async def _store_long_term_text(
             if row is None:
                 return False, "update_target_not_found", None, None
 
+            if dry_run:
+                # Alvo validado pelo mesmo cross-encoder da produção — nada
+                # é escrito. O id de resposta é o cru (o gate só lê o reason).
+                return True, "updated", target_id, None
+
             ok = target_db.update(
                 target_id, text,
                 source=source, confidence=confidence,
@@ -423,6 +431,11 @@ async def _store_long_term_text(
                     f"(cosine={max_sim:.3f} mas cross_score={cross_score:.3f} < {RERANK_UPDATE_SCORE}) "
                     f"— gravando como fato novo: {text[:60]}"
                 )
+
+        if dry_run:
+            # Chegou aqui → não é duplicata (exata nem semântica) e o
+            # cross-encoder não pediu update: a decisão seria gravar.
+            return True, "ok", None, None
 
         try:
             memory_id = state.lt_db.insert(text, source, confidence, forgettable, ttl_days)
@@ -561,18 +574,19 @@ async def _process_write_request(req: WriteRequest) -> WriteResponse:
     stored, reason, memory_id, candidate = await _store_long_term_text(
         req.text, req.source, req.confidence, req.forgettable,
         ttl_days=req.ttl_days, action=req.action, memory_id=req.memory_id,
-        allow_near=linking,
+        allow_near=linking, dry_run=req.dry_run,
     )
-    if linking and stored and reason == "ok" and memory_id is not None:
+    if linking and not req.dry_run and stored and reason == "ok" and memory_id is not None:
         await _link_new_memory(memory_id, req.link_to, req.link_type)
     # ── NEW (people cards): vincula a memória ao nó de identidade do card
     # (aresta co_activation). Depois da ligação explícita — person_id inválido
     # → warning e grava sem vínculo, sem bloquear.
-    if req.person_id is not None and stored and reason == "ok" and memory_id is not None:
+    if req.person_id is not None and not req.dry_run and stored and reason == "ok" and memory_id is not None:
         await _link_memory_to_person(memory_id, req.person_id)
     # ── NEW (blocos): o extrator pode propor um bloco novo ou associar o
     # átomo a um bloco existente. O bloco é ponteiro: nunca substitui o fato.
-    if req.block is not None and MEMORY_BLOCKS_ENABLED and stored and reason == "ok" and memory_id is not None:
+    if (req.block is not None and MEMORY_BLOCKS_ENABLED and not req.dry_run
+            and stored and reason == "ok" and memory_id is not None):
         try:
             from memory_blocks import attach_memory_to_block, block_write, _sanitize_guide, _guide_hash
             b = req.block
@@ -640,13 +654,16 @@ async def write_memory_batch(req: WriteBatchRequest):
         loop = asyncio.get_event_loop()
         prev_id: Optional[int] = None
         for item in req.items:
+            if req.dry_run and not item.dry_run:
+                item = item.model_copy(update={"dry_run": True})
             resp = await _process_write_request(item)
             results.append(resp)
             # ── NEW: batch sequencial → aresta temporal_precedence (anterior → seguinte)
             # NEW (projetos): aresta só quando AMBAS as ids são do MESMO escopo —
             # ids compostas (offset) indicam memória do geral (update em modo
             # projeto); arestas nunca cruzam escopos.
-            if req.sequential and resp.stored and resp.memory_id is not None:
+            if (req.sequential and not req.dry_run and not item.dry_run
+                    and resp.stored and resp.memory_id is not None):
                 if (
                     prev_id is not None and prev_id != resp.memory_id
                     and not is_general_ref(prev_id) and not is_general_ref(resp.memory_id)

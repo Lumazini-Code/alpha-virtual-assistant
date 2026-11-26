@@ -87,6 +87,7 @@ from __future__ import annotations
 import json
 import asyncio
 import base64
+import random
 import logging
 import logging.handlers
 import os
@@ -387,6 +388,13 @@ ST_WINDOW_TURNS = max(1, int(os.getenv("AVA_ST_WINDOW_TURNS", "6")))
 ST_WINDOW_MAX_TOKENS = max(0, int(os.getenv("AVA_ST_WINDOW_MAX_TOKENS", "12000")))
 ST_KEEP_PRIOR_TOOLS = os.getenv("AVA_ST_KEEP_PRIOR_TOOLS", "0") != "0"
 TASK_STATE_ENABLED = os.getenv("AVA_TASK_STATE", "1") != "0"
+# Triagem de memória (Fase 1): 8% dos turnos recebem UM probe relaxado
+# extra, em background, sem gravar memórias — recupera fatos que o orçamento
+# de produção suprimiu. O turno normal continua idêntico.
+MEMORY_TRIAGE_PROBE = os.getenv("AVA_MEMORY_TRIAGE_PROBE", "1") != "0"
+MEMORY_TRIAGE_PROBE_RATE = min(0.5, max(0.0, float(
+    os.getenv("AVA_MEMORY_TRIAGE_PROBE_RATE", "0.08")
+)))
 
 # ── Multi-chat: serialização e cancelamento por sessão ────────────────────────
 # Um turno por sessão por vez: dois envios no MESMO chat esperam na fila em
@@ -2762,7 +2770,10 @@ async def _recall_for_turn(query: str, sid: str,
 
 
 async def _extract_memories_via_llm(u: str, a: str, sid: str,
-                                    scope: Optional[str] = None) -> bool:
+                                    scope: Optional[str] = None,
+                                    turn_id: Optional[str] = None,
+                                    probe: Optional[str] = None,
+                                    propensity: float = 1.0) -> bool:
     """Extração de memórias pós-turno via o modelo extrator DEDICADO do LLM.py
     (endpoint /memories/extract). Substitui o antigo _save_lt('Usuário disse:
     ...') ingênuo, que gravava QUALQUER input como fato permanente de LT —
@@ -2803,7 +2814,10 @@ async def _extract_memories_via_llm(u: str, a: str, sid: str,
             json={"user_input": u, "assistant_response": a, "session_id": sid,
                   **({"scope": scope} if scope else {}),
                   **({"task_state": task_state} if task_state else {}),
-                  **({"tool_context": tool_context} if tool_context else {})},
+                  **({"tool_context": tool_context} if tool_context else {}),
+                  **({"turn_id": turn_id} if turn_id else {}),
+                  **({"probe": probe} if probe else {}),
+                  "propensity": float(propensity)},
             timeout=httpx.Timeout(120.0, connect=10.0),
         )
         if r.status_code == 200:
@@ -6717,8 +6731,26 @@ async def _execute_stream_generator(req: ExecuteRequest):
         # B+: extração real (modelo extrator do LLM.py, roteando semantic→LT /
         # episodic→ST) no lugar do antigo "_save_lt('Usuário disse: ...')" —
         # que gravava qualquer input como fato permanente de LT.
-        _spawn(_extract_memories_via_llm(req.input, final_response, sid,
-                                        scope=_CURRENT_SCOPE.get()))
+        _scope = _CURRENT_SCOPE.get()
+        # Probe de cobertura (Fase 1 §5.2): fração pequena dos turnos ganha
+        # UMA extração relaxada EXTRA, que só rotula — a extração normal
+        # continua gravando exatamente como antes. Propensão vai no log para
+        # inverse propensity weighting no treino.
+        _do_triage_probe = (
+            MEMORY_TRIAGE_PROBE and bool(eid)
+            and random.random() < MEMORY_TRIAGE_PROBE_RATE
+        )
+        _spawn(_extract_memories_via_llm(
+            req.input, final_response, sid, scope=_scope, turn_id=eid,
+            propensity=(1.0 - MEMORY_TRIAGE_PROBE_RATE) if _do_triage_probe else 1.0,
+        ))
+        if _do_triage_probe:
+            _metric_inc("triage_probe_calls_total")
+            _spawn(_extract_memories_via_llm(
+                req.input, final_response, sid, scope=_scope,
+                turn_id=f"{eid}:relaxed", probe="relaxed",
+                propensity=MEMORY_TRIAGE_PROBE_RATE,
+            ))
 
     lat = round((time.perf_counter() - t0) * 1000, 2)
     turn_usage = _usage_delta(usage_before, _usage_snapshot(sid))
@@ -7212,6 +7244,18 @@ async def metrics():
             lines.append(f"ava_memory_{key} {int(mb.get(key) or 0)}")
     except Exception as e:
         log.debug(f"/metrics: blocos de memória indisponíveis ({type(e).__name__}: {e})")
+    try:
+        tri = await _memory_request("GET", "/triage/stats")
+        for key in (
+            "turns_total", "samples_total", "labelled_total", "unlabeled_total",
+            "suppressed_total", "render_labels_total",
+        ):
+            lines.append(f"ava_triage_{key} {int((tri or {}).get(key) or 0)}")
+        lines.append(f"ava_triage_recall_gap {float((tri or {}).get('recall_gap') or 0):.6f}")
+        for reason, n in ((tri or {}).get("suppressed_by_reason") or {}).items():
+            lines.append(f'ava_triage_suppressed_by_reason{{reason="{reason}"}} {int(n)}')
+    except Exception as e:
+        log.debug(f"/metrics: triagem indisponível ({type(e).__name__}: {e})")
     return "\n".join(lines) + "\n"
 
 
@@ -7269,6 +7313,13 @@ async def status():
         "never_selected": never_selected,
     }
 
+    # Triagem de memória (Fase 1): best-effort — /status continua 200 mesmo
+    # com a API de memória indisponível (o health check já reporta isso).
+    try:
+        triage_status = await _memory_request("GET", "/triage/stats")
+    except Exception as e:
+        triage_status = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "orchestrator": "ok", "architecture": "tool-calling + MCP manager (two-stage discovery)",
         "services": checks,
@@ -7276,6 +7327,7 @@ async def status():
         "mcp_servers": mcp_servers,
         "metrics": _metric_snapshot(),
         "agent_skills": agent_skills_status,
+        "memory_triage": triage_status,
     }
 
 @app.delete("/session/{session_id}")

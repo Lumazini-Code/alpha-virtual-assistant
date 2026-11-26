@@ -510,6 +510,26 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `EPISODE_MAX_CHARS` | memory | `1200` | Teto do texto do episódio |
 | `AVA_TASK_STATE` | orchestrator | `1` | Liga o objeto explícito de tarefa atual |
 | `AVA_MEMORY_BLOCKS` | memory | `1` | Liga blocos de memória (ponteiros para grupos de átomos); `0` desliga sem apagar dados |
+| `AVA_MEMORY_TRIAGE_LOG` | memory/LLM | `1` | Instrumenta a extração: registra o proposto, o aplicado e o suprimido em `memory_triage_*`; `0` desliga |
+| `AVA_MEMORY_TRIAGE_LOG_TEXT` | memory | `1` | Guarda o texto dos segmentos; `0` = só hash |
+| `AVA_MEMORY_TRIAGE_PROBE` | memory/LLM/orchestrator | `1` | Habilita o probe relaxado (orçamento maior, sem gravar memórias) |
+| `AVA_MEMORY_TRIAGE_PROBE_RATE` | orchestrator | `0.08` | Fração de turnos com um probe relaxado extra (máx. `0.5`) |
+| `AVA_MEMORY_TRIAGE_PROBE_MAX` | memory | `3` | Máximo de segmentos sondados por turno |
+| `AVA_MEMORY_TRIAGE_PU` | memory | `1` | Trata `unlabeled` como não rotulado — nunca como negativo |
+| `AVA_MEMORY_TRIAGE_RENDER_LABELS` | memory | `1` | Deriva frame/fragmento/slots de `evidence`↔`text` para a Fase 3 |
+| `AVA_MEMORY_TRIAGE_RETENTION_DAYS` | memory | `90` | Poda do log; `0` desliga |
+| `AVA_MEMORY_TRIAGE_SHADOW` | memory | `0` | Reservado para a Fase 2 |
+| `AVA_MEMORY_TRIAGE_TARGET_SAMPLES` | memory | `2000` | Alvo de rótulos exibido na barra/notificação da WebUI |
+| `AVA_MEMORY_TRIAGE_GATE` | memory/LLM | `1` | Gate cross-encoder local via `/write` com `dry_run` (rótulo `gate_label`, peso 0.6) |
+| `AVA_MEMORY_TRIAGE_SEGMENT_PROBE` | LLM | `1` | Probes por segmento suprimido (≤3/turno, modelo extrator) |
+| `AVA_MEMORY_TRIAGE_SEGMENT_MIN_CHARS` | memory/LLM | `20` | Tamanho mínimo do segmento sondado |
+| `AVA_MEMORY_TRIAGE_CONTRASTIVE` | LLM | `1` | Pares "lembre-se disso" com/sem cue (peso 0.8) |
+| `AVA_MEMORY_TRIAGE_SYNTHETIC` | LLM | `1` | Perturbações sintéticas aceitas só se o teacher confirmar |
+| `AVA_MEMORY_TRIAGE_SYNTHETIC_RATE` | LLM | `0.05` | Fração de turnos com sintético (limite de custo) |
+| `AVA_MEMORY_TRIAGE_SYNTHETIC_MAX` | LLM | `2` | Máximo de perturbações por turno (teto 25% do batch) |
+| `AVA_MEMORY_TRIAGE_THINKING` | LLM | `1` | Habilita `probe=thinking` (CoT só como probe, nunca `applied`) |
+| `AVA_MEMORY_TRIAGE_PAIR_TOP_K` | memory | `5` | Candidatos por linha de par (`target`/`related` + top-K) |
+| `AVA_MEMORY_TRIAGE_GOLD_TARGET` | memory | `200` | Alvo do gold set revisado |
 | `BLOCK_MIN_MEMBERS` | memory | `3` | Mínimo de átomos para consolidar um bloco |
 | `BLOCK_MIN_DENSITY` | memory | `0.5` | Densidade mínima de co-ativação do cluster |
 | `BLOCK_MIN_AVG_WEIGHT` | memory | `0.25` | Peso médio mínimo das arestas internas |
@@ -570,6 +590,42 @@ curl -s localhost:9001/browser/status   # Chrome do host
 | `ONNX_PROVIDERS` | compose | `CPUExecutionProvider` | Provedores do ONNX Runtime |
 
 **CWD dos MCPs stdio**: não é variável de ambiente — é escolhido pela WebUI (`📁`) e persistido por projeto em `cache/webui_cwd.json`. Sem seleção, o padrão é a pasta base do usuário (`HOME`/`USERPROFILE`). O mcp_manager mantém uma sessão por par **(servidor, cwd)**: chats em pastas diferentes coexistem sem derrubar um ao outro, limitados por `AVA_MCP_MAX_SESSIONS` (LRU). Servidores `http` compartilham uma sessão por nome. O tray expõe `GET/PUT/DELETE /fs/cwd` (loopback-only) para ler/gravar esse estado.
+
+### Triagem de memória — dataset para a rede local (Fase 1)
+
+O extrator continua decidindo e gravando normalmente; agora ele **também**
+registra cada decisão em `memory_triage_turn` / `memory_triage_sample`: o que
+o LLM propôs (`proposed_label`), o que o pipeline de escrita aplicou
+(`applied_label`) e os segmentos sobre os quais ele não se pronunciou
+(`teacher_emitted=0`, `applied_label='unlabeled'`). Suprimido por orçamento
+**não** é `DISCARD` — é desconhecido, e a exportação nunca o converte em
+negativo (PU learning). A Fase 1 pertence ao planejamento em
+`docs/MEMORY_TRIAGE_PHASE1.md`.
+
+Rotas no memory API (proxeadas pela WebUI via `/memory/*` e pelo tray):
+`POST /triage/log` (idempotente por turno+segmento+candidato+variant),
+`GET /triage/labels?limit&since&scope&origin&variant&include_unlabeled`,
+`GET /triage/stats` (contagens, `recall_gap`, `suppressed_by_reason`,
+`emitted_rate_by_position`/`role`/`size`, `gate_label_counts`, `gold_total` e
+`readiness`), `GET /triage/gold/candidates`, `POST /triage/gold` (imutável),
+`GET /triage/gold` e `DELETE /triage/log?scope=` (privacidade).
+
+`POST /memories/extract` aceita `turn_id`, `probe` e `propensity`. Variants:
+`relaxed` (só orçamento), `segment`, `contrastive`, `synthetic`, `replay` e
+`thinking`. **Todos os variants de instrumentação são somente leitura** —
+nenhum grava memórias ou episódios. Cerca de 8% dos turnos recebem um probe
+relaxado extra em background. O gate cross-encoder usa `POST /write` com
+`dry_run: true`: mesma decisão de dedup/rerank, zero mutação.
+
+Replay offline: `python scripts/triage_replay.py --limit 200` (use `--dry-run`
+para inspecionar, `--mode thinking` para o recorte de CoT). As revisões do gold
+set são feitas em `GET /triage/gold/candidates` → `POST /triage/gold`; a
+calibração da Fase 2 deve usar **somente** esses rótulos.
+
+A barra **Dados** na barra lateral da WebUI mostra o progresso até
+`AVA_MEMORY_TRIAGE_TARGET_SAMPLES` rótulos e um aviso one-shot aparece quando
+o dataset fica pronto. O contador de rótulos exclui `unlabeled`; as métricas
+`ava_triage_*` e o bloco `memory_triage` de `/status` expõem o resto.
 
 ### Providers de inferência (OpenAI-compatible)
 

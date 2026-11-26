@@ -40,6 +40,10 @@ class Metrics:
             "memory_save_failures": 0,
             "memory_extraction_failures": 0,
             "force_finish_calls": 0,
+            "triage_probe_calls_total": 0,
+            "triage_logged_total": 0,
+            "triage_alignment": {},
+            "triage_log_failures": 0,
         }
 
     def inc(self, name: str, key: str | None = None, n: int = 1) -> None:

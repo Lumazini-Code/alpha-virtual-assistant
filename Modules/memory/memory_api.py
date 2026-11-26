@@ -181,6 +181,50 @@ async def episodes_list(session_id: Optional[str] = None, scope: Optional[str] =
         session_id=session_id, scope=scope, limit=limit)]}
 
 
+# ── Triagem de memória (Fase 1: dataset de treino da rede local) ──────────────
+# Best-effort por design: o extrator não espera por estas rotas e falhas aqui
+# nunca derrubam o turno. Auth interna já aplicada pelo install_internal_auth.
+@app.post("/triage/log", response_model=mem.TriageLogResponse)
+async def triage_log(req: mem.TriageLogRequest):
+    return await mem.triage_log(req)
+
+
+@app.get("/triage/labels", response_model=mem.TriageLabelsResponse)
+async def triage_labels(limit: int = 500, since: Optional[float] = None,
+                        scope: Optional[str] = None, origin: Optional[str] = None,
+                        variant: Optional[str] = None,
+                        include_unlabeled: bool = False):
+    return await mem.triage_labels(
+        limit=limit, since=since, scope=scope, origin=origin,
+        variant=variant, include_unlabeled=include_unlabeled,
+    )
+
+
+@app.get("/triage/stats", response_model=mem.TriageStatsResponse)
+async def triage_stats(scope: Optional[str] = None):
+    return await mem.triage_stats(scope=scope)
+
+
+@app.get("/triage/gold/candidates", response_model=mem.TriageLabelsResponse)
+async def triage_gold_candidates(limit: int = 300, scope: Optional[str] = None):
+    return await mem.triage_gold_candidates(limit=limit, scope=scope)
+
+
+@app.get("/triage/gold", response_model=mem.TriageGoldListResponse)
+async def triage_gold_list(limit: int = 300, scope: Optional[str] = None):
+    return await mem.triage_gold_list(limit=limit, scope=scope)
+
+
+@app.post("/triage/gold", response_model=mem.TriageGoldResponse)
+async def triage_gold_write(req: mem.TriageGoldRequest):
+    return await mem.triage_gold_write(req)
+
+
+@app.delete("/triage/log")
+async def triage_log_delete(scope: Optional[str] = None):
+    return await mem.triage_delete(scope=scope)
+
+
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     return await mem.clear_session(session_id)

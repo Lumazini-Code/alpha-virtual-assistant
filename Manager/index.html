@@ -104,6 +104,9 @@ textarea{width:100%;border:0;outline:0;background:none;resize:none;max-height:22
 .mbar i{display:block;height:100%;width:0;background:var(--gr);border-radius:99px;transition:width .35s,background .35s}
 .metric.wa .mbar i{background:var(--am)}
 .metric.er .mbar i{background:var(--rd)}
+#m-triage{grid-template-columns:46px 1fr auto}
+.tri-notice{margin:2px 10px 8px;padding:7px 9px;border:1px solid var(--gr);background:var(--acs);border-radius:8px;font-size:11.5px;line-height:1.35;color:var(--ink)}
+.tri-notice[hidden]{display:none}
 .jobs{display:flex;flex-direction:column;gap:4px;padding:2px 10px 8px;max-height:160px;overflow:auto}
 .jobcount{color:var(--ac);font-weight:500;margin-left:6px}
 .jobitem{border:1px solid var(--ln);border-radius:8px;padding:5px 8px;background:var(--bg);font-size:12px;color:var(--mu)}
@@ -447,7 +450,9 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
       <div class="metric" id="m-cpu"><span>CPU</span><div class="mbar"><i id="bcpu"></i></div><b id="tcpu">–</b></div>
       <div class="metric" id="m-ram"><span>RAM</span><div class="mbar"><i id="bram"></i></div><b id="tram">–</b></div>
       <div class="metric" id="m-gpu"><span>GPU</span><div class="mbar"><i id="bgpu"></i></div><b id="tgpu">–</b></div>
+      <div class="metric" id="m-triage" hidden title="Dataset de triagem de memória para a rede da Fase 2"><span>Dados</span><div class="mbar"><i id="btri"></i></div><b id="ttri">–</b></div>
     </div>
+    <div class="tri-notice" id="triNotice" role="status" aria-live="polite" hidden></div>
     <div class="st"><i id="sd"></i><span id="sdt">docker: verificando…</span></div>
     <button class="nb" id="olog">▤ Logs do Docker</button>
     <button class="nb" id="oset">⚙ Configurações</button>
@@ -1519,6 +1524,41 @@ async function loadStats(){
   }catch{
     setBar('m-cpu','bcpu','tcpu',0,'—');setBar('m-ram','bram','tram',0,'—');setBar('m-gpu','bgpu','tgpu',0,'—');
   }
+  void loadTriageStats();
+}
+/* ---------- Dataset da triagem de memória (Fase 1 → Fase 2) ----------
+   A barra acompanha o número de rótulos em relação ao alvo configurável
+   (AVA_MEMORY_TRIAGE_TARGET_SAMPLES). O aviso é one-shot por alvo: salvo em
+   localStorage para não reaparecer a cada 2s do polling. */
+let triNoticeTimer=null;
+function showTriageNotice(msg){
+  const n=$('#triNotice');if(!n)return;
+  n.textContent=msg;n.hidden=false;
+  clearTimeout(triNoticeTimer);
+  triNoticeTimer=setTimeout(()=>{n.hidden=true},12000);
+}
+async function loadTriageStats(){
+  if(cfg.demo)return;
+  try{
+    const s=await jf('mem','/triage/stats');
+    const r=s.readiness||{},row=$('#m-triage');
+    if(!row)return;
+    row.hidden=false;
+    const pct=Math.max(0,Math.min(100,Number(r.progress||0)*100));
+    row.classList.toggle('wa',!r.ready&&pct>=60);
+    row.classList.remove('er');
+    $('#btri').style.width=pct+'%';
+    $('#ttri').textContent=Math.round(pct)+'%';
+    const title=`Dataset: ${r.labelled||0}/${r.target||0} rótulos · ${s.samples_total||0} amostras · ${s.turns_total||0} turnos · ${s.suppressed_total||0} suprimidos · gold ${s.gold_total||0}/${s.gold_target||0}`;
+    row.title=title;$('#ttri').title=title;
+    if(r.ready){
+      const key='ava-triage-ready-'+String(r.target||0);
+      if(!localStorage.getItem(key)){
+        localStorage.setItem(key,'1');
+        showTriageNotice(`✓ Dataset pronto: ${r.labelled} de ${r.target} rótulos. Já é possível treinar a rede da Fase 2.`);
+      }
+    }
+  }catch{ const row=$('#m-triage');if(row)row.hidden=true }
 }
 
 /* ---------- Logs do Docker (Ctrl+D) ---------- */
