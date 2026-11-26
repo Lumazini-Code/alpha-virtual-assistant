@@ -165,6 +165,16 @@ pub async fn serve(
         .route("/graph/replay", get(get_graph_replay))
         .route("/assets/vis-network.min.js", get(get_vis_network))
         .route("/docker/logs", get(get_docker_logs))
+        // Ferramentas de host p/ o alpha-mcp (leitura, busca e shell).
+        // Rodam no processo do tray (host), exigem Bearer interno e são
+        // chamadas via proxy /host/* do orchestrator.
+        .route("/host/read", post(crate::host_tools::read_file))
+        .route("/host/list", post(crate::host_tools::list_dir))
+        .route("/host/glob", post(crate::host_tools::glob_files))
+        .route("/host/grep", post(crate::host_tools::grep_files))
+        .route("/host/write", post(crate::host_tools::write_file))
+        .route("/host/edit", post(crate::host_tools::edit_file))
+        .route("/host/shell", post(crate::host_tools::shell))
         // Preview de HTML gerado pelo modelo. O Manager lê o arquivo do host
         // (mesma validação de cwd dos MCPs) e serve HTML + assets irmãos.
         .route("/preview/register", post(crate::preview::register))

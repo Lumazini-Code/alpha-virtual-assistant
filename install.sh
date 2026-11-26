@@ -241,7 +241,7 @@ if ! docker_alive; then
 fi
 ok "Daemon Docker respondendo."
 
-# 1c. Node.js no host — os MCPs Playwright/Desktop Commander são spawnados
+# 1c. Node.js no host — o MCP Playwright é spawnado
 # pelo mcp_manager do host via `npx`; sem node/npm o registro falha.
 node_major() {
   node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1
@@ -483,6 +483,14 @@ if [ -f "$BOARDVIEW_DIR/SKILL.md" ]; then
   mkdir -p .agents/skills/boardview
   cp -f "$BOARDVIEW_DIR/SKILL.md" .agents/skills/boardview/SKILL.md
   ok "Skill boardview instalada (.agents/skills/boardview/SKILL.md)."
+
+  # Skill do Presenton: .agents é gitignored, então a fonte versionada é
+  # skills/presenton/ — copiar aqui garante que ela chegue no zip do release.
+  if [ -f "$INSTALL_DIR/skills/presenton/SKILL.md" ]; then
+    mkdir -p .agents/skills/presenton
+    cp -f "$INSTALL_DIR/skills/presenton/SKILL.md" .agents/skills/presenton/SKILL.md
+    ok "Skill presenton instalada (.agents/skills/presenton/SKILL.md)."
+  fi
 else
   warn "Boardview: SKILL.md ausente em $BOARDVIEW_DIR — skill não instalada."
 fi
@@ -1023,67 +1031,162 @@ EOF
   ok "alpha-mcp registrado e sincronizado."
 }
 
-register_desktop_commander_mcp() {
-  local payload
-  # Os exemplos em português são vetores de busca no ToolsDB: sem eles o
-  # seletor semântico (descrições em inglês) não casa "liste os arquivos da
-  # pasta" com `list_directory` e o servidor fica fora da rodada.
-  payload='{
-  "name": "desktop-commander",
-  "skill_summary": "Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)",
-  "transport": "stdio",
-  "command": "npx",
-  "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
-  "enabled": true,
-  "always_on": false,
-  "examples": {
-    "list_directory": ["liste os arquivos da pasta", "listar arquivos do diretório", "quais arquivos tem nessa pasta", "mostre o conteúdo da pasta", "encontre o arquivo nessa pasta"],
-    "read_file": ["leia o arquivo", "abra o conteúdo desse arquivo", "mostre o texto do arquivo"],
-    "read_multiple_files": ["leia esses arquivos", "mostre o conteúdo de vários arquivos"],
-    "write_file": ["crie um arquivo", "escreva no arquivo", "salve esse texto em um arquivo"],
-    "edit_block": ["edite o arquivo", "altere esse trecho do arquivo", "faça uma correção no arquivo"],
-    "start_search": ["busque dentro dos arquivos", "procure esse texto nos arquivos da pasta"],
-    "get_file_info": ["informações do arquivo", "tamanho e data do arquivo", "detalhes do arquivo"],
-    "start_process": ["execute um comando no terminal", "rode esse comando"],
-    "list_processes": ["liste os processos", "quais processos estão rodando"]
-  }
-}'
+# Sobe o container do Presenton (imagem + volume persistente em app_data).
+# É chamado na instalação e, em runtime, o próprio manager repete o start sob
+# demanda quando uma tool do servidor é requisitada (campo autostart do
+# /servers). Aqui deixamos a imagem baixada e o container criado — o primeiro
+# turno que usar uma tool não paga o pull.
+# A imagem oficial expõe só as 7 tools que chamam o LLM interno. A pasta
+# presenton/ traz um Dockerfile que aplica o patch de montagem sem modelo
+# (create_blank -> prepare ordered -> render -> export) sobre essa mesma
+# imagem base e regenera o openapi_spec.json, que é estático e descartaria
+# campos novos em silêncio.
+PRESENTON_BASE_IMAGE="ghcr.io/presenton/presenton:latest"
+PRESENTON_IMAGE="ava-presenton:latest"
+PRESENTON_CONTAINER="presenton"
 
-  info "Registrando Desktop Commander MCP no mcp_manager ($MCP_MANAGER_URL)..."
-  local registered=0 i
-  for i in $(seq 1 24); do
-    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
-         -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $AVA_TOKEN" -d "$payload" >/dev/null 2>&1; then
-      registered=1
-      break
-    fi
-    sleep 5
-  done
-  if [ "$registered" -ne 1 ]; then
-    warn "Não consegui cadastrar o Desktop Commander MCP — manager não respondeu em 2 min."
-    warn "Cadastre manualmente depois (dois comandos):"
-    printf '  curl -X POST %s/servers -H '"'"'Content-Type: application/json'"'"' -H "Authorization: Bearer $AVA_INTERNAL_TOKEN" -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
-    printf '  curl -X POST %s/servers/desktop-commander/sync -H "Authorization: Bearer $AVA_INTERNAL_TOKEN"\n' "$MCP_MANAGER_URL"
+# Monta a imagem com o patch. Se falhar, cai para a imagem oficial: o MCP
+# continua funcionando, só sem as tools de montagem sem LLM.
+ensure_presenton_image() {
+  local ctx="$INSTALL_DIR/presenton"
+  if [ ! -f "$ctx/Dockerfile" ] || [ ! -f "$ctx/presenton-mcp-assembly.diff" ]; then
+    warn "Presenton: presenton/ ausente — usando a imagem oficial (sem tools de montagem)."
+    PRESENTON_IMAGE="$PRESENTON_BASE_IMAGE"
+    return 0
+  fi
+  if docker image inspect "$PRESENTON_IMAGE" >/dev/null 2>&1; then
+    info "Presenton: imagem '$PRESENTON_IMAGE' já existe."
+    return 0
+  fi
+  info "Presenton: construindo '$PRESENTON_IMAGE' (patch do MCP sobre a imagem oficial)..."
+  if ! docker build -t "$PRESENTON_IMAGE" --build-arg "PRESENTON_BASE=$PRESENTON_BASE_IMAGE" "$ctx" >/dev/null 2>&1; then
+    warn "Presenton: build da imagem com patch falhou — usando a oficial."
+    PRESENTON_IMAGE="$PRESENTON_BASE_IMAGE"
+    return 0
+  fi
+  ok "Presenton: imagem '$PRESENTON_IMAGE' pronta (14 tools de MCP)."
+}
+
+ensure_presenton_container() {
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Presenton: docker não encontrado — autostart do container indisponível."
     return 1
   fi
-
-  # /sync: exige a memory_api (:3000) de pé; o 1º sync baixa o pacote npm.
-  local synced=0
-  for i in $(seq 1 12); do
-    if curl -fsS --max-time 240 -X POST "$MCP_MANAGER_URL/servers/desktop-commander/sync" \
-         -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
-      synced=1
-      break
-    fi
-    sleep 10
-  done
-  if [ "$synced" -ne 1 ]; then
-    warn "Desktop Commander MCP cadastrado, mas o sync falhou (memory_api ainda bootando?)."
-    warn "Rode manualmente: curl -X POST $MCP_MANAGER_URL/servers/desktop-commander/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
+  if ! docker info >/dev/null 2>&1; then
+    warn "Presenton: daemon do Docker não respondeu — container não será criado agora."
     return 1
   fi
-  ok "Desktop Commander MCP registrado e sincronizado."
+  ensure_presenton_image || true
+  if docker inspect "$PRESENTON_CONTAINER" >/dev/null 2>&1; then
+    info "Presenton: container '$PRESENTON_CONTAINER' já existe."
+    info "Presenton: criando container '$PRESENTON_CONTAINER' ($PRESENTON_IMAGE)..."
+    # DISABLE_AUTH=true: instância local sem ADMIN; sem isso o MCP exige
+    # "Auth required" mesmo com PRESENTON_API_KEY vazio.
+    if ! docker run -d --name "$PRESENTON_CONTAINER" -p 5001:80 \
+         -e DISABLE_AUTH=true \
+         -v "$INSTALL_DIR/app_data:/app_data" "$PRESENTON_IMAGE" >/dev/null 2>&1; then
+      warn "Presenton: falha ao criar o container (imagem baixada? rede?)."
+      warn "Rode manualmente: docker run -d --name presenton -p 5001:80 -e DISABLE_AUTH=true -v \"$INSTALL_DIR/app_data:/app_data\" $PRESENTON_IMAGE"
+      return 1
+    fi
+  fi
+  # Espera a porta responder; o manager repete essa espera no autostart.
+  local i
+  for i in $(seq 1 60); do
+    if (exec 3<>/dev/tcp/127.0.0.1/5001) 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
+      ok "Presenton: respondendo em http://127.0.0.1:5001."
+      return 0
+    fi
+    sleep 2
+  done
+  warn "Presenton: container criado, mas a porta 5001 ainda não responde (1º boot baixa modelos)."
+  return 0
+}
+
+register_presenton_mcp() {
+  # Presenton é self-hosted e roda FORA do stack da Alpha. O container é
+  # criado na instalação (ensure_presenton_container) e o manager o sobe sob
+  # demanda via campo autostart. Sem PRESENTON_API_KEY o registro sai sem
+  # headers (instância local sem auth) — com a chave, ela vai no Authorization.
+  local key url payload
+  key="$(get_env_var PRESENTON_API_KEY)"
+  url="$(get_env_var PRESENTON_MCP_URL)"
+  url="${url:-http://127.0.0.1:5001/mcp}"
+  if [ -z "$key" ]; then
+    info "Presenton MCP sem PRESENTON_API_KEY — registrando instância local sem auth."
+  fi
+  ensure_presenton_container || true
+  url="$(get_env_var PRESENTON_MCP_URL)"
+  url="${url:-http://127.0.0.1:5001/mcp}"
+  # transport=http + headers: o manager manda o Authorization em POST, GET-SSE
+  # e DELETE (mcp_server.rs build_header_map). O valor NUNCA volta no GET
+  # /servers — sai mascarado.
+  payload="$(python3 - "$url" "$key" "$PRESENTON_IMAGE" "$PRESENTON_CONTAINER" "$INSTALL_DIR" <<'PY'
+import json, sys
+url, key, image, container, install_dir = sys.argv[1:6]
+payload = {
+    "name": "presenton",
+    "skill_summary": (
+        "Presenton: gera apresentações e decks (pptx/pdf) a partir de um tema ou "
+        "de documentos enviados, com exportação e URL de edição"
+    ),
+    "transport": "http",
+    "url": url,
+    "always_on": False,
+    # O manager sobe o container quando uma tool deste servidor é requisitada
+    # (autostart_ensure em mcp_server.rs) — inclusive na seleção de skills.
+    "autostart": {
+        "enabled": True,
+        "image": image,
+        "container": container,
+        # DISABLE_AUTH no próprio run: sem isso o MCP responde "Auth required"
+        # mesmo sem PRESENTON_API_KEY, e o container criado pelo manager
+        # ficaria inutilizável.
+        "args": ["-e", "DISABLE_AUTH=true"],
+        "ports": "5001:80",
+        "volume": install_dir + "/app_data",
+        "ready_timeout_s": 300,
+    },
+    "examples": {
+        # Montagem sem LLM: o agente decide o texto, o Presenton só renderiza.
+        "create_blank_presentation": [
+            "monte uma apresentação com este texto", "crie um deck do zero",
+        ],
+        "template_get": ["quais layouts esse template tem"],
+        "prepare_presentation": ["prepare os slides para renderizar"],
+        "render_presentation": ["renderize os slides"],
+        "export_presentation": ["exporta em pptx", "gera o pdf da apresentação"],
+        # Geração automática (exige LLM no container).
+        "start_standard_presentation": [
+            "crie uma apresentação sobre", "monte um deck de slides sobre",
+            "gere uma apresentação em pptx",
+        ],
+        "start_smart_presentation": ["crie slides em HTML sobre", "faça um deck visual sobre"],
+        "upload_files": ["usa esse pdf para a apresentação", "gera slides a partir desse documento"],
+        "list_templates": ["quais templates de apresentação existem"],
+        "get_job_status": ["como está a apresentação", "já terminou a geração"],
+    },
+}
+# Sem chave o Presenton local roda sem auth e o header não é enviado (um
+# "Bearer " vazio faria o verifier recusar com 401).
+if key:
+    payload["headers"] = {"Authorization": "Bearer " + key}
+print(json.dumps(payload))
+PY
+)"
+  if ! curl -fsS -X POST "$MCP_MANAGER_URL/servers" \
+      -H "Authorization: Bearer $AVA_TOKEN" \
+      -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+    warn "Presenton MCP: registro falhou (manager fora do ar?)."
+    return 0
+  fi
+  if ! curl -fsS -X POST "$MCP_MANAGER_URL/servers/presenton/sync" \
+      -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
+    warn "Presenton MCP: registrado, mas o sync falhou (instância Presenton no ar?)."
+    return 0
+  fi
+  ok "Presenton MCP registrado e sincronizado."
 }
 
 register_boardview_mcp() {
@@ -1268,8 +1371,10 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # Registro dos MCPs — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
   register_alpha_mcp || true
-  register_desktop_commander_mcp || true
   register_boardview_mcp || true
+  # Presenton: cria o container (se preciso) e registra com autostart — o
+  # manager sobe a instância sob demanda quando uma tool dela é requisitada.
+  register_presenton_mcp || true
 
 
 

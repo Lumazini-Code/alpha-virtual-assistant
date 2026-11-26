@@ -46,7 +46,7 @@ class CodeModeRuntime:
         catalog: list[dict[str, Any]],
         *,
         timeout_ms: int = 30_000,
-        max_tool_calls: int = 50,
+        max_tool_calls: int = 0,
         max_output_chars: int = 200_000,
     ) -> CodeModeResult:
         if not self.available:

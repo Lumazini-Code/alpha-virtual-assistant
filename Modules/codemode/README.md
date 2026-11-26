@@ -20,7 +20,7 @@ instrução no system prompt.
 - Node roda em subprocesso; o código não recebe `require`, `process`, fs,
   rede ou timers.
 - `AVA_CODEMODE_TIMEOUT_MS` limita a execução inteira.
-- `AVA_CODEMODE_MAX_TOOL_CALLS` limita chamadas de tool.
+- `AVA_CODEMODE_MAX_TOOL_CALLS` limita chamadas de tool; `0` (default) = sem limite.
 - `AVA_CODEMODE_MAX_OUTPUT_CHARS` limita a saída.
 
 ## Configuração

@@ -38,9 +38,11 @@ def make_execute_spec(
     catalog: Catalog,
     *,
     timeout_ms: int = 30_000,
-    max_tool_calls: int = 50,
+    max_tool_calls: int = 0,
     max_output_chars: int = 200_000,
     on_tool_result: Optional[ToolResultHook] = None,
+    default_cwd: Optional[str] = None,
+    cwd_tools: Optional[set[str]] = None,
 ) -> ToolSpec:
     async def execute(args: dict[str, Any], context: Any) -> ToolResult:
         code = str(args.get("code") or "")
@@ -59,6 +61,9 @@ def make_execute_spec(
                 )
             if resolved == "execute":
                 return ToolResult(content="ERROR: execute cannot call itself", is_error=True)
+            if (default_cwd and cwd_tools and resolved in cwd_tools
+                    and isinstance(payload, dict) and not payload.get("cwd")):
+                payload = {**payload, "cwd": default_cwd}
             result = await snapshot.execute(resolved, payload, context)
             if on_tool_result is not None:
                 try:

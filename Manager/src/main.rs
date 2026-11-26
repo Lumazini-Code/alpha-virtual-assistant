@@ -34,6 +34,7 @@ mod chat;
 mod docker_logs;
 mod docker_cli;
 mod graph;
+mod host_tools;
 mod mcp_server;
 mod platform;
 mod preview;

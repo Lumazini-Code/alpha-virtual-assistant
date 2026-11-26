@@ -109,6 +109,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # ── Utilitários ─────────────────────────────────────────────────────────────
 anyhow = "1"
 chrono = "0.4"
+glob = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # CPU/RAM/GPU do host para o painel de status do WebUI (mesmo dado que a
 # TUI antiga lia via systeminformation).

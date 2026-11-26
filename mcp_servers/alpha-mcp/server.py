@@ -52,6 +52,10 @@ Tools MCP expostas:
     WebUI um HTML já gravado em disco (path dentro do cwd da sessão). O
     Manager valida e serve o arquivo + assets irmãos; o preview recarrega
     quando o arquivo muda. Não copia o HTML para o histórico do LLM.
+  - `host_read_file`, `host_list_dir`, `host_glob`, `host_grep`,
+    `host_write_file`, `host_edit`, `host_shell`
+    → leitura, escrita, edição, busca e execução de shell NO HOST (via
+    orchestrator → Manager), sem o isolamento do filesystem do container.
 
 Fluxo da busca web:
   1. Cache de busca no Valkey (hash da query, TTL de horas) → hit retorna direto
@@ -1285,6 +1289,113 @@ async def html_preview(path: str, title: str = "", description: str = "") -> str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Ferramentas de HOST — leitura, busca e shell no computador do usuário
+# ══════════════════════════════════════════════════════════════════════════════
+# O alpha-mcp vive no container; estas tools chamam /host/* no orchestrator,
+# que faz proxy para o Manager (processo do HOST, mesmo usuário do desktop).
+# Segurança: todas exigem o Bearer interno; o Manager recusa sem ele.
+
+async def _host_tool(action: str, payload: dict, timeout: float = 60.0) -> str:
+    try:
+        data = await _orchestrator_request(
+            "POST", f"/host/{action}", payload, timeout=timeout
+        )
+    except MemoryToolError as e:
+        return f"Erro: {e.detail}"
+    except Exception as e:
+        log.exception("host tool %s falhou", action)
+        return f"Erro: {e}"
+    return json.dumps(data, ensure_ascii=False)
+
+
+@mcp.tool()
+async def host_read_file(path: str, cwd: str = "", offset: int = 1,
+                         limit: int = 2000) -> str:
+    """Lê um arquivo de texto NO HOST (computador do usuário), não no
+    container. Use para inspecionar código, configs, logs, JSON etc.
+    `path` aceita caminho relativo ao `cwd` (padrão: pasta home) ou absoluto.
+    `offset` é 1-based; `limit` é o máximo de linhas (até 10000). Retorna
+    `content`, `total_lines` e `truncated`."""
+    return await _host_tool("read", {
+        "path": path, "cwd": cwd or None,
+        "offset": int(offset or 1), "limit": int(limit or 2000),
+    })
+
+
+@mcp.tool()
+async def host_list_dir(path: str = ".", cwd: str = "") -> str:
+    """Lista um diretório NO HOST. Retorna nome, caminho, se é diretório e
+    tamanho de cada entrada. Use antes de ler arquivos para descobrir a
+    estrutura; `path` é relativo ao `cwd` (padrão: home) ou absoluto."""
+    return await _host_tool("list", {"path": path, "cwd": cwd or None})
+
+
+@mcp.tool()
+async def host_glob(pattern: str, cwd: str = "", max_results: int = 500) -> str:
+    """Busca arquivos/diretórios NO HOST por padrão glob (ex.:
+    `src/**/*.ts`, `**/package.json`). `cwd` é a base (padrão: home) e
+    `pattern` pode ser absoluto. Retorna caminhos, `is_dir` e `size`."""
+    return await _host_tool("glob", {
+        "pattern": pattern, "cwd": cwd or None,
+        "max_results": int(max_results or 500),
+    })
+
+
+@mcp.tool()
+async def host_grep(pattern: str, path: str = ".", cwd: str = "",
+                    max_results: int = 200, fixed_strings: bool = False) -> str:
+    """Busca o CONTEÚDO de arquivos NO HOST (equivalente a `rg`/`grep`).
+    `pattern` é regex por padrão; use `fixed_strings=true` para texto literal.
+    `path` é o arquivo/diretório alvo (relativo ao `cwd` ou absoluto).
+    Retorna as linhas no formato `arquivo:linha:texto`."""
+    return await _host_tool("grep", {
+        "pattern": pattern, "path": path, "cwd": cwd or None,
+        "max_results": int(max_results or 200),
+        "fixed_strings": bool(fixed_strings),
+    })
+
+
+@mcp.tool()
+async def host_write_file(path: str, content: str, cwd: str = "",
+                         create_dirs: bool = True) -> str:
+    """Grava (cria ou sobrescreve) um arquivo NO HOST. Use para gerar HTML,
+    código, configs e documentos. `path` é relativo ao `cwd` (padrão: home)
+    ou absoluto; `create_dirs=true` cria os diretórios-pai. Retorna `path`,
+    `bytes` e `ok`."""
+    return await _host_tool("write", {
+        "path": path, "content": content, "cwd": cwd or None,
+        "create_dirs": bool(create_dirs),
+    })
+
+
+@mcp.tool()
+async def host_edit(path: str, old_string: str, new_string: str,
+                    cwd: str = "", replace_all: bool = False) -> str:
+    """Edita um arquivo NO HOST substituindo um trecho EXATO. `old_string`
+    precisa existir; se aparecer mais de uma vez, informe
+    `replace_all=true` ou um trecho mais específico. Use para correções
+    cirúrgicas sem reescrever o arquivo inteiro. Retorna `replacements`."""
+    return await _host_tool("edit", {
+        "path": path, "old_string": old_string, "new_string": new_string,
+        "cwd": cwd or None, "replace_all": bool(replace_all),
+    })
+
+
+@mcp.tool()
+async def host_shell(command: str, cwd: str = "", timeout_s: int = 60) -> str:
+    """Executa um comando de shell NO HOST (bash -lc; cmd no Windows), com o
+    mesmo usuário do desktop — sem isolamento do container. Use para build,
+    testes, git, scripts e inspeção do sistema. `cwd` é o diretório de
+    trabalho (padrão: home) e `timeout_s` vai de 1 a 600.
+    Retorna `ok`, `exit_code`, `stdout`, `stderr`, `timed_out` e `duration_ms`.
+    Prefira comandos não interativos e limites de saída."""
+    return await _host_tool("shell", {
+        "command": command, "cwd": cwd or None,
+        "timeout_s": int(timeout_s or 60),
+    }, timeout=float(max(1, min(600, int(timeout_s or 60))) + 15))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Tool Tips — dicas de execução que VOCÊ grava sobre suas próprias tools
 # ══════════════════════════════════════════════════════════════════════════════
 # Memória de USO REAL, aditiva à description (fonte da verdade da tool continua
@@ -1302,7 +1413,7 @@ async def tool_tip_add(tool: str, tip: str) -> str:
     nesta conversa: modo de falha ("falha com payload > 5MB"), requisito de
     ordem ("chame X antes de Y, senão retorna vazio"), armadilha de parâmetro.
     `tool` é o nome exato da tool: graph_name para MCP ('servidor__tool', ex.:
-    'desktop-commander__start_process') ou o nome da tool nativa (ex.:
+    'alpha-mcp__host_shell') ou o nome da tool nativa (ex.:
     'memory_search', 'list_plans'). `tip` é UMA frase imperativa e GERAL — não
     o caso específico desta conversa.
     NÃO use para: fatos do usuário/tarefa (memory_write_batch), preferência ou
@@ -1383,10 +1494,15 @@ def _get_orchestrator_client() -> httpx.AsyncClient:
     return _orchestrator_client
 
 
-async def _orchestrator_request(method: str, path: str, payload: dict | None = None) -> dict:
+async def _orchestrator_request(method: str, path: str, payload: dict | None = None,
+                               timeout: float | None = None) -> dict:
     """Request autenticada ao orchestrator. Levanta MemoryToolError com o
-    `detail` do servidor em erro HTTP (mesmo contrato da _memory_api_request)."""
-    r = await _get_orchestrator_client().request(method, path, json=payload)
+    `detail` do servidor em erro HTTP (mesmo contrato da _memory_api_request).
+    `timeout` sobrescreve o timeout do client (usado pelo shell do host)."""
+    kwargs = {"json": payload}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    r = await _get_orchestrator_client().request(method, path, **kwargs)
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError:

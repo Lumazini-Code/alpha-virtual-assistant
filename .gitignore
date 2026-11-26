@@ -94,3 +94,5 @@ Manager/vendor
 boardview/.pytest_cache
 boardview/boardview_mcp.egg-info
 boardview/build
+
+presenton_data

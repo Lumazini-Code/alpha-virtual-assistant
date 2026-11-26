@@ -376,7 +376,7 @@ if (-not (Test-DockerCompose)) {
 Write-Ok 'Pre-requisitos validados.'
 
 # -- 1b. Node 24 no host -------------------------------------------------------
-# Os MCPs Playwright e Desktop Commander sao spawnados pelo mcp_manager do host
+# O MCP Playwright e spawnado pelo mcp_manager do host
 # via `npx` — sem Node 24 no Windows o registro falha na primeira pergunta.
 function Test-Node24 {
   $node = Get-Command node -ErrorAction SilentlyContinue
@@ -732,6 +732,18 @@ if (Test-Path $BoardviewSkill) {
   Write-Ok 'Skill boardview instalada (.agents\skills\boardview\SKILL.md).'
 } else {
   Write-Warn2 "Boardview: SKILL.md ausente em $BoardviewDir - skill nao instalada."
+}
+
+# Skill do Presenton: .agents e gitignored, entao a fonte versionada e
+# skills/presenton/ - copiar aqui garante que ela chegue no zip do release.
+$PresentonSkill = Join-Path (Join-Path (Join-Path $InstallDir 'skills') 'presenton') 'SKILL.md'
+if (Test-Path $PresentonSkill) {
+  $PresentonSkillDir = Join-Path (Join-Path (Join-Path $InstallDir '.agents') 'skills') 'presenton'
+  New-Item -ItemType Directory -Force -Path $PresentonSkillDir | Out-Null
+  Copy-Item -Force $PresentonSkill (Join-Path $PresentonSkillDir 'SKILL.md')
+  Write-Ok ('Skill presenton instalada: ' + (Join-Path $PresentonSkillDir 'SKILL.md'))
+} else {
+  Write-Warn2 'Presenton: skills/presenton/SKILL.md ausente - skill nao instalada.'
 }
 
 # Skill de frontend/HTML (Preview da WebUI): a fonte fica na raiz do projeto.
@@ -1130,7 +1142,7 @@ function Register-PlaywrightMcp {
   return $true
 }
 
-# -- 5c. Registro dos demais MCPs (alpha-mcp e Desktop Commander) -------------
+# -- 5c. Registro dos demais MCPs (alpha-mcp) ---------------------------------
 # Mesmo fluxo do Playwright: POST /servers (upsert idempotente) + POST /sync.
 # Helper generico para nao triplicar o loop de retry. O body vai em bytes UTF-8
 # (Invoke-RestMethod com string usa ISO-8859-1 no Windows PowerShell 5.1 e
@@ -1216,36 +1228,156 @@ function Register-AlphaMcp {
   })
 }
 
-function Register-DesktopCommanderMcp {
-  # Exemplos em português são vetores de busca no ToolsDB: sem eles o seletor
-  # semântico (descrições em inglês) não casa "liste os arquivos da pasta"
-  # com `list_directory` e o servidor fica fora da rodada.
-  return (Register-McpServer -Label 'Desktop Commander' -Name 'desktop-commander' -SyncTimeoutSec 240 -Spec @{
-    name          = 'desktop-commander'
-    skill_summary = 'Arquivos e terminal do computador (ler/escrever/editar arquivos, listar diretórios, buscar, executar comandos e processos)'
-    transport     = 'stdio'
-    command       = 'npx'
-    args          = @('-y', '@wonderwhy-er/desktop-commander@latest')
+# A imagem oficial expoe so as 7 tools que chamam o LLM interno. A pasta
+# presenton/ traz um Dockerfile que aplica o patch de montagem sem modelo
+# (create_blank -> prepare ordered -> render -> export) sobre essa mesma
+# imagem base e regenera o openapi_spec.json, que e estatico e descartaria
+# campos novos em silencio.
+$script:PresentonBaseImage = "ghcr.io/presenton/presenton:latest"
+$script:PresentonImage = "ava-presenton:latest"
+$script:PresentonContainer = "presenton"
+
+function Ensure-PresentonImage {
+  # Monta a imagem com o patch. Se falhar, cai para a oficial: o MCP continua
+  # funcionando, so sem as tools de montagem sem LLM.
+  $ctx = Join-Path $InstallDir "presenton"
+  $dockerfile = Join-Path $ctx "Dockerfile"
+  $diff = Join-Path $ctx "presenton-mcp-assembly.diff"
+  if (-not (Test-Path $dockerfile) -or -not (Test-Path $diff)) {
+    Write-Warn2 "Presenton: presenton/ ausente - usando a imagem oficial (sem tools de montagem)."
+    $script:PresentonImage = $script:PresentonBaseImage
+    return $true
+  }
+  docker image inspect $script:PresentonImage *> $null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Info "Presenton: imagem '$($script:PresentonImage)' ja existe."
+    return $true
+  }
+  Write-Info "Presenton: construindo '$($script:PresentonImage)' (patch do MCP sobre a imagem oficial)..."
+  docker build -t $script:PresentonImage --build-arg "PRESENTON_BASE=$($script:PresentonBaseImage)" $ctx *> $null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 "Presenton: build da imagem com patch falhou - usando a oficial."
+    $script:PresentonImage = $script:PresentonBaseImage
+    return $true
+  }
+  Write-Ok "Presenton: imagem '$($script:PresentonImage)' pronta (14 tools de MCP)."
+  return $true
+}
+
+function Ensure-PresentonContainer {
+  # Cria (ou reaproveita) o container do Presenton com volume persistente.
+  # Em runtime o proprio manager repete o start sob demanda (campo autostart do
+  # /servers), entao aqui basta deixar imagem baixada e container criado: o
+  # primeiro turno que usar uma tool nao paga o pull.
+  if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    Write-Warn2 "Presenton: docker nao encontrado - autostart indisponivel."
+    return $false
+  }
+  Ensure-PresentonImage | Out-Null
+  $existing = docker inspect $script:PresentonContainer 2>&1
+  if ($LASTEXITCODE -eq 0) {
+    Write-Info "Presenton: container '$($script:PresentonContainer)' ja existe."
+  } else {
+    Write-Info "Presenton: criando container '$($script:PresentonContainer)' ($($script:PresentonImage))..."
+    $dataDir = Join-Path $InstallDir "app_data"
+    docker run -d --name $script:PresentonContainer -p 5001:80 -e DISABLE_AUTH=true `
+      -v ($dataDir + ':/app_data') $script:PresentonImage 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Write-Warn2 "Presenton: falha ao criar o container (imagem baixada? rede?)."
+      Write-Warn2 "Rode manualmente: docker run -d --name presenton -p 5001:80 -e DISABLE_AUTH=true -v `"$dataDir:/app_data`" $($script:PresentonImage)"
+      return $false
+    }
+  }
+  for ($i = 0; $i -lt 60; $i++) {
+    $open = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($open) {
+      Write-Ok "Presenton: respondendo em http://127.0.0.1:5001."
+      return $true
+    }
+    Start-Sleep -Seconds 2
+  }
+  Write-Warn2 "Presenton: container criado, mas a porta 5001 ainda nao responde (1o boot baixa modelos)."
+  return $true
+}
+
+function Register-PresentonMcp {
+  # Presenton e self-hosted e roda FORA do stack da Alpha. O container e criado
+  # aqui e o manager o sobe sob demanda (autostart). Sem PRESENTON_API_KEY o
+  # registro sai sem headers (instancia local sem auth).
+  $key = Get-EnvVar "PRESENTON_API_KEY"
+  $presentonUrl = Get-EnvVar "PRESENTON_MCP_URL"
+  if (-not $presentonUrl) { $presentonUrl = "http://127.0.0.1:5001/mcp" }
+  if (-not $key) {
+    Write-Info "Presenton MCP sem PRESENTON_API_KEY - registrando instancia local sem auth."
+  }
+  Ensure-PresentonContainer | Out-Null
+  # transport=http + headers: o manager envia o Authorization em POST, GET-SSE e
+  # DELETE (mcp_server.rs build_header_map) e devolve o valor mascarado no GET
+  # /servers, para o token nao vazar para o WebUI nem para os logs.
+  $body = [ordered]@{
+    name          = "presenton"
+    skill_summary = "Presenton: gera apresentacoes e decks (pptx/pdf) a partir de um tema ou de documentos enviados, com exportacao e URL de edicao"
+    transport     = "http"
+    url           = $presentonUrl
     enabled       = $true
     always_on     = $false
-    examples      = @{
-      list_directory = @(
-        'liste os arquivos da pasta',
-        'listar arquivos do diretório',
-        'quais arquivos tem nessa pasta',
-        'mostre o conteúdo da pasta',
-        'encontre o arquivo nessa pasta'
-      )
-      read_file = @('leia o arquivo', 'abra o conteúdo desse arquivo', 'mostre o texto do arquivo')
-      read_multiple_files = @('leia esses arquivos', 'mostre o conteúdo de vários arquivos')
-      write_file = @('crie um arquivo', 'escreva no arquivo', 'salve esse texto em um arquivo')
-      edit_block = @('edite o arquivo', 'altere esse trecho do arquivo', 'faça uma correção no arquivo')
-      start_search = @('busque dentro dos arquivos', 'procure esse texto nos arquivos da pasta')
-      get_file_info = @('informações do arquivo', 'tamanho e data do arquivo', 'detalhes do arquivo')
-      start_process = @('execute um comando no terminal', 'rode esse comando')
-      list_processes = @('liste os processos', 'quais processos estão rodando')
+    # O manager sobe o container quando uma tool deste servidor e requisitada
+    # (autostart_ensure em mcp_server.rs), inclusive na selecao de skills.
+    autostart     = @{
+      enabled         = $true
+      image           = $script:PresentonImage
+      container       = $script:PresentonContainer
+      # DISABLE_AUTH no proprio run: sem isso o MCP responde "Auth required"
+      # mesmo sem PRESENTON_API_KEY e o container criado pelo manager ficaria
+      # inutilizavel.
+      args            = @("-e", "DISABLE_AUTH=true")
+      ports           = "5001:80"
+      volume          = (Join-Path $InstallDir "app_data")
+      ready_timeout_s = 300
     }
-  })
+    examples      = @{
+      # Montagem sem LLM: o agente decide o texto, o Presenton so renderiza.
+      create_blank_presentation   = @("monte uma apresentacao com este texto", "crie um deck do zero")
+      template_get                = @("quais layouts esse template tem")
+      prepare_presentation        = @("prepare os slides para renderizar")
+      render_presentation         = @("renderize os slides")
+      export_presentation         = @("exporta em pptx", "gera o pdf da apresentacao")
+      # Geracao automatica (exige LLM no container).
+      start_standard_presentation = @("crie uma apresentacao sobre", "monte um deck de slides sobre", "gere uma apresentacao em pptx")
+      start_smart_presentation    = @("crie slides em HTML sobre", "faca um deck visual sobre")
+      upload_files                = @("usa esse pdf para a apresentacao", "gera slides a partir desse documento")
+      list_templates              = @("quais templates de apresentacao existem")
+      get_job_status              = @("como esta a apresentacao", "ja terminou a geracao")
+    }
+  }
+  # Sem chave o Presenton local roda sem auth: um "Bearer " vazio faria o
+  # verifier recusar com 401, entao o header so entra quando ha chave.
+  if ($key) { $body["headers"] = @{ Authorization = "Bearer $key" } }
+  $payload = $body | ConvertTo-Json -Depth 6
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+  $registered = $false
+  for ($i = 0; $i -lt 12; $i++) {
+    try {
+      Invoke-RestMethod -Uri "$McpManagerUrl/servers" -Method Post `
+        -ContentType "application/json; charset=utf-8" -Body $bytes -TimeoutSec 10 -Headers $McpHeaders | Out-Null
+      $registered = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $registered) {
+    Write-Warn2 "Presenton MCP: registro falhou (manager fora do ar?)."
+    return $false
+  }
+  try {
+    Invoke-RestMethod -Uri "$McpManagerUrl/servers/presenton/sync" -Method Post -TimeoutSec 120 -Headers $McpHeaders | Out-Null
+  } catch {
+    Write-Warn2 "Presenton MCP: registrado, mas o sync falhou (instancia Presenton no ar?)."
+    return $false
+  }
+  Write-Ok "Presenton MCP registrado e sincronizado."
+  return $true
 }
 
 function Register-BoardviewMcp {
@@ -1575,8 +1707,9 @@ if (-not $SkipBuild) {
   # Registro dos MCPs - logo apos o up, quando o stack ja esta carregado.
   Register-PlaywrightMcp | Out-Null
   Register-AlphaMcp | Out-Null
-  Register-DesktopCommanderMcp | Out-Null
   Register-BoardviewMcp | Out-Null
+# Presenton (opcional): so age se PRESENTON_API_KEY estiver no .env
+Register-PresentonMcp | Out-Null
 
   $StatusUrl = 'http://127.9.12.22:9000/status'
   $MaxWait = 1200  # 20 min

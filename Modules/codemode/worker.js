@@ -17,7 +17,7 @@ const vm = require("vm");
 const readline = require("readline");
 
 let catalog = [];
-let maxCalls = 50;
+let maxCalls = Infinity;
 let timeoutMs = 30_000;
 let callSeq = 0;
 let callCount = 0;
@@ -112,7 +112,9 @@ function makeConsole() {
 
 async function run(message) {
   catalog = Array.isArray(message.catalog) ? message.catalog : [];
-  maxCalls = Number(message.limits && message.limits.maxToolCalls) || 50;
+  const configuredCalls = Number(message.limits && message.limits.maxToolCalls);
+  // 0/ausente = sem limite; valor positivo mantém o teto opcional.
+  maxCalls = Number.isFinite(configuredCalls) && configuredCalls > 0 ? configuredCalls : Infinity;
   timeoutMs = Number(message.limits && message.limits.timeoutMs) || 30_000;
 
   const context = vm.createContext({

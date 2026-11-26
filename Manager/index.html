@@ -762,17 +762,37 @@ function chatTitle(c){
   return u?String(u.text||'').slice(0,80):'Nova conversa';
 }
 async function hydrate(c){
-  if(!c||c.hydrated||!c.sid)return;
+  if(!c||!c.sid)return;
+  if(c._hydrating)return c._hydrating;
+  if(c.hydrated)return;
   c.hydrated=true;
-  try{
-    const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/messages?limit=300');
-    c.ms=(d.messages||[]).map(msgToUi).filter(Boolean);
-    const s=d.session||{};
-    if(s.title&&!c.title)c.title=s.title;
-    if(s.project_id)c.project=s.project_id;
-  }catch(e){c.err=true}
-  if(c.id===S.active){draw(true);ui()}
-  renderChats();
+  const beforeLen=(c.ms||[]).length;
+  c._hydrating=(async()=>{
+    try{
+      const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/messages?limit=300');
+      const serverMs=(d.messages||[]).map(msgToUi).filter(Boolean);
+      // Mensagens locais criadas DURANTE o fetch (ex.: usuário enviou a
+      // primeira pergunta logo após abrir o chat) não podem ser apagadas
+      // quando o histórico chega. Anexa só o que é novo, sem duplicar a
+      // user message que o servidor porventura já tenha persistido.
+      let localMs=(c.ms||[]).slice(beforeLen);
+      if(localMs.length){
+        const last=serverMs[serverMs.length-1], first=localMs[0];
+        if(last&&first&&last.role==='u'&&first.role==='u'&&last.text===first.text){
+          localMs=localMs.slice(1);
+        }
+        serverMs.push(...localMs);
+      }
+      c.ms=serverMs;
+      const s=d.session||{};
+      if(s.title&&!c.title)c.title=s.title;
+      if(s.project_id)c.project=s.project_id;
+    }catch(e){c.err=true;c.hydrated=false}
+    finally{c._hydrating=null}
+    if(c.id===S.active){draw(true);ui()}
+    renderChats();
+  })();
+  return c._hydrating;
 }
 /** Converte uma mensagem do session store no formato de bolha da UI. */
 function msgToUi(m){
@@ -1186,6 +1206,10 @@ async function send(text){
   if(l==='/projects'){document.body.classList.remove('nosb');return $('#addp').focus()}
   if(l==='/clear'||l==='/new')return clear();
   if(c.streaming)return;
+  // Se o chat acabou de ser aberto (principalmente após restart do app), o
+  // hydrate ainda pode estar buscando o histórico. Esperar aqui evita que a
+  // resposta da hidratação sobrescreva a primeira pergunta recém-enviada.
+  await hydrate(c);
   // Modelo por chat: sem modelo escolhido (provider personalizado/novo) abre
   // o seletor em vez de mandar um ID vazio ao runtime.
   const mkey=cfg.demo?null:ensureChatModel(c);

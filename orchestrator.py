@@ -109,7 +109,7 @@ import ipaddress
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 import regex as re
 # MCP é consumido VIA mcp_manager (REST) — este processo nunca
 # spawna servidores MCP nem segura sessões; o manager é o único executante
@@ -192,6 +192,19 @@ ALWAYS_ON_MCP_SERVERS = {
         "AVA_ALWAYS_ON_MCP_SERVERS", "alpha-mcp"
     ).split(",") if s.strip()
 }
+
+# Tools do alpha-mcp que executam no HOST: se o modelo não informar `cwd`,
+# o orchestrator injeta o cwd da sessão (mesmo diretório usado pelas tools
+# de arquivo stdio). Vale para chamada MCP direta e para Code Mode.
+HOST_TOOL_NAMES = frozenset({
+    "alpha-mcp__host_read_file",
+    "alpha-mcp__host_list_dir",
+    "alpha-mcp__host_glob",
+    "alpha-mcp__host_grep",
+    "alpha-mcp__host_write_file",
+    "alpha-mcp__host_edit",
+    "alpha-mcp__host_shell",
+})
 
 
 # ── Agent Skills (SKILL.md — padrão "Agent Skills"/skills.sh) ─────────────────
@@ -339,7 +352,9 @@ CODEMODE_ENABLED = os.getenv("AVA_CODEMODE", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
 CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "30000")))
-CODEMODE_MAX_TOOL_CALLS = max(1, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "50")))
+# 0 = sem limite de chamadas dentro de um mesmo `execute`. O timeout por
+# execução (CODEMODE_TIMEOUT_MS) continua sendo o guarda-corpo.
+CODEMODE_MAX_TOOL_CALLS = max(0, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "0")))
 CODEMODE_MAX_OUTPUT_CHARS = max(1_000, int(os.getenv("AVA_CODEMODE_MAX_OUTPUT_CHARS", "200000")))
 SKILL_CATALOG_ENABLED = os.getenv("AVA_SKILL_CATALOG", "1").strip().lower() in (
     "1", "true", "yes", "on",
@@ -728,7 +743,7 @@ def _session_history(
     if store is None or not sid:
         return None
     try:
-        return build_working_context(
+        messages = build_working_context(
             store.load_messages(sid),
             mode=normalize_mode(mode, CONTEXT_MODE_DEFAULT),
             max_turns=ST_WINDOW_TURNS,
@@ -737,6 +752,12 @@ def _session_history(
             keep_trailing_tools=keep_trailing_tools,
             max_chars=HISTORY_MAX_CHARS,
         )
+        # O reasoning é só para a UI/session store. Provedores OpenAI-like
+        # não devem receber o chain-of-thought de turnos anteriores.
+        for message in messages or []:
+            if isinstance(message, dict):
+                message.pop("reasoning", None)
+        return messages
     except Exception as e:
         log.warning(f"[session] falha ao ler histórico ({sid[:8]}): {type(e).__name__}: {e}")
         return None
@@ -1465,14 +1486,10 @@ class ExecuteRequest(BaseModel):
     search_pdfs:   bool           = False
     stream:        bool           = True
     # ── Eficiência de uso de tokens (custo/tempo) ────────────────────────────
-    # Teto de turnos do tool loop ReAct. Sem teto, "turismo" de leitura
-    # (read/snapshot/search alternados) drena minutos de thinking + tokens
-    # (26/10: ~10 min lendo sem executar nada). Ao atingir o teto,
-    # _force_finish faz UMA chamada final SEM tools sintetizando o que foi
-    # coletado (histórico intacto). None = usa AVA_EXECUTE_MAX_STEPS
-    # (default 25). É o ÚNICO guarda-corpo de loop — o anti-loop de MESMA
-    # tool (REPEAT_NUDGE_AT/REPEAT_HARD_LIMIT) foi removido a pedido.
-    max_steps:     Optional[int]  = Field(None, ge=1, le=100)
+    # Teto de turnos do tool loop ReAct. None/0 = sem teto (padrão): o loop
+    # só termina quando o modelo responde sem tool_calls. Um positivo reativa
+    # o _force_finish. Precedência: request > AVA_EXECUTE_MAX_STEPS.
+    max_steps:     Optional[int]  = Field(None, ge=0)
     # Esforço de raciocínio do OpenRouter (reasoning.effort). Precedência:
     # request > resource/settings.json (aba settings da TUI) > env
     # AVA_REASONING_EFFORT > nativo (template do modelo decide).
@@ -1542,7 +1559,7 @@ class AlphaCodeRequest(BaseModel):
     task: str = Field(..., max_length=200_000, description="Descrição da tarefa em linguagem natural")
     session_id: Optional[str] = Field(None, description="ID de sessão. None = gera novo.")
     project_dir: Optional[str] = Field(None, description="Diretório alvo. None = BASE_DIR do scraping_client.")
-    max_steps: int = Field(25, ge=1, le=100, description="Limite de iterações ReAct")
+    max_steps: int = Field(0, ge=0, description="Limite de iterações ReAct; 0 = sem limite")
     temperature: float = Field(0.3, ge=0.0, le=2.0)
     model_override: Optional[str] = Field(None, max_length=200, description="Força modelo para TODOS os steps. None = roteamento adaptativo.")
     stream: bool = Field(True, description="True = SSE streaming, False = síncrono")
@@ -4231,6 +4248,8 @@ def _build_codemode_snapshot(
         max_tool_calls=CODEMODE_MAX_TOOL_CALLS,
         max_output_chars=CODEMODE_MAX_OUTPUT_CHARS,
         on_tool_result=_after_tool,
+        default_cwd=req.cwd,
+        cwd_tools=set(HOST_TOOL_NAMES),
     )
     registry = ToolRegistry(hooks=ToolHooks(), error_formatter=_format_tool_exception)
     for spec in base.specs.values():
@@ -5576,11 +5595,12 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
          turno (não existe tool "finish").
       3. Se houver tool_calls: cada uma é executada e o resultado volta ao
          histórico como mensagem role="tool" (tool_call_id correspondente).
-      4. Fora isso, não há limite de rodadas — o teto é o max_steps
-         (AVA_EXECUTE_MAX_STEPS): atingido ele, `_force_finish` faz UMA
-         chamada final sem tools. (O guarda anti-loop de MESMA tool —
-         REPEAT_NUDGE_AT/REPEAT_HARD_LIMIT — foi removido a pedido:
-         interrompia trabalho legítimo e repetitivo mais do que loops.)
+      4. Fora isso, não há limite de rodadas por padrão. Um valor positivo
+         em max_steps (AVA_EXECUTE_MAX_STEPS) reativa o guarda-corpo:
+         atingido ele, `_force_finish` faz UMA chamada final sem tools.
+         (O guarda anti-loop de MESMA tool — REPEAT_NUDGE_AT/
+         REPEAT_HARD_LIMIT — também foi removido: interrompia trabalho
+         legítimo e repetitivo mais do que loops.)
     """
     _metric_inc("turns_total")
     depth, think_instruction = await _think_instruction(req.input)
@@ -5968,21 +5988,28 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
         # evento "reasoning" NA HORA; a TUI renderiza no bloco dim "💭"
         # acima da resposta. \n\n separa rajadas de turnos distintos.
         _reason_sep = {"flush": False}
+        # Raciocínio do step atual: entra no assistant message persistido
+        # (a UI reidrata os thinks) mas é removido do histórico enviado ao
+        # modelo em _session_history().
+        reasoning_buf: list[str] = []
 
         async def on_thinking(piece: str) -> None:
             prefix = "\n\n" if _reason_sep["flush"] else ""
             _reason_sep["flush"] = False
+            reasoning_buf.append(prefix + piece)
             await on_event("reasoning", prefix + piece)
     else:
         on_delta = None
         on_thinking = None
+        reasoning_buf = []
 
     # ── Eficiência de uso de tokens (custo/tempo) ──────────────────────────
-    # Teto de turnos do loop: sem ele, "turismo" de leitura (read/snapshot/
-    # search alternados — que o anti-loop de MESMA tool não pega) roda até o
-    # modelo SE CANSAR. Precedência do esforço de reasoning: request >
-    # settings.json (aba settings da TUI) > env > nativo.
-    max_steps = req.max_steps or int(os.getenv("AVA_EXECUTE_MAX_STEPS", "25"))
+    # Sem teto de turnos por padrão (0/None = ilimitado): o loop só termina
+    # quando o modelo responde sem tool_calls. Um valor positivo em
+    # AVA_EXECUTE_MAX_STEPS (ou req.max_steps) reativa o guarda-corpo antigo.
+    max_steps = (req.max_steps if req.max_steps is not None
+                 else int(os.getenv("AVA_EXECUTE_MAX_STEPS", "0")))
+    max_steps = max(0, max_steps)
     reasoning_effort = (req.reasoning_effort
                         or (_SETTINGS.get("reasoning_effort") or "")
                         or os.getenv("AVA_REASONING_EFFORT", "")).strip().lower() or None
@@ -5990,11 +6017,10 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
 
     overflow_recovered = False
     while True:
-        # ── Guarda-corpo: teto de turnos ────────────────────────────────────
-        # UMA chamada final SEM tools (_force_finish) sintetizando o que já
-        # foi lido — o histórico fica intacto, nada é descartado. Único
-        # guarda-corpo de loop restante (o anti-loop de MESMA tool saiu).
-        if turn >= max_steps:
+        # ── Guarda-corpo opcional: teto de turnos ───────────────────────────
+        # Só existe quando max_steps > 0. Com o padrão atual (0) o loop segue
+        # até o modelo responder em texto puro sem tools.
+        if max_steps > 0 and turn >= max_steps:
             _metric_inc("force_finish_calls")
             log.warning(
                 f"[{eid[:8]}] teto de turnos ({max_steps}) atingido — "
@@ -6014,6 +6040,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
             break
 
         # ── Passo 1: LLM responde, podendo incluir tool_calls estruturadas ──
+        reasoning_buf.clear()
         try:
             request_history = _bound_request_images(history)
             if on_delta is not None:
@@ -6062,8 +6089,17 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
+        reasoning_text = "".join(reasoning_buf).strip()
+        if not reasoning_text and isinstance(message.get("reasoning"), str):
+            reasoning_text = message["reasoning"].strip()
+        # O histórico do MODELO usa a mensagem sem reasoning (provider não
+        # precisa receber o chain-of-thought de volta). O store recebe uma
+        # cópia com reasoning para a WebUI reidratar os blocos "think".
         history.append(assistant_msg)
-        _session_append(sid, assistant_msg)
+        stored_msg = dict(assistant_msg)
+        if reasoning_text:
+            stored_msg["reasoning"] = reasoning_text
+        _session_append(sid, stored_msg)
 
         if not tool_calls:
             # Modelo respondeu sem chamar nenhuma tool. Texto puro encerra o
@@ -6142,6 +6178,13 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                 err = None
                 action = json.dumps(args, ensure_ascii=False)
             server = mcp_dispatch[tool_name][0] if kind == "mcp" else None
+            # Tools de host do alpha-mcp herdam o cwd da sessão quando o
+            # modelo não passa um explicitamente (mesmo diretório das tools
+            # de arquivo stdio).
+            if (kind == "mcp" and tool_name in HOST_TOOL_NAMES
+                    and isinstance(args, dict) and not args.get("cwd") and req.cwd):
+                args["cwd"] = req.cwd
+                action = json.dumps(args, ensure_ascii=False)
             prepared.append({
                 "index": idx, "call_id": call_id, "tool_name": tool_name,
                 "args": args, "kind": kind, "server": server,
@@ -7084,6 +7127,36 @@ async def search(req: SearchRequest):
     except Exception as e:
         raise HTTPException(502, f"Search falhou: {e}")
 
+@app.post("/host/{action}")
+async def host_tool_proxy(action: str, payload: dict):
+    """Proxy interno das ferramentas de host do Manager (leitura/busca/shell).
+
+    O alpha-mcp roda em container e chama estas rotas via orchestrator; o
+    processo do tray (`PROCESS_MANAGER_URL`) é quem executa no filesystem e
+    no shell do usuário. A autenticação é a mesma do resto do serviço.
+    """
+    allowed = {"read", "list", "glob", "grep", "write", "edit", "shell"}
+    if action not in allowed:
+        raise HTTPException(404, f"ação de host desconhecida: {action}")
+    timeout = 30.0
+    if action == "shell":
+        try:
+            timeout = min(610.0, float(payload.get("timeout_s") or 60) + 10.0)
+        except (TypeError, ValueError):
+            timeout = 70.0
+    try:
+        r = await state.process_manager_client.post(
+            f"/host/{action}", json=payload, timeout=timeout
+        )
+    except Exception as e:
+        raise HTTPException(502, f"host tool '{action}' falhou: {type(e).__name__}: {e}")
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text}
+    return JSONResponse(content=data, status_code=r.status_code)
+
+
 @app.post("/read-url")
 async def read_url(req: ReadUrlRequest):
     # T6 — SSRF guard: recusa URLs que resolvem para loopback/private/link-local
@@ -7243,10 +7316,29 @@ async def session_messages(session_id: str, limit: int = 200):
     if store is None:
         return {"enabled": False, "session": None, "messages": []}
     messages = store.load_messages(session_id)
+    if limit > 0:
+        messages = messages[-limit:]
+        # O recorte por contagem pode começar no meio de um turno longo
+        # (cadeia de tools). A WebUI precisa começar na pergunta do usuário;
+        # sem isso o histórico reidratado abre com "execute ✓" antes da
+        # pergunta e parece que a primeira mensagem sumiu.
+        first_user = next(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+            None,
+        )
+        if first_user is not None:
+            # Mantém o resumo de compactação (se houver) imediatamente antes
+            # da primeira pergunta; o resto do orphan chain é descartado.
+            prefix = [m for m in messages[:first_user] if m.get("type") == "compaction"]
+            messages = prefix + messages[first_user:]
+        else:
+            messages = [m for m in messages if m.get("type") == "compaction"]
+    else:
+        messages = []
     return {
         "enabled": True,
         "session": store.get(session_id),
-        "messages": messages[-limit:] if limit > 0 else [],
+        "messages": messages,
     }
 
 

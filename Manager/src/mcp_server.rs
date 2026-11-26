@@ -67,6 +67,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 use rmcp::model::{CallToolRequestParam, RawContent};
 use rmcp::service::{Peer, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
@@ -544,6 +545,15 @@ struct ServerRegisterRequest {
     // ── http: conecta a um servidor MCP JÁ RODANDO (streamable-http) ──
     #[serde(default)]
     url: Option<String>,
+    // Container Docker que este servidor http precisa. Quando preenchido, o
+    // manager sobe o container SOB DEMANDA (primeiro connect/sync/call) em vez
+    // de exigir que o usuário o mantenha rodando. Vazio = nenhum autostart.
+    #[serde(default)]
+    autostart: AutostartSpec,
+    // Headers extras em TODA requisição http (POST/GET-SSE/DELETE). É como a
+    // maioria dos servidores MCP remotos autentica: Authorization: Bearer ...
+    #[serde(default)]
+    headers: IndexMap<String, String>,
     #[serde(default = "d_true")]
     enabled: bool,
     // ── capability de base: tools entram no grafo como "core" e o servidor
@@ -553,6 +563,33 @@ struct ServerRegisterRequest {
     // Exemplos de gatilho por tool (chave = nome da tool EXPOSTA pelo servidor).
     #[serde(default)]
     examples: IndexMap<String, Vec<String>>,
+}
+
+/// Como subir o container Docker de um servidor MCP http sob demanda.
+/// Todos os campos têm default; enabled=false desliga o autostart sem
+/// apagar a configuração.
+#[derive(Deserialize, serde::Serialize, Clone, Default)]
+struct AutostartSpec {
+    #[serde(default)]
+    enabled: bool,
+    /// Imagem a rodar quando o container não existe (docker run).
+    #[serde(default)]
+    image: String,
+    /// Nome do container. Vazio = o próprio nome do servidor MCP.
+    #[serde(default)]
+    container: String,
+    /// Args extras do docker run (ex.: ["-e","AUTH_USERNAME=admin"]).
+    #[serde(default)]
+    args: Vec<String>,
+    /// Volume montado em /app_data (pasta do host). Vazio = raiz do projeto.
+    #[serde(default)]
+    volume: String,
+    /// Mapeamento publicado, no formato host:container. Vazio = sem -p.
+    #[serde(default)]
+    ports: String,
+    /// Segundos de espera pela porta responder depois do start.
+    #[serde(default)]
+    ready_timeout_s: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -822,10 +859,16 @@ struct ServerRow {
     examples_json: String,
     created_at: f64,
     last_sync: Option<f64>,
+    // JSON {Header: valor}. Índice 12 em SERVER_COLS (sempre no fim, para não
+    // renumerar os campos acima).
+    headers_json: String,
+    // JSON do AutostartSpec. Índice 13 (também no fim, mesmo motivo).
+    autostart_json: String,
 }
 
 const SERVER_COLS: &str = "name, skill_summary, transport, command, args_json, env_json, url, \
-                           enabled, always_on, examples_json, created_at, last_sync";
+                           enabled, always_on, examples_json, created_at, last_sync, headers_json, \
+                           autostart_json";
 
 impl ServerRow {
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -842,6 +885,8 @@ impl ServerRow {
             examples_json: r.get(9)?,
             created_at: r.get(10)?,
             last_sync: r.get(11)?,
+            headers_json: r.get(12)?,
+            autostart_json: r.get(13)?,
         })
     }
 }
@@ -890,6 +935,8 @@ fn open_db(cfg: &Config) -> rusqlite::Result<Connection> {
             enabled       INTEGER NOT NULL DEFAULT 1,
             always_on     INTEGER NOT NULL DEFAULT 0,
             examples_json TEXT NOT NULL DEFAULT '{}',
+            headers_json  TEXT NOT NULL DEFAULT '{}',
+            autostart_json TEXT NOT NULL DEFAULT '{}',
             created_at    REAL NOT NULL,
             last_sync     REAL
         );
@@ -920,6 +967,12 @@ fn open_db(cfg: &Config) -> rusqlite::Result<Connection> {
     if !srv_cols.iter().any(|c| c == "examples_json") {
         conn.execute_batch("ALTER TABLE mcp_servers ADD COLUMN examples_json TEXT NOT NULL DEFAULT '{}'")?;
     }
+    if !srv_cols.iter().any(|c| c == "headers_json") {
+        conn.execute_batch("ALTER TABLE mcp_servers ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'")?;
+    }
+    if !srv_cols.iter().any(|c| c == "autostart_json") {
+        conn.execute_batch("ALTER TABLE mcp_servers ADD COLUMN autostart_json TEXT NOT NULL DEFAULT '{}'")?;
+    }
     let tool_cols = table_cols("mcp_tools")?;
     if !tool_cols.iter().any(|c| c == "core") {
         conn.execute_batch("ALTER TABLE mcp_tools ADD COLUMN core INTEGER NOT NULL DEFAULT 0")?;
@@ -949,13 +1002,16 @@ impl AppState {
         let res = db
             .execute(
                 "INSERT INTO mcp_servers (name, skill_summary, transport, command, \
-                 args_json, env_json, url, enabled, always_on, examples_json, created_at) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+                 args_json, env_json, url, enabled, always_on, examples_json, headers_json, \
+                 autostart_json, created_at) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) \
                  ON CONFLICT(name) DO UPDATE SET skill_summary=excluded.skill_summary, \
                  transport=excluded.transport, command=excluded.command, \
                  args_json=excluded.args_json, env_json=excluded.env_json, \
                  url=excluded.url, enabled=excluded.enabled, \
-                 always_on=excluded.always_on, examples_json=excluded.examples_json",
+                 always_on=excluded.always_on, examples_json=excluded.examples_json, \
+                 headers_json=excluded.headers_json, \
+                 autostart_json=excluded.autostart_json",
                 params![
                     req.name,
                     req.skill_summary.trim(),
@@ -967,6 +1023,13 @@ impl AppState {
                     req.enabled as i64,
                     req.always_on as i64,
                     serde_json::to_string(&examples).unwrap_or_else(|_| "{}".into()),
+                    // Headers são opacos (token, User-Agent) e não passam pela
+                    // normalização de exemplos: o valor vai como veio.
+                    serde_json::to_string(&req.headers).unwrap_or_else(|_| "{}".into()),
+                    // Autostart: normalizado (login e defaults resolvidos na
+                    // leitura), então o JSON guardado é o que veio, sem
+                    // transformação — o spec é opaco e pequeno.
+                    serde_json::to_string(&req.autostart).unwrap_or_else(|_| "{}".into()),
                     now,
                 ],
             )
@@ -1100,6 +1163,46 @@ fn parse_args(s: &str) -> Vec<String> {
 
 fn parse_env(s: &str) -> IndexMap<String, String> {
     serde_json::from_str(if s.is_empty() { "{}" } else { s }).unwrap_or_default()
+}
+
+/// Headers http do servidor ({Nome: valor}). Mesmo formato de `env_json`, mas
+/// sem as proibições de PATH/LD_PRELOAD (não vão para o ambiente de processo).
+fn parse_headers(s: &str) -> IndexMap<String, String> {
+    parse_env(s)
+}
+
+/// Versão mascarável dos headers, para GET /servers e para os logs.
+/// Um token de API não deve voltar inteiro para o WebUI nem para o journal:
+/// o front só precisa saber QUAIS headers existem.
+fn mask_headers(s: &str) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (k, v) in parse_headers(s) {
+        let chars: Vec<char> = v.chars().collect();
+        let masked = if chars.len() <= 8 {
+            "********".to_string()
+        } else {
+            let head: String = chars[..4].iter().collect();
+            let tail: String = chars[chars.len() - 4..].iter().collect();
+            format!("{head}…{tail}")
+        };
+        out.insert(k, Value::String(masked));
+    }
+    out
+}
+
+/// Converte o mapa de headers do DB em HeaderMap do reqwest.
+/// Header inválido é erro de conexão explícito (não silencioso): um nome/value
+/// malformado faria o servidor recusar o handshake com 400 sem diagnóstico.
+fn build_header_map(headers: &IndexMap<String, String>) -> Result<reqwest::header::HeaderMap, String> {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(k.trim().as_bytes())
+            .map_err(|e| format!("InvalidHeaderName({k}): {e}"))?;
+        let value = reqwest::header::HeaderValue::from_str(v)
+            .map_err(|e| format!("InvalidHeaderValue({k}): {e}"))?;
+        map.insert(name, value);
+    }
+    Ok(map)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1608,8 +1711,30 @@ async fn session_keeper(
                 .clone()
                 .filter(|u| !u.is_empty())
                 .ok_or_else(|| "RuntimeError: transport='http' sem url configurada".to_string())?;
+            // Autostart: sobe o container do servidor http antes do handshake,
+            // senão o primeiro connect falha e o servidor fica unhealthy.
+            if let Err(e) = autostart_ensure(&st, &row).await {
+                warn!("MCP[{name}]: autostart falhou: {e}");
+                return Err(format!("AutostartError: {e}"));
+            }
             info!("MCP[{name}]: conectando via streamable-http em {url}");
-            let transport = StreamableHttpClientTransport::from_uri(url);
+            // Headers são enviados em POST, GET-SSE e DELETE. reqwest::Client
+            // implementa StreamableHttpClient (feature do Cargo.toml), então
+            // o default_headers cobre o handshake e as chamadas seguintes.
+            let headers = parse_headers(&row.headers_json);
+            let transport = if headers.is_empty() {
+                StreamableHttpClientTransport::from_uri(url)
+            } else {
+                let client = reqwest::Client::builder()
+                    .default_headers(build_header_map(&headers)?)
+                    .build()
+                    .map_err(|e| format!("HTTPClientError: {e}"))?;
+                info!("MCP[{name}]: {} header(s) configurado(s)", headers.len());
+                StreamableHttpClientTransport::with_client(
+                    client,
+                    StreamableHttpClientTransportConfig::with_uri(url),
+                )
+            };
             ().serve(transport)
                 .await
                 .map_err(|e| format!("ClientInitializeError: {e}"))?
@@ -1697,6 +1822,204 @@ fn resolve_call_cwd(st: &AppState, requested: Option<&str>) -> Result<PathBuf, A
         ));
     }
     Ok(canonical)
+}
+
+/// Serializa os docker run: dois connects simultâneos para o mesmo servidor
+/// não podem disparar dois containers.
+static AUTOSTART_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+/// Extrai (host, porta) de uma URL http(s). Porta default: 80/443.
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("http://") {
+        (r, 80u16)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        (r, 443u16)
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+        None => (authority.to_string(), default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// true se a porta TCP aceita conexão agora.
+async fn tcp_open(host: &str, port: u16) -> bool {
+    let target = format!("{host}:{port}");
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(&target)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Roda um comando docker (rota Docker Desktop/WSL resolvida por docker_cli).
+async fn run_docker(args: &[String], timeout: f64) -> Result<(i32, String), String> {
+    let mut c = crate::docker_cli::command(None);
+    c.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = c.spawn().map_err(|e| format!("FileNotFoundError: {e}"))?;
+    match tokio::time::timeout(Duration::from_secs_f64(timeout), child.wait_with_output()).await {
+        Err(_) => Err(format!("docker {} excedeu {timeout:.0}s", args.join(" "))),
+        Ok(Err(e)) => Err(format!("OSError: {e}")),
+        Ok(Ok(out)) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok((out.status.code().unwrap_or(-1), text.trim().to_string()))
+        }
+    }
+}
+
+/// true quando o servidor declara autostart utilizável (transport http +
+/// enabled + image). Lido sem I/O: só o JSON já carregado na row.
+fn autostart_declared(row: &ServerRow) -> bool {
+    if row.transport != "http" || row.autostart_json.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<AutostartSpec>(&row.autostart_json)
+        .map(|s| s.enabled && !s.image.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Serve si mesma: evita empilhar uma task de autostart por turno enquanto o
+/// container ainda está subindo.
+fn retry_guard() -> &'static AsyncMutex<Vec<String>> {
+    static G: LazyLock<AsyncMutex<Vec<String>>> = LazyLock::new(|| AsyncMutex::new(Vec::new()));
+    &G
+}
+
+/// Dispara o autostart em background (não bloqueia o chamador).
+fn spawn_autostart(st: Arc<AppState>, row: ServerRow) {
+    tokio::spawn(async move {
+        {
+            let mut inflight = retry_guard().lock().await;
+            if inflight.iter().any(|n| n == &row.name) {
+                return; // já existe uma subida em andamento para este servidor
+            }
+            inflight.push(row.name.clone());
+        }
+        if let Err(e) = autostart_ensure(&st, &row).await {
+            warn!("MCP[{}]: autostart (background) falhou: {e}", row.name);
+        }
+        retry_guard().lock().await.retain(|n| n != &row.name);
+    });
+}
+
+/// Sobe o container Docker de um servidor MCP http SOB DEMANDA.
+///
+/// Chamado antes do handshake (session_keeper) e na seleção de skills: a
+/// primeira tool requisitada paga só o tempo de start da instância, em vez de
+/// exigir um container sempre ligado. No-op quando o servidor não declara
+/// autostart ou quando a porta já responde.
+async fn autostart_ensure(st: &Arc<AppState>, row: &ServerRow) -> Result<(), String> {
+    if row.transport != "http" {
+        return Ok(());
+    }
+    let spec: AutostartSpec = serde_json::from_str(if row.autostart_json.is_empty() {
+        "{}"
+    } else {
+        &row.autostart_json
+    })
+    .unwrap_or_default();
+    if !spec.enabled || spec.image.trim().is_empty() {
+        return Ok(());
+    }
+    let url = row.url.clone().unwrap_or_default();
+    let Some((host, port)) = url_host_port(&url) else {
+        return Err(format!("autostart: url inválida no servidor '{}'", row.name));
+    };
+    // Instância já no ar: nada a fazer (o caminho comum depois do 1º start).
+    if tcp_open(&host, port).await {
+        return Ok(());
+    }
+
+    let _held = AUTOSTART_LOCK.lock().await;
+    if tcp_open(&host, port).await {
+        return Ok(()); // outro connect subiu enquanto esperávamos o lock
+    }
+
+    let container = if spec.container.trim().is_empty() {
+        row.name.clone()
+    } else {
+        spec.container.trim().to_string()
+    };
+
+    // Container existente mas parado -> start (preserva dados e config).
+    let (rc, _out) = run_docker(
+        &[
+            "inspect".into(),
+            "--format".into(),
+            "{{.State.Running}}".into(),
+            container.clone(),
+        ],
+        30.0,
+    )
+    .await?;
+    if rc == 0 {
+        info!("MCP[{}]: container '{}' existe — iniciando", row.name, container);
+        let (rc, out) = run_docker(&["start".into(), container.clone()], 120.0).await?;
+        if rc != 0 {
+            return Err(format!("docker start {} falhou: {out}", container));
+        }
+    } else {
+        let mut args: Vec<String> =
+            vec!["run".into(), "-d".into(), "--name".into(), container.clone()];
+        if !spec.ports.trim().is_empty() {
+            args.push("-p".into());
+            args.push(spec.ports.trim().to_string());
+        }
+        let volume = if spec.volume.trim().is_empty() {
+            project_root(&st.cfg)
+                .join(format!("{container}_data"))
+                .display()
+                .to_string()
+        } else {
+            spec.volume.trim().to_string()
+        };
+        args.push("-v".into());
+        args.push(format!("{volume}:/app_data"));
+        for a in &spec.args {
+            args.push(a.clone());
+        }
+        args.push(spec.image.trim().to_string());
+        info!(
+            "MCP[{}]: subindo container '{}' ({})",
+            row.name,
+            container,
+            spec.image.trim()
+        );
+        let (rc, out) = run_docker(&args, 600.0).await?;
+        if rc != 0 {
+            return Err(format!("docker run {} falhou: {out}", spec.image.trim()));
+        }
+    }
+
+    // Espera a porta aceitar conexão: o handshake MCP falharia se corrêssemos
+    // antes do processo ficar de pé (primeiro boot baixa modelos).
+    let ready_timeout = spec.ready_timeout_s.unwrap_or(180.0).clamp(5.0, 1800.0);
+    let deadline = Instant::now() + Duration::from_secs_f64(ready_timeout);
+    while Instant::now() < deadline {
+        if tcp_open(&host, port).await {
+            info!("MCP[{}]: '{}' respondeu em {}:{}", row.name, container, host, port);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+    Err(format!(
+        "autostart: '{}' não respondeu em {}:{} após {:.0}s",
+        container, host, port, ready_timeout
+    ))
 }
 
 /// Retorna a sessão do servidor, conectando (spawn) na primeira vez — via
@@ -1909,9 +2232,12 @@ fn server_dict(st: &AppState, row: &ServerRow) -> Result<Value, ApiError> {
         "args": parse_json_or(&row.args_json, "[]"),
         "env": parse_json_or(&row.env_json, "{}"),
         "url": row.url,
+        // Mascarados: o valor do token nunca sai do servidor.
+        "headers": mask_headers(&row.headers_json),
         "enabled": row.enabled,
         "always_on": row.always_on,
         "examples": parse_json_or(&row.examples_json, "{}"),
+        "autostart": parse_json_or(&row.autostart_json, "{}"),
         "unhealthy": is_unhealthy(st, &row.name),
         "created_at": row.created_at,
         "last_sync": row.last_sync,
@@ -1962,6 +2288,9 @@ async fn register_server(
         if !(u.starts_with("http://") || u.starts_with("https://")) {
             return Err(http_err(400, "transport='http' exige 'url' (http:// ou https://)"));
         }
+        // Valida no registro, não no connect: um header malformado só
+        // apareceria como ClientInitializeError opaco na primeira chamada.
+        build_header_map(&req.headers).map_err(|e| http_err(422, e))?;
     }
     let existed = st.db_get_server(&name)?.is_some();
     let row = st.db_upsert_server(&req)?;
@@ -2070,6 +2399,11 @@ async fn sync_server_inner(st: &Arc<AppState>, name: &str) -> Result<Value, ApiE
         .db_get_server(name)?
         .ok_or_else(|| http_err(404, format!("Servidor MCP '{name}' não registrado")))?;
     let default_cwd = st.cfg.default_cwd.clone();
+    // Autostart ANTES do get_session: o pull/start do container pode levar
+    // minutos e não pode consumir o teto do handshake (MCP_CONNECT_TIMEOUT).
+    autostart_ensure(st, &row)
+        .await
+        .map_err(|e| ApiError::Internal(format!("AutostartError: {e}")))?;
     let session = get_session(st, name, &default_cwd, true).await?;
     let result = match list_tools_with_timeout(&session).await {
         Ok(r) => r,
@@ -2387,6 +2721,8 @@ async fn install_server(
                 args: npx_args.clone(),
                 env: req.env.clone(),
                 url: None,
+                headers: IndexMap::new(),
+                autostart: AutostartSpec::default(),
                 enabled: req.enabled,
                 always_on: req.always_on,
                 examples: req.examples.clone(),
@@ -2508,7 +2844,11 @@ async fn skills_select(
     // melhor disponível e falhando do que sumida do schema.
     let enabled: Vec<&str> = servers
         .iter()
-        .filter(|r| r.always_on || !is_unhealthy(&st, &r.name))
+        .filter(|r| {
+            // always_on: nunca sai do schema. Com autostart: a seleção sobe o
+            // container, então "unhealthy" (só significa parado) não o exclui.
+            r.always_on || autostart_declared(r) || !is_unhealthy(&st, &r.name)
+        })
         .map(|r| r.name.as_str())
         .collect();
     let summaries: HashMap<&str, &str> = servers
@@ -2531,6 +2871,24 @@ async fn skills_select(
             continue;
         }
         by_server.entry(server).or_default().push(mname);
+    }
+
+    // Autostart por demanda: servidor http cujo container está parado sobe
+    // AGORA, no instante em que uma tool dele foi selecionada — antes de o
+    // orchestrator carregar os schemas. Assim a primeira chamada não paga o
+    // start (e um servidor unhealthy nunca "desaparece" só por estar parado).
+    if !by_server.is_empty() {
+        let rows = st.db_list_servers(true)?;
+        for (server, _) in by_server.iter() {
+            if let Some(row) = rows.iter().find(|r| &r.name == server) {
+                if autostart_declared(row) {
+                    // Em BACKGROUND: /skills/select roda no começo do turno e
+                    // não pode pagar o start (pull + boot) aqui. Quem espera de
+                    // verdade é o session_keeper, no instante da chamada.
+                    spawn_autostart(st.clone(), row.clone());
+                }
+            }
+        }
     }
 
     let skills: Vec<Value> = by_server

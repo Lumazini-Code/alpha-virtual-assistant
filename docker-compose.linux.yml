@@ -26,3 +26,23 @@ services:
     group_add:
       # Acesso ao áudio e render sem sudo
       - audio
+
+  # O alpha-mcp precisa falar com o orchestrator/memory/Manager no HOST.
+  # No Linux o `ava` roda em network_mode: host; um container em bridge não
+  # resolve `ava` (nome só existe na rede do compose). Colocamos o alpha-mcp
+  # na mesma rede do host e usamos os binds 127.9.12.22 publicados.
+  alpha-mcp:
+    network_mode: host
+    environment:
+      ALPHA_MCP_HOST: "127.9.12.22"
+      ORCHESTRATOR_URL: "http://127.9.12.22:9000"
+      MEMORY_API_URL: "http://127.9.12.22:3000"
+      SEARXNG_URL: "http://127.9.12.22:8081"
+      CRAWL4AI_URL: "http://127.9.12.22:11235"
+      VALKEY_URL: "redis://127.9.12.22:6379/0"
+      # O proxy do socket Docker está em bridge; expomos só no loopback.
+      DOCKER_HOST: "tcp://127.9.12.22:2375"
+
+  docker-socket-proxy:
+    ports:
+      - "127.9.12.22:2375:2375"
