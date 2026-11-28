@@ -55,6 +55,8 @@ node_modules/
 cache/
 
 Modules/transcribe/build
+Modules/transcribe/build-linux/
+Modules/transcribe/build-windows/
 
 Modules/memory/db/*
 
