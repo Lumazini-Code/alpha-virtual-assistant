@@ -17,6 +17,10 @@
 Tools MCP expostas:
   - `web_search(query, max_results)` → trechos relevantes com fontes.
     O LLM não vê as etapas internas — recebe só o resultado final.
+  - `math_calculate(expression)` → avalia uma expressão matemática com avaliador
+    AST seguro (nunca `eval`): aritmética, potências, raiz, logaritmos,
+    trigonometria e constantes pi/e/tau. A sintaxe está na skill
+    `math-calculator` (.agents/skills).
   - `memory_write_batch(facts)` → grava múltiplos fatos PERMANENTES na
     memória de longo prazo (LT) via a memory_api — o análogo da extração
     automática de memórias, mas disparado pelo próprio modelo (ex.: extrair
@@ -98,6 +102,8 @@ from rank_bm25 import BM25Plus
 import redis.asyncio as aioredis
 
 from mcp.server.mcpserver import MCPServer
+
+from math_eval import safe_eval
 
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("AVA_DEBUG") else logging.INFO,
@@ -1011,6 +1017,23 @@ async def web_search(query: str, max_results: int = 5) -> str:
     except Exception as e:
         log.exception("pipeline falhou")
         return f"Erro na busca web: {e}"
+
+
+@mcp.tool()
+async def math_calculate(expression: str) -> str:
+    """Avalia uma expressão matemática e devolve SOMENTE o resultado.
+
+    Use para qualquer conta: aritmética, porcentagem, potências, raiz,
+    logaritmos, trigonometria, fatorial e constantes pi/e/tau. Passe apenas a
+    expressão — sem texto, sem "=" e sem unidades. Exemplos válidos:
+    `2 + 3 * 4`, `1500 * (1 + 0.1) ** 3`, `sqrt(81) + log(100, 10)`,
+    `sin(pi/2)`, `round(355/113, 4)`, `factorial(10)`.
+
+    Aceita `^` como potência (equivalente a `**`), `×`, `÷` e `π`. Não aceita
+    variáveis, strings, comparações nem funções arbitrárias: a avaliação é
+    feita por AST com allowlist, nunca por `eval`. Limites: expoente até 1000
+    e fatorial até 1000. Em caso de erro devolve `Erro: ...` em português."""
+    return safe_eval(expression)
 
 
 @mcp.tool()

@@ -45,6 +45,9 @@ Tools NATIVAS (permanecem hardcoded — acopladas demais ao loop pra virar MCP):
     GATE por VISION_OBJECTS_ENABLED (default 0 — vision.py fora do ar): com a
     flag desligada a tool NÃO é oferecida e as imagens vão embutidas direto
     no contexto do modelo principal (blocos image_url multi-parte).
+  - view_image: abre uma imagem do filesystem do HOST via Manager
+    (/host/read_image) e a injeta na mensagem role="tool" como bloco
+    image_url — é assim que o modelo lê fotos dentro de pastas.
   - use_skill / skill_file: Agent Skills (SKILL.md — padrão skills.sh,
     instaladas em .agents/skills/ pelo CLI `skills` do npm). Leitura direto
     do disco (Modules/agent_skills.py); índice semântico no MESMO ToolsDB
@@ -109,9 +112,25 @@ import socket
 import ipaddress
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 import regex as re
+try:
+    from Modules.attachments import (
+        IMAGE_RESULT_KEY as AVA_IMAGE_RESULT_KEY,
+        detect_image_mime as _detect_image_mime,
+        normalize_request_attachments as _normalize_request_attachments,
+        redact_image_result as _redact_image_result,
+        image_result_content as _image_result_content,
+    )
+except ImportError:  # execução fora da raiz do projeto (CWD diferente)
+    from attachments import (
+        IMAGE_RESULT_KEY as AVA_IMAGE_RESULT_KEY,
+        detect_image_mime as _detect_image_mime,
+        normalize_request_attachments as _normalize_request_attachments,
+        redact_image_result as _redact_image_result,
+        image_result_content as _image_result_content,
+    )
 # MCP é consumido VIA mcp_manager (REST) — este processo nunca
 # spawna servidores MCP nem segura sessões; o manager é o único executante
 # (embutido no tray do host, servido na MESMA porta :9001 da API do tray).
@@ -1045,6 +1064,7 @@ EXECUTOR_TIMEOUTS: dict[str, float] = {
     "alpha_code": 9999999.0,
     "run_plan": 9999999.0,  # planos podem ser longos (vários passos de browser)
     "use_skill": 15.0, "skill_file": 15.0,  # leitura local (disco) — rápido
+    "view_image": 30.0,  # leitura de imagem no host via Manager
 }
 
 MAX_CONTEXT_CHARS = 3000
@@ -1451,6 +1471,13 @@ async def _mirror_conversation(hub: ConversationHub, name: str, data: Any) -> No
         pass  # erro no espelho jamais afeta o turno do usuário
 
 
+class Attachment(BaseModel):
+    """Anexo enviado pelo cliente: `data` é base64 puro para imagens e texto
+    já extraído para documentos. O nome só aparece no nudge ao modelo."""
+    name: Optional[str] = Field(None, max_length=512)
+    data: str = Field(..., max_length=10_000_000)
+
+
 class ExecuteRequest(BaseModel):
     input:         str = Field(..., max_length=200_000)
     session_id:    Optional[str]  = None
@@ -1491,6 +1518,14 @@ class ExecuteRequest(BaseModel):
     # O conteúdo é injetado no user_content enviado ao modelo, mas a TUI só
     # exibe o nome do arquivo (não o conteúdo) na mensagem do usuário.
     document_content: Optional[str] = Field(None, max_length=2_000_000)
+    # Listas de anexos (WebUI com seleção múltipla / pasta). Quando presentes,
+    # têm precedência sobre os campos singleton acima, que ficam apenas para
+    # compatibilidade com a TUI e clientes antigos. Cada imagem vira um bloco
+    # `image_url` distinto no user_content; cada documento é injetado como
+    # texto nomeado. O orçamento de imagens (_bound_request_images) cobre a
+    # lista inteira, não apenas o primeiro anexo.
+    images:        Optional[list[Attachment]] = Field(None, max_length=12)
+    documents:     Optional[list[Attachment]] = Field(None, max_length=12)
     search_pdfs:   bool           = False
     stream:        bool           = True
     # ── Eficiência de uso de tokens (custo/tempo) ────────────────────────────
@@ -1509,6 +1544,17 @@ class ExecuteRequest(BaseModel):
     # Modo de contexto escolhido pelo usuário na WebUI (Shift+Tab/clique).
     # "conversational" = janela ST + episódios; "execution" = histórico completo.
     context_mode:  Optional[Literal["conversational", "execution"]] = None
+
+    @model_validator(mode="after")
+    def _cap_attachment_totals(self) -> "ExecuteRequest":
+        # Teto agregado (além do teto por item e por quantidade) para um
+        # cliente não transformar um único turno num payload de centenas de MB.
+        if self.images and sum(len(att.data) for att in self.images) > 30_000_000:
+            raise ValueError("total de imagens anexadas excede o limite do turno")
+        if self.documents and sum(len(att.data) for att in self.documents) > 6_000_000:
+            raise ValueError("total de documentos anexados excede o limite do turno")
+        return self
+
 
 class TaskStateRequest(BaseModel):
     goal:           Optional[str] = None
@@ -3142,6 +3188,59 @@ async def _tool_vision_objects(args: dict, req: ExecuteRequest, sid: str = ""):
         "answer": answer,
     }
 
+
+async def _tool_view_image(args: dict, req: ExecuteRequest, sid: str = ""):
+    """Lê uma imagem do filesystem do HOST e a devolve como bloco multimodal.
+
+    O orchestrator roda em container e não vê a pasta do usuário; a leitura
+    acontece no Manager (processo do tray, mesmo usuário do desktop) via
+    `/host/read_image`. O retorno usa o marcador `__ava_image__`, convertido
+    pelo loop em conteúdo multi-parte da mensagem role="tool" — o modelo vê a
+    foto de verdade, não o base64 como texto.
+
+    Use `host_glob`/`host_list_dir` (MCP) para descobrir as fotos de uma pasta
+    e esta tool para abri-las, uma por chamada.
+    """
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return "Erro: `path` é obrigatório (caminho relativo ao cwd ou absoluto no host)."
+    cwd = str(args.get("cwd") or req.cwd or "").strip() or None
+    try:
+        r = await state.process_manager_client.post(
+            "/host/read_image", json={"path": raw_path, "cwd": cwd}, timeout=30.0
+        )
+    except Exception as e:
+        return f"Erro ao ler imagem no host: {type(e).__name__}: {e}"
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("error")
+        except Exception:
+            detail = r.text
+        return f"Erro ao ler imagem no host: {detail or r.status_code}"
+    try:
+        data = r.json()
+    except Exception:
+        return "Erro: resposta inválida do host ao ler a imagem."
+    b64 = data.get("base64")
+    if not isinstance(b64, str) or not b64:
+        return "Erro: o host não devolveu dados da imagem."
+    resolved = data.get("path") or raw_path
+    mime = data.get("mime") or _detect_image_mime(b64)
+    size = data.get("size")
+    return {
+        AVA_IMAGE_RESULT_KEY: {
+            "base64": b64,
+            "mime": mime,
+            "path": resolved,
+            "size": size,
+            "caption": (
+                f"[Imagem lida do host: {resolved} ({mime}, {size} bytes). "
+                "Analise a imagem abaixo para responder ao usuário.]"
+            ),
+        }
+    }
+
+
 # _tool_alpha_code foi REMOVIDO — hoje vira um servidor MCP comum
 # cadastrado no mcp_manager (ou o endpoint direto /code, ver abaixo).
 
@@ -3989,6 +4088,20 @@ TOOLS: dict[str, dict[str, Any]] = {
         "fields": [("prompt", "string", False)],
         "executor": _tool_vision_objects,
     },
+    "view_image": {
+        "description": (
+            "Opens an IMAGE FILE that lives in the user's computer (host) and attaches "
+            "it to the conversation so you can actually see it. Use this to read photos "
+            "inside folders: first discover them with host_glob/host_list_dir (e.g. "
+            "host_glob(pattern='**/*.jpg', cwd=<folder>)), then call view_image once per "
+            "photo. `path` is relative to `cwd` (defaults to this chat's working folder) "
+            "or absolute. Supports PNG, JPEG, GIF, WEBP and BMP up to ~7 MB. The image "
+            "itself is returned to you as an image block — do NOT describe it from the "
+            "filename alone, and do not ask the user to upload a photo you can read here."
+        ),
+        "fields": [("path", "string", True), ("cwd", "string", False)],
+        "executor": _tool_view_image,
+    },
     "use_skill": {
         "description": (
             "Load the full playbook (SKILL.md) of an installed Agent Skill. Call this "
@@ -4022,17 +4135,9 @@ TOOLS: dict[str, dict[str, Any]] = {
 
 _JSON_SCHEMA_TYPES = {"string": "string", "number": "number"}
 
-# ── Detecção de MIME por assinatura binária ──────────────────────────────────
-# A TUI envia a imagem como base64 PURO (sem prefixo data:) — o data URL
-# embutido no bloco image_url precisa do MIME correto. Sniff dos magic bytes
-# cobre os formatos aceitos por modelos multimodais (PNG/JPEG/GIF/WEBP);
-# fallback image/jpeg (o mais tolerado quando a assinatura não casa).
-_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"\xff\xd8\xff",      "image/jpeg"),
-    (b"GIF87a",            "image/gif"),
-    (b"GIF89a",            "image/gif"),
-)
+# Detecção de MIME, normalização de anexos e marcador de imagem da tool
+# `view_image` vivem em Modules/attachments.py (stdlib-only, testável fora do
+# container) e são importados no topo deste módulo.
 
 
 def _bound_request_images(messages: list[dict]) -> list[dict]:
@@ -4085,19 +4190,20 @@ def _bound_request_images(messages: list[dict]) -> list[dict]:
     return result
 
 
-def _detect_image_mime(b64: str) -> str:
-    """MIME de um base64 de imagem (prefixo data: opcional e ignorado)."""
-    payload = b64.split(",", 1)[-1]
-    try:
-        head = base64.b64decode(payload[:64], validate=False)[:12]
-    except Exception:
-        return "image/jpeg"
-    for magic, mime in _IMAGE_MAGIC:
-        if head.startswith(magic):
-            return mime
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
+def _tool_message_content(res: Any, *, success: bool, err: Optional[str]) -> Any:
+    """Conteúdo da mensagem role="tool" enviada ao modelo.
+
+    Tools de imagem devolvem `{__ava_image__: {base64, mime, caption}}`. Aqui
+    isso vira conteúdo multi-parte OpenAI (texto + image_url), o mesmo formato
+    já aceito por ToolCallMessage/LLM.py para os anexos do usuário.
+    """
+    if success and isinstance(res, dict):
+        image = res.get(AVA_IMAGE_RESULT_KEY)
+        if isinstance(image, dict):
+            blocks = _image_result_content(image)
+            if blocks is not None:
+                return blocks
+    return _result_to_text(res) if success else (err or "ERROR: tool failed")
 
 
 def _preview_from_tool(tool_name: str, output: Any) -> Optional[dict[str, Any]]:
@@ -4273,10 +4379,11 @@ def _build_codemode_snapshot(
 
 
 def _build_native_tools_schema() -> list[dict]:
-    """Converte o TOOLS registry (nativas: memory_search + vision_objects
-    quando VISION_OBJECTS_ENABLED=1) para a lista `tools` no formato OpenAI.
-    vision_objects é omitido quando a flag está desligada (vision.py fora do
-    ar — imagens vão embutidas direto no contexto do modelo principal)."""
+    """Converte o TOOLS registry (memory_search, view_image, use_skill,
+    skill_file, ... e vision_objects apenas com VISION_OBJECTS_ENABLED=1)
+    para a lista `tools` no formato OpenAI. vision_objects é omitido quando a
+    flag está desligada (vision.py fora do ar — imagens vão embutidas direto
+    no contexto do modelo principal)."""
     schema = []
     for name, spec in TOOLS.items():
         if name == "vision_objects" and not VISION_OBJECTS_ENABLED:
@@ -4556,7 +4663,7 @@ _MCP_UNSAFE_TOKENS = {
     "install", "start", "stop", "kill", "set", "open", "close", "apply",
     "submit", "save", "edit", "move", "rename", "copy", "evaluate", "drag",
 }
-_NATIVE_PARALLEL_SAFE = {"list_plans", "memory_search", "use_skill", "skill", "skill_file"}
+_NATIVE_PARALLEL_SAFE = {"list_plans", "memory_search", "use_skill", "skill", "skill_file", "view_image"}
 
 
 def _is_parallel_safe(tool_name: str, kind: str = "mcp") -> bool:
@@ -5861,58 +5968,58 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     turn_input = f"[Current local time: {time_hint}]\n\n{req.input}"
     user_content: str | list[dict] = turn_input
 
-    # Documento anexado via /attach na TUI: injeta o conteúdo extraído
-    # no user_content que vai ao modelo, sem poluir a mensagem exibida no
-    # terminal (a TUI renderiza apenas o nome do arquivo).
-    if req.document_content:
-        doc_nudge = (
-            f"\n\n[Documento anexado ao prompt — conteúdo abaixo]\n"
-            f"{req.document_content}"
-        )
-        if isinstance(user_content, str):
-            user_content += doc_nudge
-        elif isinstance(user_content, list) and len(user_content) > 0 and user_content[0].get("type") == "text":
-            user_content[0]["text"] += doc_nudge
-    if req.image_base64:
-        if VISION_OBJECTS_ENABLED:
-            # Fluxo vision_objects (flag ligada): sem o nudge, o LLM não tem
-            # nenhum sinal no histórico de que uma imagem foi de fato
-            # anexada a ESTE request — só a descrição genérica da tool
-            # vision_objects ("only works if an image was sent"), que não é
-            # uma confirmação. Resultado: o modelo assume que não há imagem
-            # e pede pro usuário reenviar, mesmo com req.image_base64
-            # preenchido.
+    # Anexos: a WebUI manda listas (múltiplos arquivos/pasta); TUI e clientes
+    # antigos mandam os campos singleton. _normalize_request_attachments
+    # unifica os dois sem repetir base64.
+    images, documents = _normalize_request_attachments(req)
+
+    # Documentos anexados: injeta o conteúdo extraído no user_content que vai
+    # ao modelo, sem poluir a mensagem exibida na UI (ela mostra só os nomes).
+    if documents:
+        chunks = []
+        for doc in documents:
+            label = doc["name"] or "documento"
+            chunks.append(f"[Documento anexado — {label}]\n{doc['data']}")
+        doc_nudge = "\n\n" + "\n\n".join(chunks)
+        user_content = user_content + doc_nudge if isinstance(user_content, str) else user_content
+
+    if images:
+        # Fluxo vision_objects (flag ligada, UMA imagem legada): mantém o
+        # nudge para o modelo chamar a tool antiga em vez de pedir reenvio.
+        legacy_vision = VISION_OBJECTS_ENABLED and len(images) == 1 and not req.images
+        if legacy_vision:
             user_content = (
                 f"{turn_input}\n\n"
                 "[An image was attached to this message. Use the vision_objects "
                 "tool to see it before answering — do not ask the user to send "
                 "it again.]"
-            )
+            ) + (doc_nudge if documents else "")
         else:
-            # Fluxo direto ao modelo principal: a imagem vai embutida no
-            # CONTEXTO como bloco multi-parte do OpenAI vision — o LLM.py
-            # repassa verbatim ao OpenRouter (ToolCallMessage aceita
-            # content: str | list[dict]). Sem tool, sem crops, sem vision.py:
-            # o modelo vê a imagem original (melhor que os crops da pipeline
-            # antiga) e responde em texto puro, com streaming normal.
-            mime = _detect_image_mime(req.image_base64)
-            user_content = [
-                {
-                    "type": "text",
-                    "text": (
-                        f"{turn_input}\n\n"
-                        "[An image was attached to this message — see it above; "
-                        "do not ask the user to send it again.]"
-                    ),
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{req.image_base64}"},
-                },
+            # Fluxo direto: cada imagem vira um bloco image_url distinto. O
+            # LLM.py repassa a lista verbatim ao OpenRouter; o orçamento de
+            # imagens (_bound_request_images) remove as mais antigas se o
+            # total passar do gatilho.
+            names = ", ".join(
+                item["name"] or f"imagem {index + 1}"
+                for index, item in enumerate(images)
+            )
+            nudge = (
+                f"[Foram anexadas {len(images)} imagem(ns) a esta mensagem: {names}. "
+                "Analise os blocos de imagem abaixo; não peça ao usuário para reenviar.]"
+            )
+            parts: list[dict] = [
+                {"type": "text", "text": f"{turn_input}\n\n{nudge}" + (doc_nudge if documents else "")}
             ]
+            for item in images:
+                mime = _detect_image_mime(item["data"])
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{item['data']}"},
+                })
+            user_content = parts
             log.info(
-                f"[{eid[:8]}] imagem anexada ({mime}, {len(req.image_base64)} chars b64) "
-                "embutida no contexto do modelo principal"
+                f"[{eid[:8]}] {len(images)} imagem(ns) anexada(s) embutida(s) no "
+                "contexto do modelo principal"
             )
 
     # ── Histórico: system + histórico durável + user atual ──────────────────
@@ -6357,7 +6464,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                 log.info(
                     f"[{eid[:8]}] TOOL RESULT '{tool_name}' (call_id={call_id}, "
                     f"{lat}ms) args={json.dumps(args, ensure_ascii=False)} "
-                    f"result={json.dumps(result, ensure_ascii=False, default=str)}"
+                    f"result={json.dumps(_redact_image_result(result), ensure_ascii=False, default=str)}"
                 )
             else:
                 log.info(
@@ -6376,15 +6483,15 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
             sr = StepResult(
                 step=turn, executor=tool_name,
                 action=rec["action"],
-                success=success, result=result, error=err, latency_ms=lat,
-                tool_call_id=call_id,
+                success=success, result=_redact_image_result(result), error=err,
+                latency_ms=lat, tool_call_id=call_id,
             )
             if on_event:
                 await on_event("tool_result", sr.model_dump())
             return {
                 "rec": rec, "sr": sr, "success": success, "result": result,
                 "err": err,
-                "tool_content": _result_to_text(result) if success else err,
+                "tool_content": _tool_message_content(result, success=success, err=err),
                 "used_mcp": used_mcp, "used_skill": used_skill,
                 "used_mcp_names": used_mcp_names,
             }
@@ -7167,7 +7274,7 @@ async def host_tool_proxy(action: str, payload: dict):
     processo do tray (`PROCESS_MANAGER_URL`) é quem executa no filesystem e
     no shell do usuário. A autenticação é a mesma do resto do serviço.
     """
-    allowed = {"read", "list", "glob", "grep", "write", "edit", "shell"}
+    allowed = {"read", "read_image", "list", "glob", "grep", "write", "edit", "shell"}
     if action not in allowed:
         raise HTTPException(404, f"ação de host desconhecida: {action}")
     timeout = 30.0

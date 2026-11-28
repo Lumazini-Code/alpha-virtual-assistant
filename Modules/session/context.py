@@ -108,9 +108,19 @@ def _trim_to_budget(messages: list[dict[str, Any]], max_tokens: int) -> list[dic
         return out
 
     # Ainda passou: trunca o texto das mensagens mais antigas restantes.
+    # Mensagens com blocos de mídia (image_url) são preservadas — recortar o
+    # texto dela substituiria o content multi-parte por uma string e derrubaria
+    # as imagens anexadas. O orçamento de imagens do request cuida do tamanho.
     excess = total - max_tokens
     for i, message in enumerate(out[:-1]):
-        text = message_text(message.get("content"))
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict)
+            and part.get("type") not in (None, "text", "input_text")
+            for part in content
+        ):
+            continue
+        text = message_text(content)
         if not text:
             continue
         cut = min(len(text), max(0, excess * 4))

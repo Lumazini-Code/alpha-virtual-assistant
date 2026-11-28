@@ -25,8 +25,9 @@
 #       (gitignored; flags -a universal -y; falha = aviso, não morte)
 #   3c. OfficeCLI: npm install -g @officecli/officecli + skill
 #       officecli.ai/SKILL.md → .agents/skills/officecli (falha = aviso)
-#   3d. Boardview MCP: venv .venv-boardview + boardview/ (mcp + pillow) e
-#       SKILL.md → .agents/skills/boardview (falha = aviso)
+#   3d. Boardview MCP: venv .venv-boardview + mcp_servers/boardview (mcp + pillow)
+#       e skills próprias da Alpha (skills/) → .agents/skills (falha = aviso)
+#   3e. CadQuery MCP: venv .venv-cadquery + mcp_servers/3d_modeling (CAD/3D)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
 #   5. Deixa o Modules/.env sem provedor de IA: o cadastro (catálogo models.dev)
 #      acontece na primeira execução da WebUI e grava LLM_* em Modules/.env
@@ -431,12 +432,12 @@ else
 fi
 
 # ── 3d. Boardview MCP (GenCAD .cad) + skill ───────────────────────────────────
-# `boardview/` traz um servidor MCP em Python (mcp + pillow) e a SKILL.md de
-# reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
+# `mcp_servers/boardview/` traz um servidor MCP em Python (mcp + pillow) e a
+# SKILL.md de reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
 # stdio; instalamos o pacote num venv dedicado (.venv-boardview) para não
 # depender do Python do sistema. Sem python3/venv ou sem rede, o cadastro é
 # pulado com aviso — o restante da instalação segue.
-BOARDVIEW_DIR="$INSTALL_DIR/boardview"
+BOARDVIEW_DIR="$INSTALL_DIR/mcp_servers/boardview"
 BOARDVIEW_VENV="$INSTALL_DIR/.venv-boardview"
 BOARDVIEW_PY="$BOARDVIEW_VENV/bin/python"
 BOARDVIEW_OK=0
@@ -477,31 +478,55 @@ else
   fi
 fi
 
-# A SKILL.md vai para o store canônico (gitignored) que o scanner do
-# orchestrator lê; a tool `skill` carrega o playbook sem restart.
-if [ -f "$BOARDVIEW_DIR/SKILL.md" ]; then
-  mkdir -p .agents/skills/boardview
-  cp -f "$BOARDVIEW_DIR/SKILL.md" .agents/skills/boardview/SKILL.md
-  ok "Skill boardview instalada (.agents/skills/boardview/SKILL.md)."
-
-  # Skill do Presenton: .agents é gitignored, então a fonte versionada é
-  # skills/presenton/ — copiar aqui garante que ela chegue no zip do release.
-  if [ -f "$INSTALL_DIR/skills/presenton/SKILL.md" ]; then
-    mkdir -p .agents/skills/presenton
-    cp -f "$INSTALL_DIR/skills/presenton/SKILL.md" .agents/skills/presenton/SKILL.md
-    ok "Skill presenton instalada (.agents/skills/presenton/SKILL.md)."
-  fi
+# Skills próprias da Alpha: a fonte versionada é `skills/<nome>/SKILL.md`
+# (.agents é gitignored). Cada pasta vira .agents/skills/<nome>/SKILL.md, o
+# store canônico lido pelo scanner do orchestrator — a tool `skill` carrega o
+# playbook sem restart. Inclui boardview, math-calculator e as demais.
+SKILLS_SRC="$INSTALL_DIR/skills"
+if [ -d "$SKILLS_SRC" ]; then
+  for skill_md in "$SKILLS_SRC"/*/SKILL.md; do
+    [ -f "$skill_md" ] || continue
+    skill_name="$(basename "$(dirname "$skill_md")")"
+    mkdir -p ".agents/skills/$skill_name"
+    cp -f "$skill_md" ".agents/skills/$skill_name/SKILL.md"
+    ok "Skill $skill_name instalada (.agents/skills/$skill_name/SKILL.md)."
+  done
 else
-  warn "Boardview: SKILL.md ausente em $BOARDVIEW_DIR — skill não instalada."
+  warn "Pasta skills/ ausente — nenhuma skill própria da Alpha instalada."
 fi
 
-# Skill de frontend/HTML (Preview da WebUI): a fonte fica na raiz do projeto.
-if [ -f SKILL.md ]; then
-  mkdir -p .agents/skills/frontend-design
-  cp -f SKILL.md .agents/skills/frontend-design/SKILL.md
-  ok "Skill frontend-design instalada (.agents/skills/frontend-design/SKILL.md)."
+# ── 3e. CadQuery MCP (CAD paramétrico / impressão 3D) ─────────────────────────
+# `mcp_servers/3d_modeling/` traz um servidor MCP stdio (mcp + cadquery). O
+# mcp_manager spawna `python -m cadquery_mcp_server` no venv dedicado. Prefere
+# Python 3.12/3.11 (wheels do CadQuery); sem python3/uv, o cadastro é pulado.
+CADQUERY_DIR="$INSTALL_DIR/mcp_servers/3d_modeling"
+CADQUERY_VENV="$INSTALL_DIR/.venv-cadquery"
+CADQUERY_PY="$CADQUERY_VENV/bin/python"
+CADQUERY_OK=0
+
+if [ ! -d "$CADQUERY_DIR" ]; then
+  warn "CadQuery MCP: pasta $CADQUERY_DIR ausente — pulei o servidor."
+elif ! command -v python3 >/dev/null 2>&1 && ! command -v uv >/dev/null 2>&1; then
+  warn "CadQuery MCP: python3/uv ausentes no host — instale Python 3.10-3.12 e rode o instalador de novo."
 else
-  warn "SKILL.md não encontrado na raiz — skill de preview não instalada."
+  info "CadQuery MCP: criando venv e instalando cadquery..."
+  CQ_BASE_PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"
+  "$CQ_BASE_PY" -m venv "$CADQUERY_VENV" >/dev/null 2>&1 || true
+  if [ ! -x "$CADQUERY_PY" ] && command -v uv >/dev/null 2>&1; then
+    uv venv --seed --python 3.12 "$CADQUERY_VENV" >/dev/null 2>&1 || true
+  fi
+  if [ ! -x "$CADQUERY_PY" ]; then
+    warn "CadQuery MCP: não consegui criar $CADQUERY_VENV — instale python3-venv e rode de novo."
+  elif "$CADQUERY_PY" -m pip install --quiet --disable-pip-version-check -e "$CADQUERY_DIR"; then
+    CADQUERY_OK=1
+    ok "CadQuery MCP instalado ($CADQUERY_PY)."
+  elif "$CADQUERY_PY" -c 'import cadquery_mcp_server' >/dev/null 2>&1; then
+    # Reinstalação sem rede: o venv anterior continua válido.
+    CADQUERY_OK=1
+    warn "CadQuery MCP: pip install falhou, mantendo a versão já instalada no venv."
+  else
+    warn "CadQuery MCP: pip install falhou (sem rede?) — instale depois com: $CADQUERY_PY -m pip install -e \"$CADQUERY_DIR\""
+  fi
 fi
 
 # ── 4. Modelos ────────────────────────────────────────────────────────────────
@@ -968,7 +993,7 @@ register_alpha_mcp() {
   payload=$(cat <<EOF
 {
   "name": "alpha-mcp",
-  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.",
+  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado.",
   "transport": "http",
   "url": "$ws_url",
   "enabled": true,
@@ -987,6 +1012,17 @@ register_alpha_mcp() {
       "salve essa informação",
       "lembre-se de que",
       "memorize os fatos deste documento"
+    ],
+    "math_calculate": [
+      "calcule",
+      "quanto é",
+      "faça a conta",
+      "some",
+      "subtraia",
+      "multiplique",
+      "divida",
+      "raiz quadrada de",
+      "calcule a expressão"
     ]
   }
 }
@@ -1268,6 +1304,104 @@ PY
   ok "Boardview MCP registrado e sincronizado."
 }
 
+register_cadquery_mcp() {
+  # O servidor foi instalado no venv da etapa 3e; sem ele não há o que cadastrar.
+  if [ "${CADQUERY_OK:-0}" -ne 1 ] || [ ! -x "${CADQUERY_PY:-}" ]; then
+    warn "CadQuery MCP não instalado — cadastro no mcp_manager pulado."
+    return 1
+  fi
+
+  local payload
+  payload="$("$CADQUERY_PY" - "$CADQUERY_PY" <<'PY'
+import json, sys
+py = sys.argv[1]
+print(json.dumps({
+    "name": "cadquery-3d-printing",
+    "skill_summary": (
+        "CAD paramétrico e impressão 3D (CadQuery): crie, edite, meça, valide e exporte "
+        "peças em milímetros para STEP/STL/3MF com histórico reproduzível"
+    ),
+    "transport": "stdio",
+    "command": py,
+    "args": ["-m", "cadquery_mcp_server"],
+    "env": {"PYTHONUNBUFFERED": "1"},
+    "enabled": True,
+    "always_on": False,
+    "examples": {
+        "create_primitive": [
+            "crie uma caixa 3d",
+            "modele um cilindro",
+            "faça uma peça paramétrica",
+            "crie um sólido com cadquery"
+        ],
+        "make_hole": [
+            "faça um furo na peça",
+            "furos de montagem",
+            "fure a placa com 4 mm"
+        ],
+        "boolean_operation": [
+            "una os dois sólidos",
+            "subtraia um bloco da peça",
+            "corte o cilindro da caixa"
+        ],
+        "export_object": [
+            "exporte para STL",
+            "gere um arquivo STEP",
+            "salve a peça em 3MF",
+            "exporte o modelo para impressão 3d"
+        ],
+        "validate_printability": [
+            "valide a peça para impressão 3d",
+            "verifique se é imprimível",
+            "cheque a espessura das paredes"
+        ],
+        "measure_objects": [
+            "meça a peça",
+            "confira o encaixe das peças",
+            "qual é o volume do modelo"
+        ],
+        "execute_cadquery_script": [
+            "rode um script cadquery",
+            "modele com código cadquery"
+        ]
+    },
+}))
+PY
+)"
+
+  info "Registrando CadQuery MCP no mcp_manager ($MCP_MANAGER_URL)..."
+  local registered=0 i
+  for i in $(seq 1 24); do
+    if curl -fsS --max-time 10 -X POST "$MCP_MANAGER_URL/servers" \
+         -H 'Content-Type: application/json' \
+         -H "Authorization: Bearer $AVA_TOKEN" -d "$payload" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$registered" -ne 1 ]; then
+    warn "Não consegui cadastrar o CadQuery MCP — manager não respondeu em 2 min."
+    printf '  Cadastre depois: curl -X POST %s/servers -H "Content-Type: application/json" -H "Authorization: Bearer $AVA_INTERNAL_TOKEN" -d '"'"'%s'"'"'\n' "$MCP_MANAGER_URL" "$payload"
+    return 1
+  fi
+  local synced=0
+  for i in $(seq 1 12); do
+    if curl -fsS --max-time 120 -X POST "$MCP_MANAGER_URL/servers/cadquery-3d-printing/sync" \
+         -H "Authorization: Bearer $AVA_TOKEN" >/dev/null 2>&1; then
+      synced=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$synced" -ne 1 ]; then
+    warn "CadQuery MCP cadastrado, mas o sync falhou (memory_api bootando?)."
+    warn "Rode: curl -X POST $MCP_MANAGER_URL/servers/cadquery-3d-printing/sync -H \"Authorization: Bearer \$AVA_INTERNAL_TOKEN\""
+    return 1
+  fi
+  ok "CadQuery MCP registrado e sincronizado."
+}
+
 
 # ── 5d. Manager (ava-tray) — API REST em :9001 ───────────────────────────────
 # O Manager sobe/derruba o stack Docker e serve o mcp_manager embutido
@@ -1372,6 +1506,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   register_playwright_mcp || true
   register_alpha_mcp || true
   register_boardview_mcp || true
+  register_cadquery_mcp || true
   # Presenton: cria o container (se preciso) e registra com autostart — o
   # manager sobe a instância sob demanda quando uma tool dela é requisitada.
   register_presenton_mcp || true

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cadquery-3d-printing-mcp"
+version = "0.1.0"
+description = "MCP server for parametric CadQuery CAD and 3D-printing exports"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.8.0,<2.0",
+  "cadquery>=2.4.0",
+]
+
+[project.scripts]
+cadquery-mcp = "cadquery_mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["cadquery_mcp_server"]

@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+COPY math_eval.py .
 
 EXPOSE 4010
 CMD ["python", "server.py"]

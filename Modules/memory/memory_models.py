@@ -255,7 +255,8 @@ class TriageLabelsResponse(BaseModel):
 
 class TriageReadiness(BaseModel):
     target: int
-    labelled: int
+    labelled: int          # rótulos EFETIVOS (soma dos pesos, arredondado)
+    labelled_raw: int = 0  # contagem bruta de linhas rotuladas
     progress: float = 0.0
     ready: bool = False
     missing: int = 0
@@ -286,6 +287,8 @@ class TriageStatsResponse(BaseModel):
     turns_total: int = 0
     samples_total: int = 0
     labelled_total: int = 0
+    weighted_labelled_total: float = 0.0
+    labelled_by_origin: dict[str, int] = {}
     unlabeled_total: int = 0
     teacher_emitted_total: int = 0
     suppressed_total: int = 0

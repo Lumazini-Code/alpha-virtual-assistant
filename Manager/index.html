@@ -93,7 +93,7 @@ textarea{width:100%;border:0;outline:0;background:none;resize:none;max-height:22
 .cwdlbl{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mu);font-size:12px;cursor:pointer;padding:3px 7px;border-radius:8px}
 .cwdlbl:hover{background:var(--ln);color:var(--ink)}
 .go{width:34px;height:34px;border-radius:50%;background:var(--ink);color:var(--bg);display:grid;place-items:center}.go:disabled{opacity:.3;cursor:default}.go.stop{background:var(--rd);color:#fff}
-#att{display:none;margin:0 0 6px}#att span{display:inline-flex;gap:8px;align-items:center;background:var(--sb);border:1px solid var(--ln);border-radius:10px;padding:3px 6px 3px 10px;font-size:13px}
+#att{display:none;margin:0 0 6px;flex-wrap:wrap;gap:6px}#att span{display:inline-flex;gap:8px;align-items:center;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--sb);border:1px solid var(--ln);border-radius:10px;padding:3px 6px 3px 10px;font-size:13px}
 #att button{color:var(--mu)}
 .drop::after{content:"Solte o arquivo para anexar";position:absolute;inset:8px;border:2px dashed var(--ac);border-radius:18px;background:color-mix(in srgb,var(--bg) 88%,transparent);display:grid;place-items:center;color:var(--ac);font-weight:500;z-index:5}
 /* status de recursos (CPU/RAM/GPU) — espelha o StatusPanel da TUI */
@@ -590,14 +590,16 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
     <div id="att"></div>
     <textarea id="in" rows="1" placeholder="Digite sua mensagem, ou arraste um arquivo aqui" aria-label="Mensagem"></textarea>
     <div class="bar">
-      <button class="ib" id="clip" title="Anexar arquivo" aria-label="Anexar arquivo">📎</button>
+      <button class="ib" id="clip" title="Anexar arquivos (vários)" aria-label="Anexar arquivos">📎</button>
+      <button class="ib" id="folderclip" title="Anexar todas as fotos/arquivos de uma pasta" aria-label="Anexar fotos de uma pasta">📂</button>
       <button class="ib" id="cwd" title="Escolher pasta de trabalho dos MCPs" aria-label="Escolher pasta de trabalho dos MCPs">📁</button>
       <span class="cwdlbl" id="cwdlabel" role="button" tabindex="0" title="Pasta de trabalho dos MCPs">pasta base (~)</span>
       <span class="sp"></span>
       <button class="go" id="go" aria-label="Enviar" disabled>↑</button>
     </div>
     <div class="modelbar"><button id="modebtn" title="Modo de contexto (Shift+Tab alterna)" aria-label="Modo de contexto"><span class="mb-mode" id="mb-mode">Conversacional</span></button><span class="mb-sep">·</span><button id="mbtn" title="Trocar modelo" aria-haspopup="dialog"><span class="mb-model" id="mb-model">Escolha um modelo</span><span class="mb-prov" id="mb-prov"></span><span class="mb-sep" id="mb-effsep" hidden>·</span><span class="mb-eff" id="mb-eff" hidden></span></button></div>
-    <input type="file" id="fi" hidden>
+    <input type="file" id="fi" hidden multiple>
+    <input type="file" id="fdir" hidden webkitdirectory directory multiple>
   </div>
   </div>
 </main>
@@ -730,13 +732,18 @@ const $=s=>document.querySelector(s);
 /* ══ multi-chat: cada chat é uma sessão raiz com projeto, histórico, uso e
    subagentes próprios. `S.chats` mantém TODOS os chats (os que streamam em
    background inclusive); `S.active` é o que a tela mostra. ══ */
-const S={chats:[],active:null,view:'chat',att:null,full:false,act:'general',pjs:[],plans:[],mcps:[],voices:[]};
+const S={chats:[],active:null,view:'chat',atts:[],full:false,act:'general',pjs:[],plans:[],mcps:[],voices:[]};
 const CHAT_KEY='ava-chats';
 let _chatSig='';
 const MAX_STREAMING=4;
+// Histórico na tela: o endpoint devolve as últimas N mensagens; pedir um N
+// alto o suficiente mostra o chat inteiro (o corte a 6 turnos do modo
+// conversacional afeta só o contexto enviado ao modelo, nunca a exibição).
+const HISTORY_LIMIT=100000;
 const chat=()=>S.chats.find(c=>c.id===S.active)||null;
 const newSid=()=>'ses_'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
 function newChat(project){
+  S.atts=[];
   const c={id:'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
     sid:newSid(),title:'',project:project||S.act||'general',cwd:null,model:null,
     mode:'conversational',previews:[],preview:null,
@@ -774,7 +781,7 @@ async function hydrate(c){
   const beforeLen=(c.ms||[]).length;
   c._hydrating=(async()=>{
     try{
-      const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/messages?limit=300');
+      const d=await jf('orch','/session/'+encodeURIComponent(c.sid)+'/messages?limit='+HISTORY_LIMIT);
       const serverMs=(d.messages||[]).map(msgToUi).filter(Boolean);
       // Mensagens locais criadas DURANTE o fetch (ex.: usuário enviou a
       // primeira pergunta logo após abrir o chat) não podem ser apagadas
@@ -1019,8 +1026,9 @@ function ui(){
   $('#m0').classList.toggle('on',!graphView&&!previewView);$('#m1').classList.toggle('on',graphView);$('#m2').classList.toggle('on',previewView);
   const proj=(c&&c.project)||S.act;
   const b=$('#bdg');b.style.display=proj&&proj!=='general'?'inline-block':'none';b.textContent='◆ '+proj;
-  $('#att').style.display=S.att?'block':'none';
-  $('#att').innerHTML=S.att?`<span>${S.att.kind==='image'?'🖼':'📄'} ${esc(S.att.name)}<button data-rmatt aria-label="Remover anexo">✕</button></span>`:'';
+  const atts=S.atts||[];
+  $('#att').style.display=atts.length?'flex':'none';
+  $('#att').innerHTML=atts.map((a,i)=>`<span title="${esc(a.name)}">${a.kind==='image'?'🖼':'📄'} ${esc(a.name)}<button data-rmatt="${i}" aria-label="Remover anexo">✕</button></span>`).join('');
   const cw=$('#cwdlabel');
   if(cw){
     const dir=c&&c.cwd;
@@ -1223,8 +1231,11 @@ async function send(text){
   // Guarda de recurso: N chats streamando ao mesmo tempo; o resto espera o
   // término de um deles (o usuário pode parar qualquer chat pelo mismo botão).
   if(S.chats.filter(x=>x.streaming).length>=MAX_STREAMING)return toast(`Máximo de ${MAX_STREAMING} chats simultâneos — pare um para continuar.`);
-  const att=S.att;S.att=null;
-  const u={role:'u',text,att:att?.name},a={role:'a',text:'',streaming:true,timeline:[],usage:null};
+  const atts=(S.atts||[]).slice();S.atts=[];
+  const imgs=atts.filter(a=>a.kind==='image'&&a.data).map(a=>({name:a.name,data:a.data}));
+  const docs=atts.filter(a=>a.kind==='doc'&&a.data).map(a=>({name:a.name,data:a.data}));
+  const attNames=atts.map(a=>a.name).filter(Boolean).join(', ');
+  const u={role:'u',text,att:attNames},a={role:'a',text:'',streaming:true,timeline:[],usage:null};
   c.ms.push(u,a);c.busy=true;c.streaming=true;c.err=false;
   if(!c.title)c.title=text.replace(/\s+/g,' ').slice(0,80);
   $('#in').value='';fit();ui();draw(true);saveChats();
@@ -1232,7 +1243,10 @@ async function send(text){
   ensureDocker();
   const body={input:text,session_id:c.sid,project:c.project,voice:'M1',lang:'pt',tts:false,tts_output:'client',
     model:mInfo?mInfo.id:null,context_mode:c.mode||'conversational',
-    image_base64:att?.kind==='image'?att.data:null,document_content:att?.kind==='doc'?att.data:null,
+    images:imgs,documents:docs,
+    // Campos legados: compatibilidade com orchestrators antigos (1º anexo).
+    // O runtime atual prioriza `images`/`documents` quando presentes.
+    image_base64:imgs[0]?.data||null,document_content:docs[0]?.data||null,
     search_pdfs:false,stream:true,cwd:c.cwd||null};
   try{
     let it;
@@ -1258,14 +1272,31 @@ function stopChat(c){
 }
 function clear(){newChat();draw(true);ui()}
 
-/* ---------- Anexos (imagem → base64, texto → document_content) ---------- */
+/* ---------- Anexos (vários: imagens → base64, texto → documentos) ---------- */
 const TXT=/\.(txt|md|markdown|json|ya?ml|toml|ini|cfg|conf|html?|css|csv|xml|sql|sh|py|js|ts|tsx|jsx|rs|go|java|kt|swift|c|h|cc|cpp|hpp|rb|php|lua|r|scala|dart)$/i;
-function attach(f){
-  if(!f)return;const rd=new FileReader();
-  if(f.type.startsWith('image/')){rd.onload=()=>{S.att={kind:'image',name:f.name,data:String(rd.result).split(',')[1]};ui()};rd.readAsDataURL(f)}
-  else if(f.type.startsWith('text/')||TXT.test(f.name)){rd.onload=()=>{S.att={kind:'doc',name:f.name,data:String(rd.result)};ui()};rd.readAsText(f)}
-  else{toast(`Tipo não suportado no navegador: ${f.name} (PDF/DOCX exigem o backend)`)}
+const MAX_ATT=12,MAX_IMG_BYTES=7*1024*1024,MAX_DOC_BYTES=1_500_000;
+/** Lê uma lista de arquivos (seletor múltiplo, colagem, arrastar ou pasta)
+ *  e acumula todos os anexos pendentes do turno. */
+function attachFiles(files){
+  const list=[...files||[]];if(!list.length)return;
+  let added=0,skipped=0;
+  for(const f of list){
+    if((S.atts||[]).length>=MAX_ATT){skipped++;continue}
+    const isImg=String(f.type||'').startsWith('image/');
+    const isDoc=String(f.type||'').startsWith('text/')||TXT.test(f.name||'');
+    if(!isImg&&!isDoc){skipped++;continue}
+    if(f.size>(isImg?MAX_IMG_BYTES:MAX_DOC_BYTES)){skipped++;continue}
+    const att={kind:isImg?'image':'doc',name:f.name,data:''};
+    S.atts.push(att);added++;
+    const rd=new FileReader();
+    rd.onload=()=>{att.data=isImg?String(rd.result).split(',')[1]:String(rd.result);ui()};
+    rd.onerror=()=>{const i=S.atts.indexOf(att);if(i>=0)S.atts.splice(i,1);ui()};
+    if(isImg)rd.readAsDataURL(f);else rd.readAsText(f);
+  }
+  if(skipped)toast(`${skipped} arquivo(s) ignorado(s) — tipo/tamanho não suportado ou limite de ${MAX_ATT} anexos`);
+  ui();
 }
+const attach=f=>attachFiles([f]);
 function toast(t){const n=$('#sdt');const o=n.textContent;n.textContent=t;setTimeout(()=>n.textContent=o,4000)}
 /** Sobe o container no máximo uma vez por minuto — vários chats enviando ao
  * mesmo tempo não disparam N requests de start. Reusa o fluxo do popup de
@@ -1549,7 +1580,8 @@ async function loadTriageStats(){
     row.classList.remove('er');
     $('#btri').style.width=pct+'%';
     $('#ttri').textContent=Math.round(pct)+'%';
-    const title=`Dataset: ${r.labelled||0}/${r.target||0} rótulos · ${s.samples_total||0} amostras · ${s.turns_total||0} turnos · ${s.suppressed_total||0} suprimidos · gold ${s.gold_total||0}/${s.gold_target||0}`;
+    const byO=s.labelled_by_origin||{};
+    const title=`Dataset: ${r.labelled||0}/${r.target||0} rótulos efetivos (peso ${s.weighted_labelled_total||0}) · ${r.labelled_raw||0} linhas rotuladas · ao vivo ${byO.live||0} · replay ${byO.replay||0} · probe ${byO.probe||0} · ${s.samples_total||0} amostras · ${s.turns_total||0} turnos · gold ${s.gold_total||0}/${s.gold_target||0}`;
     row.title=title;$('#ttri').title=title;
     if(r.ready){
       const key='ava-triage-ready-'+String(r.target||0);
@@ -2083,10 +2115,12 @@ const inp=$('#in');
 function fit(){inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,220)+'px'}
 inp.oninput=()=>{fit();ui()};
 inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send(inp.value)}};
-inp.onpaste=e=>{const f=[...e.clipboardData.files][0];if(f){e.preventDefault();attach(f)}};
+inp.onpaste=e=>{const fs=[...e.clipboardData.files];if(fs.length){e.preventDefault();attachFiles(fs)}};
 $('#go').onclick=()=>{const c=chat();if(c&&c.busy)stopChat(c);else send(inp.value)};
 $('#clip').onclick=()=>$('#fi').click();
-$('#fi').onchange=e=>{attach(e.target.files[0]);e.target.value=''};
+$('#folderclip').onclick=()=>$('#fdir').click();
+$('#fi').onchange=e=>{attachFiles(e.target.files);e.target.value=''};
+$('#fdir').onchange=e=>{attachFiles(e.target.files);e.target.value=''};
 $('#cwd').onclick=pickCwd;
 $('#cwdlabel').onclick=pickCwd;
 $('#cwdlabel').onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pickCwd()}};
@@ -2149,12 +2183,12 @@ $('#chat').onclick=e=>{
   const c=e.target.closest('[data-copy]');
   if(c){navigator.clipboard?.writeText(c.closest('.cbw').querySelector('code').textContent);c.textContent='Copiado';setTimeout(()=>c.textContent='Copiar',1500)}
 };
-$('#att').onclick=e=>{if(e.target.closest('[data-rmatt]')){S.att=null;ui()}};
+$('#att').onclick=e=>{const b=e.target.closest('[data-rmatt]');if(b){S.atts.splice(Number(b.dataset.rmatt),1);ui()}};
 let dc=0;const mn=$('main');
 mn.ondragenter=e=>{e.preventDefault();dc++;mn.classList.add('drop')};
 mn.ondragleave=()=>{if(--dc<=0){dc=0;mn.classList.remove('drop')}};
 mn.ondragover=e=>e.preventDefault();
-mn.ondrop=e=>{e.preventDefault();dc=0;mn.classList.remove('drop');attach(e.dataTransfer.files[0])};
+mn.ondrop=e=>{e.preventDefault();dc=0;mn.classList.remove('drop');attachFiles(e.dataTransfer.files)};
 document.addEventListener('keydown',e=>{
   if(!(e.ctrlKey||e.metaKey))return;const k=e.key.toLowerCase();
   const m={e:()=>{S.full=!S.full;draw(true)},d:()=>{$('#dl').open?closeLogs():openLogs()},s:openSet,

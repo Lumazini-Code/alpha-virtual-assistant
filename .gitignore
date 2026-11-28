@@ -40,6 +40,7 @@ graphify-out
 
 .venv/**
 .venv-boardview/**
+.venv-cadquery/**
 
 .env
 
@@ -92,8 +93,10 @@ resource/projects.json
 Manager/vendor
 .grepai/
 
-boardview/.pytest_cache
-boardview/boardview_mcp.egg-info
-boardview/build
+mcp_servers/boardview/.pytest_cache
+mcp_servers/boardview/boardview_mcp.egg-info
+mcp_servers/boardview/build
+mcp_servers/3d_modeling/*.egg-info
+mcp_servers/3d_modeling/build
 
 presenton_data

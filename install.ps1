@@ -10,8 +10,9 @@
 #       (gitignored; flags -a universal -y; falha = aviso, nao morte)
 #   3c. OfficeCLI: npm install -g @officecli/officecli + skill
 #       officecli.ai/SKILL.md -> .agents\skills\officecli (falha = aviso)
-#   3d. Boardview MCP: venv .venv-boardview + boardview\ (mcp + pillow) e
-#       SKILL.md -> .agents\skills\boardview (falha = aviso)
+#   3d. Boardview MCP: venv .venv-boardview + mcp_servers\boardview (mcp + pillow)
+#       e skills proprias da Alpha (skills\) -> .agents\skills (falha = aviso)
+#   3e. CadQuery MCP: venv .venv-cadquery + mcp_servers\3d_modeling (CAD/3D)
 #   4. Extrai Modules/Models.zip em Modules/Models
 #   5. Deixa o Modules\.env sem provedor de IA: o cadastro (catalogo models.dev)
 #      acontece na primeira execucao da WebUI e grava LLM_* no Modules\.env
@@ -676,12 +677,12 @@ try {
 }
 
 # -- 3d. Boardview MCP (GenCAD .cad) + skill -----------------------------------
-# boardview\traz um servidor MCP em Python (mcp + pillow) e a SKILL.md de
-# reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
+# mcp_servers\boardview traz um servidor MCP em Python (mcp + pillow) e a
+# SKILL.md de reparo de placas. O mcp_manager do host spawna `python -m boardview_mcp` por
 # stdio; instalamos o pacote num venv dedicado (.venv-boardview) para nao
 # depender do Python do sistema. Sem python/venv ou sem rede, o cadastro e
 # pulado com aviso - o restante da instalacao segue.
-$BoardviewDir = Join-Path $InstallDir 'boardview'
+$BoardviewDir = Join-Path (Join-Path $InstallDir 'mcp_servers') 'boardview'
 $BoardviewVenv = Join-Path $InstallDir '.venv-boardview'
 $BoardviewPy = Join-Path $BoardviewVenv 'Scripts\python.exe'
 $script:BoardviewOk = $false
@@ -722,39 +723,66 @@ if (-not (Test-Path $BoardviewDir)) {
   }
 }
 
-# A SKILL.md vai para o store canonico (gitignored) que o scanner do
-# orchestrator le; a tool `skill` carrega o playbook sem restart.
-$BoardviewSkill = Join-Path $BoardviewDir 'SKILL.md'
-if (Test-Path $BoardviewSkill) {
-  $BoardviewSkillDir = Join-Path $InstallDir '.agents\skills\boardview'
-  New-Item -ItemType Directory -Force -Path $BoardviewSkillDir | Out-Null
-  Copy-Item -Force $BoardviewSkill (Join-Path $BoardviewSkillDir 'SKILL.md')
-  Write-Ok 'Skill boardview instalada (.agents\skills\boardview\SKILL.md).'
+# Skills proprias da Alpha: a fonte versionada e `skills/<nome>/SKILL.md`
+# (.agents e gitignored). Cada pasta vira .agents\skills\<nome>\SKILL.md, o
+# store canonico lido pelo scanner do orchestrator - a tool `skill` carrega o
+# playbook sem restart. Inclui boardview, math-calculator e as demais.
+$SkillsSrc = Join-Path $InstallDir 'skills'
+if (Test-Path $SkillsSrc) {
+  Get-ChildItem -Path $SkillsSrc -Directory | ForEach-Object {
+    $SkillMd = Join-Path $_.FullName 'SKILL.md'
+    if (Test-Path $SkillMd) {
+      $SkillDest = Join-Path (Join-Path (Join-Path $InstallDir '.agents') 'skills') $_.Name
+      New-Item -ItemType Directory -Force -Path $SkillDest | Out-Null
+      Copy-Item -Force $SkillMd (Join-Path $SkillDest 'SKILL.md')
+      Write-Ok ('Skill ' + $_.Name + ' instalada: ' + (Join-Path $SkillDest 'SKILL.md'))
+    }
+  }
 } else {
-  Write-Warn2 "Boardview: SKILL.md ausente em $BoardviewDir - skill nao instalada."
+  Write-Warn2 'Pasta skills/ ausente - nenhuma skill propria da Alpha instalada.'
 }
 
-# Skill do Presenton: .agents e gitignored, entao a fonte versionada e
-# skills/presenton/ - copiar aqui garante que ela chegue no zip do release.
-$PresentonSkill = Join-Path (Join-Path (Join-Path $InstallDir 'skills') 'presenton') 'SKILL.md'
-if (Test-Path $PresentonSkill) {
-  $PresentonSkillDir = Join-Path (Join-Path (Join-Path $InstallDir '.agents') 'skills') 'presenton'
-  New-Item -ItemType Directory -Force -Path $PresentonSkillDir | Out-Null
-  Copy-Item -Force $PresentonSkill (Join-Path $PresentonSkillDir 'SKILL.md')
-  Write-Ok ('Skill presenton instalada: ' + (Join-Path $PresentonSkillDir 'SKILL.md'))
-} else {
-  Write-Warn2 'Presenton: skills/presenton/SKILL.md ausente - skill nao instalada.'
-}
+# -- 3e. CadQuery MCP (CAD parametrico / impressao 3D) -------------------------
+# mcp_servers\3d_modeling traz um servidor MCP stdio (mcp + cadquery). O
+# mcp_manager spawna `python -m cadquery_mcp_server` no venv dedicado.
+$CadqueryDir = Join-Path (Join-Path $InstallDir 'mcp_servers') '3d_modeling'
+$CadqueryVenv = Join-Path $InstallDir '.venv-cadquery'
+$CadqueryPy = Join-Path $CadqueryVenv 'Scripts\python.exe'
+$script:CadqueryOk = $false
 
-# Skill de frontend/HTML (Preview da WebUI): a fonte fica na raiz do projeto.
-$FrontendSkill = Join-Path $InstallDir 'SKILL.md'
-if (Test-Path $FrontendSkill) {
-  $FrontendSkillDir = Join-Path $InstallDir '.agents\skills\frontend-design'
-  New-Item -ItemType Directory -Force -Path $FrontendSkillDir | Out-Null
-  Copy-Item -Force $FrontendSkill (Join-Path $FrontendSkillDir 'SKILL.md')
-  Write-Ok 'Skill frontend-design instalada (.agents\skills\frontend-design\SKILL.md).'
+$CqPython = Get-Command python -ErrorAction SilentlyContinue
+if (-not $CqPython) { $CqPython = Get-Command python3 -ErrorAction SilentlyContinue }
+if (-not (Test-Path $CadqueryDir)) {
+  Write-Warn2 "CadQuery MCP: pasta $CadqueryDir ausente - pulei o servidor."
+} elseif (-not $CqPython -and -not (Get-Command uv -ErrorAction SilentlyContinue)) {
+  Write-Warn2 'CadQuery MCP: python/uv ausentes no host - instale Python 3.10+ (python.org) e rode o instalador de novo.'
 } else {
-  Write-Warn2 'SKILL.md nao encontrado na raiz - skill de preview nao instalada.'
+  Write-Info 'CadQuery MCP: criando venv e instalando cadquery...'
+  if (-not (Test-Path $CadqueryPy) -and $CqPython) {
+    & $CqPython.Source -m venv $CadqueryVenv
+  }
+  if (-not (Test-Path $CadqueryPy) -and (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Info 'CadQuery MCP: usando uv para criar o venv.'
+    & uv venv --seed --python 3.12 $CadqueryVenv
+  }
+  if (-not (Test-Path $CadqueryPy)) {
+    Write-Warn2 "CadQuery MCP: nao consegui criar $CadqueryVenv (verifique o Python/venv)."
+  } else {
+    & $CadqueryPy -m pip install --quiet --disable-pip-version-check -e $CadqueryDir
+    if ($LASTEXITCODE -eq 0) {
+      $script:CadqueryOk = $true
+      Write-Ok "CadQuery MCP instalado ($CadqueryPy)."
+    } else {
+      # Reinstalacao sem rede: o venv anterior continua valido.
+      & $CadqueryPy -c 'import cadquery_mcp_server' 2>$null
+      if ($LASTEXITCODE -eq 0) {
+        $script:CadqueryOk = $true
+        Write-Warn2 'CadQuery MCP: pip install falhou, mantendo a versao ja instalada no venv.'
+      } else {
+        Write-Warn2 "CadQuery MCP: pip install falhou (sem rede?) - instale depois com: `"$CadqueryPy`" -m pip install -e `"$CadqueryDir`""
+      }
+    }
+  }
 }
 
 # -- 4. Modelos ----------------------------------------------------------------
@@ -1204,7 +1232,7 @@ function Register-AlphaMcp {
   $wsUrl = if ($env:ALPHA_MCP_URL) { $env:ALPHA_MCP_URL } else { 'http://127.9.12.22:4010/mcp' }
   return (Register-McpServer -Label 'Alpha' -Name 'alpha-mcp' -SyncTimeoutSec 120 -Spec @{
     name          = 'alpha-mcp'
-    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação.'
+    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado.'
     transport     = 'http'
     url           = $wsUrl
     enabled       = $true
@@ -1223,6 +1251,17 @@ function Register-AlphaMcp {
         'salve essa informacao',
         'lembre-se de que',
         'memorize os fatos deste documento'
+      )
+      math_calculate = @(
+        'calcule',
+        'quanto e',
+        'faca a conta',
+        'some',
+        'subtraia',
+        'multiplique',
+        'divida',
+        'raiz quadrada de',
+        'calcule a expressao'
       )
     }
   })
@@ -1407,6 +1446,62 @@ function Register-BoardviewMcp {
         'esse rail esta sem tensao',
         'a placa nao liga',
         'tem um curto nessa linha de alimentacao'
+      )
+    }
+  })
+}
+
+function Register-CadqueryMcp {
+  # O servidor foi instalado no venv da etapa 3e; sem ele nao ha o que cadastrar.
+  if (-not $script:CadqueryOk -or -not (Test-Path $CadqueryPy)) {
+    Write-Warn2 'CadQuery MCP nao instalado - cadastro no mcp_manager pulado.'
+    return $false
+  }
+  return (Register-McpServer -Label 'CadQuery' -Name 'cadquery-3d-printing' -SyncTimeoutSec 120 -Spec @{
+    name          = 'cadquery-3d-printing'
+    skill_summary = 'CAD parametrico e impressao 3D (CadQuery): crie, edite, inspecione e exporte pecas em milimetros para STEP/STL/3MF com historico reproduzivel'
+    transport     = 'stdio'
+    command       = $CadqueryPy
+    args          = @('-m', 'cadquery_mcp_server')
+    env           = @{ PYTHONUNBUFFERED = '1' }
+    enabled       = $true
+    always_on     = $false
+    examples      = @{
+      create_primitive = @(
+        'crie uma caixa 3d',
+        'modele um cilindro',
+        'faca uma peca parametrica',
+        'crie um solido com cadquery'
+      )
+      make_hole = @(
+        'faca um furo na peca',
+        'furos de montagem',
+        'fure a placa com 4 mm'
+      )
+      boolean_operation = @(
+        'una os dois solidos',
+        'subtraia um bloco da peca',
+        'corte o cilindro da caixa'
+      )
+      export_object = @(
+        'exporte para STL',
+        'gere um arquivo STEP',
+        'salve a peca em 3MF',
+        'exporte o modelo para impressao 3d'
+      )
+      validate_printability = @(
+        'valide a peca para impressao 3d',
+        'verifique se e imprimivel',
+        'cheque a espessura das paredes'
+      )
+      measure_objects = @(
+        'meça a peca',
+        'confira o encaixe das pecas',
+        'qual e o volume do modelo'
+      )
+      execute_cadquery_script = @(
+        'rode um script cadquery',
+        'modele com codigo cadquery'
       )
     }
   })
@@ -1708,6 +1803,7 @@ if (-not $SkipBuild) {
   Register-PlaywrightMcp | Out-Null
   Register-AlphaMcp | Out-Null
   Register-BoardviewMcp | Out-Null
+  Register-CadqueryMcp | Out-Null
 # Presenton (opcional): so age se PRESENTON_API_KEY estiver no .env
 Register-PresentonMcp | Out-Null
 

@@ -2074,8 +2074,14 @@ async def _triage_llm_json(system: str, user: str, max_tokens: int = 800) -> dic
         try:
             return json.loads(content)
         except json.JSONDecodeError:
-            m = re.search(r"\{[\s\S]*\}", content)
-            return json.loads(m.group(0)) if m else {}
+            # Modelos pequenos às vezes acrescentam texto depois do JSON —
+            # raw_decode pega o primeiro objeto e ignora o resto.
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                return obj if isinstance(obj, dict) else {}
+            except json.JSONDecodeError:
+                m = re.search(r"\{[\s\S]*\}", content)
+                return json.loads(m.group(0)) if m else {}
     except Exception as e:
         log.info(f"[MEMORY-TRIAGE] probe LLM falhou: {type(e).__name__}: {e}")
         return {}
@@ -4119,6 +4125,11 @@ async def memories_extract(req: MemoryExtractionRequest):
         probe=req.probe,
         propensity=req.propensity,
     )
+    # Caminhos de erro do extrator devolvem [] (sem provider, sem texto,
+    # todas as tentativas falharam). Normaliza antes de usar .get — sem isso
+    # o /memories/extract responde 500 e o replay perde o turno.
+    if not isinstance(result, dict):
+        result = {"facts": result or []}
     saved = result.get("facts") or []
     return {
         "extractor_model": MEMORY_EXTRACTOR_MODEL,

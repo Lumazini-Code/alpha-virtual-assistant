@@ -427,7 +427,9 @@ def build_samples(ctx: dict) -> list[dict]:
                 "teacher_emitted": 1,
                 "suppression_reason": "",
                 "proposed_label": fact.get("proposed_label") or "",
-                "proposed_targets": json.dumps(targets),
+                # Pydantic valida como list[int]; o json.dumps é feito no
+                # triage_log, na hora de gravar na coluna TEXT.
+                "proposed_targets": list(targets),
                 "proposed_type": fact.get("type") or "fact",
                 "proposed_validity": fact.get("validity") or "temporal",
                 "applied_label": applied,
@@ -696,33 +698,114 @@ def _counts(db, sql: str, params: tuple = ()) -> dict[str, int]:
         return {}
 
 
+def _readiness(weighted: float, raw: int) -> TriageReadiness:
+    """Progresso em rótulos EFETIVOS (soma dos pesos das fontes). Replay
+    conta, mas por 0.4 — contar linhas faria o bootstrap parecer 2x maior."""
+    target = int(MEMORY_TRIAGE_TARGET_SAMPLES)
+    effective = int(round(float(weighted)))
+    missing = max(0, target - effective)
+    return TriageReadiness(
+        target=target, labelled=effective, labelled_raw=int(raw),
+        progress=round(min(1.0, float(weighted) / target), 4),
+        ready=bool(weighted >= target), missing=missing,
+        reason=("dataset pronto para treinar a Fase 2" if weighted >= target
+                else f"faltam {missing} rótulos efetivos para o alvo de {target} "
+                     f"({raw} linhas rotuladas, peso {float(weighted):.1f})"),
+    )
+
+
 async def triage_stats(scope: Optional[str] = None) -> TriageStatsResponse:
-    """Estatísticas do dataset + readiness (target configurável) para a WebUI."""
+    """Estatísticas do dataset + readiness (target configurável) para a WebUI.
+
+    Sem `scope`, agrega TODOS os escopos já abertos: chats de projeto gravam
+    no DB do projeto, e a barra da WebUI não pode ficar em 0% só porque o
+    escopo ativo é outro.
+    """
+    if scope is None:
+        from memory_state import state
+        # "" é um escopo legítimo (TUI/replay sem projeto) e não deve ser
+        # confundido com "sem filtro" — por isso entra explícito na lista.
+        names = ["", *[n for n in state.scopes if n]]
+        merged: Optional[TriageStatsResponse] = None
+        for name in names:
+            sub = await triage_stats(scope=name)
+            if merged is None:
+                merged = sub
+                continue
+            for field in (
+                "turns_total", "samples_total", "labelled_total", "unlabeled_total",
+                "teacher_emitted_total", "suppressed_total", "render_labels_total",
+                "gold_total", "gold_candidates_total",
+                "weighted_labelled_total",
+            ):
+                setattr(merged, field, getattr(merged, field) + getattr(sub, field))
+            for field in (
+                "suppressed_by_reason", "alignment", "label_counts",
+                "origin_counts", "variant_counts", "gate_label_counts",
+                "labelled_by_origin",
+            ):
+                target = getattr(merged, field)
+                for key, value in getattr(sub, field).items():
+                    target[key] = target.get(key, 0) + value
+            for field in (
+                "emitted_rate_by_position", "emitted_rate_by_role",
+                "emitted_rate_by_size",
+            ):
+                target = getattr(merged, field)
+                for key, value in getattr(sub, field).items():
+                    w1 = getattr(merged, "samples_total") - getattr(sub, "samples_total")
+                    target[key] = round(
+                        (target.get(key, 0.0) * w1 + value * getattr(sub, "samples_total"))
+                        / max(1, getattr(merged, "samples_total")), 4,
+                    )
+            merged.recall_gap = max(merged.recall_gap, sub.recall_gap)
+        if merged is not None:
+            merged.readiness = _readiness(
+                merged.weighted_labelled_total, merged.labelled_total
+            )
+        return merged
+
     db = _db_for(scope)
-    where = " WHERE scope = ?" if scope else ""
-    params: tuple = (scope,) if scope else ()
+    scoped = scope is not None
+    where = " WHERE scope = ?" if scoped else ""
+    params: tuple = (scope,) if scoped else ()
     one = lambda sql, p=params: int(db._conn.execute(sql, p).fetchone()[0] or 0)
 
     turns_total = one("SELECT COUNT(*) FROM memory_triage_turn" + where)
     samples_total = one("SELECT COUNT(*) FROM memory_triage_sample" + where)
     labelled = one(
         "SELECT COUNT(*) FROM memory_triage_sample" +
-        (" WHERE scope = ? AND applied_label != 'unlabeled'" if scope else " WHERE applied_label != 'unlabeled'"),
+        (" WHERE scope = ? AND applied_label != 'unlabeled'" if scoped else " WHERE applied_label != 'unlabeled'"),
     )
     unlabeled = samples_total - labelled
+    # Replay entra no dataset, mas com peso menor (§4): a barra usa rótulos
+    # EFETIVOS = soma(weight), não contagem bruta de linhas. live=1.0,
+    # replay=0.4, contrastivo=0.8, sintético/thinking=0.3.
+    weighted_labelled = float(db._conn.execute(
+        "SELECT COALESCE(SUM(weight), 0) FROM memory_triage_sample" +
+        (" WHERE scope = ? AND applied_label != 'unlabeled'" if scoped
+         else " WHERE applied_label != 'unlabeled'"),
+        params,
+    ).fetchone()[0] or 0.0)
+    labelled_by_origin = _counts(db, (
+        "SELECT origin, COUNT(*) FROM memory_triage_sample" +
+        (" WHERE scope = ? AND applied_label != 'unlabeled'" if scoped
+         else " WHERE applied_label != 'unlabeled'") +
+        " GROUP BY origin"
+    ), params)
     emitted = one(
         "SELECT COUNT(*) FROM memory_triage_sample" +
-        (" WHERE scope = ? AND teacher_emitted = 1" if scope else " WHERE teacher_emitted = 1"),
+        (" WHERE scope = ? AND teacher_emitted = 1" if scoped else " WHERE teacher_emitted = 1"),
     )
     suppressed = samples_total - emitted
     render_labels = one(
         "SELECT COUNT(*) FROM memory_triage_sample" +
-        (" WHERE scope = ? AND frame_label != ''" if scope else " WHERE frame_label != ''"),
+        (" WHERE scope = ? AND frame_label != ''" if scoped else " WHERE frame_label != ''"),
     )
 
     suppression = _counts(db, (
         "SELECT suppression_reason, COUNT(*) FROM memory_triage_sample "
-        "WHERE teacher_emitted = 0" + (" AND scope = ?" if scope else "") +
+        "WHERE teacher_emitted = 0" + (" AND scope = ?" if scoped else "") +
         " GROUP BY suppression_reason"
     ), params)
     alignment = _counts(db, (
@@ -740,7 +823,7 @@ async def triage_stats(scope: Optional[str] = None) -> TriageStatsResponse:
     gate_labels = _counts(db, (
         "SELECT gate_label, COUNT(*) FROM memory_triage_sample" + where +
         " AND gate_label != '' GROUP BY gate_label"
-    ) if scope else (
+    ) if scoped else (
         "SELECT gate_label, COUNT(*) FROM memory_triage_sample "
         "WHERE gate_label != '' GROUP BY gate_label"
     ), params)
@@ -794,23 +877,15 @@ async def triage_stats(scope: Optional[str] = None) -> TriageStatsResponse:
         gap = 0.0
     _STATS["triage_recall_gap"] = round(gap, 4)
 
-    target = int(MEMORY_TRIAGE_TARGET_SAMPLES)
-    missing = max(0, target - labelled)
-    readiness = TriageReadiness(
-        target=target,
-        labelled=labelled,
-        progress=round(min(1.0, labelled / target), 4),
-        ready=labelled >= target,
-        missing=missing,
-        reason=("dataset pronto para treinar a Fase 2" if labelled >= target
-                else f"faltam {missing} rótulos para o alvo de {target}"),
-    )
+    readiness = _readiness(weighted_labelled, labelled)
 
     return TriageStatsResponse(
         enabled=MEMORY_TRIAGE_LOG,
         turns_total=turns_total,
         samples_total=samples_total,
         labelled_total=labelled,
+        weighted_labelled_total=round(weighted_labelled, 4),
+        labelled_by_origin=labelled_by_origin,
         unlabeled_total=unlabeled,
         teacher_emitted_total=emitted,
         suppressed_total=suppressed,

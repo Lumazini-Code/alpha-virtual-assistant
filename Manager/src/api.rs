@@ -169,6 +169,7 @@ pub async fn serve(
         // Rodam no processo do tray (host), exigem Bearer interno e são
         // chamadas via proxy /host/* do orchestrator.
         .route("/host/read", post(crate::host_tools::read_file))
+        .route("/host/read_image", post(crate::host_tools::read_image))
         .route("/host/list", post(crate::host_tools::list_dir))
         .route("/host/glob", post(crate::host_tools::glob_files))
         .route("/host/grep", post(crate::host_tools::grep_files))

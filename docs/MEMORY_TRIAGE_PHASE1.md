@@ -75,6 +75,10 @@ Segunda rodada — Fase 1 **completa** (todas as fontes do §4 e o gold do §7):
   **somente** estes rótulos, nunca os do teacher (§5.4).
 - `/triage/stats` também expõe `emitted_rate_by_role`, `emitted_rate_by_size`,
   `gate_label_counts`, `gold_total` e os pesos/flags de cada fonte.
+  `readiness` conta **rótulos efetivos** = soma de `weight` das linhas
+  rotuladas, não linhas brutas: replay entra, mas com peso 0.4 (§4). Assim o
+  bootstrap infla o dataset sem falsificar o progresso; `labelled_raw` e
+  `labelled_by_origin` deixam as duas contagens visíveis.
 
 O job de retenção roda de forma lazy a cada `/triage/log` (não há scheduler
 dedicado). Aplicação offline dos pesos de treino (IPW, over/under-sample e

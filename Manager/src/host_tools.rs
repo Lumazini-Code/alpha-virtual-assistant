@@ -30,6 +30,9 @@ use std::{
 use tokio::process::Command;
 
 const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+// Base64 expande ~33%; 7 MiB de imagem viram ~9,3 M caracteres, dentro do
+// limite de 10 M do campo `images[].data` no orchestrator.
+const MAX_IMAGE_BYTES: u64 = 7 * 1024 * 1024;
 const MAX_OUTPUT_CHARS: usize = 200_000;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -127,6 +130,50 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     out
 }
 
+/// Codificação base64 padrão (RFC 4648), sem depender de um crate extra.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((data.len() + 2) / 3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// MIME pela assinatura binária — o mesmo conjunto que o orchestrator usa
+/// para os anexos enviados pela WebUI.
+fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // DTOs
 // ════════════════════════════════════════════════════════════════════════
@@ -140,6 +187,13 @@ pub struct ReadFileRequest {
     pub offset: Option<usize>,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct ReadImageRequest {
+    pub path: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +307,53 @@ pub async fn read_file(
         "total_lines": total,
         "truncated": end < total,
         "content": content,
+    }))
+    .into_response()
+}
+
+/// Lê uma imagem do host e devolve base64 puro para o orchestrator embutir
+/// como bloco `image_url` na mensagem da tool `view_image`.
+pub async fn read_image(
+    headers: HeaderMap,
+    Json(req): Json<ReadImageRequest>,
+) -> Response {
+    if let Err(resp) = require_token(&headers) {
+        return resp;
+    }
+    let cwd = match resolve_cwd(req.cwd.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let path = resolve_path(&cwd, &req.path);
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => return err(StatusCode::NOT_FOUND, format!("imagem não encontrada: {e}")),
+    };
+    if !meta.is_file() {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "path não é um arquivo");
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("imagem grande demais ({} bytes; teto {MAX_IMAGE_BYTES})", meta.len()),
+        );
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::NOT_FOUND, format!("falha ao ler imagem: {e}")),
+    };
+    let mime = match detect_image_mime(&bytes) {
+        Some(m) => m,
+        None => return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "formato de imagem não suportado (use PNG, JPEG, GIF, WEBP ou BMP)",
+        ),
+    };
+    Json(json!({
+        "path": path.to_string_lossy(),
+        "mime": mime,
+        "size": bytes.len(),
+        "base64": base64_encode(&bytes),
     }))
     .into_response()
 }
@@ -579,4 +680,31 @@ async fn run_search(
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_pad_and_alphabet() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn detects_supported_image_mime() {
+        assert_eq!(detect_image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(detect_image_mime(b"\xff\xd8\xff\xe0rest"), Some("image/jpeg"));
+        assert_eq!(detect_image_mime(b"GIF89arest"), Some("image/gif"));
+        assert_eq!(detect_image_mime(b"BMrest"), Some("image/bmp"));
+        let webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+        assert_eq!(detect_image_mime(webp), Some("image/webp"));
+        assert_eq!(detect_image_mime(b"not an image"), None);
+    }
 }

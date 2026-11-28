@@ -86,6 +86,9 @@ class SampleBuilderTests(unittest.TestCase):
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0]["applied_label"], "UPDATE")
         self.assertEqual(emitted[0]["candidate_id"], 7)
+        # Bug de produção: string aqui derruba POST /triage/log com 422.
+        self.assertIsInstance(emitted[0]["proposed_targets"], list)
+        self.assertEqual(emitted[0]["proposed_targets"], [7])
         self.assertEqual(len(suppressed), 1)
         self.assertEqual(suppressed[0]["applied_label"], "unlabeled")
         self.assertEqual(suppressed[0]["weight"], 0.0)
@@ -199,6 +202,46 @@ class GateSyntheticProbeTests(unittest.TestCase):
         self.assertEqual({s["candidate_id"] for s in emitted}, {1, 2, 3})
 
 
+class ScopeAggregationTests(unittest.TestCase):
+    def test_stats_without_scope_sums_all_open_scopes(self):
+        import sys
+        from types import SimpleNamespace
+
+        dbs = {}
+        for name in ("", "proj"):
+            path = str(Path(tempfile.mkdtemp()) / f"{name or 'general'}.db")
+            db = memory_db.MemoryDB(path)
+            dbs[name] = db
+        original_db_for = tri._db_for
+        tri._db_for = lambda scope=None: dbs.get((scope or "").strip(), dbs[""])
+        try:
+            for name in ("", "proj"):
+                asyncio.run(tri.triage_log(TriageLogRequest(
+                    turn=TriageTurn(turn_id=f"t-{name}", session_id="s1",
+                                    scope=name, created_at=time.time(),
+                                    extractor_model="x"),
+                    samples=[TriageSample(
+                        turn_id=f"t-{name}", session_id="s1", scope=name,
+                        segment_index=0, segment_text="x", segment_hash=f"h-{name}",
+                        created_at=time.time(), teacher_emitted=1,
+                        applied_label="ADD", proposed_label="ADD",
+                    )],
+                )))
+            sys.modules["memory_state"] = SimpleNamespace(state=SimpleNamespace(
+                scopes={"proj": SimpleNamespace()},
+                active_scope="proj",
+            ))
+            stats = asyncio.run(tri.triage_stats())
+            self.assertEqual(stats.turns_total, 2)
+            self.assertEqual(stats.samples_total, 2)
+            self.assertEqual(stats.labelled_total, 2)
+        finally:
+            tri._db_for = original_db_for
+            sys.modules.pop("memory_state", None)
+            for db in dbs.values():
+                db.close()
+
+
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -278,6 +321,29 @@ class StorageTests(unittest.TestCase):
         self.assertGreater(deleted["deleted"], 0)
         stats = asyncio.run(tri.triage_stats(scope="scope1"))
         self.assertEqual(stats.samples_total, 0)
+
+    def test_readiness_counts_weighted_labels_not_raw_rows(self):
+        old_target = tri.MEMORY_TRIAGE_TARGET_SAMPLES
+        tri.MEMORY_TRIAGE_TARGET_SAMPLES = 10
+        try:
+            p = self._payload("tw")
+            p.samples[0].applied_label = "ADD"
+            p.samples[0].origin = "live"
+            p.samples[0].weight = 1.0
+            p.samples[1].applied_label = "KEEP"
+            p.samples[1].origin = "replay"
+            p.samples[1].weight = 0.4
+            asyncio.run(tri.triage_log(p))
+            stats = asyncio.run(tri.triage_stats(scope="scope1"))
+            self.assertEqual(stats.labelled_total, 2)
+            self.assertAlmostEqual(stats.weighted_labelled_total, 1.4, places=2)
+            self.assertEqual(stats.readiness.labelled, 1)
+            self.assertEqual(stats.readiness.labelled_raw, 2)
+            self.assertAlmostEqual(stats.readiness.progress, 0.14, places=2)
+            self.assertEqual(stats.labelled_by_origin["live"], 1)
+            self.assertEqual(stats.labelled_by_origin["replay"], 1)
+        finally:
+            tri.MEMORY_TRIAGE_TARGET_SAMPLES = old_target
 
     def test_gold_set_is_immutable_and_stratified(self):
         asyncio.run(tri.triage_log(self._payload()))

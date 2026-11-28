@@ -146,6 +146,9 @@ async def main() -> None:
     ap.add_argument("--mode", choices=["replay", "thinking", "both"], default="both")
     ap.add_argument("--min-chars", type=int, default=20)
     ap.add_argument("--sample", type=float, default=1.0, help="fração de turnos (0-1)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="não reenvia turnos já presentes no log (retomada)")
+    ap.add_argument("--memory", default=os.getenv("MEMORY_API_URL", "http://127.9.12.22:3000"))
     ap.add_argument("--dry-run", action="store_true", help="só imprime os payloads")
     args = ap.parse_args()
 
@@ -165,6 +168,26 @@ async def main() -> None:
 
     if args.sample < 1.0:
         payloads = [p for p in payloads if random.random() < args.sample]
+
+    if args.skip_existing:
+        existing: set[str] = set()
+        try:
+            async with httpx.AsyncClient(
+                base_url=args.memory.rstrip("/"), headers=_headers(), timeout=30.0,
+            ) as mem:
+                for origin in ("replay", "probe_thinking"):
+                    r = await mem.get("/triage/labels", params={
+                        "origin": origin, "limit": 10000, "include_unlabeled": "true",
+                    })
+                    if r.status_code == 200:
+                        existing.update(
+                            str(s.get("turn_id") or "") for s in r.json().get("samples", [])
+                        )
+        except Exception as e:
+            print(f"aviso: não foi possível consultar rótulos existentes: {e}", file=sys.stderr)
+        before = len(payloads)
+        payloads = [p for p in payloads if p["turn_id"] not in existing]
+        print(f"triagem replay: {before - len(payloads)} já registrado(s) ignorado(s)")
 
     print(f"triagem replay: {len(sessions)} sessão(ões) → {len(payloads)} payload(s)")
     if args.dry_run:
