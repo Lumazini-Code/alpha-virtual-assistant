@@ -221,7 +221,7 @@ dialog{border:1px solid var(--ln);border-radius:18px;background:var(--sf);color:
 .mdl-manual input{flex:1;border:1px solid var(--ln);border-radius:10px;padding:7px 9px;background:var(--bg)}
 .mdl-manual .btn{margin-top:0}
 .mdl-empty{color:var(--mu);font-size:13px;padding:12px 8px}
-/* ══ Preview de HTML (aba full-screen) ══ */
+/* ══ Preview de artefatos (aba full-screen) ══ */
 #preview-view{position:relative;flex:1;min-height:0;margin:0 16px 16px;display:none;
   flex-direction:column;border:1px solid var(--ln);border-radius:14px;overflow:hidden;background:var(--bg)}
 body.preview #preview-view{display:flex}
@@ -245,7 +245,24 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
 #pv-meta small{display:block;color:var(--mu);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #pv-body{position:relative;flex:1;min-height:0;background:#fff}
 #pv-frame{width:100%;height:100%;border:0;background:#fff;display:block}
-#pv-frame[hidden]{display:none}
+#pv-frame[hidden],#pv-img[hidden],#pv-canvas[hidden],#pv-doc[hidden],
+#pv-media[hidden],#pv-audio[hidden],#pv-fallback[hidden]{display:none}
+#pv-img,#pv-media{width:100%;height:100%;object-fit:contain;background:#0b0d13;display:block}
+#pv-audio{width:min(720px,92%);margin:auto;display:block}
+#pv-canvas{width:100%;height:100%;display:block;background:#0b0d13;touch-action:none}
+#pv-doc{width:100%;height:100%;overflow:auto;background:var(--bg);padding:24px 32px;
+  color:var(--ink);font-size:14px;line-height:1.6}
+#pv-doc pre{margin:0;white-space:pre-wrap;word-break:break-word;
+  font:13px/1.55 'JetBrains Mono',ui-monospace,monospace}
+#pv-fallback{width:100%;height:100%;display:grid;place-content:center;gap:10px;text-align:center}
+#pv-fallback a{color:var(--ac)}
+#pv-loading{position:absolute;inset:0;display:grid;place-content:center;text-align:center;
+  color:var(--mu);font-size:13px;background:rgba(11,13,19,.55);z-index:3}
+#pv-loading[hidden],#pv-hint[hidden]{display:none}
+#pv-hint{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:2;
+  background:rgba(10,12,18,.78);border:1px solid #30384a;border-radius:99px;
+  padding:6px 14px;color:#cbd5e1;font-size:12px;white-space:nowrap;backdrop-filter:blur(6px)}
+#pv-hint button{border:0;background:none;color:#7dd3fc;text-decoration:underline;cursor:pointer;font-size:12px}
 #pv-empty{position:absolute;inset:0;display:grid;place-content:center;text-align:center;gap:6px;
   padding:24px;color:var(--mu);background:var(--bg)}
 #pv-empty[hidden]{display:none}
@@ -463,7 +480,7 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
     <button class="ib" id="tsb" title="Barra lateral" aria-label="Alternar barra lateral">☰</button>
     <span class="badge" id="bdg"></span>
     <span class="sp"></span>
-    <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Grafo</button><button id="m2">Preview</button></div>
+    <div class="mode" role="group" aria-label="Modo"><button id="m0" class="on">Chat</button><button id="m1">Grafo</button><button id="m2">Artefatos</button></div>
     <button class="ib" id="thm" title="Tema" aria-label="Alternar tema">◐</button>
   </header>
   <div id="sbar">
@@ -559,16 +576,16 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
 <div id="panel"><span class="close" id="panelClose">✕</span><div id="panelBody"></div></div>
   </div>
 
-  <!-- ══ Preview de HTML (full-screen) ══ -->
+  <!-- ══ Preview de artefatos (full-screen) ══ -->
   <div id="preview-view">
     <div id="pv-bar">
       <div id="pv-listwrap">
         <button id="pv-listbtn" aria-haspopup="true" aria-expanded="false">
-          ☰ HTMLs desta sessão <span id="pv-count">0</span>
+          ◫ Artefatos desta sessão <span id="pv-count">0</span>
         </button>
         <div id="pv-list" hidden></div>
       </div>
-      <div id="pv-meta"><b id="pv-title">Preview</b><small id="pv-file"></small></div>
+      <div id="pv-meta"><b id="pv-title">Artefatos</b><small id="pv-file"></small></div>
       <span class="sp"></span>
       <button class="ib" id="pv-refresh" title="Recarregar do disco" aria-label="Recarregar">⟳</button>
       <button class="ib" id="pv-open" title="Abrir em nova janela" aria-label="Abrir em nova janela">↗</button>
@@ -576,13 +593,21 @@ body.preview #chat,body.preview #cm,body.preview #sbar,body.preview #graph-view{
     </div>
     <div id="pv-body">
       <div id="pv-empty">
-        <b>Nenhum HTML publicado nesta sessão</b>
-        <p>Quando o modelo gerar uma página e chamar <code>html_preview</code>, ela aparece aqui.</p>
+        <b>Nenhum artefato publicado nesta sessão</b>
+        <p>Quando o modelo gerar um arquivo e chamar <code>artifact_preview</code>, ele aparece aqui.</p>
       </div>
       <iframe id="pv-frame" hidden
         sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
         referrerpolicy="no-referrer"
-        title="Preview do HTML gerado"></iframe>
+        title="Visualização do artefato"></iframe>
+      <img id="pv-img" hidden alt="Artefato de imagem">
+      <canvas id="pv-canvas" hidden></canvas>
+      <div id="pv-doc" hidden></div>
+      <video id="pv-media" hidden controls playsinline></video>
+      <audio id="pv-audio" hidden controls></audio>
+      <div id="pv-fallback" hidden></div>
+      <div id="pv-loading" hidden>Carregando artefato…</div>
+      <div id="pv-hint" hidden>Arraste para girar · roda para zoom · <button id="pv-reset" type="button">redefinir vista</button></div>
     </div>
   </div>
 
@@ -755,7 +780,7 @@ function saveChats(){
     localStorage.setItem(CHAT_KEY,JSON.stringify({
       active:S.active,
       chats:S.chats.filter(c=>c.sid).map(c=>({id:c.id,sid:c.sid,title:c.title,project:c.project,model:c.model||null,mode:c.mode||'conversational',
-        previews:Array.isArray(c.previews)?c.previews.map(p=>({id:p.id,title:p.title||'',description:p.description||'',path:p.path,cwd:p.cwd||null,url:p.url||'',created_ms:p.created_ms||0,mtime_ms:p.mtime_ms||null,size:p.size||null,missing:!!p.missing})):[],preview:c.preview||null})),
+        previews:Array.isArray(c.previews)?c.previews.map(p=>({id:p.id,title:p.title||'',description:p.description||'',artifact_kind:p.artifact_kind||'',path:p.path,cwd:p.cwd||null,url:p.url||'',created_ms:p.created_ms||0,mtime_ms:p.mtime_ms||null,size:p.size||null,missing:!!p.missing})):[],preview:c.preview||null})),
     }));
   }catch{}
 }
@@ -1076,27 +1101,50 @@ function setView(view){
   ui();
   if(view==='graph'&&typeof window.initGraphView==='function')window.initGraphView();
   if(view==='preview'){renderPreview(true);startPreviewPolling();}
-  else stopPreviewPolling();
+  else{stopPreviewPolling();disposeModel()}
 }
 
-/* ---------- Preview de HTML (arquivos do usuário via Manager) ---------- */
+/* ---------- Preview de artefatos (arquivos do usuário via Manager) ---------- */
 const pvInflight=new Set();
 let pvTimer=null;
+let modelState=null;  // cena 3D ativa (dispose ao trocar de artefato)
+let pvMounted=null;   // {id,kind,path,version} do renderizador atual
+let threePromise=null;
+const PV_KINDS=['html','pdf','image','model','document','media','code'];
+const PV_EXT_KIND={html:'html',htm:'html',pdf:'pdf',png:'image',jpg:'image',jpeg:'image',gif:'image',webp:'image',svg:'image',bmp:'image',avif:'image',ico:'image',glb:'model',gltf:'model',stl:'model',obj:'model',md:'document',markdown:'document',txt:'document',text:'document',json:'document',jsonl:'document',csv:'document',tsv:'document',yaml:'document',yml:'document',xml:'document',log:'document',rst:'document',mp4:'media',webm:'media',ogv:'media',mov:'media',mp3:'media',wav:'media',ogg:'media',m4a:'media',flac:'media',py:'code',js:'code',mjs:'code',ts:'code',tsx:'code',jsx:'code',css:'code',rs:'code',go:'code',java:'code',c:'code',cpp:'code',h:'code',hpp:'code',sql:'code',sh:'code',ps1:'code',toml:'code',ini:'code'};
+const PV_ICON={html:'◇',pdf:'▤',image:'▧',model:'◈',document:'▦',media:'▷',code:'⌘'};
+const PV_AUDIO_EXT=/^(mp3|wav|ogg|m4a|flac)$/i;
+const PV_MD_EXT=/^(md|markdown)$/i;
 function activePreview(c){
   c=c||chat();
   if(!c||!Array.isArray(c.previews)||!c.previews.length)return null;
   return c.previews.find(p=>p.id===c.preview)||c.previews[c.previews.length-1];
 }
+function previewKind(p){
+  const k=String(p&&p.artifact_kind||'').toLowerCase();
+  if(PV_KINDS.includes(k))return k;
+  return PV_EXT_KIND[String(p&&p.path||'').split('.').pop().toLowerCase()]||'document';
+}
 function previewFromResult(res){
   if(!res)return null;
   let d=res;
   if(typeof d==='string'){d=pj(d)}
-  if(!d||typeof d!=='object'||d.kind!=='ava_html_preview'||!d.path)return null;
-  return d;
+  if(!d||typeof d!=='object'||!d.path)return null;
+  if(d.kind!=='ava_artifact_preview'&&d.kind!=='ava_html_preview')return null;
+  return {kind:'ava_artifact_preview',
+    artifact_kind:d.artifact_kind||(d.kind==='ava_html_preview'?'html':''),
+    path:d.path,title:d.title||'',description:d.description||''};
 }
 function pvSrc(p){return sameOrigin?p.url:cfg.api+p.url}
 const pvBase=p=>String(p||'').replace(/\\/g,'/').split('/').filter(Boolean).pop()||String(p||'');
+function hidePvViews(){
+  ['frame','img','canvas','doc','media','audio','fallback'].forEach(k=>{const el=$('#pv-'+k);if(el)el.hidden=true});
+  const l=$('#pv-loading');if(l)l.hidden=true;
+  const h=$('#pv-hint');if(h)h.hidden=true;
+  disposeModel();pvMounted=null;
+}
 function showPreviewEmpty(title,text){
+  hidePvViews();
   const box=$('#pv-empty');if(!box)return;
   box.hidden=false;
   const b=box.querySelector('b'),p=box.querySelector('p');
@@ -1106,30 +1154,172 @@ function showPreviewEmpty(title,text){
 function renderPreviewList(){
   const c=chat(),list=(c&&c.previews)||[],active=activePreview(c);
   $('#pv-count').textContent=String(list.length);
-  $('#pv-list').innerHTML=list.length?list.map(p=>
-    `<button class="pv-item${active&&p.id===active.id?' on':''}" data-pv="${esc(p.id)}">
-      <b>${esc(p.title||'Preview')}</b><small>${esc(pvBase(p.path))}${p.missing?' · arquivo ausente':''}</small>
-    </button>`).join(''):'<div class="empty">Nenhum HTML nesta sessão.</div>';
+  $('#pv-list').innerHTML=list.length?list.map(p=>{
+    const k=previewKind(p);
+    return `<button class="pv-item${active&&p.id===active.id?' on':''}" data-pv="${esc(p.id)}">
+      <b>${PV_ICON[k]||'▧'} ${esc(p.title||'Artefato')}</b><small>${esc(pvBase(p.path))}${p.missing?' · arquivo ausente':''}</small>
+    </button>`}).join(''):'<div class="empty">Nenhum artefato nesta sessão.</div>';
 }
 function renderPreview(force){
-  const c=chat(),list=(c&&c.previews)||[],p=activePreview(c),frame=$('#pv-frame');
+  const p=activePreview(chat());
   renderPreviewList();
   if(!p){
-    frame.hidden=true;$('#pv-title').textContent='Preview';$('#pv-file').textContent='';
-    showPreviewEmpty('Nenhum HTML publicado nesta sessão','Quando o modelo gerar uma página e chamar html_preview, ela aparece aqui.');
+    $('#pv-title').textContent='Artefatos';$('#pv-file').textContent='';
+    showPreviewEmpty('Nenhum artefato publicado nesta sessão','Quando o modelo gerar um arquivo e chamar artifact_preview, ele aparece aqui.');
     return;
   }
-  $('#pv-title').textContent=p.title||'Preview';
+  $('#pv-title').textContent=p.title||'Artefato';
   $('#pv-file').textContent=p.path||'';
   if(p.missing){
-    frame.hidden=true;
-    showPreviewEmpty('Arquivo não encontrado',`O HTML registrado não existe mais em ${p.path||'disco'}.`);
+    showPreviewEmpty('Arquivo não encontrado',`O artefato registrado não existe mais em ${p.path||'disco'}.`);
     return;
   }
-  frame.hidden=false;$('#pv-empty').hidden=true;
-  if(force||frame.dataset.pid!==p.id){
-    frame.dataset.pid=p.id;
-    frame.src=pvSrc(p)+'?v='+(force?Date.now():(p.mtime_ms||Date.now()));
+  const kind=previewKind(p),version=force?Date.now():(p.mtime_ms||Date.now());
+  const same=!force&&pvMounted&&pvMounted.id===p.id&&pvMounted.kind===kind&&pvMounted.path===p.path&&pvMounted.version===version;
+  if(same)return;
+  hidePvViews();$('#pv-empty').hidden=true;
+  const src=pvSrc(p)+'?v='+version;
+  if(kind==='html'||kind==='pdf'){
+    const f=$('#pv-frame');f.hidden=false;
+    if(kind==='pdf')f.removeAttribute('sandbox');
+    else f.setAttribute('sandbox','allow-scripts allow-forms allow-modals allow-popups allow-downloads');
+    f.title=kind==='pdf'?'Visualizador de PDF':'Visualização do artefato HTML';
+    f.src=src+(kind==='pdf'?'#toolbar=1':'');
+    pvMounted={id:p.id,kind,path:p.path,version};
+  }
+  else if(kind==='image'){
+    const im=$('#pv-img');im.hidden=false;im.alt=p.title||'Imagem';im.src=src;
+    pvMounted={id:p.id,kind,path:p.path,version};
+  }
+  else if(kind==='model')void mountModel(p,src,version);
+  else if(kind==='media')mountMedia(p,src,version);
+  else void mountDocument(p,src,kind,version);
+}
+function mountMedia(p,src,version){
+  const ext=String(p.path||'').split('.').pop().toLowerCase();
+  const el=$(PV_AUDIO_EXT.test(ext)?'#pv-audio':'#pv-media');
+  el.hidden=false;el.src=src;if(el.load)el.load();
+  pvMounted={id:p.id,kind:'media',path:p.path,version};
+}
+async function mountDocument(p,src,kind,version){
+  const box=$('#pv-doc');box.hidden=false;
+  box.innerHTML='<div class="txt" style="color:var(--mu)">Carregando…</div>';
+  try{
+    const r=await fetch(src,{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    let text=await r.text();
+    if(text.length>2000000)text=text.slice(0,2000000)+'\n\n… (visualização truncada)';
+    if(activePreview(chat())?.id!==p.id)return;
+    if(kind==='document'&&PV_MD_EXT.test(String(p.path||'')))box.innerHTML='<div class="txt">'+md(text)+'</div>';
+    else if(kind==='document'&&/\.jsonl?$/i.test(String(p.path||''))){
+      try{box.innerHTML='<pre>'+esc(JSON.stringify(JSON.parse(text),null,2))+'</pre>'}
+      catch{box.innerHTML='<pre>'+esc(text)+'</pre>'}
+    }
+    else box.innerHTML='<pre>'+esc(text)+'</pre>';
+    pvMounted={id:p.id,kind,path:p.path,version};
+  }catch(e){
+    box.hidden=true;
+    showPreviewEmpty('Falha ao carregar o documento',String(e&&e.message||e));
+  }
+}
+function ensureThree(){
+  if(window.THREE&&window.THREE.OrbitControls&&window.THREE.GLTFLoader)return Promise.resolve();
+  if(threePromise)return threePromise;
+  threePromise=(async()=>{
+    for(const src of ['/assets/three.min.js','/assets/three-OrbitControls.js','/assets/three-GLTFLoader.js','/assets/three-STLLoader.js','/assets/three-OBJLoader.js']){
+      await new Promise((resolve,reject)=>{
+        const s=document.createElement('script');s.src=src;s.async=false;
+        s.onload=resolve;s.onerror=()=>reject(new Error('falha ao carregar '+src));
+        document.head.appendChild(s);
+      });
+    }
+  })();
+  return threePromise;
+}
+function disposeModel(){
+  const st=modelState;if(!st)return;modelState=null;
+  try{cancelAnimationFrame(st.raf)}catch{}
+  try{st.ro?st.ro.disconnect():st.onResize&&window.removeEventListener('resize',st.onResize)}catch{}
+  try{st.controls&&st.onChange&&st.controls.removeEventListener('change',st.onChange)}catch{}
+  try{st.controls&&st.controls.dispose()}catch{}
+  try{st.scene&&st.scene.traverse(o=>{
+    if(o.geometry)o.geometry.dispose();
+    const m=o.material;if(!m)return;
+    (Array.isArray(m)?m:[m]).forEach(x=>{
+      if(!x)return;
+      for(const k of ['map','normalMap','roughnessMap','metalnessMap','emissiveMap'])if(x[k])x[k].dispose();
+      x.dispose();
+    });
+  })}catch{}
+  try{st.renderer&&st.renderer.dispose()}catch{}
+}
+async function mountModel(p,src,version){
+  const canvas=$('#pv-canvas'),loading=$('#pv-loading'),hint=$('#pv-hint');
+  canvas.hidden=false;loading.hidden=false;hint.hidden=false;
+  try{
+    await ensureThree();
+    if(activePreview(chat())?.id!==p.id)return;
+    disposeModel();
+    const THREE=window.THREE;
+    const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+    renderer.setClearColor(0x0b0d13,1);
+    const scene=new THREE.Scene();
+    scene.add(new THREE.HemisphereLight(0xffffff,0x3a4152,1.15));
+    const key=new THREE.DirectionalLight(0xffffff,0.85);key.position.set(5,8,6);scene.add(key);
+    const fill=new THREE.DirectionalLight(0x93c5fd,0.35);fill.position.set(-6,-2,-5);scene.add(fill);
+    const camera=new THREE.PerspectiveCamera(45,1,0.01,10000);
+    const controls=new THREE.OrbitControls(camera,renderer.domElement);
+    controls.enableDamping=true;controls.dampingFactor=0.08;
+    const ext=String(p.path||'').split('.').pop().toLowerCase();
+    const loader=ext==='stl'?new THREE.STLLoader():ext==='obj'?new THREE.OBJLoader():new THREE.GLTFLoader();
+    const loaded=await new Promise((resolve,reject)=>loader.load(src,resolve,undefined,reject));
+    let root=loaded&&loaded.scene?loaded.scene:loaded;
+    if(root&&root.isBufferGeometry)root=new THREE.Mesh(root,new THREE.MeshStandardMaterial({color:0x9fb4c8,metalness:0.12,roughness:0.55}));
+    scene.add(root);
+    const box=new THREE.Box3().setFromObject(root);
+    const size=box.getSize(new THREE.Vector3());
+    const max=Math.max(size.x,size.y,size.z)||1;
+    root.position.sub(box.getCenter(new THREE.Vector3()));
+    root.scale.setScalar(2/max);
+    const fitted=new THREE.Box3().setFromObject(root);
+    const target=fitted.getCenter(new THREE.Vector3());
+    const radius=Math.max(0.5,fitted.getSize(new THREE.Vector3()).length());
+    camera.position.copy(target.clone().add(new THREE.Vector3(radius*0.75,radius*0.5,radius)));
+    camera.near=Math.max(0.001,radius/500);camera.far=radius*100;camera.updateProjectionMatrix();
+    controls.target.copy(target);controls.update();
+    const grid=new THREE.GridHelper(10,10,0x3a4a60,0x222a38);
+    grid.position.y=fitted.min.y-0.015;grid.scale.setScalar(Math.max(1,max/8));
+    scene.add(grid);
+    const resize=()=>{
+      const b=canvas.getBoundingClientRect();
+      if(b.width>0&&b.height>0){renderer.setSize(b.width,b.height,false);camera.aspect=b.width/b.height;camera.updateProjectionMatrix()}
+      if(modelState&&modelState.renderer===renderer&&modelState.onChange)modelState.onChange();
+    };
+    resize();
+    const ro=typeof ResizeObserver!=='undefined'?new ResizeObserver(resize):null;
+    if(ro)ro.observe(canvas);else window.addEventListener('resize',resize);
+    // Renderiza só quando há movimento: o loop contínuo mantinha a GPU em
+    // ~100% com o canvas parado. O 'change' do OrbitControls dispara enquanto
+    // o damping está assentando, então a janela extra cobre a inércia.
+    let raf=0,lastChange=0;
+    const draw=()=>{
+      raf=0;
+      if(!modelState||modelState.renderer!==renderer)return;
+      controls.update();
+      renderer.render(scene,camera);
+      if(Date.now()-lastChange<700)raf=requestAnimationFrame(draw);
+    };
+    const requestDraw=()=>{lastChange=Date.now();if(!raf)raf=requestAnimationFrame(draw)};
+    controls.addEventListener('change',requestDraw);
+    resize();requestDraw();
+    modelState={raf,ro,onResize:ro?null:resize,onChange:requestDraw,camera,controls,scene,renderer,
+      home:{pos:camera.position.clone(),target:target.clone()}};
+    pvMounted={id:p.id,kind:'model',path:p.path,version};
+    loading.hidden=true;
+  }catch(e){
+    loading.hidden=true;canvas.hidden=true;hint.hidden=true;
+    showPreviewEmpty('Falha ao carregar o modelo 3D',String(e&&e.message||e));
   }
 }
 function stopPreviewPolling(){if(pvTimer){clearInterval(pvTimer);pvTimer=null}}
@@ -1151,9 +1341,13 @@ async function refreshPreviewStat(force){
     }
     if(p.missing){p.missing=false;p.mtime_ms=st.mtime_ms;p.size=st.size;saveChats();renderPreview(true);return;}
     if(force||st.mtime_ms!==p.mtime_ms||st.size!==p.size){
+      // Ao abrir a aba, renderPreview(true) já montou com Date.now(): não
+      // descarte o modelo/doc recém-carregado só porque o cache local estava
+      // desatualizado.
+      const fresh=pvMounted&&pvMounted.id===p.id&&typeof pvMounted.version==='number'
+        &&pvMounted.version>=st.mtime_ms;
       p.mtime_ms=st.mtime_ms;p.size=st.size;p.missing=false;saveChats();
-      $('#pv-frame').dataset.pid=p.id;
-      $('#pv-frame').src=pvSrc(p)+'?v='+(st.mtime_ms||Date.now());
+      if(!fresh)renderPreview(true);
     }
   }catch(e){/* registro antigo após restart do tray — revalida ao reabrir */}
 }
@@ -1167,9 +1361,11 @@ async function addPreview(data,ch){
     const r=await jf('api','/preview/register','POST',{
       session_id:ch.sid,cwd:ch.cwd||null,path:data.path,
       title:data.title||'',description:data.description||'',
+      kind:data.artifact_kind||'',
     });
     const list=ch.previews||(ch.previews=[]);
-    const item={id:r.id,title:r.title||data.title||'Preview',description:r.description||'',
+    const item={id:r.id,title:r.title||data.title||'Artefato',description:r.description||'',
+      artifact_kind:r.kind||data.artifact_kind||'',
       path:r.path||data.path,cwd:r.cwd||ch.cwd||null,url:r.url||'',created_ms:r.created_ms||Date.now(),
       mtime_ms:r.mtime_ms??null,size:r.size??null,missing:false};
     const i=list.findIndex(p=>p.id===item.id||p.path===item.path);
@@ -1177,7 +1373,7 @@ async function addPreview(data,ch){
     ch.preview=item.id;saveChats();
     if(ch.id===S.active){setView('preview');}
     else{ch.unread=true;renderChats();}
-  }catch(e){toast('Preview: '+e.message)}
+  }catch(e){toast('Artefatos: '+e.message)}
   finally{pvInflight.delete(key)}
 }
 async function revalidatePreviews(c){
@@ -1187,8 +1383,10 @@ async function revalidatePreviews(c){
     try{
       const r=await jf('api','/preview/register','POST',{
         session_id:c.sid,cwd:p.cwd||c.cwd||null,path:p.path,title:p.title||'',description:p.description||'',
+        kind:p.artifact_kind||'',
       });
       out.push({...p,id:r.id,url:r.url||p.url,title:r.title||p.title,cwd:r.cwd||p.cwd||null,
+        artifact_kind:r.kind||p.artifact_kind||'',
         mtime_ms:r.mtime_ms??p.mtime_ms,size:r.size??p.size,missing:false});
     }catch(e){out.push({...p,missing:true})}
   }
@@ -1201,6 +1399,11 @@ $('#m2').onclick=()=>setView('preview');
 $('#pv-close').onclick=()=>setView('chat');
 $('#pv-refresh').onclick=()=>renderPreview(true);
 $('#pv-open').onclick=()=>{const p=activePreview(chat());if(p&&!p.missing)window.open(pvSrc(p),'_blank','noopener')};
+$('#pv-reset').onclick=()=>{
+  const st=modelState;if(!st||!st.home)return;
+  st.camera.position.copy(st.home.pos);
+  st.controls.target.copy(st.home.target);st.controls.update();
+};
 $('#pv-listbtn').onclick=()=>{const box=$('#pv-list');box.hidden=!box.hidden;$('#pv-listbtn').setAttribute('aria-expanded',String(!box.hidden))};
 $('#pv-list').onclick=e=>{
   const b=e.target.closest('[data-pv]');if(!b)return;
@@ -2734,7 +2937,13 @@ function nodeColor(act, seedRecent, born, meta) {
            border: act > 0.05 ? '#ffd166' : BASE_NODE_BORDER };
 }
 
+// Um único loop de activação por grafo, e só enquanto a aba Grafo está aberta.
+// Antes ele se reagendava para sempre (mesmo após trocar de aba), mantendo
+// redraws e GPU ocupados sem necessidade.
+let graphTickRunning=false;
 function tick() {
+  if (S.view !== 'graph') { graphTickRunning=false; return; }
+  graphTickRunning=true;
   const now = Date.now();
   const nodeUpdates = [];
   const edgeUpdates = [];
@@ -3171,7 +3380,7 @@ function applySnapshot(g){
     lastSnapshotKey = key;
     pushLog(`snapshot: ${nodeMeta.size} nós, ${edgeMeta.size} arestas · ${scopeOrder.length} escopo(s)`);
   }
-  tick();
+  if (!graphTickRunning) tick();
   setLoading(false);
   if (!window.__graphRevealed) { window.__graphRevealed = true; playGraphReveal(); }
   loadMemoryStats();

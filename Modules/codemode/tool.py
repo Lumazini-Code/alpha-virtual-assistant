@@ -11,7 +11,7 @@ from .runtime import CodeModeRuntime
 
 # Callback opcional após CADA tool executada dentro do Code Mode. O orchestrator
 # usa isso para detectar resultados que precisam virar evento de UI (ex.:
-# html_preview) mesmo quando a chamada MCP acontece dentro de `execute`.
+# artifact_preview) mesmo quando a chamada MCP acontece dentro de `execute`.
 ToolResultHook = Callable[[str, ToolResult], Awaitable[None]]
 
 DESCRIPTION = """Run JavaScript in a confined Code Mode runtime to compose MCP tool calls.

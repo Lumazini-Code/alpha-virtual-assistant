@@ -8,8 +8,9 @@
 #   3. Extrai em %LOCALAPPDATA%\Programs\AlphaAI (override: -InstallDir)
 #   3b. Agent Skills: npx skills add heygen-com/hyperframes -> .agents\skills
 #       (gitignored; flags -a universal -y; falha = aviso, nao morte)
-#   3c. OfficeCLI: npm install -g @officecli/officecli + skill
-#       officecli.ai/SKILL.md -> .agents\skills\officecli (falha = aviso)
+#   3c. OfficeCLI: binario nativo via d.officecli.ai/install.ps1 (fallback:
+#       npm -g @officecli/officecli) + skill officecli.ai/SKILL.md ->
+#       .agents\skills\officecli (falha = aviso; opt-out AVA_OFFICECLI=0)
 #   3d. Boardview MCP: venv .venv-boardview + mcp_servers\boardview (mcp + pillow)
 #       e skills proprias da Alpha (skills\) -> .agents\skills (falha = aviso)
 #   3e. CadQuery MCP: venv .venv-cadquery + mcp_servers\3d_modeling (CAD/3D)
@@ -637,32 +638,65 @@ if ($Npx) {
   Write-Warn2 'npx ausente no host - pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes).'
 }
 
-# -- 3c. OfficeCLI (binario npm -g + skill SKILL.md) ---------------------------
-# `officecli` = leitura/edicao de .docx/.xlsx/.pptx (o binario nativo vem no
-# postinstall do pacote). npm -g usa o prefix do usuario (%APPDATA%\npm, sem
-# admin). A SKILL.md do site oficial vai direto para o store canonico
-# .agents\skills\officecli\ (gitignored; o mount ro entrega ao container e o
-# scanner do orchestrator descobre na proxima pergunta, sem restart).
-# Download em arquivo temporario + Move-Item — SKILL.md truncado por rede nao
-# entra no indice. Obs.: no PS 5.1 `curl` e alias de Invoke-WebRequest, entao
-# o cmdlet e chamado explicitamente. Falha e aviso, nao morte.
-$NpmCmd = Get-Command npm -ErrorAction SilentlyContinue
-$OfficeFail = $false
-if ($NpmCmd) {
-  Write-Info 'OfficeCLI: npm install -g @officecli/officecli...'
-  & npm install -g '@officecli/officecli'
-  if ($LASTEXITCODE -ne 0) { $OfficeFail = $true }
+# -- 3c. OfficeCLI (binario nativo + skill SKILL.md) ---------------------------
+# `officecli` = leitura/edicao de .docx/.xlsx/.pptx via DOM, com servidor MCP
+# embutido (`officecli mcp`). O binario e NATIVO e nao vem do npm: o pacote
+# @officecli/officecli e so um shim que baixa o binario no postinstall. Por isso
+# o instalador oficial e o caminho primario - ele resolve a tag imutavel,
+# confere o SHA256 e grava em %LOCALAPPDATA%\OfficeCLI (PATH do usuario). O
+# npm -g fica como fallback quando o download do instalador oficial falha.
+# A SKILL.md do site oficial vai para o store canonico .agents\skills\officecli\
+# (gitignored; o mount ro entrega ao container e o scanner do orchestrator
+# descobre na proxima pergunta, sem restart). Download em arquivo temporario +
+# Move-Item — SKILL.md truncado por rede nao entra no indice. Obs.: no PS 5.1
+# `curl` e alias de Invoke-WebRequest, entao o cmdlet e chamado explicitamente.
+# Falha e aviso, nao morte. Opt-out: $env:AVA_OFFICECLI = '0'.
+$OfficeOk = $false
+if ($env:AVA_OFFICECLI -eq '0') {
+  Write-Info 'OfficeCLI: pulado (AVA_OFFICECLI=0).'
 } else {
-  Write-Warn2 'npm ausente no host - pulei o OfficeCLI (rode: npm install -g @officecli/officecli).'
-}
-if ($OfficeFail) {
-  Write-Warn2 'npm install -g @officecli/officecli falhou - o sistema sobe sem o OfficeCLI.'
-  Write-Warn2 'Para instalar depois: npm install -g @officecli/officecli'
-} elseif ($NpmCmd) {
   $Ocli = Get-Command officecli -ErrorAction SilentlyContinue
-  $OcliLabel = 'via npm -g'
-  if ($Ocli) { $OcliLabel = $Ocli.Source }
-  Write-Ok "OfficeCLI instalado ($OcliLabel)."
+  if ($Ocli) {
+    Write-Ok "OfficeCLI ja instalado ($($Ocli.Source))."
+    $OfficeOk = $true
+  } else {
+    Write-Info 'OfficeCLI: instalando binario nativo (d.officecli.ai/install.ps1)...'
+    $OcliPs1 = Join-Path $env:TEMP 'officecli-install.ps1'
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri 'https://d.officecli.ai/install.ps1' -OutFile $OcliPs1 -TimeoutSec 300 -ErrorAction Stop
+      & powershell -NoProfile -ExecutionPolicy Bypass -File $OcliPs1
+      if ($LASTEXITCODE -eq 0) { $OfficeOk = $true }
+    } catch {
+      Write-Warn2 "Instalador oficial do OfficeCLI falhou ($($_.Exception.Message)) - tentando npm -g como fallback."
+    } finally {
+      Remove-Item -Force $OcliPs1 -ErrorAction SilentlyContinue
+    }
+    if (-not $OfficeOk) {
+      $NpmCmd = Get-Command npm -ErrorAction SilentlyContinue
+      if ($NpmCmd) {
+        Write-Info 'OfficeCLI: npm install -g @officecli/officecli...'
+        & npm install -g '@officecli/officecli'
+        if ($LASTEXITCODE -eq 0) { $OfficeOk = $true }
+      } else {
+        Write-Warn2 'npm ausente no host - sem fallback disponivel.'
+      }
+    }
+    # O instalador oficial grava em %LOCALAPPDATA%\OfficeCLI e so altera o PATH
+    # do usuario (vale no proximo processo). Esta sessao precisa da pasta agora.
+    if ($OfficeOk) {
+      $OcliDir = Join-Path $env:LOCALAPPDATA 'OfficeCLI'
+      if ((Test-Path (Join-Path $OcliDir 'officecli.exe')) -and ($env:Path -notlike "*$OcliDir*")) {
+        $env:Path = "$OcliDir;$env:Path"
+      }
+    }
+    $Ocli = Get-Command officecli -ErrorAction SilentlyContinue
+    if ($Ocli) {
+      Write-Ok "OfficeCLI instalado ($($Ocli.Source))."
+    } else {
+      Write-Warn2 'OfficeCLI nao instalado - o sistema sobe sem ele.'
+      Write-Warn2 'Para instalar depois: irm https://d.officecli.ai/install.ps1 | iex'
+    }
+  }
 }
 
 $OfficeSkillDir = Join-Path $InstallDir '.agents\skills\officecli'
@@ -1087,7 +1121,24 @@ function Register-PlaywrightMcp {
     command        = 'npx'
     args           = @('-y', '@playwright/mcp@latest', '--extension')
     env            = $envMap
-  } | ConvertTo-Json -Depth 3
+    examples       = @{
+      browser_navigate        = @('abra o site', 'navegue para', 'vá até esta página', 'acesse o link', 'abra o navegador')
+      browser_click           = @('clique no botão', 'clique aqui', 'aperte o link')
+      browser_take_screenshot = @('tire um screenshot', 'capture a tela', 'faça uma captura da página')
+      browser_snapshot        = @('leia a página', 'extraia o texto do site', 'veja o conteúdo da página')
+      browser_fill_form       = @('preencha o formulário', 'preencha o login', 'digite nos campos')
+      browser_type            = @('digite no campo', 'escreva na caixa de texto')
+      browser_evaluate        = @('rode javascript na página', 'execute um script no site', 'inspecione o DOM')
+      browser_console_messages = @('veja o console', 'verifique erros no console')
+      browser_tabs            = @('abra outra aba', 'liste as abas', 'feche a aba')
+      browser_wait_for        = @('espere a página carregar', 'aguarde alguns segundos')
+      browser_navigate_back   = @('volte para a página anterior')
+      browser_network_requests = @('veja as requisições de rede')
+      browser_resize          = @('mude o tamanho da janela')
+      browser_select_option   = @('selecione esta opção')
+      browser_press_key       = @('aperte Enter', 'pressione uma tecla')
+    }
+  } | ConvertTo-Json -Depth 5
   # Corpo em bytes UTF-8: no Windows PowerShell 5.1 o Invoke-RestMethod com
   # string usa ISO-8859-1 e os acentos do skill_summary viram bytes inválidos
   # em UTF-8 (o servidor responde 422 e o Playwright nunca é cadastrado).
@@ -1232,7 +1283,7 @@ function Register-AlphaMcp {
   $wsUrl = if ($env:ALPHA_MCP_URL) { $env:ALPHA_MCP_URL } else { 'http://127.9.12.22:4010/mcp' }
   return (Register-McpServer -Label 'Alpha' -Name 'alpha-mcp' -SyncTimeoutSec 120 -Spec @{
     name          = 'alpha-mcp'
-    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado.'
+    skill_summary = 'Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado. Publicação de artefatos (HTML, PDF, imagens, modelos 3D e documentos) na aba Artefatos da WebUI.'
     transport     = 'http'
     url           = $wsUrl
     enabled       = $true
@@ -1262,6 +1313,13 @@ function Register-AlphaMcp {
         'divida',
         'raiz quadrada de',
         'calcule a expressao'
+      )
+      artifact_preview = @(
+        'mostre o resultado na aba de artefatos',
+        'publique o HTML na visualizacao',
+        'abra o modelo 3D no visualizador',
+        'coloque o PDF/documento na aba Artefatos',
+        'exiba o grafico gerado'
       )
     }
   })

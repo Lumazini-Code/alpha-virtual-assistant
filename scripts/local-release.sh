@@ -3,14 +3,19 @@
 #
 # Uso:
 #   ./scripts/local-release.sh --version v5.1 [--yes] [--skip-build] [--skip-install]
+#   ./scripts/local-release.sh --version v5.1 --local-only [--yes] [--skip-build]
 #
-# O working tree PRECISA estar limpo: a tag aponta para o HEAD, que é o mesmo
-# código usado para montar os zips. O script avisa e aborta se houver mudanças
-# não commitadas.
+# Modo --local-only: compila, monta os zips e reinstala a instalação local.
+# Não exige working tree limpo, não cria tag, não publica no GitHub e não faz
+# commits — útil para testar mudanças ainda não commitadas.
+#
+# No modo completo, o working tree PRECISA estar limpo: a tag aponta para o
+# HEAD, que é o mesmo código usado para montar os zips. O script avisa e aborta
+# se houver mudanças não commitadas.
 #
 # Saída: dist/alpha-ai-linux-<VER>.zip, dist/alpha-ai-windows-<VER>.zip,
 #        dist/RELEASE_NOTES.md, dist/SHA256SUMS
-# Depois: cria/push da tag Alpha-AI-<VER>, release no GitHub via gh.
+# Depois (modo completo): cria/push da tag Alpha-AI-<VER>, release no GitHub via gh.
 # Por fim (salvo --skip-install): reinstala localmente com ALPHA_RELEASE_ZIP.
 
 set -euo pipefail
@@ -23,6 +28,7 @@ VERSION="v5.1"
 YES=0
 SKIP_BUILD=0
 SKIP_INSTALL=0
+LOCAL_ONLY=0
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
@@ -39,6 +45,7 @@ while (($#)); do
         --yes|-y)       YES=1; shift ;;
         --skip-build)   SKIP_BUILD=1; shift ;;
         --skip-install) SKIP_INSTALL=1; shift ;;
+        --local-only)   LOCAL_ONLY=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *) die "argumento desconhecido: $1 (use --help)" ;;
     esac
@@ -53,28 +60,42 @@ TMP_ROOT="$(mktemp -d -t alpha-release-XXXXXX)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
-for tool in git cmake zip unzip gh cargo rustup python3 \
+for tool in git cmake zip unzip cargo rustup python3 \
             x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++; do
     command -v "$tool" >/dev/null 2>&1 || die "'$tool' não encontrado no PATH."
 done
-gh auth status >/dev/null 2>&1 || die "gh não autenticado (rode 'gh auth login')."
 
-if [[ -n "$(git status --porcelain)" ]]; then
-    warn "Working tree sujo — as mudanças precisam ser commitadas antes do release."
-    git status --short >&2
-    die "Commite e rode novamente. A tag precisa apontar para o mesmo código dos zips."
-fi
+if (( LOCAL_ONLY )); then
+    info "Modo local: build + instalação local, sem tag/GitHub/commits."
+else
+    command -v gh >/dev/null 2>&1 || die "'gh' não encontrado no PATH."
+    gh auth status >/dev/null 2>&1 || die "gh não autenticado (rode 'gh auth login')."
 
-if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-    die "Tag $TAG já existe no git."
+    if [[ -n "$(git status --porcelain)" ]]; then
+        warn "Working tree sujo — as mudanças precisam ser commitadas antes do release."
+        git status --short >&2
+        die "Commite e rode novamente. A tag precisa apontar para o mesmo código dos zips."
+    fi
+
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+        die "Tag $TAG já existe no git."
+    fi
 fi
 
 PREV_TAG="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
 [[ -n "$PREV_TAG" ]] || PREV_TAG="$(git rev-list --max-parents=0 HEAD | head -n1)"
-info "Versão $VERSION — tag $TAG — commits desde $PREV_TAG"
+if (( LOCAL_ONLY )); then
+    info "Versão local $VERSION (working tree atual)."
+else
+    info "Versão $VERSION — tag $TAG — commits desde $PREV_TAG"
+fi
 
 if (( ! YES )); then
-    printf 'Criar release %s, publicar no GitHub e reinstalar localmente? [s/N] ' "$TITLE"
+    if (( LOCAL_ONLY )); then
+        printf 'Compilar e reinstalar localmente a versão %s? [s/N] ' "$TITLE"
+    else
+        printf 'Criar release %s, publicar no GitHub e reinstalar localmente? [s/N] ' "$TITLE"
+    fi
     read -r ans || ans=""
     case "$ans" in
         s*|S*) ;;
@@ -106,12 +127,16 @@ ok "Binários verificados."
 mkdir -p "$DIST"
 
 # ── Notas de release (commits da versão) ──────────────────────────────────────
-{
-    printf '# %s\n\n' "$TITLE"
-    printf 'Commits desde %s:\n\n' "$PREV_TAG"
-    git log --no-merges --pretty=format:'- %h %s' "${PREV_TAG}..HEAD"
-    printf '\n'
-} > "$DIST/RELEASE_NOTES.md"
+if (( LOCAL_ONLY )); then
+    printf '# %s\n\nBuild local (sem tag e sem publicação no GitHub).\n' "$TITLE" > "$DIST/RELEASE_NOTES.md"
+else
+    {
+        printf '# %s\n\n' "$TITLE"
+        printf 'Commits desde %s:\n\n' "$PREV_TAG"
+        git log --no-merges --pretty=format:'- %h %s' "${PREV_TAG}..HEAD"
+        printf '\n'
+    } > "$DIST/RELEASE_NOTES.md"
+fi
 ok "Notas geradas: $DIST/RELEASE_NOTES.md"
 
 # ── Models.zip (somente os modelos em uso) ────────────────────────────────────
@@ -213,22 +238,26 @@ validate_zip "$DIST/$WINDOWS_ZIP" windows
 (cd "$DIST" && sha256sum "$LINUX_ZIP" "$WINDOWS_ZIP" > SHA256SUMS)
 ok "SHA256SUMS gerado."
 
-# ── Tag + push ────────────────────────────────────────────────────────────────
-info "Criando tag $TAG …"
-git tag -a "$TAG" -m "$TITLE"
-git push origin "$TAG"
-ok "Tag publicada: $TAG"
+if (( ! LOCAL_ONLY )); then
+    # ── Tag + push ──────────────────────────────────────────────────────────────
+    info "Criando tag $TAG …"
+    git tag -a "$TAG" -m "$TITLE"
+    git push origin "$TAG"
+    ok "Tag publicada: $TAG"
 
-# ── Release no GitHub ─────────────────────────────────────────────────────────
-if gh release view "$TAG" >/dev/null 2>&1; then
-    info "Release $TAG já existe — fazendo upload dos assets…"
-    gh release upload "$TAG" "$DIST/$LINUX_ZIP" "$DIST/$WINDOWS_ZIP" --clobber
+    # ── Release no GitHub ───────────────────────────────────────────────────────
+    if gh release view "$TAG" >/dev/null 2>&1; then
+        info "Release $TAG já existe — fazendo upload dos assets…"
+        gh release upload "$TAG" "$DIST/$LINUX_ZIP" "$DIST/$WINDOWS_ZIP" --clobber
+    else
+        info "Criando release $TITLE …"
+        gh release create "$TAG" --title "$TITLE" --notes-file "$DIST/RELEASE_NOTES.md" \
+            "$DIST/$LINUX_ZIP" "$DIST/$WINDOWS_ZIP"
+    fi
+    ok "Release publicado: https://github.com/Lumazini-Code/alpha-virtual-assistant/releases/tag/$TAG"
 else
-    info "Criando release $TITLE …"
-    gh release create "$TAG" --title "$TITLE" --notes-file "$DIST/RELEASE_NOTES.md" \
-        "$DIST/$LINUX_ZIP" "$DIST/$WINDOWS_ZIP"
+    warn "Tag/release no GitHub pulados (--local-only)."
 fi
-ok "Release publicado: https://github.com/Lumazini-Code/alpha-virtual-assistant/releases/tag/$TAG"
 
 # ── Reinstalação local em modo teste ──────────────────────────────────────────
 if (( SKIP_INSTALL )); then
@@ -242,4 +271,8 @@ else
     ok "Instalação local atualizada."
 fi
 
-info "Release $VERSION concluído. Assets em $DIST/"
+if (( LOCAL_ONLY )); then
+    info "Versão local $VERSION atualizada. Assets em $DIST/"
+else
+    info "Release $VERSION concluído. Assets em $DIST/"
+fi

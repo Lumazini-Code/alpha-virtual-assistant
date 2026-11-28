@@ -52,10 +52,12 @@ Tools MCP expostas:
     pergunta. Via orchestrator (POST /skills/create).
   - `skill_list()` → catálogo de TODAS as skills (CLI do projeto, globais e
     criadas pelo agente) com nome, descrição, origem e status de índice.
-  - `html_preview(path, title?, description?)` → publica na aba Preview da
-    WebUI um HTML já gravado em disco (path dentro do cwd da sessão). O
-    Manager valida e serve o arquivo + assets irmãos; o preview recarrega
-    quando o arquivo muda. Não copia o HTML para o histórico do LLM.
+  - `artifact_preview(path, title?, description?, kind?)` → publica na aba
+    Artefatos da WebUI um arquivo já gravado em disco (path dentro do cwd da
+    sessão): HTML, PDF, imagem, modelo 3D (glb/gltf/stl/obj), documento
+    (md/txt/json/csv/yaml/xml) ou mídia. O Manager valida e serve o arquivo +
+    assets irmãos; o preview recarrega quando o arquivo muda. Não copia o
+    conteúdo para o histórico do LLM. `html_preview` continua como alias.
   - `host_read_file`, `host_list_dir`, `host_glob`, `host_grep`,
     `host_write_file`, `host_edit`, `host_shell`
     → leitura, escrita, edição, busca e execução de shell NO HOST (via
@@ -1281,34 +1283,90 @@ async def memory_identity_edit(
     return f"Card de identidade atualizado: {_format_identity(c)}"
 
 
-@mcp.tool()
-async def html_preview(path: str, title: str = "", description: str = "") -> str:
-    """Publica na aba Preview da WebUI um arquivo HTML já gravado em disco.
-    Use SEMPRE depois de escrever/atualizar um HTML com as tools de arquivo:
-    o preview lê o arquivo do disco e atualiza sozinho quando ele muda.
+# Renderizadores da aba Artefatos. Manter em sincronia com `artifact_kind()`
+# de Manager/src/preview.rs (o Manager é quem valida e serve o arquivo).
+_ARTIFACT_EXTENSIONS: dict[str, str] = {}
+for _kind, _exts in {
+    "html": ("html", "htm"),
+    "pdf": ("pdf",),
+    "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico"),
+    "model": ("glb", "gltf", "stl", "obj"),
+    "document": (
+        "md", "markdown", "txt", "text", "json", "jsonl", "csv", "tsv",
+        "yaml", "yml", "xml", "log", "rst",
+    ),
+    "media": ("mp4", "webm", "ogv", "mov", "mp3", "wav", "ogg", "m4a", "flac"),
+    "code": (
+        "py", "js", "mjs", "ts", "tsx", "jsx", "css", "rs", "go", "java",
+        "c", "cpp", "h", "hpp", "sql", "sh", "ps1", "toml", "ini",
+    ),
+}.items():
+    for _ext in _exts:
+        _ARTIFACT_EXTENSIONS[_ext] = _kind
 
-    `path` é o caminho do HTML no cwd da sessão (relativo ou absoluto DENTRO
-    do cwd) — o Manager valida e serve o arquivo, sem copiar o conteúdo para
-    o histórico do LLM. `title` é o nome mostrado na lista da sessão (vazio
-    usa o nome do arquivo). Assets irmãos (CSS/JS/imagens) são servidos
-    automaticamente; use caminhos relativos a partir do HTML.
 
-    Retorne ao usuário que a página está na aba Preview. NÃO cole o HTML no
-    chat como resposta final."""
+def _artifact_kind_for_path(path: str) -> str | None:
+    ext = Path(str(path or "")).suffix.lstrip(".").lower()
+    return _ARTIFACT_EXTENSIONS.get(ext)
+
+
+def _artifact_payload(path: str, title: str, description: str,
+                      kind: str | None = None) -> str:
+    """Monta o marcador JSON que o orchestrator repassa como evento de UI."""
     raw_path = str(path or "").strip()
     if not raw_path:
         return "Erro: `path` vazio."
-    clean_title = str(title or "").strip()
-    if not clean_title:
-        clean_title = Path(raw_path).stem or "Preview"
+    detected = _artifact_kind_for_path(raw_path)
+    if detected is None:
+        return (
+            "Erro: extensão não suportada no preview. Use html/pdf/imagem/"
+            "modelo 3D (glb, gltf, stl, obj)/documento/mídia/código."
+        )
+    clean_kind = str(kind or "").strip().lower() or detected
+    clean_title = str(title or "").strip() or Path(raw_path).stem or "Artefato"
     payload = {
-        "kind": "ava_html_preview",
+        "kind": "ava_artifact_preview",
+        "artifact_kind": clean_kind,
         "path": raw_path,
         "title": clean_title,
         "description": str(description or "").strip(),
     }
-    log.info(f"[html_preview] publicado para a WebUI: {raw_path!r} ({clean_title!r})")
+    log.info(f"[artifact_preview] publicado para a WebUI: {raw_path!r} "
+             f"({clean_kind!r}, {clean_title!r})")
     return json.dumps(payload, ensure_ascii=False)
+
+
+@mcp.tool()
+async def artifact_preview(path: str, title: str = "", description: str = "",
+                           kind: str = "") -> str:
+    """Publica na aba Artefatos da WebUI um arquivo já gravado em disco.
+    Use SEMPRE depois de escrever/atualizar o arquivo com as tools de
+    arquivo: o preview lê do disco e recarrega sozinho quando ele muda.
+
+    Formatos aceitos (o renderizador é inferido da extensão):
+      - HTML/HTM: página interativa, com CSS/JS/imagens irmãos;
+      - PDF: visualizador nativo do navegador;
+      - Imagens: png/jpg/gif/webp/svg/bmp/avif/ico;
+      - Modelos 3D: glb/gltf (com texturas irmãs), stl e obj — girar com
+        o mouse, zoom com a roda, botão de reset no canto;
+      - Documentos: md/txt/json/csv/yaml/xml/log (markdown renderizado);
+      - Mídia: mp4/webm/mov/ogv e mp3/wav/ogg/m4a/flac;
+      - Código: py/js/ts/css/rs/go/sql/sh/etc. em visualização de texto.
+
+    `path` é relativo ao cwd da sessão (ou absoluto DENTRO dele) — o Manager
+    valida e serve o arquivo sem copiar o conteúdo para o histórico do LLM.
+    `title`/`description` aparecem na lista; `kind` pode forçar o
+    renderizador quando a extensão é ambígua. Retorne ao usuário que o
+    artefato está na aba Artefatos; NÃO cole o conteúdo no chat."""
+    return _artifact_payload(path, title, description, kind)
+
+
+@mcp.tool()
+async def html_preview(path: str, title: str = "", description: str = "") -> str:
+    """Alias compatível de `artifact_preview` para páginas HTML.
+    Publica na aba Artefatos da WebUI um HTML já gravado em disco; use a
+    nova `artifact_preview` para qualquer outro tipo de arquivo."""
+    return _artifact_payload(path, title, description)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

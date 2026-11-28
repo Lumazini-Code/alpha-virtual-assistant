@@ -371,7 +371,7 @@ TOOL_REGISTRY_ENABLED = os.getenv("AVA_TOOL_REGISTRY", "1").strip().lower() in (
 CODEMODE_ENABLED = os.getenv("AVA_CODEMODE", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "30000")))
+CODEMODE_TIMEOUT_MS = max(1_000, int(os.getenv("AVA_CODEMODE_TIMEOUT_MS", "180000")))
 # 0 = sem limite de chamadas dentro de um mesmo `execute`. O timeout por
 # execução (CODEMODE_TIMEOUT_MS) continua sendo o guarda-corpo.
 CODEMODE_MAX_TOOL_CALLS = max(0, int(os.getenv("AVA_CODEMODE_MAX_TOOL_CALLS", "0")))
@@ -4206,14 +4206,46 @@ def _tool_message_content(res: Any, *, success: bool, err: Optional[str]) -> Any
     return _result_to_text(res) if success else (err or "ERROR: tool failed")
 
 
-def _preview_from_tool(tool_name: str, output: Any) -> Optional[dict[str, Any]]:
-    """Extrai o marcador de preview publicado pela tool html_preview.
+# Renderizadores reconhecidos pela WebUI (ver Manager/src/preview.rs).
+_ARTIFACT_KINDS = frozenset(
+    {"html", "pdf", "image", "model", "document", "media", "code"}
+)
+_ARTIFACT_EXTENSIONS = {
+    "html": "html", "htm": "html",
+    "pdf": "pdf",
+    "png": "image", "jpg": "image", "jpeg": "image", "gif": "image",
+    "webp": "image", "svg": "image", "bmp": "image", "avif": "image",
+    "ico": "image",
+    "glb": "model", "gltf": "model", "stl": "model", "obj": "model",
+    "md": "document", "markdown": "document", "txt": "document",
+    "text": "document", "json": "document", "jsonl": "document",
+    "csv": "document", "tsv": "document", "yaml": "document",
+    "yml": "document", "xml": "document", "log": "document", "rst": "document",
+    "mp4": "media", "webm": "media", "ogv": "media", "mov": "media",
+    "mp3": "media", "wav": "media", "ogg": "media", "m4a": "media",
+    "flac": "media",
+    "py": "code", "js": "code", "mjs": "code", "ts": "code", "tsx": "code",
+    "jsx": "code", "css": "code", "rs": "code", "go": "code", "java": "code",
+    "c": "code", "cpp": "code", "h": "code", "hpp": "code", "sql": "code",
+    "sh": "code", "ps1": "code", "toml": "code", "ini": "code",
+}
 
-    A tool NÃO lê o arquivo: devolve só `{kind, path, title, description}`.
-    O caminho é resolvido e servido pelo Manager no host (mesma regra de cwd
-    dos MCPs), nunca pelo orchestrator/container.
+
+def _artifact_kind_from_path(path: str) -> Optional[str]:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return _ARTIFACT_EXTENSIONS.get(ext)
+
+
+def _preview_from_tool(tool_name: str, output: Any) -> Optional[dict[str, Any]]:
+    """Extrai o marcador publicado por `artifact_preview` (ou o legado
+    `html_preview`) e normaliza para o evento único `preview`.
+
+    A tool NÃO lê o arquivo: devolve só `{kind, artifact_kind, path, title,
+    description}`. O caminho é resolvido e servido pelo Manager no host
+    (mesma regra de cwd dos MCPs), nunca pelo orchestrator/container.
     """
-    if not str(tool_name or "").lower().endswith("__html_preview"):
+    name = str(tool_name or "").lower()
+    if not (name.endswith("__artifact_preview") or name.endswith("__html_preview")):
         return None
     data: Any = output
     if isinstance(data, str):
@@ -4221,18 +4253,26 @@ def _preview_from_tool(tool_name: str, output: Any) -> Optional[dict[str, Any]]:
             data = json.loads(data.strip())
         except Exception:
             return None
-    if not isinstance(data, dict) or data.get("kind") != "ava_html_preview":
+    if not isinstance(data, dict) or data.get("kind") not in (
+        "ava_artifact_preview", "ava_html_preview"
+    ):
         return None
     path = str(data.get("path") or "").strip()
     if not path:
         return None
+    kind = str(data.get("artifact_kind") or "").strip().lower()
+    if kind not in _ARTIFACT_KINDS:
+        kind = _artifact_kind_from_path(path) or (
+            "html" if data.get("kind") == "ava_html_preview" else "document"
+        )
     fallback_title = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     if "." in fallback_title:
         fallback_title = fallback_title.rsplit(".", 1)[0]
     return {
-        "kind": "ava_html_preview",
+        "kind": "ava_artifact_preview",
+        "artifact_kind": kind,
         "path": path,
-        "title": str(data.get("title") or fallback_title or "Preview"),
+        "title": str(data.get("title") or fallback_title or "Artefato"),
         "description": str(data.get("description") or ""),
     }
 
@@ -4269,7 +4309,7 @@ def _build_tool_snapshot(
         async def execute(args: dict[str, Any], _ctx: ToolContext, _name: str = name):
             return await asyncio.wait_for(
                 TOOLS[_name]["executor"](args, req, sid),
-                timeout=EXECUTOR_TIMEOUTS.get(_name, 60.0),
+                timeout=EXECUTOR_TIMEOUTS.get(_name, 180.0),
             )
 
         registry.register(
@@ -5768,6 +5808,13 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
     # Teto TOTAL de tools por rodada (nativas contam): sempre-on → grafo →
     # resto. Truncar aqui é o que impede o schema de crescer sem limite.
     _mcp_budget = max(0, MCP_MAX_TOOLS_PER_TURN - len(native_tools_schema))
+    # Code Mode não envia os schemas MCP ao modelo — só um catálogo compacto,
+    # renderizado com até 80 entradas. O teto de 40 schemas foi dimensionado
+    # para o modo sem Code Mode; aplicá-lo aqui esconderia tools que o modelo
+    # só pode descobrir via search() no catálogo (ex.: create_primitive/export_object
+    # de um servidor com muitas tools quando o turno não casou semanticamente).
+    if CODEMODE_ENABLED:
+        _mcp_budget = max(_mcp_budget, 80)
     mcp_schema, mcp_dispatch, mcp_tip_name_map = _cap_mcp_tools(
         mcp_schema, mcp_dispatch, mcp_tip_name_map, _mcp_budget
     )
@@ -6399,7 +6446,7 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                     if kind == "native":
                         result = await asyncio.wait_for(
                             TOOLS[tool_name]["executor"](args, req, sid),
-                            timeout=EXECUTOR_TIMEOUTS.get(tool_name, 60.0),
+                            timeout=EXECUTOR_TIMEOUTS.get(tool_name, 180.0),
                         )
                         # use_skill bem-sucedida → aprendizado do grafo (mesmo
                         # registro das MCP tools). Resultado de erro (string
@@ -6451,9 +6498,9 @@ async def _run_tool_loop_unlocked(req: ExecuteRequest, eid: str, sid: str,
                 _metric_inc("tool_failures_by_category", category)
             lat = round((time.perf_counter() - t0) * 1000, 2)
 
-            # Preview de HTML: evento próprio para a WebUI. No Code Mode as
-            # chamadas MCP acontecem dentro de `execute` e são repassadas pelo
-            # callback de make_execute_spec; aqui cobre a chamada MCP direta.
+            # Preview de artefato: evento próprio para a WebUI. No Code Mode
+            # as chamadas MCP acontecem dentro de `execute` e são repassadas
+            # pelo callback de make_execute_spec; aqui cobre a chamada direta.
             if success and tool_name != "execute":
                 preview = _preview_from_tool(tool_name, result)
                 if preview and on_event:
@@ -6796,8 +6843,8 @@ async def _execute_stream_generator(req: ExecuteRequest):
                 await _mirror_conversation(CONVERSATION_HUB, "result", result_text)
                 yield _sse("result", result_text)
         elif name == "preview":
-            # Tool html_preview publicou um arquivo HTML (já gravado em disco).
-            # A WebUI registra o caminho no Manager e abre a aba Preview.
+            # Tool artifact_preview publicou um arquivo (já gravado em disco).
+            # A WebUI registra o caminho no Manager e abre a aba Artefatos.
             yield _sse("preview", data)
         elif name == "skill_loaded":
             # Skills selecionadas para ESTE turno — a TUI/web UI mostra qual

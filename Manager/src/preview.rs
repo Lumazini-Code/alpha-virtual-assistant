@@ -12,18 +12,20 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! Preview de arquivos HTML do usuário.
+//! Preview de ARTEFATOS do usuário (HTML, PDF, imagens, modelos 3D,
+//! documentos e mídia).
 //!
-//! O modelo grava o HTML em disco com as mesmas tools de arquivo dos MCPs
-//! (cwd da sessão). A tool `html_preview` só devolve `{path,title}`; o
+//! O modelo grava o arquivo em disco com as mesmas tools de arquivo dos MCPs
+//! (cwd da sessão). A tool `artifact_preview` só devolve `{path,title}`; o
 //! orchestrator repassa o evento para a WebUI, que registra o caminho AQUI.
 //! O Manager — processo do HOST — valida o cwd exatamente como
-//! `mcp_server::resolve_call_cwd` e serve o HTML + assets irmãos direto do
-//! disco. Nada de copiar o conteúdo para o histórico do LLM.
+//! `mcp_server::resolve_call_cwd` e serve o artefato + assets irmãos direto
+//! do disco. Nada de copiar o conteúdo para o histórico do LLM.
 //!
-//! Registro é POR SESSÃO (memória do tray): a lista da aba Preview mostra
-//! apenas os HTMLs publicados naquela conversa. Os arquivos em si ficam no
-//! disco do usuário.
+//! Registro é POR SESSÃO (memória do tray): a lista da aba Artefatos mostra
+//! apenas os arquivos publicados naquela conversa. Os arquivos em si ficam no
+//! disco do usuário. O `kind` (html/pdf/image/model/document/media/code) é
+//! inferido da extensão e devolvido à WebUI para escolher o renderizador.
 
 use axum::{
     body::Body,
@@ -51,8 +53,10 @@ struct PreviewEntry {
     /// CWD usado no registro: revalidar depois de trocar de pasta continua
     /// funcionando (o Manager já guardou o root, mas a WebUI reenvia o cwd).
     cwd: PathBuf,
-    /// Pasta do HTML: assets irmãos são servidos a partir daqui.
+    /// Pasta do artefato: assets irmãos são servidos a partir daqui.
     root: PathBuf,
+    /// Tipo de renderização escolhido pela WebUI (ver `artifact_kind`).
+    kind: String,
     title: String,
     description: String,
     created_ms: u64,
@@ -84,6 +88,9 @@ pub struct RegisterRequest {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// Override opcional do renderizador (ex.: forçar `document` num `.txt`).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -91,6 +98,7 @@ struct PreviewSummary {
     id: String,
     title: String,
     description: String,
+    kind: String,
     path: String,
     cwd: String,
     url: String,
@@ -148,10 +156,16 @@ pub async fn register(
             )
         }
     };
-    if !canonical.starts_with(&cwd) {
+    // Cada chat tem um cwd por projeto, mas o modelo pode escrever artefatos
+    // em qualquer lugar do home (ex.: ~/modelos-3d, ~/Downloads). Exigir só
+    // o cwd fazia o registro falhar com 403 quando a mesma tool era chamada
+    // de outro chat/projeto. O home é o limite externo; a allowlist de
+    // extensões e o sandbox dos assets irmãos continuam valendo.
+    let home = crate::api::host_home_dir();
+    if !canonical.starts_with(&cwd) && !canonical.starts_with(&home) {
         return err(
             StatusCode::FORBIDDEN,
-            "o HTML precisa estar dentro do cwd da sessão",
+            "o artefato precisa estar dentro do cwd da sessão ou do home do usuário",
         );
     }
     if !canonical.is_file() {
@@ -162,12 +176,24 @@ pub async fn register(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if ext != "html" && ext != "htm" {
-        return err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "o preview aceita apenas arquivos .html/.htm",
-        );
-    }
+    let detected_kind = match artifact_kind(&ext) {
+        Some(kind) => kind,
+        None => {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "extensão não suportada; use html/pdf/imagem/modelo 3D/documento/mídia",
+            )
+        }
+    };
+    // O override só troca o renderizador — a extensão continua precisando
+    // estar na allowlist (evita servir arquivos arbitrários do cwd).
+    let kind = req
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && is_artifact_kind(k))
+        .unwrap_or(detected_kind)
+        .to_string();
 
     let default_title = canonical
         .file_stem()
@@ -196,6 +222,7 @@ pub async fn register(
     if let Some(entry) = list.iter_mut().find(|e| e.path == canonical) {
         entry.title = title;
         entry.description = req.description.trim().to_string();
+        entry.kind = kind;
         return Json(summary(entry)).into_response();
     }
 
@@ -208,6 +235,7 @@ pub async fn register(
         path: canonical,
         root,
         cwd,
+        kind,
         title,
         description: req.description.trim().to_string(),
         created_ms: now_ms(),
@@ -216,7 +244,7 @@ pub async fn register(
     Json(summary(&entry)).into_response()
 }
 
-/// GET /preview/{session} — lista os HTMLs publicados naquela sessão.
+/// GET /preview/{session} — lista os artefatos publicados naquela sessão.
 pub async fn list(
     Extension(store): Extension<PreviewState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -248,7 +276,7 @@ pub async fn clear_session(
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// GET /preview/{session}/{id}/ — serve o HTML registrado.
+/// GET /preview/{session}/{id}/ — serve o artefato registrado.
 pub async fn get_document(
     Extension(store): Extension<PreviewState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -263,7 +291,7 @@ pub async fn get_document(
     serve_file(&entry, "").await
 }
 
-/// GET /preview/{session}/{id}/{*path} — serve assets irmãos do HTML.
+/// GET /preview/{session}/{id}/{*path} — serve assets irmãos do artefato.
 pub async fn get_asset(
     Extension(store): Extension<PreviewState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -302,6 +330,34 @@ pub async fn get_stat(
 // ════════════════════════════════════════════════════════════════════════
 // Helpers
 // ════════════════════════════════════════════════════════════════════════
+
+/// Extensões aceitas e o renderizador correspondente na WebUI. Manter em
+/// sincronia com `_artifact_kind_for_path()` do alpha-mcp (o Manager manda).
+fn artifact_kind(ext: &str) -> Option<&'static str> {
+    match ext {
+        "html" | "htm" => Some("html"),
+        "pdf" => Some("pdf"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "avif" | "ico" => {
+            Some("image")
+        }
+        "glb" | "gltf" | "stl" | "obj" => Some("model"),
+        "md" | "markdown" | "txt" | "text" | "json" | "jsonl" | "csv" | "tsv" | "yaml"
+        | "yml" | "xml" | "log" | "rst" => Some("document"),
+        "mp4" | "webm" | "ogv" | "mov" | "mp3" | "wav" | "ogg" | "m4a" | "flac" => {
+            Some("media")
+        }
+        "py" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "css" | "rs" | "go" | "java" | "c"
+        | "cpp" | "h" | "hpp" | "sql" | "sh" | "ps1" | "toml" | "ini" => Some("code"),
+        _ => None,
+    }
+}
+
+fn is_artifact_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "html" | "pdf" | "image" | "model" | "document" | "media" | "code"
+    )
+}
 
 fn valid_session(session: &str) -> bool {
     !session.is_empty()
@@ -348,6 +404,7 @@ fn summary(entry: &PreviewEntry) -> PreviewSummary {
         id: entry.id.clone(),
         title: entry.title.clone(),
         description: entry.description.clone(),
+        kind: entry.kind.clone(),
         path: entry.path.to_string_lossy().into_owned(),
         cwd: entry.cwd.to_string_lossy().into_owned(),
         // URL same-origin do Manager. O iframe usa caminho relativo na WebUI.
@@ -391,14 +448,16 @@ async fn serve_file(entry: &PreviewEntry, asset: &str) -> Response {
         Err(_) => return err(StatusCode::NOT_FOUND, "arquivo não encontrado"),
     };
     let content_type = content_type_for(&canonical);
-    let is_html = matches!(
+    // SVG e XML também podem executar script num documento de topo: recebem
+    // o mesmo sandbox de origem opaca do HTML.
+    let sandboxed = matches!(
         canonical
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase()
             .as_str(),
-        "html" | "htm"
+        "html" | "htm" | "svg" | "xml"
     );
     let mut response = Response::new(Body::from(bytes));
     if let Ok(value) = HeaderValue::from_str(content_type) {
@@ -419,7 +478,7 @@ async fn serve_file(entry: &PreviewEntry, asset: &str) -> Response {
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
     );
-    if is_html {
+    if sandboxed {
         // Sandbox também no acesso direto (abrir em nova janela): scripts
         // rodam, mas o documento fica em origem opaca e não alcança a API
         // interna da WebUI. Assets irmãos continuam carregando por markup.
@@ -445,21 +504,43 @@ fn content_type_for(path: &Path) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "json" | "map" => "application/json; charset=utf-8",
+        "jsonl" => "application/x-ndjson; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "yaml" | "yml" => "text/yaml; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "avif" => "image/avif",
+        "bmp" => "image/bmp",
         "ico" => "image/x-icon",
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
+        "stl" => "model/stl",
+        // OBJLoader lê texto; text/plain evita downloads e mantém o CORS simples.
+        "obj" => "text/plain; charset=utf-8",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "wasm" => "application/wasm",
-        "txt" => "text/plain; charset=utf-8",
+        "txt" | "text" | "log" | "rst" | "py" | "ts" | "tsx" | "jsx" | "rs" | "go"
+        | "java" | "c" | "cpp" | "h" | "hpp" | "sql" | "sh" | "ps1" | "toml" | "ini" => {
+            "text/plain; charset=utf-8"
+        }
         "mp4" => "video/mp4",
         "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
@@ -482,4 +563,32 @@ fn system_time_ms(time: SystemTime) -> u64 {
 
 fn err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{artifact_kind, is_artifact_kind};
+
+    #[test]
+    fn known_extensions_map_to_renderers() {
+        for (ext, expected) in [
+            ("html", "html"), ("htm", "html"), ("pdf", "pdf"),
+            ("png", "image"), ("svg", "image"), ("webp", "image"),
+            ("glb", "model"), ("gltf", "model"), ("stl", "model"), ("obj", "model"),
+            ("md", "document"), ("json", "document"), ("csv", "document"),
+            ("mp4", "media"), ("mp3", "media"), ("py", "code"), ("rs", "code"),
+        ] {
+            assert_eq!(artifact_kind(ext), Some(expected), ".{ext}");
+            assert!(is_artifact_kind(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_extensions_are_rejected() {
+        for ext in ["exe", "env", "dll", "pdfx", ""] {
+            assert_eq!(artifact_kind(ext), None, ".{ext}");
+        }
+        assert!(!is_artifact_kind("execute"));
+        assert!(!is_artifact_kind(""));
+    }
 }

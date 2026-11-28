@@ -1,6 +1,6 @@
 ---
 name: frontend-design
-description: Build a frontend with a deliberate visual direction held through palette, typography, structure, and texture, with on-screen strings that name real information rather than fabricated demo data or filler labels. Use when building or restyling a frontend, a standalone HTML page, a dashboard, a web app, or a visualização de projeto no Alpha AI — and publish it to the WebUI Preview tab with html_preview.
+description: Build a frontend with a deliberate visual direction held through palette, typography, structure, and texture, with on-screen strings that name real information rather than fabricated demo data or filler labels. Use when building or restyling a frontend, a standalone HTML page, a dashboard, a web app, or a visualização de projeto no Alpha AI — and publish it to the WebUI Artefatos tab with artifact_preview.
 ---
 
 # Frontend Design Skill
@@ -13,7 +13,7 @@ Eight anchors. Each is a distinct aesthetic territory locked to specific CSS tok
 
 ## 0. Delivery in Alpha AI (mandatory)
 
-This skill runs inside Alpha AI. The deliverable is a **real HTML file on disk**, published into the WebUI **Preview** tab. Never answer with the full HTML pasted into the chat unless the user explicitly asks for the code.
+This skill runs inside Alpha AI. The deliverable is a **real HTML file on disk**, published into the WebUI **Artefatos** tab with `artifact_preview` (HTML, PDF, images, 3D models and documents are all supported there). Never answer with the full HTML pasted into the chat unless the user explicitly asks for the code.
 
 1. **Write the file** in the session cwd using the available file-writing MCP tool (`write_file`, filesystem MCP, etc.):
    - prefer a dedicated folder: `preview/<slug>/index.html`;
@@ -22,7 +22,7 @@ This skill runs inside Alpha AI. The deliverable is a **real HTML file on disk**
 2. **Assets stay next to the HTML.** For CSS, JS, SVGs, fonts or images, write them in the same folder and reference them with relative paths. Sibling assets are served automatically.
 3. **Publish it** after writing or updating:
    ```text
-   alpha-mcp__html_preview({
+   alpha-mcp__artifact_preview({
      path: "preview/<slug>/index.html",
      title: "Human title for this page",
      description: "One line about what the page shows"
@@ -30,13 +30,13 @@ This skill runs inside Alpha AI. The deliverable is a **real HTML file on disk**
    ```
    In Code Mode:
    ```js
-   return await tools["alpha-mcp__html_preview"]({
+   return await tools["alpha-mcp__artifact_preview"]({
      path: "preview/<slug>/index.html",
      title: "Human title for this page",
      description: "One line about what the page shows"
    });
    ```
-4. **Updating:** overwrite the same file and call `html_preview` again if the title/description changed. The Preview tab reloads automatically when the file's mtime/size changes, and always reloads when the user returns from Chat or Grafo to Preview.
+4. **Updating:** overwrite the same file and call `artifact_preview` again if the title/description changed. The Artefatos tab reloads automatically when the file's mtime/size changes, and always reloads when the user returns from Chat or Grafo to Artefatos.
 5. **Security and offline behavior:** the preview runs sandboxed. Scripts, CSS, inline SVG, `<img>`, `<script src>` and `<link>` to sibling files work. `fetch`/XHR to AVA APIs does not. Embed the data in the file or in a sibling JSON loaded by a classic `<script>`.
 6. **Self-contained first:** inline CSS/JS when the page is small; use sibling assets when the app grows. No build step, no dev server, no `file://`.
 7. **Finish the turn** with the stated direction (anchor + differentiator) and a short summary of the file and what changed — not the code.
@@ -131,7 +131,7 @@ Each anchor locks specific CSS tokens. Picking the anchor commits to those token
 
 Every implementation delivers:
 
-- **A real file** — the page lives in the session cwd and was published with `html_preview`; the Preview tab opens from disk.
+- **A real file** — the page lives in the session cwd and was published with `artifact_preview`; the Artefatos tab opens from disk.
 - **Stated direction** — A short preamble in a designer's prose before the code, naming: the chosen anchor, why this pairing over the safe one, the differentiator, and the key palette / typefaces / texture choices pulled from the anchor. Written with conviction, not as a checklist.
 - **Token fidelity** — The rendered CSS matches the anchor's tokens exactly. If Swiss is chosen, the CSS contains no warm paper, no Fraunces, no grain. If Industrial is chosen, every typeface declared is monospace. Token drift means the anchor didn't hold.
 - **Content discipline** — Every string, number, and label on screen names real information or is authored content that knows what it is. No fabricated data, no filler labels, no themed replacement for standard UI copy, no unicode-glyph icons. Token fidelity alone is not sufficient; content ships too.
@@ -141,7 +141,7 @@ Every implementation delivers:
 
 ## 5. Before shipping
 
-- **File published** — Is the HTML in the session cwd and did `html_preview` run? Does the Preview tab show the latest file?
+- **File published** — Is the HTML in the session cwd and did `artifact_preview` run? Does the Artefatos tab show the latest file?
 - **Unexpected pairing** — Did the choice reach for creative tension, or default to the safe pairing?
 - **Token fidelity** — Does every rendered token live inside the anchor's allowed range? If tokens appear that the anchor doesn't allow, the anchor didn't hold.
 - **Content discipline** — Every label names real information; standard UI copy for standard actions; no fabrication, filler mono-caps, `//` kickers, unicode-glyph icons, twee subcopy, or AI-slop register. If any appeared, cut.

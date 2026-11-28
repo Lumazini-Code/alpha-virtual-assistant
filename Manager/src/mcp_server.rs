@@ -89,7 +89,7 @@ use tracing::{debug, info, warn};
 // pendurar o handler nem travar a connect_lock.
 const SYNC_TIMEOUT: f64 = 90.0;
 const REGISTER_TIMEOUT: f64 = 180.0; // batch register na memory: cada tool é embedada
-const DEFAULT_CALL_TIMEOUT: f64 = 120.0;
+const DEFAULT_CALL_TIMEOUT: f64 = 180.0;
 
 // Nome de servidor: sem "__" (é o separador do graph_name) e sem pontos.
 static SERVER_NAME_RE: LazyLock<Regex> =

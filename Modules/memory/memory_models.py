@@ -308,7 +308,8 @@ class TriageStatsResponse(BaseModel):
     gold_candidates_total: int = 0
     readiness: TriageReadiness
     flags: dict[str, object] = {}
-    counters: dict[str, int] = {}
+    # `triage_recall_gap` é uma razão (float); os demais contadores são ints.
+    counters: dict[str, int | float] = {}
 
 class BlockGuideRequest(BaseModel):
     guide:  str

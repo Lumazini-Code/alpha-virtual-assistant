@@ -23,11 +23,15 @@
 #   3. Extrai em ~/.local/opt/alpha-ai (override: ALPHA_INSTALL_DIR ou --install-dir)
 #   3b. Agent Skills: npx skills add heygen-com/hyperframes → .agents/skills
 #       (gitignored; flags -a universal -y; falha = aviso, não morte)
-#   3c. OfficeCLI: npm install -g @officecli/officecli + skill
-#       officecli.ai/SKILL.md → .agents/skills/officecli (falha = aviso)
+#   3c. OfficeCLI: binário nativo via d.officecli.ai/install.sh (fallback:
+#       npm -g @officecli/officecli) + skill officecli.ai/SKILL.md →
+#       .agents/skills/officecli (falha = aviso; opt-out AVA_OFFICECLI=0)
 #   3d. Boardview MCP: venv .venv-boardview + mcp_servers/boardview (mcp + pillow)
 #       e skills próprias da Alpha (skills/) → .agents/skills (falha = aviso)
 #   3e. CadQuery MCP: venv .venv-cadquery + mcp_servers/3d_modeling (CAD/3D)
+#   3f. MCPs em Docker: scripts/setup-docker-mcps.sh builda imagens enxutas de
+#       boardview/cadquery e registra como HTTP (padrão; --skip-docker-mcps
+#       desliga e mantém o registro stdio dos venvs)
 #   4. Extrai Modules/Models.zip em Modules/Models (e apaga o zip, salvo --keep-models-zip)
 #   5. Deixa o Modules/.env sem provedor de IA: o cadastro (catálogo models.dev)
 #      acontece na primeira execução da WebUI e grava LLM_* em Modules/.env
@@ -65,6 +69,7 @@ fi
 KEEP_MODELS_ZIP=0
 SKIP_BUILD=0
 NO_LAUNCH=0
+SKIP_DOCKER_MCPS=0
 INSTALL_DIR="${ALPHA_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 
 usage() {
@@ -74,6 +79,8 @@ Uso: install.sh [opções]
   --install-dir DIR   Pasta de instalação (padrão: $DEFAULT_INSTALL_DIR)
   --keep-models-zip   Não apaga Modules/Models.zip após extrair
   --skip-build        Pula o build/up do Docker (útil para reinstalar)
+  --skip-docker-mcps  Não builda/registra boardview e cadquery em Docker
+                      (mantém o registro stdio dos venvs do host)
   --no-launch         Não abre o WebUI ao final
   -h, --help          Esta ajuda
 
@@ -92,6 +99,7 @@ while [ $# -gt 0 ]; do
     --install-dir)   INSTALL_DIR="$2"; shift 2 ;;
     --keep-models-zip) KEEP_MODELS_ZIP=1; shift ;;
     --skip-build)    SKIP_BUILD=1; shift ;;
+    --skip-docker-mcps) SKIP_DOCKER_MCPS=1; shift ;;
     --no-launch)     NO_LAUNCH=1; shift ;;
     -h|--help)       usage ;;
     *) echo "Opção desconhecida: $1"; usage ;;
@@ -394,41 +402,87 @@ else
   warn "npx ausente no host — pulei as Agent Skills (rode: npx skills add heygen-com/hyperframes)."
 fi
 
-# ── 3c. OfficeCLI (binário npm -g + skill SKILL.md) ───────────────────────────
-# `officecli` = leitura/edição de .docx/.xlsx/.pptx (o binário nativo vem no
-# postinstall do pacote). npm -g com prefix do usuário (nvm) não pede root;
-# com node de apt/pacman o prefix não é escrevível → as_root. A SKILL.md do
-# site oficial vai direto para o store canônico .agents/skills/officecli/
+# ── 3c. OfficeCLI (binário nativo + skill SKILL.md) ───────────────────────────
+# `officecli` = leitura/edição de .docx/.xlsx/.pptx via DOM, com servidor MCP
+# embutido (`officecli mcp`). O binário é NATIVO e não vem do npm: o pacote
+# @officecli/officecli é só um shim que baixa o binário no postinstall (e de
+# novo, lazy, no primeiro uso). Por isso o instalador oficial é o caminho
+# primário — ele resolve a tag imutável, confere o SHA256 e instala em
+# ~/.local/bin (adicionando essa pasta ao PATH do shell rc). O npm -g fica como
+# fallback quando o download do instalador oficial falha.
+# A SKILL.md do site oficial vai para o store canônico .agents/skills/officecli/
 # (gitignored; o mount ro entrega ao container e o scanner do orchestrator
 # descobre na próxima pergunta, sem restart). Download em arquivo temporário +
-# mv — SKILL.md truncado por rede não entra no índice. Falha é AVISO, não
-# morte — o sistema sobe sem o OfficeCLI/skill.
-OFFICE_FAIL=0
-if command -v npm >/dev/null 2>&1; then
-  info "OfficeCLI: npm install -g @officecli/officecli ..."
-  GPREFIX="$(npm prefix -g 2>/dev/null || echo /usr/lib)"
-  if [ -w "$GPREFIX" ]; then
-    npm install -g @officecli/officecli || OFFICE_FAIL=1
-  else
-    as_root npm install -g @officecli/officecli || OFFICE_FAIL=1
-  fi
-else
-  warn "npm ausente no host — pulei o OfficeCLI (rode: npm install -g @officecli/officecli)."
+# mv — SKILL.md truncado por rede não entra no índice.
+# Falha é AVISO, não morte — o sistema sobe sem o OfficeCLI/skill.
+# Opt-out: AVA_OFFICECLI=0
+OFFICE_OK=0
+OFFICE_SKIP=0
+# O instalador oficial grava em ~/.local/bin, que pode não estar no PATH de um
+# shell novo (ele só edita o rc). Procurar lá também evita rebaixar o binário a
+# cada re-execução do instalador.
+if [ -x "$HOME/.local/bin/officecli" ]; then
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+  esac
 fi
-if [ "$OFFICE_FAIL" -eq 0 ] && command -v npm >/dev/null 2>&1; then
-  ok "OfficeCLI instalado ($(command -v officecli 2>/dev/null || echo 'via npm -g'))."
-elif [ "$OFFICE_FAIL" -ne 0 ]; then
-  warn "npm install -g @officecli/officecli falhou — o sistema sobe sem o OfficeCLI."
-  warn "Para instalar depois: npm install -g @officecli/officecli"
+if [ "${AVA_OFFICECLI:-1}" = "0" ]; then
+  info "OfficeCLI: pulado (AVA_OFFICECLI=0)."
+  OFFICE_SKIP=1
+elif command -v officecli >/dev/null 2>&1 && officecli --version >/dev/null 2>&1; then
+  ok "OfficeCLI já instalado ($(officecli --version 2>/dev/null | head -1))."
+  OFFICE_OK=1
+else
+  info "OfficeCLI: instalando binário nativo (d.officecli.ai/install.sh)..."
+  _OCLI_SH="$(mktemp -t officecli-install-XXXXXX.sh)"
+  if curl -fsSL --max-time 300 --connect-timeout 10 \
+       https://d.officecli.ai/install.sh -o "$_OCLI_SH" 2>/dev/null \
+     && bash "$_OCLI_SH"; then
+    OFFICE_OK=1
+  else
+    warn "Instalador oficial do OfficeCLI falhou — tentando npm -g como fallback."
+    if command -v npm >/dev/null 2>&1; then
+      GPREFIX="$(npm prefix -g 2>/dev/null || echo /usr/lib)"
+      if [ -w "$GPREFIX" ]; then
+        npm install -g @officecli/officecli || true
+      else
+        as_root npm install -g @officecli/officecli || true
+      fi
+      command -v officecli >/dev/null 2>&1 && OFFICE_OK=1
+    else
+      warn "npm ausente no host — sem fallback disponível."
+    fi
+  fi
+  rm -f "$_OCLI_SH"
+fi
+# O instalador oficial grava em ~/.local/bin e só mexe no PATH do shell rc:
+# esta sessão precisa da pasta no PATH para o resto do script (e o Manager, que
+# herda o ambiente) enxergar o binário.
+if [ "$OFFICE_OK" -eq 1 ] && ! command -v officecli >/dev/null 2>&1 \
+   && [ -x "$HOME/.local/bin/officecli" ]; then
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+if [ "$OFFICE_OK" -eq 1 ]; then
+  if command -v officecli >/dev/null 2>&1; then
+    ok "OfficeCLI $(officecli --version 2>/dev/null | head -1) em $(command -v officecli)."
+  else
+    warn "OfficeCLI instalado, mas fora do PATH desta sessão (~/.local/bin)."
+    warn "Abra um terminal novo ou rode: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+elif [ "$OFFICE_SKIP" -eq 0 ]; then
+  warn "OfficeCLI não instalado — o sistema sobe sem ele."
+  warn "Para instalar depois: curl -fsSL https://d.officecli.ai/install.sh | bash"
 fi
 
 mkdir -p .agents/skills/officecli
-if curl -fsSL https://officecli.ai/SKILL.md -o .agents/skills/officecli/.SKILL.md.tmp; then
+if curl -fsSL --max-time 60 https://officecli.ai/SKILL.md -o .agents/skills/officecli/.SKILL.md.tmp 2>/dev/null \
+   || curl -fsSL --max-time 60 https://d.officecli.ai/SKILL.md -o .agents/skills/officecli/.SKILL.md.tmp 2>/dev/null; then
   mv .agents/skills/officecli/.SKILL.md.tmp .agents/skills/officecli/SKILL.md
   ok "Skill officecli instalada (.agents/skills/officecli/SKILL.md)."
 else
   rm -f .agents/skills/officecli/.SKILL.md.tmp
-  warn "curl https://officecli.ai/SKILL.md falhou — skill ausente (o CLI, se instalado, funciona)."
+  warn "Download do SKILL.md (officecli.ai) falhou — skill ausente (o CLI, se instalado, funciona)."
 fi
 
 # ── 3d. Boardview MCP (GenCAD .cad) + skill ───────────────────────────────────
@@ -910,7 +964,24 @@ PY
   "transport": "stdio",
   "command": "npx",
   "args": ["-y", "@playwright/mcp@latest", "--extension"],
-  "env": %s
+  "env": %s,
+  "examples": {
+    "browser_navigate": ["abra o site", "navegue para", "vá até esta página", "acesse o link", "abra o navegador"],
+    "browser_click": ["clique no botão", "clique aqui", "aperte o link"],
+    "browser_take_screenshot": ["tire um screenshot", "capture a tela", "faça uma captura da página"],
+    "browser_snapshot": ["leia a página", "extraia o texto do site", "veja o conteúdo da página"],
+    "browser_fill_form": ["preencha o formulário", "preencha o login", "digite nos campos"],
+    "browser_type": ["digite no campo", "escreva na caixa de texto"],
+    "browser_evaluate": ["rode javascript na página", "execute um script no site", "inspecione o DOM"],
+    "browser_console_messages": ["veja o console", "verifique erros no console"],
+    "browser_tabs": ["abra outra aba", "liste as abas", "feche a aba"],
+    "browser_wait_for": ["espere a página carregar", "aguarde alguns segundos"],
+    "browser_navigate_back": ["volte para a página anterior"],
+    "browser_network_requests": ["veja as requisições de rede"],
+    "browser_resize": ["mude o tamanho da janela"],
+    "browser_select_option": ["selecione esta opção"],
+    "browser_press_key": ["aperte Enter", "pressione uma tecla"]
+  }
 }' "$env_json")"
 
   # A extensão precisa ser instalada manualmente na Chrome Web Store —
@@ -993,7 +1064,7 @@ register_alpha_mcp() {
   payload=$(cat <<EOF
 {
   "name": "alpha-mcp",
-  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado.",
+  "skill_summary": "Busca na web: pesquisa fatos atuais e retorna trechos relevantes das melhores páginas, com título e URL para citação. Cálculo matemático: avalia expressões com segurança (aritmética, potências, raiz, logaritmos e trigonometria) e devolve o resultado. Publicação de artefatos (HTML, PDF, imagens, modelos 3D e documentos) na aba Artefatos da WebUI.",
   "transport": "http",
   "url": "$ws_url",
   "enabled": true,
@@ -1023,6 +1094,13 @@ register_alpha_mcp() {
       "divida",
       "raiz quadrada de",
       "calcule a expressão"
+    ],
+    "artifact_preview": [
+      "mostre o resultado na aba de artefatos",
+      "publique o HTML na visualização",
+      "abra o modelo 3D no visualizador",
+      "coloque o PDF/documento na aba Artefatos",
+      "exiba o gráfico gerado"
     ]
   }
 }
@@ -1347,8 +1425,28 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # Registro dos MCPs — logo após o up, quando o stack já está carregado.
   register_playwright_mcp || true
   register_alpha_mcp || true
-  register_boardview_mcp || true
-  register_cadquery_mcp || true
+
+  # Boardview/CadQuery: padrão em Docker (HTTP + autostart). O script faz
+  # build das imagens e registra/sincroniza as tools; se falhar, volta para
+  # o registro stdio dos venvs do host, para não deixar o usuário sem tools.
+  if [ "$SKIP_DOCKER_MCPS" -eq 0 ] && command -v docker >/dev/null 2>&1 \
+     && [ -f "$INSTALL_DIR/scripts/setup-docker-mcps.sh" ]; then
+    info "Build/registro dos MCPs em Docker (boardview + cadquery)..."
+    if bash "$INSTALL_DIR/scripts/setup-docker-mcps.sh" \
+         --install-dir "$INSTALL_DIR" --build --register --restart --yes; then
+      ok "MCPs Docker registrados (boardview + cadquery)."
+    else
+      warn "Setup Docker dos MCPs falhou — usando registro stdio como fallback."
+      register_boardview_mcp || true
+      register_cadquery_mcp || true
+    fi
+  else
+    if [ "$SKIP_DOCKER_MCPS" -eq 1 ]; then
+      info "MCPs Docker pulados (--skip-docker-mcps): usando registro stdio."
+    fi
+    register_boardview_mcp || true
+    register_cadquery_mcp || true
+  fi
 
 
 

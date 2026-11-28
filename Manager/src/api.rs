@@ -60,7 +60,7 @@ use axum::{
     http::{
         header,
         header::{CACHE_CONTROL, CONTENT_TYPE},
-        HeaderName, HeaderValue, StatusCode,
+        HeaderName, HeaderValue, StatusCode, Uri,
     },
     response::{IntoResponse, Json, Response},
     routing::{any, get, post},
@@ -164,6 +164,12 @@ pub async fn serve(
         .route("/graph/events", get(get_graph_events))
         .route("/graph/replay", get(get_graph_replay))
         .route("/assets/vis-network.min.js", get(get_vis_network))
+        // Visualizador 3D do Preview de artefatos (vendorizado, sem CDN).
+        .route("/assets/three.min.js", get(get_three))
+        .route("/assets/three-OrbitControls.js", get(get_three))
+        .route("/assets/three-GLTFLoader.js", get(get_three))
+        .route("/assets/three-STLLoader.js", get(get_three))
+        .route("/assets/three-OBJLoader.js", get(get_three))
         .route("/docker/logs", get(get_docker_logs))
         // Ferramentas de host p/ o alpha-mcp (leitura, busca e shell).
         // Rodam no processo do tray (host), exigem Bearer interno e são
@@ -1008,6 +1014,31 @@ async fn get_graph_replay(
 async fn get_vis_network() -> Response {
     const JS: &[u8] = include_bytes!("../assets/vis-network.min.js");
     let mut response = Response::new(Body::from(JS));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
+}
+
+/// Arquivos three.js vendorizados — o visualizador 3D roda na própria WebUI,
+/// sem CDN e sem página externa. O nome vem do path para um handler servir
+/// todos os arquivos sem expandir a tabela de rotas.
+async fn get_three(uri: Uri) -> Response {
+    let name = uri.path().rsplit('/').next().unwrap_or("");
+    let js: &[u8] = match name {
+        "three.min.js" => include_bytes!("../assets/three.min.js"),
+        "three-OrbitControls.js" => include_bytes!("../assets/three-OrbitControls.js"),
+        "three-GLTFLoader.js" => include_bytes!("../assets/three-GLTFLoader.js"),
+        "three-STLLoader.js" => include_bytes!("../assets/three-STLLoader.js"),
+        "three-OBJLoader.js" => include_bytes!("../assets/three-OBJLoader.js"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut response = Response::new(Body::from(js));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/javascript; charset=utf-8"),

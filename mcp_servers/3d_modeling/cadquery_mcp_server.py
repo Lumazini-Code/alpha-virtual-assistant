@@ -1,10 +1,13 @@
 """MCP server for parametric 3D-printable CAD with CadQuery.
 
 Run with: python cadquery_mcp_server.py
-Transport: stdio by default; use CQ_MCP_TRANSPORT=sse for an HTTP/SSE server.
+Transport: stdio by default. CQ_MCP_TRANSPORT=streamable-http exposes /mcp for
+the HTTP transport used by the host MCP manager; CQ_MCP_HOST/CQ_MCP_PORT set
+the bind address. Stateless HTTP keeps the process small between calls.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -17,23 +20,40 @@ try:
 except ImportError as exc:  # pragma: no cover - gives an actionable runtime error
     raise SystemExit("Install dependencies first: pip install -e .") from exc
 
-try:
-    import cadquery as cq
-    from cadquery import exporters, importers
-except ImportError:
-    cq = None
-    exporters = importers = None
+# OCP (dependência do CadQuery) é pesado: carregá-lo só na primeira tool que
+# realmente modela mantém o processo HTTP leve enquanto está ocioso.
+cq: Any = None
+exporters: Any = None
+importers: Any = None
 
-mcp = FastMCP("cadquery-3d-printing")
+mcp = FastMCP(
+    "cadquery-3d-printing",
+    host=os.environ.get("CQ_MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("CQ_MCP_PORT", "8000")),
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
+)
 OBJECTS: dict[str, Any] = {}
 META: dict[str, dict[str, Any]] = {}
 WORKDIR = Path(os.environ.get("CQ_WORKDIR", os.getcwd())).expanduser().resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 
-def _require_cq() -> None:
+def _require_cq() -> Any:
+    global cq, exporters, importers
     if cq is None:
-        raise RuntimeError("CadQuery não está instalado. Execute: pip install -e .")
+        try:
+            import cadquery as _cq
+            from cadquery import exporters as _exporters, importers as _importers
+        except ImportError as exc:
+            raise RuntimeError("CadQuery não está instalado. Execute: pip install -e .") from exc
+        cq, exporters, importers = _cq, _exporters, _importers
+    return cq
+
+
+def _cadquery_available() -> bool:
+    return cq is not None or importlib.util.find_spec("cadquery") is not None
 
 
 def _obj(name: str) -> Any:
@@ -93,7 +113,7 @@ def inspect_object(name: str) -> dict[str, Any]:
 @mcp.tool()
 def health_check() -> dict[str, Any]:
     """Return server/runtime status and the active work directory."""
-    return {"ok": True, "cadquery_available": cq is not None, "object_count": len(OBJECTS), "workdir": str(WORKDIR)}
+    return {"ok": True, "cadquery_available": _cadquery_available(), "object_count": len(OBJECTS), "workdir": str(WORKDIR)}
 
 
 @mcp.tool()
@@ -271,8 +291,10 @@ def save_manifest(filename: str = "cadquery_manifest.json") -> dict[str, Any]:
 
 
 def main() -> None:
-    transport = os.environ.get("CQ_MCP_TRANSPORT", "stdio")
-    if transport == "sse":
+    transport = os.environ.get("CQ_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport in ("streamable-http", "http"):
+        mcp.run(transport="streamable-http")
+    elif transport == "sse":
         mcp.run(transport="sse")
     else:
         mcp.run()

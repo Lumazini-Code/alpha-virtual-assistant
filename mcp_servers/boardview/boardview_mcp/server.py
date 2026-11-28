@@ -1,4 +1,8 @@
-"""Servidor MCP para análise de boardviews (GenCAD .cad) por IAs."""
+"""Servidor MCP para análise de boardviews (GenCAD .cad) por IAs.
+
+Stdio por padrão; `--transport streamable-http` expõe /mcp para o mcp_manager
+do host (BOARDVIEW_MCP_HOST/BOARDVIEW_MCP_PORT controlam o bind).
+"""
 from __future__ import annotations
 
 import functools
@@ -19,6 +23,11 @@ from .render import resolve_center
 
 mcp = FastMCP(
     "boardview",
+    host=os.environ.get("BOARDVIEW_MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("BOARDVIEW_MCP_PORT", "8000")),
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
     instructions=(
         "Análise de placas eletrônicas a partir de boardview GenCAD (.cad). Comece com load_board (se nenhuma placa "
         "estiver carregada) e board_info. Para rails use list_power_rails e power_rail_analysis; para ver um "
