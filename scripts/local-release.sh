@@ -238,7 +238,7 @@ else
     export ALPHA_RELEASE_ZIP="$DIST/$LINUX_ZIP"
     # Os \n aceitam os defaults do instalador: manter token, perfil econômico,
     # não mexer no PATH, etc. O .env da instalação é preservado (zip não tem .env).
-    printf '\n\n\n\n\n\n' | ./install.sh --no-launch
+    printf '\n\n\n\n\n\n' | bash ./install.sh --no-launch
     ok "Instalação local atualizada."
 fi
 
