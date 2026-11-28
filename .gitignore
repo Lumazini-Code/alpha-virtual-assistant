@@ -100,3 +100,5 @@ mcp_servers/3d_modeling/*.egg-info
 mcp_servers/3d_modeling/build
 
 presenton_data
+
+.venv*
