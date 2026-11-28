@@ -115,5 +115,13 @@ endif()
 if(UNIX)
     # Achar as .so na pasta do executável (DT_RPATH vale também pras dependências das libs)
     set_target_properties(transcript PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
-    target_link_options(transcript PRIVATE -Wl,--disable-new-dtags -Wl,-rpath-link,${ROOT})
+    target_link_options(transcript PRIVATE -Wl,--disable-new-dtags -Wl,-rpath-link,${ROOT} -Wl,-rpath-link,${LIBRARY_SEARCH_PATH})
+
+    # libten_vad.so foi compilado com libc++; linka o runtime/ABI ao lado dele
+    # para resolver os símbolos std::__1 (o resto do exe segue em libstdc++).
+    foreach(_libcxx libc++ libc++abi)
+        if(EXISTS "${LIBRARY_SEARCH_PATH}/lib${_libcxx}.so.1")
+            target_link_libraries(transcript PRIVATE "${LIBRARY_SEARCH_PATH}/lib${_libcxx}.so.1")
+        endif()
+    endforeach()
 endif()

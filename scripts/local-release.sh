@@ -154,8 +154,9 @@ ok "Stage montado (working tree)."
 cp -a Manager/ava-tray Manager/ava-web "$STAGE_L/Manager/"
 mkdir -p "$STAGE_L/Modules/transcribe"
 cp -a Modules/transcribe/transcript "$STAGE_L/Modules/transcribe/"
-# O RPATH do exe é $ORIGIN: as .so precisam ficar ao lado dele, não em linux/.
-cp -a Modules/transcribe/linux/*.so "$STAGE_L/Modules/transcribe/"
+# O RPATH do exe é $ORIGIN: todas as .so (incluindo libc++/libc++abi/libunwind,
+# exigidas por libten_vad.so) precisam ficar ao lado dele, não em linux/.
+cp -a Modules/transcribe/linux/. "$STAGE_L/Modules/transcribe/"
 
 cp -a Manager/ava-tray.exe Manager/ava-web.exe Manager/WebView2Loader.dll "$STAGE_W/Manager/"
 mkdir -p "$STAGE_W/Modules/transcribe"
