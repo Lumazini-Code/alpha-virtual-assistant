@@ -99,6 +99,12 @@ mcp_servers/boardview/build
 mcp_servers/3d_modeling/*.egg-info
 mcp_servers/3d_modeling/build
 
-presenton_data
-
 .venv*
+
+__pycache__
+
+logs
+
+scraping_client.py
+
+tests
