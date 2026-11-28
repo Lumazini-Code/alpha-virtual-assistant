@@ -77,6 +77,8 @@ AGENTS.md
 *.so
 Modules/transcribe/linux/
 Modules/transcribe/windows/*
+Modules/transcribe/*.dll
+Modules/transcribe/transcript.exe
 
 install-playwright-mcp.sh
 
